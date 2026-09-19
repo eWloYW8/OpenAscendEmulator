@@ -6,8 +6,13 @@ use crate::device_elf::{
 use crate::isa::{AicDecoderHint, AicFramingError, AicInstructionWord, AicWordFramer};
 use crate::kernel_config::{KernelConfigDocument, KernelConfigError};
 use crate::plan::{LaunchPlan, PlanError, SimulatorRequest};
+use crate::prof_stub_object_verify::{ProfStubObjectVerification, verify_prof_stub_object};
+use crate::prof_stub_packet::ProfStubPacketError;
+use crate::prof_stub_stream::inspect_prof_stub_stream;
 use crate::replay_seed::{ReplaySeed, ReplaySeedError};
+use crate::rvec::C310RvecArithmeticHint;
 use crate::trace::verify_scalar_trace;
+use crate::vec_c220::C220VecArithmeticHint;
 use crate::workspace::{PreparedRun, WorkspaceError, WorkspaceOptions};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -27,6 +32,11 @@ fn parse_u64_address(raw: &str) -> Result<u64, String> {
         raw.parse()
             .map_err(|_| format!("invalid decimal address: {raw}"))
     }
+}
+
+fn parse_u32_word(raw: &str) -> Result<u32, String> {
+    let value = parse_u64_address(raw)?;
+    u32::try_from(value).map_err(|_| format!("instruction word exceeds 32 bits: {raw}"))
 }
 
 fn parse_pc_start_addr(bytes: &[u8]) -> Result<u64, &'static str> {
@@ -70,6 +80,27 @@ fn read_pc_start_addr(path: &Path) -> Result<u64, CliError> {
     })
 }
 
+fn read_bounded_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, CliError> {
+    let mut bytes = Vec::new();
+    let file = File::open(path).map_err(|source| CliError::FileRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| CliError::FileRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(CliError::InputFileTooLarge {
+            path: path.to_path_buf(),
+            limit: max_bytes,
+        });
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "open-ascend-emulator", version, about)]
 struct Cli {
@@ -98,6 +129,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    InspectRvecWord {
+        #[arg(value_parser = parse_u32_word)]
+        word: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    InspectC220VecWord {
+        #[arg(value_parser = parse_u32_word)]
+        word: u32,
+        #[arg(long)]
+        json: bool,
+    },
     InspectElf {
         path: PathBuf,
         #[arg(long)]
@@ -117,6 +160,32 @@ enum Command {
         path: PathBuf,
         #[arg(long)]
         architecture: Architecture,
+        #[arg(long)]
+        json: bool,
+    },
+    InspectProfStubStream {
+        path: PathBuf,
+        #[arg(long, default_value_t = 1_048_576)]
+        max_bytes: u64,
+        #[arg(long, default_value_t = 16)]
+        max_records: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    VerifyProfStubObject {
+        stream: PathBuf,
+        #[arg(long)]
+        object: PathBuf,
+        #[arg(long)]
+        kernel: String,
+        #[arg(long)]
+        pc_start_addr_file: PathBuf,
+        #[arg(long, default_value_t = 1_048_576)]
+        max_bytes: u64,
+        #[arg(long, default_value_t = 16_777_216)]
+        max_object_bytes: u64,
+        #[arg(long, default_value_t = 16)]
+        max_examples: usize,
         #[arg(long)]
         json: bool,
     },
@@ -205,6 +274,14 @@ pub enum CliError {
     DeviceElf(#[from] DeviceElfError),
     #[error(transparent)]
     AicFraming(#[from] AicFramingError),
+    #[error(transparent)]
+    ProfStubPacket(#[from] ProfStubPacketError),
+    #[error("input file {path} exceeds explicit {limit}-byte read limit")]
+    InputFileTooLarge { path: PathBuf, limit: u64 },
+    #[error(
+        "ProfStub object binding did not verify all instruction records: {checked}/{total} checked"
+    )]
+    ProfStubObjectUnverified { checked: usize, total: usize },
     #[error("failed to read scalar trace: {0}")]
     TraceRead(#[from] io::Error),
     #[error("scalar trace contained no supported scalar arithmetic, move, or ZEROEXT records")]
@@ -322,6 +399,56 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
                             .join(",")
                     );
                 }
+            }
+        }
+        Command::InspectRvecWord { word, json } => {
+            let output = RvecWordInspection {
+                word,
+                architecture: Architecture::Dav3510,
+                hint: C310RvecArithmeticHint::from_word(word),
+            };
+            if json {
+                print_json(&output)?;
+            } else if let Some(hint) = output.hint {
+                println!("word: {:#010x}", output.word);
+                println!("operation: {:?}", hint.operation);
+                println!("vendor-isa-name: {}", hint.vendor_isa_name);
+                println!("destination-v-register: {}", hint.destination_v_register);
+                println!("first-source-v-register: {}", hint.first_source_v_register);
+                println!(
+                    "second-source-v-register: {}",
+                    hint.second_source_v_register
+                );
+                println!("predicate-register: {}", hint.predicate_register);
+                println!("dtype-selector: {}", hint.dtype_selector);
+                println!("fp32-value-path: {}", hint.has_fp32_value_path());
+            } else {
+                println!("word: {:#010x}", output.word);
+                println!("C310 RVec VADD/VSUB opcode: unrecognized");
+            }
+        }
+        Command::InspectC220VecWord { word, json } => {
+            let output = C220VecWordInspection {
+                word,
+                architecture: Architecture::Dav2201,
+                hint: C220VecArithmeticHint::from_word(word),
+            };
+            if json {
+                print_json(&output)?;
+            } else if let Some(hint) = output.hint {
+                println!("word: {:#010x}", output.word);
+                println!("operation: {:?}", hint.operation);
+                println!("vendor-isa-name: {}", hint.vendor_isa_name);
+                println!("x-register-index-0: {}", hint.x_register_index_0);
+                println!("x-register-index-4: {}", hint.x_register_index_4);
+                println!("x-register-index-6: {}", hint.x_register_index_6);
+                println!("x-register-index-8: {}", hint.x_register_index_8);
+                println!("dtype-selector: {}", hint.dtype_selector);
+                println!("vendor-dtype-code: {}", hint.vendor_dtype_code);
+                println!("fp32-value-path: {}", hint.has_fp32_value_path());
+            } else {
+                println!("word: {:#010x}", output.word);
+                println!("C220 Vec VADD/VSUB opcode: unrecognized");
             }
         }
         Command::InspectElf {
@@ -550,6 +677,88 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
                 return Err(CliError::ScalarTraceMismatch(summary.mismatches));
             }
         }
+        Command::InspectProfStubStream {
+            path,
+            max_bytes,
+            max_records,
+            json,
+        } => {
+            let bytes = read_bounded_file(&path, max_bytes)?;
+            let summary = inspect_prof_stub_stream(&bytes, max_records)?;
+            if json {
+                print_json(&summary)?;
+            } else {
+                println!("stream-bytes: {}", summary.stream_bytes);
+                println!("packets: {}", summary.packet_count);
+                for (packet_type, count) in &summary.counts_by_type {
+                    println!("type[{packet_type}]: {count}");
+                }
+                for record in &summary.records {
+                    println!(
+                        "offset={} type={} payload={} {:?}",
+                        record.offset, record.packet_type, record.payload_bytes, record.detail
+                    );
+                }
+                println!("omitted-records: {}", summary.omitted_records);
+            }
+        }
+        Command::VerifyProfStubObject {
+            stream,
+            object,
+            kernel,
+            pc_start_addr_file,
+            max_bytes,
+            max_object_bytes,
+            max_examples,
+            json,
+        } => {
+            let stream_bytes = read_bounded_file(&stream, max_bytes)?;
+            let object_bytes = read_bounded_file(&object, max_object_bytes)?;
+            let elf = DeviceElf::parse(&object_bytes)?;
+            let code_base = read_pc_start_addr(&pc_start_addr_file)?;
+            let projected = elf.project_kernel(&kernel, code_base)?;
+            let result = verify_prof_stub_object(&stream_bytes, &projected, max_examples)?;
+            let output = ProfStubObjectInspection {
+                stream,
+                object,
+                kernel,
+                pc_start_addr_file,
+                device_entry_address: projected.entry_address,
+                verification: result,
+            };
+            if json {
+                print_json(&output)?;
+            } else {
+                println!("kernel: {}", output.kernel);
+                println!("device-entry: {:#x}", output.device_entry_address);
+                println!(
+                    "instruction-events: {}",
+                    output.verification.instruction_events
+                );
+                println!("checked-events: {}", output.verification.checked_events);
+                println!(
+                    "unique-checked-pcs: {}",
+                    output.verification.unique_checked_pcs
+                );
+                println!(
+                    "all-instruction-words-match-object: {}",
+                    output.verification.all_instruction_words_match_object
+                );
+                for issue in &output.verification.examples {
+                    println!(
+                        "  offset={} pc={:#x} {:?}",
+                        issue.packet_offset, issue.pc, issue
+                    );
+                }
+                println!("omitted-examples: {}", output.verification.omitted_examples);
+            }
+            if !output.verification.all_instruction_words_match_object {
+                return Err(CliError::ProfStubObjectUnverified {
+                    checked: output.verification.checked_events,
+                    total: output.verification.instruction_events,
+                });
+            }
+        }
         Command::Op {
             command: OpCommand::Simulator(arguments),
         } => {
@@ -660,6 +869,20 @@ struct RawWord {
 }
 
 #[derive(Debug, Serialize)]
+struct RvecWordInspection {
+    word: u32,
+    architecture: Architecture,
+    hint: Option<C310RvecArithmeticHint>,
+}
+
+#[derive(Debug, Serialize)]
+struct C220VecWordInspection {
+    word: u32,
+    architecture: Architecture,
+    hint: Option<C220VecArithmeticHint>,
+}
+
+#[derive(Debug, Serialize)]
 struct KernelPreview {
     summary: DeviceKernelSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -695,6 +918,16 @@ struct ElfInspection {
     code_base: Option<CodeBaseEvidence>,
     kernels: Vec<DeviceKernelSummary>,
     selected: Option<KernelPreview>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProfStubObjectInspection {
+    stream: PathBuf,
+    object: PathBuf,
+    kernel: String,
+    pc_start_addr_file: PathBuf,
+    device_entry_address: u64,
+    verification: ProfStubObjectVerification,
 }
 
 #[cfg(test)]
@@ -749,6 +982,78 @@ mod tests {
     }
 
     #[test]
+    fn parses_bounded_prof_stub_stream_inspection() {
+        let cli = Cli::try_parse_from([
+            "open-ascend-emulator",
+            "inspect-prof-stub-stream",
+            "capture.bin",
+            "--max-bytes",
+            "32768",
+            "--max-records",
+            "0",
+            "--json",
+        ])
+        .unwrap();
+        let Command::InspectProfStubStream {
+            path,
+            max_bytes,
+            max_records,
+            json,
+        } = cli.command
+        else {
+            panic!("unexpected command")
+        };
+        assert_eq!(path, PathBuf::from("capture.bin"));
+        assert_eq!(max_bytes, 32768);
+        assert_eq!(max_records, 0);
+        assert!(json);
+    }
+
+    #[test]
+    fn parses_object_bound_prof_stub_verification() {
+        let cli = Cli::try_parse_from([
+            "open-ascend-emulator",
+            "verify-prof-stub-object",
+            "capture.bin",
+            "--object",
+            "kernel.o",
+            "--kernel",
+            "ClearL2Cache",
+            "--pc-start-addr-file",
+            "pc_start_addr.txt",
+            "--max-bytes",
+            "32768",
+            "--max-object-bytes",
+            "8388608",
+            "--max-examples",
+            "4",
+            "--json",
+        ])
+        .unwrap();
+        let Command::VerifyProfStubObject {
+            stream,
+            object,
+            kernel,
+            pc_start_addr_file,
+            max_bytes,
+            max_object_bytes,
+            max_examples,
+            json,
+        } = cli.command
+        else {
+            panic!("unexpected command")
+        };
+        assert_eq!(stream, PathBuf::from("capture.bin"));
+        assert_eq!(object, PathBuf::from("kernel.o"));
+        assert_eq!(kernel, "ClearL2Cache");
+        assert_eq!(pc_start_addr_file, PathBuf::from("pc_start_addr.txt"));
+        assert_eq!(max_bytes, 32768);
+        assert_eq!(max_object_bytes, 8_388_608);
+        assert_eq!(max_examples, 4);
+        assert!(json);
+    }
+
+    #[test]
     fn parses_device_elf_inspection_with_explicit_aic_front_end() {
         let cli = Cli::try_parse_from([
             "open-ascend-emulator",
@@ -795,6 +1100,46 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_bounded_c310_rvec_word() {
+        let cli = Cli::try_parse_from([
+            "open-ascend-emulator",
+            "inspect-rvec-word",
+            "0x80082781",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::InspectRvecWord {
+                word: 0x8008_2781,
+                json: true
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["open-ascend-emulator", "inspect-rvec-word", "0x100000000"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_bounded_c220_vec_word() {
+        let cli = Cli::try_parse_from([
+            "open-ascend-emulator",
+            "inspect-c220-vec-word",
+            "0x85dcb619",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::InspectC220VecWord {
+                word: 0x85dc_b619,
+                json: true
+            }
+        ));
     }
 
     #[test]

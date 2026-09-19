@@ -95,6 +95,26 @@ impl AclArgumentPlan {
                 passes_null_pointer: false,
             });
         }
+        for &size in &config.workspace_sizes {
+            let index = slots.len();
+            let allocation = size.checked_add(WORKSPACE_EXTRA_BYTES).ok_or(
+                AclArgumentPlanError::AllocationOverflow {
+                    kind: AclArgKind::Workspace,
+                    index,
+                },
+            )?;
+            slots.push(AclArgSlot {
+                index,
+                kind: AclArgKind::Workspace,
+                path: None,
+                logical_bytes: Some(size),
+                host_allocation_bytes: None,
+                device_allocation_bytes: Some(allocation),
+                host_to_device_copy_bytes: None,
+                device_to_host_copy_bytes: None,
+                passes_null_pointer: false,
+            });
+        }
         if let Some(tiling) = &config.tiling_data {
             let index = slots.len();
             let size = tiling.size;
@@ -117,26 +137,6 @@ impl AclArgumentPlan {
                 host_allocation_bytes: Some(size),
                 device_allocation_bytes: Some(rounded),
                 host_to_device_copy_bytes: Some(size),
-                device_to_host_copy_bytes: None,
-                passes_null_pointer: false,
-            });
-        }
-        for &size in &config.workspace_sizes {
-            let index = slots.len();
-            let allocation = size.checked_add(WORKSPACE_EXTRA_BYTES).ok_or(
-                AclArgumentPlanError::AllocationOverflow {
-                    kind: AclArgKind::Workspace,
-                    index,
-                },
-            )?;
-            slots.push(AclArgSlot {
-                index,
-                kind: AclArgKind::Workspace,
-                path: None,
-                logical_bytes: Some(size),
-                host_allocation_bytes: None,
-                device_allocation_bytes: Some(allocation),
-                host_to_device_copy_bytes: None,
                 device_to_host_copy_bytes: None,
                 passes_null_pointer: false,
             });
@@ -179,11 +179,11 @@ mod tests {
         assert_eq!(plan.slots[1].host_to_device_copy_bytes, Some(9));
         assert_eq!(plan.slots[2].kind, AclArgKind::Output);
         assert_eq!(plan.slots[2].device_to_host_copy_bytes, Some(64));
-        assert_eq!(plan.slots[3].kind, AclArgKind::Tiling);
-        assert_eq!(plan.slots[3].device_allocation_bytes, Some(128));
-        assert_eq!(plan.slots[3].host_to_device_copy_bytes, Some(96));
-        assert_eq!(plan.slots[4].kind, AclArgKind::Workspace);
-        assert_eq!(plan.slots[4].device_allocation_bytes, Some(0x100_0080));
+        assert_eq!(plan.slots[3].kind, AclArgKind::Workspace);
+        assert_eq!(plan.slots[3].device_allocation_bytes, Some(0x100_0080));
+        assert_eq!(plan.slots[4].kind, AclArgKind::Tiling);
+        assert_eq!(plan.slots[4].device_allocation_bytes, Some(128));
+        assert_eq!(plan.slots[4].host_to_device_copy_bytes, Some(96));
     }
 
     #[test]

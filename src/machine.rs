@@ -8,12 +8,14 @@ use serde::Serialize;
 use thiserror::Error;
 
 pub const SCALAR_X_REGISTER_COUNT: usize = 32;
+const SCALAR_SPR_SNAPSHOT_CAPACITY: usize = 243;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScalarMachine {
     architecture: Architecture,
     xregs: [u64; SCALAR_X_REGISTER_COUNT],
     spr2: u64,
+    spr_values: [Option<u64>; SCALAR_SPR_SNAPSHOT_CAPACITY],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -30,6 +32,17 @@ pub struct ScalarStep {
     pub signed_overflow: bool,
     pub prior_spr2: u64,
     pub spr2: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ScalarSprStep {
+    pub pc: u64,
+    pub word: u32,
+    pub destination_spr: u16,
+    pub prior_destination_value: Option<u64>,
+    pub source_register: u8,
+    pub source_value: u64,
+    pub value: u64,
 }
 
 pub trait ScalarMemoryBus {
@@ -88,6 +101,7 @@ impl ScalarMachine {
             architecture,
             xregs,
             spr2,
+            spr_values: [None; SCALAR_SPR_SNAPSHOT_CAPACITY],
         }
     }
 
@@ -101,6 +115,46 @@ impl ScalarMachine {
 
     pub const fn spr2(&self) -> u64 {
         self.spr2
+    }
+
+    pub fn spr_value(&self, index: u16) -> Option<u64> {
+        self.spr_values.get(usize::from(index)).copied().flatten()
+    }
+
+    pub fn execute_spr_word(
+        &mut self,
+        pc: u64,
+        word: u32,
+    ) -> Result<ScalarSprStep, ScalarMachineError> {
+        let Some(AicDecoderHint::ScalarKey2MoveToSpr {
+            encoded_destination_spr,
+            source_register,
+            ..
+        }) = AicDecoderHint::from_word(self.architecture, word)
+        else {
+            return Err(ScalarMachineError::UnsupportedWord { pc, word });
+        };
+        let mask = match (self.architecture, encoded_destination_spr) {
+            (Architecture::Dav2201, 3) | (Architecture::Dav3510, 3 | 105 | 112) => u64::MAX,
+            (Architecture::Dav3510, 90) => 0xff,
+            _ => return Err(ScalarMachineError::UnsupportedWord { pc, word }),
+        };
+        let Some(&source_value) = self.xregs.get(usize::from(source_register)) else {
+            return Err(ScalarMachineError::UnsupportedWord { pc, word });
+        };
+        let slot = &mut self.spr_values[usize::from(encoded_destination_spr)];
+        let prior_destination_value = *slot;
+        let value = source_value & mask;
+        *slot = Some(value);
+        Ok(ScalarSprStep {
+            pc,
+            word,
+            destination_spr: encoded_destination_spr,
+            prior_destination_value,
+            source_register,
+            source_value,
+            value,
+        })
     }
 
     pub fn set_xreg(&mut self, register: u8, value: u64) -> Result<(), ScalarMachineError> {
@@ -804,5 +858,65 @@ mod tests {
             ));
             assert_eq!(machine, before);
         }
+    }
+
+    #[test]
+    fn observed_c220_mov_spr_xn_writes_full_width_ctrl_value() {
+        let mut machine = ScalarMachine::new(Architecture::Dav2201, [0; 32], 0x55);
+        machine.set_xreg(19, 0x0100_0000_0000_0000).unwrap();
+        let first = machine.execute_spr_word(0x1131_2644, 0x0207_3900).unwrap();
+        assert_eq!(first.destination_spr, 3);
+        assert_eq!(first.source_register, 19);
+        assert_eq!(first.source_value, 0x0100_0000_0000_0000);
+        assert_eq!(first.prior_destination_value, None);
+        assert_eq!(machine.spr_value(3), Some(0x0100_0000_0000_0000));
+
+        machine.set_xreg(19, 0).unwrap();
+        let second = machine.execute_spr_word(0x1131_2654, 0x0207_3900).unwrap();
+        assert_eq!(second.prior_destination_value, Some(first.value));
+        assert_eq!(machine.spr_value(3), Some(0));
+        assert_eq!(machine.spr2(), 0x55);
+    }
+
+    #[test]
+    fn observed_c310_mov_spr_xn_applies_spr90_mask() {
+        let mut machine = ScalarMachine::new(Architecture::Dav3510, [0; 32], 0x55);
+        machine.set_xreg(0, 0x1234_5678_9abc_def0).unwrap();
+        for (word, destination, expected) in [
+            (0x0206_0900, 3, 0x1234_5678_9abc_def0),
+            (0x02b4_0900, 90, 0xf0),
+            (0x02d2_0900, 105, 0x1234_5678_9abc_def0),
+            (0x02e0_0900, 112, 0x1234_5678_9abc_def0),
+        ] {
+            let step = machine.execute_spr_word(0x10d0_d140, word).unwrap();
+            assert_eq!(step.destination_spr, destination);
+            assert_eq!(step.value, expected);
+            assert_eq!(machine.spr_value(destination), Some(expected));
+        }
+        assert_eq!(machine.spr2(), 0x55);
+    }
+
+    #[test]
+    fn unverified_spr_destinations_and_out_of_range_sources_fail_closed() {
+        let mut c310 = ScalarMachine::new(Architecture::Dav3510, [0; 32], 0x55);
+        let before = c310.clone();
+        assert!(matches!(
+            c310.execute_spr_word(0x100, 0x0230_0901),
+            Err(ScalarMachineError::UnsupportedWord { .. })
+        ));
+        assert_eq!(c310, before);
+        assert!(matches!(
+            c310.execute_word(0x100, 0x0206_0900),
+            Err(ScalarMachineError::UnsupportedWord { .. })
+        ));
+        assert_eq!(c310, before);
+
+        let mut c220 = ScalarMachine::new(Architecture::Dav2201, [0; 32], 0x55);
+        let before = c220.clone();
+        assert!(matches!(
+            c220.execute_spr_word(0x100, 0x0206_1920),
+            Err(ScalarMachineError::UnsupportedWord { .. })
+        ));
+        assert_eq!(c220, before);
     }
 }

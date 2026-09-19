@@ -2,15 +2,13 @@
 use thiserror::Error;
 
 use crate::architecture::Architecture;
-use crate::hbm::{CamodelHbmAllocator, HbmAllocationError, HbmResolveError};
+use crate::hbm::{CamodelHbmAllocator, HbmAllocationError};
 use crate::pv_memory::{PvMemory, PvMemoryError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum HbmPvMemoryError {
     #[error(transparent)]
     Allocation(#[from] HbmAllocationError),
-    #[error(transparent)]
-    Address(#[from] HbmResolveError),
     #[error(transparent)]
     Store(#[from] PvMemoryError),
 }
@@ -54,11 +52,6 @@ impl HbmPvMemory {
         device_address: u64,
         source: &[u8],
     ) -> Result<(), HbmPvMemoryError> {
-        if source.is_empty() {
-            return Ok(());
-        }
-        let bytes = u64::try_from(source.len()).map_err(|_| PvMemoryError::RangeOverflow)?;
-        self.allocator.resolve_live(device_address, bytes)?;
         self.store.write(device_address, source)?;
         Ok(())
     }
@@ -68,12 +61,18 @@ impl HbmPvMemory {
         device_address: u64,
         destination: &mut [u8],
     ) -> Result<(), HbmPvMemoryError> {
-        if destination.is_empty() {
-            return Ok(());
-        }
-        let bytes = u64::try_from(destination.len()).map_err(|_| PvMemoryError::RangeOverflow)?;
-        self.allocator.resolve_live(device_address, bytes)?;
         self.store.read_into(device_address, destination)?;
+        Ok(())
+    }
+
+    pub fn device_to_device(
+        &mut self,
+        destination_address: u64,
+        source_address: u64,
+        length: usize,
+    ) -> Result<(), HbmPvMemoryError> {
+        self.store
+            .copy(destination_address, source_address, length)?;
         Ok(())
     }
 }
@@ -113,24 +112,34 @@ mod tests {
     }
 
     #[test]
-    fn live_range_guard_rejects_cross_allocation_and_freed_addresses() {
+    fn host_copies_follow_vendor_bytes_outside_live_allocations() {
         for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
             let mut memory = HbmPvMemory::new(architecture, 0, 1);
-            let first = memory.allocate(4).unwrap();
-            let second = memory.allocate(4).unwrap();
-            assert_eq!(second, first + 4);
-            let before = memory.clone();
-            assert!(matches!(
-                memory.host_to_device(first + 3, &[1, 2]),
-                Err(HbmPvMemoryError::Address(HbmResolveError::Unmapped { .. }))
-            ));
-            assert_eq!(memory, before);
-            memory.free(first).unwrap();
-            assert!(matches!(
-                memory.host_to_device(first, &[9]),
-                Err(HbmPvMemoryError::Address(HbmResolveError::Unmapped { .. }))
-            ));
-            assert_eq!(memory.store().page_count(), 0);
+            let first = memory.allocate_driver_request(64).unwrap();
+            let second = memory.allocate_driver_request(64).unwrap();
+            assert_eq!(second, first + 512);
+            let pattern: [u8; 16] = [
+                0x01, 0x80, 0x00, 0xff, 0x5a, 0xa5, 0x12, 0x34, 0xde, 0xad, 0xbe, 0xef, 0x7f, 0x20,
+                0x09, 0xc3,
+            ];
+            memory.host_to_device(first + 3, &pattern).unwrap();
+            memory.device_to_device(second + 5, first + 3, 16).unwrap();
+            let mut result = [0; 16];
+            memory.device_to_host(second + 5, &mut result).unwrap();
+            assert_eq!(result, pattern);
+
+            memory.free(second).unwrap();
+            memory.device_to_host(second + 5, &mut result).unwrap();
+            assert_eq!(result, pattern);
+            result.fill(0x55);
+            memory.device_to_host(second + 512, &mut result).unwrap();
+            assert_eq!(result, [0; 16]);
+            memory.host_to_device(second + 5, &pattern).unwrap();
+            memory.device_to_host(second + 5, &mut result).unwrap();
+            assert_eq!(result, pattern);
+            memory.host_to_device(second + 512, &pattern).unwrap();
+            memory.device_to_host(second + 512, &mut result).unwrap();
+            assert_eq!(result, pattern);
         }
     }
 

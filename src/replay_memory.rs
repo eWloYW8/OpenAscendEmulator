@@ -267,11 +267,11 @@ mod tests {
             memory.read_states(1, 0, 4).unwrap(),
             [MemoryByteState::Unknown; 4]
         );
-        assert_eq!(memory.read_known(2, 0, 2).unwrap(), [4, 5]);
+        assert_eq!(memory.read_known(3, 0, 2).unwrap(), [4, 5]);
         assert_eq!(
-            memory.read_known(2, 2, 1),
+            memory.read_known(3, 2, 1),
             Err(ReplayMemoryError::UnknownBytes {
-                region: 2,
+                region: 3,
                 offset: 2
             })
         );

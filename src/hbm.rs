@@ -5,7 +5,17 @@ use thiserror::Error;
 
 pub const CAMODEL_HBM_BASE: u64 = 0x1000_0000;
 pub const CAMODEL_HBM_BYTES: u64 = 0x5_0000_0000;
-pub const C310_DRIVER_ALLOCATION_ALIGNMENT: u64 = 512;
+pub const CAMODEL_DRIVER_ALLOCATION_ALIGNMENT: u64 = 512;
+
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DriverMemStatus {
+    Success = 0,
+    InvalidArgument = 3,
+    InvalidPointer = 4,
+    UnsupportedMemoryType = 5,
+    NoMemory = 6,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct HbmSpan {
@@ -109,12 +119,55 @@ impl CamodelHbmAllocator {
         if bytes > CAMODEL_HBM_BYTES {
             return Err(HbmAllocationError::TooLarge { requested: bytes });
         }
-        let actual_bytes = if self.architecture == Architecture::Dav3510 {
-            (bytes + C310_DRIVER_ALLOCATION_ALIGNMENT - 1) & !(C310_DRIVER_ALLOCATION_ALIGNMENT - 1)
-        } else {
-            bytes
-        };
+        let actual_bytes = (bytes + CAMODEL_DRIVER_ALLOCATION_ALIGNMENT - 1)
+            & !(CAMODEL_DRIVER_ALLOCATION_ALIGNMENT - 1);
         self.allocate(actual_bytes)
+    }
+
+    pub fn drv_mem_alloc(
+        &mut self,
+        output: Option<&mut u64>,
+        bytes: u64,
+        memory_type: i32,
+        device_id: i32,
+    ) -> DriverMemStatus {
+        let Some(output) = output else {
+            return DriverMemStatus::InvalidPointer;
+        };
+        if bytes > CAMODEL_HBM_BYTES {
+            return DriverMemStatus::NoMemory;
+        }
+        if bytes == 0 || device_id != 0 {
+            return DriverMemStatus::InvalidArgument;
+        }
+        if memory_type != 0 {
+            return DriverMemStatus::UnsupportedMemoryType;
+        }
+        match self.allocate_driver_request(bytes) {
+            Ok(pointer) => {
+                *output = pointer;
+                DriverMemStatus::Success
+            }
+            Err(HbmAllocationError::ZeroSize) => DriverMemStatus::InvalidArgument,
+            Err(HbmAllocationError::UnknownPointer(_)) => DriverMemStatus::InvalidPointer,
+            Err(HbmAllocationError::TooLarge { .. })
+            | Err(HbmAllocationError::OutOfMemory { .. })
+            | Err(HbmAllocationError::HostAllocationFailed) => DriverMemStatus::NoMemory,
+        }
+    }
+
+    pub fn drv_mem_free(&mut self, pointer: u64, device_id: i32) -> DriverMemStatus {
+        if pointer == 0 {
+            return DriverMemStatus::InvalidPointer;
+        }
+        if device_id != 0 {
+            return DriverMemStatus::InvalidArgument;
+        }
+        match self.free(pointer) {
+            Ok(()) => DriverMemStatus::Success,
+            Err(HbmAllocationError::UnknownPointer(_)) => DriverMemStatus::InvalidPointer,
+            Err(_) => DriverMemStatus::InvalidArgument,
+        }
     }
 
     pub fn free(&mut self, pointer: u64) -> Result<(), HbmAllocationError> {
@@ -245,24 +298,157 @@ mod tests {
     }
 
     #[test]
-    fn c310_driver_entry_rounds_to_512_before_hbm_first_fit() {
-        let mut c220 = CamodelHbmAllocator::new(Architecture::Dav2201);
-        let mut c310 = CamodelHbmAllocator::new(Architecture::Dav3510);
-        assert_eq!(c220.allocate_driver_request(1), Ok(CAMODEL_HBM_BASE));
-        assert_eq!(c310.allocate_driver_request(1), Ok(CAMODEL_HBM_BASE));
-        assert_eq!(c220.allocate_driver_request(513), Ok(CAMODEL_HBM_BASE + 1));
-        assert_eq!(
-            c310.allocate_driver_request(513),
-            Ok(CAMODEL_HBM_BASE + 512)
-        );
-        assert_eq!(c220.spans()[1].bytes, 513);
-        assert_eq!(c310.spans()[1].bytes, 1024);
-        assert_eq!(
-            c310.allocate_driver_request(CAMODEL_HBM_BYTES + 1),
-            Err(HbmAllocationError::TooLarge {
-                requested: CAMODEL_HBM_BYTES + 1
-            })
-        );
+    fn both_driver_entries_round_to_512_before_hbm_first_fit() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut hbm = CamodelHbmAllocator::new(architecture);
+            assert_eq!(hbm.allocate_driver_request(1), Ok(CAMODEL_HBM_BASE));
+            assert_eq!(hbm.allocate_driver_request(513), Ok(CAMODEL_HBM_BASE + 512));
+            assert_eq!(hbm.spans()[0].bytes, 512);
+            assert_eq!(hbm.spans()[1].bytes, 1024);
+            assert_eq!(
+                hbm.allocate_driver_request(CAMODEL_HBM_BYTES + 1),
+                Err(HbmAllocationError::TooLarge {
+                    requested: CAMODEL_HBM_BYTES + 1
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn direct_launcher_allocation_traces_match_both_driver_models() {
+        let c220: &[(u64, u64)] = &[
+            (131072, 0x10000000),
+            (32768, 0x10020000),
+            (16384, 0x10028000),
+            (2096640, 0x1002c000),
+            (6356992, 0x1022be00),
+            (1966080, 0x1083be00),
+            (3018752, 0x10a1be00),
+            (65536, 0x10cfce00),
+            (2097152, 0x10d0ce00),
+            (2, 0x10f0ce00),
+            (131072, 0x10f0d000),
+            (131072, 0x10f2d000),
+            (2457600, 0x10f4d000),
+            (1228800, 0x111a5000),
+            (2, 0x112d1000),
+            (131072, 0x112d1200),
+            (8, 0x112f1200),
+            (512, 0x112f1400),
+            (2, 0x112f1600),
+            (131072, 0x112f1800),
+            (1, 0x11311800),
+            (1, 0x11311a00),
+            (64, 0x11311c00),
+            (64, 0x11311e00),
+        ];
+        let c310: &[(u64, u64)] = &[
+            (131072, 0x10000000),
+            (32768, 0x10020000),
+            (16392, 0x10028000),
+            (2096640, 0x1002c200),
+            (6356992, 0x1022c000),
+            (1966080, 0x1083c000),
+            (3018752, 0x10a1c000),
+            (65536, 0x10cfd000),
+            (2097152, 0x10d0d000),
+            (174588032, 0x10f0d000),
+            (131072, 0x1b58d200),
+            (3539072, 0x1b5ad200),
+            (512, 0x1b90d400),
+            (131072, 0x1b90d600),
+            (1, 0x1b92d600),
+            (1, 0x1b92d800),
+            (64, 0x1b92da00),
+            (64, 0x1b92dc00),
+        ];
+        for (architecture, trace) in [(Architecture::Dav2201, c220), (Architecture::Dav3510, c310)]
+        {
+            let mut hbm = CamodelHbmAllocator::new(architecture);
+            for &(requested, observed_pointer) in trace {
+                assert_eq!(
+                    hbm.allocate_driver_request(requested),
+                    Ok(observed_pointer),
+                    "{architecture:?} request {requested}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn isolated_driver_abi_probe_matches_reuse_merge_and_exhaustion() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut hbm = CamodelHbmAllocator::new(architecture);
+            let one = hbm.allocate_driver_request(1).unwrap();
+            let two = hbm.allocate_driver_request(513).unwrap();
+            let three = hbm.allocate_driver_request(64).unwrap();
+            assert_eq!(one, CAMODEL_HBM_BASE);
+            assert_eq!(two, CAMODEL_HBM_BASE + 512);
+            assert_eq!(three, CAMODEL_HBM_BASE + 1536);
+            hbm.free(two).unwrap();
+            assert_eq!(hbm.allocate_driver_request(512), Ok(two));
+            hbm.free(one).unwrap();
+            hbm.free(three).unwrap();
+            hbm.free(two).unwrap();
+            assert_eq!(hbm.allocate_driver_request(CAMODEL_HBM_BYTES), Ok(one));
+            assert_eq!(
+                hbm.allocate_driver_request(1),
+                Err(HbmAllocationError::OutOfMemory { requested: 512 })
+            );
+            hbm.free(one).unwrap();
+            hbm.free(one).unwrap();
+            assert_eq!(
+                hbm.free(one + 1),
+                Err(HbmAllocationError::UnknownPointer(one + 1))
+            );
+        }
+    }
+
+    #[test]
+    fn public_driver_api_statuses_match_both_vendor_error_probes() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut hbm = CamodelHbmAllocator::new(architecture);
+            let mut pointer = 0x1234;
+            assert_eq!(
+                hbm.drv_mem_alloc(None, 1, 0, 0),
+                DriverMemStatus::InvalidPointer
+            );
+            assert_eq!(
+                hbm.drv_mem_alloc(Some(&mut pointer), 0, 0, 0),
+                DriverMemStatus::InvalidArgument
+            );
+            assert_eq!(pointer, 0x1234);
+            assert_eq!(
+                hbm.drv_mem_alloc(Some(&mut pointer), CAMODEL_HBM_BYTES + 1, 0, 0),
+                DriverMemStatus::NoMemory
+            );
+            assert_eq!(pointer, 0x1234);
+            assert_eq!(
+                hbm.drv_mem_alloc(Some(&mut pointer), 1, 0, 1),
+                DriverMemStatus::InvalidArgument
+            );
+            assert_eq!(pointer, 0x1234);
+            assert_eq!(
+                hbm.drv_mem_alloc(Some(&mut pointer), 1, 1, 0),
+                DriverMemStatus::UnsupportedMemoryType
+            );
+            assert_eq!(pointer, 0x1234);
+            assert_eq!(hbm.drv_mem_free(0, 0), DriverMemStatus::InvalidPointer);
+            assert_eq!(
+                hbm.drv_mem_free(CAMODEL_HBM_BASE, 1),
+                DriverMemStatus::InvalidArgument
+            );
+            assert_eq!(
+                hbm.drv_mem_free(CAMODEL_HBM_BASE - 1, 0),
+                DriverMemStatus::InvalidPointer
+            );
+            assert_eq!(
+                hbm.drv_mem_alloc(Some(&mut pointer), 1, 0, 0),
+                DriverMemStatus::Success
+            );
+            assert_eq!(pointer, CAMODEL_HBM_BASE);
+            assert_eq!(hbm.drv_mem_free(pointer, 0), DriverMemStatus::Success);
+        }
     }
 
     #[test]

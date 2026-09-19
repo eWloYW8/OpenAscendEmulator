@@ -330,17 +330,19 @@ mod tests {
         assert_eq!(seed.regions[1].kind(), AclArgKind::Output);
         assert!(seed.regions[1].known_prefix().is_empty());
         assert_eq!(seed.regions[1].unknown_tail_bytes(), 4);
-        assert_eq!(seed.regions[2].known_prefix(), [4, 5]);
-        assert_eq!(seed.regions[2].unknown_tail_bytes(), 62);
-        assert_eq!(seed.regions[3].unknown_tail_bytes(), 0x100_0010);
+        assert_eq!(seed.regions[2].kind(), AclArgKind::Workspace);
+        assert_eq!(seed.regions[2].unknown_tail_bytes(), 0x100_0010);
+        assert_eq!(seed.regions[3].kind(), AclArgKind::Tiling);
+        assert_eq!(seed.regions[3].known_prefix(), [4, 5]);
+        assert_eq!(seed.regions[3].unknown_tail_bytes(), 62);
         let summary = seed.summary();
-        assert_eq!(summary.regions[2].known_prefix_bytes, 2);
-        assert_eq!(summary.regions[2].unknown_tail_bytes, 62);
+        assert_eq!(summary.regions[3].known_prefix_bytes, 2);
+        assert_eq!(summary.regions[3].unknown_tail_bytes, 62);
         assert_eq!(seed.read_known(0, 1, 2).unwrap(), [2, 3]);
-        assert_eq!(seed.read_known(2, 0, 2).unwrap(), [4, 5]);
+        assert_eq!(seed.read_known(3, 0, 2).unwrap(), [4, 5]);
         assert_eq!(
-            seed.read_known(2, 2, 1),
-            Err(SeedReadError::UnknownBytes { region: 2 })
+            seed.read_known(3, 2, 1),
+            Err(SeedReadError::UnknownBytes { region: 3 })
         );
         assert_eq!(
             seed.read_known(1, 0, 1),

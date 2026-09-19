@@ -131,6 +131,11 @@ pub enum AicDecoderHint {
         destination_register: u8,
         source_register: u8,
     },
+    ScalarKey2MoveToSpr {
+        vendor_isa_name: u16,
+        encoded_destination_spr: u16,
+        source_register: u8,
+    },
     ScalarKey2ZeroExtend {
         vendor_isa_name: u16,
         width: ZeroExtendWidth,
@@ -276,6 +281,22 @@ impl AicDecoderHint {
                     vendor_isa_name: 33,
                     dtype_field: ((word >> 22) & 3) as u8,
                     destination_register,
+                    source_register,
+                })
+            }
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 18 => {
+                let encoded_destination_spr = if matches!(architecture, Architecture::Dav2201) {
+                    ((word >> 17) & 0x7f) as u16
+                } else {
+                    (((word & 1) << 7) | ((word >> 17) & 0x7f)) as u16
+                };
+                let mut source_register = ((word >> 12) & 0x1f) as u8;
+                if matches!(architecture, Architecture::Dav2201) {
+                    source_register |= (word & 0x20) as u8;
+                }
+                Some(Self::ScalarKey2MoveToSpr {
+                    vendor_isa_name: 35,
+                    encoded_destination_spr,
                     source_register,
                 })
             }
@@ -991,6 +1012,37 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn scalar_key2_mov_spr_xn_fields_match_both_pem_decoders() {
+        for (architecture, word, spr, source) in [
+            (Architecture::Dav2201, 0x0206_1900, 3, 1),
+            (Architecture::Dav2201, 0x0207_3900, 3, 19),
+            (Architecture::Dav2201, 0x0206_1920, 3, 33),
+            (Architecture::Dav3510, 0x0206_0900, 3, 0),
+            (Architecture::Dav3510, 0x02b4_0900, 90, 0),
+            (Architecture::Dav3510, 0x02d2_0900, 105, 0),
+            (Architecture::Dav3510, 0x02e0_0900, 112, 0),
+            (Architecture::Dav3510, 0x0230_0901, 152, 0),
+        ] {
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, word),
+                Some(AicDecoderHint::ScalarKey2MoveToSpr {
+                    vendor_isa_name: 35,
+                    encoded_destination_spr: spr,
+                    source_register: source,
+                })
+            );
+        }
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x0230_0901),
+            Some(AicDecoderHint::ScalarKey2MoveToSpr {
+                vendor_isa_name: 35,
+                encoded_destination_spr: 24,
+                source_register: 0,
+            })
+        );
     }
 
     #[test]
