@@ -1,0 +1,13 @@
+/target/
+/.analysis/
+/docs/
+/examples/
+/probes/
+/scripts/
+/evidence/
+*.i64
+*.idb
+*.id0
+*.id1
+*.nam
+*.til

@@ -1,0 +1,148 @@
+
+use thiserror::Error;
+
+use crate::architecture::Architecture;
+use crate::hbm::{CamodelHbmAllocator, HbmAllocationError, HbmResolveError};
+use crate::pv_memory::{PvMemory, PvMemoryError};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum HbmPvMemoryError {
+    #[error(transparent)]
+    Allocation(#[from] HbmAllocationError),
+    #[error(transparent)]
+    Address(#[from] HbmResolveError),
+    #[error(transparent)]
+    Store(#[from] PvMemoryError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HbmPvMemory {
+    allocator: CamodelHbmAllocator,
+    store: PvMemory,
+}
+
+impl HbmPvMemory {
+    pub fn new(architecture: Architecture, default_byte: u8, max_pages: usize) -> Self {
+        Self {
+            allocator: CamodelHbmAllocator::new(architecture),
+            store: PvMemory::new(architecture, default_byte, max_pages),
+        }
+    }
+
+    pub fn allocator(&self) -> &CamodelHbmAllocator {
+        &self.allocator
+    }
+
+    pub fn store(&self) -> &PvMemory {
+        &self.store
+    }
+
+    pub fn allocate(&mut self, bytes: u64) -> Result<u64, HbmPvMemoryError> {
+        Ok(self.allocator.allocate(bytes)?)
+    }
+
+    pub fn allocate_driver_request(&mut self, bytes: u64) -> Result<u64, HbmPvMemoryError> {
+        Ok(self.allocator.allocate_driver_request(bytes)?)
+    }
+
+    pub fn free(&mut self, pointer: u64) -> Result<(), HbmPvMemoryError> {
+        Ok(self.allocator.free(pointer)?)
+    }
+
+    pub fn host_to_device(
+        &mut self,
+        device_address: u64,
+        source: &[u8],
+    ) -> Result<(), HbmPvMemoryError> {
+        if source.is_empty() {
+            return Ok(());
+        }
+        let bytes = u64::try_from(source.len()).map_err(|_| PvMemoryError::RangeOverflow)?;
+        self.allocator.resolve_live(device_address, bytes)?;
+        self.store.write(device_address, source)?;
+        Ok(())
+    }
+
+    pub fn device_to_host(
+        &mut self,
+        device_address: u64,
+        destination: &mut [u8],
+    ) -> Result<(), HbmPvMemoryError> {
+        if destination.is_empty() {
+            return Ok(());
+        }
+        let bytes = u64::try_from(destination.len()).map_err(|_| PvMemoryError::RangeOverflow)?;
+        self.allocator.resolve_live(device_address, bytes)?;
+        self.store.read_into(device_address, destination)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hbm::CAMODEL_HBM_BASE;
+
+    #[test]
+    fn host_copy_uses_absolute_hbm_address_on_both_architectures() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut memory = HbmPvMemory::new(architecture, 0xa5, 1);
+            let pointer = memory.allocate(16).unwrap();
+            assert_eq!(pointer, CAMODEL_HBM_BASE);
+            memory.host_to_device(pointer + 3, &[1, 2, 3]).unwrap();
+            let mut result = [0; 5];
+            memory.device_to_host(pointer + 2, &mut result).unwrap();
+            assert_eq!(result, [0xa5, 1, 2, 3, 0xa5]);
+            assert_eq!(memory.store().dirty_byte(pointer + 2), Some(0));
+            assert_eq!(memory.store().dirty_byte(pointer + 3), Some(1));
+        }
+    }
+
+    #[test]
+    fn missing_direct_read_preserves_architecture_specific_page_effect() {
+        for (architecture, expected_pages) in
+            [(Architecture::Dav2201, 1), (Architecture::Dav3510, 0)]
+        {
+            let mut memory = HbmPvMemory::new(architecture, 0x7f, 1);
+            let pointer = memory.allocate(4).unwrap();
+            let mut bytes = [0; 4];
+            memory.device_to_host(pointer, &mut bytes).unwrap();
+            assert_eq!(bytes, [0x7f; 4]);
+            assert_eq!(memory.store().page_count(), expected_pages);
+        }
+    }
+
+    #[test]
+    fn live_range_guard_rejects_cross_allocation_and_freed_addresses() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut memory = HbmPvMemory::new(architecture, 0, 1);
+            let first = memory.allocate(4).unwrap();
+            let second = memory.allocate(4).unwrap();
+            assert_eq!(second, first + 4);
+            let before = memory.clone();
+            assert!(matches!(
+                memory.host_to_device(first + 3, &[1, 2]),
+                Err(HbmPvMemoryError::Address(HbmResolveError::Unmapped { .. }))
+            ));
+            assert_eq!(memory, before);
+            memory.free(first).unwrap();
+            assert!(matches!(
+                memory.host_to_device(first, &[9]),
+                Err(HbmPvMemoryError::Address(HbmResolveError::Unmapped { .. }))
+            ));
+            assert_eq!(memory.store().page_count(), 0);
+        }
+    }
+
+    #[test]
+    fn free_and_reallocate_do_not_clear_pem_bytes() {
+        let mut memory = HbmPvMemory::new(Architecture::Dav2201, 0, 1);
+        let pointer = memory.allocate(4).unwrap();
+        memory.host_to_device(pointer, &[1, 2, 3, 4]).unwrap();
+        memory.free(pointer).unwrap();
+        assert_eq!(memory.allocate(4).unwrap(), pointer);
+        let mut bytes = [0; 4];
+        memory.device_to_host(pointer, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4]);
+    }
+}
