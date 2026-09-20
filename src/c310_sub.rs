@@ -12,7 +12,7 @@ pub const C310_CAPTURED_SUB_BYTES: usize = C310_CAPTURED_SUB_TILE_BYTES * C310_C
 pub const C310_CAPTURED_SUB_MTE2_X_WORD: u32 = 0x74ad_8bae;
 pub const C310_CAPTURED_SUB_MTE2_Y_WORD: u32 = 0x74b3_6bae;
 pub const C310_CAPTURED_SUB_VSUB_WORD: u32 = 0x8008_2781;
-pub const C310_CAPTURED_SUB_VST_WORD: u32 = 0x4028_0108;
+pub const C310_CAPTURED_SUB_VST_WORD: u32 = crate::rvec::C310_CAPTURED_SUB_VST_WORD;
 pub const C310_CAPTURED_SUB_MTE3_WORD: u32 = 0x74e1_192c;
 const fn observed_p1() -> [u8; 32] {
     let mut image = [0_u8; 32];

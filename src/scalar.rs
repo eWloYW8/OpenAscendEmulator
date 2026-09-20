@@ -1,3 +1,4 @@
+use crate::architecture::Architecture;
 use crate::isa::{AicDecoderHint, ScalarKey8Operation};
 use thiserror::Error;
 
@@ -73,6 +74,22 @@ pub(crate) const fn update_overflow_spr2(
         (prior_spr2 & 0xffff_ffff_ff00_ffff) | (((runtime_isa_pc >> 2) & 0xff) << 16) | 0x10
     } else {
         prior_spr2
+    }
+}
+
+pub(crate) const fn update_neg_overflow_spr2(
+    architecture: Architecture,
+    prior_spr2: u64,
+    runtime_isa_pc: u64,
+    signed_overflow: bool,
+) -> u64 {
+    if !signed_overflow {
+        return prior_spr2;
+    }
+    let pc_byte = ((runtime_isa_pc >> 2) & 0xff) << 16;
+    match architecture {
+        Architecture::Dav2201 => (prior_spr2 & 0xffff_ffff_ff00_ffff) | pc_byte | 8,
+        Architecture::Dav3510 => (prior_spr2 & 0xffff_ffff_ffff_f007) | pc_byte | 8,
     }
 }
 

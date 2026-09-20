@@ -4,9 +4,11 @@ use crate::device_elf::{
     DeviceElf, DeviceElfError, DeviceElfHeader, DeviceGlobalPatchSite, DeviceKernelSummary,
     DeviceLoadImageSummary,
 };
+use crate::flow_trace::verify_jump_trace;
 use crate::isa::{AicDecoderHint, AicFramingError, AicInstructionWord, AicWordFramer};
 use crate::kernel_config::{KernelConfigDocument, KernelConfigError};
 use crate::plan::{LaunchPlan, PlanError, SimulatorRequest};
+use crate::prof_stub_flow::inspect_prof_stub_branch_edges;
 use crate::prof_stub_object_verify::{ProfStubObjectVerification, verify_prof_stub_object};
 use crate::prof_stub_packet::ProfStubPacketError;
 use crate::prof_stub_stream::inspect_prof_stub_stream;
@@ -164,12 +166,30 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    VerifyJumpTrace {
+        path: PathBuf,
+        #[arg(long)]
+        architecture: Architecture,
+        #[arg(long)]
+        json: bool,
+    },
     InspectProfStubStream {
         path: PathBuf,
         #[arg(long, default_value_t = 1_048_576)]
         max_bytes: u64,
         #[arg(long, default_value_t = 16)]
         max_records: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    InspectProfStubBranchEdges {
+        path: PathBuf,
+        #[arg(long)]
+        architecture: Architecture,
+        #[arg(long, default_value_t = 1_048_576)]
+        max_bytes: u64,
+        #[arg(long, default_value_t = 16)]
+        max_issues: usize,
         #[arg(long)]
         json: bool,
     },
@@ -289,6 +309,10 @@ pub enum CliError {
     EmptyScalarTrace,
     #[error("scalar trace has {0} mismatches")]
     ScalarTraceMismatch(u64),
+    #[error("jump trace contained no JUMP records")]
+    EmptyJumpTrace,
+    #[error("jump trace has {0} mismatches")]
+    JumpTraceMismatch(u64),
     #[error(transparent)]
     Workspace(#[from] WorkspaceError),
     #[error(transparent)]
@@ -663,6 +687,7 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
                 println!("multiply-immediate: {}", summary.multiply_immediate);
                 println!("subtract-immediate: {}", summary.subtract_immediate);
                 println!("add-register: {}", summary.add_register);
+                println!("subtract-register: {}", summary.subtract_register);
                 println!("multiply-register: {}", summary.multiply_register);
                 println!("multiply-add-fields: {}", summary.multiply_add_fields);
                 println!(
@@ -684,9 +709,19 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
                     "shift-left-unknown-prior: {}",
                     summary.shift_left_unknown_prior
                 );
+                println!("shift-right-fields: {}", summary.shift_right_fields);
+                println!(
+                    "shift-right-value-checked: {}",
+                    summary.shift_right_value_checked
+                );
+                println!(
+                    "shift-right-unknown-prior: {}",
+                    summary.shift_right_unknown_prior
+                );
                 println!("move-immediate: {}", summary.checked_move_immediate);
                 println!("move-keep-lane: {}", summary.checked_move_keep_lane);
                 println!("move-register: {}", summary.checked_register_move);
+                println!("negate: {}", summary.checked_negate);
                 println!("zero-extend-u8: {}", summary.zero_extend_u8);
                 println!("zero-extend-u16: {}", summary.zero_extend_u16);
                 println!("zero-extend-u32: {}", summary.zero_extend_u32);
@@ -698,14 +733,17 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
             }
             if summary.checked_s64
                 + summary.add_register
+                + summary.subtract_register
                 + summary.multiply_register
                 + summary.multiply_add_fields
                 + summary.and_register
                 + summary.or_register
                 + summary.shift_left_fields
+                + summary.shift_right_fields
                 + summary.checked_move_immediate
                 + summary.checked_move_keep_lane
                 + summary.checked_register_move
+                + summary.checked_negate
                 + summary.zero_extend_u8
                 + summary.zero_extend_u16
                 + summary.zero_extend_u32
@@ -715,6 +753,60 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
             }
             if summary.mismatches != 0 {
                 return Err(CliError::ScalarTraceMismatch(summary.mismatches));
+            }
+        }
+        Command::VerifyJumpTrace {
+            path,
+            architecture,
+            json,
+        } => {
+            let summary = if path.as_os_str() == "-" {
+                verify_jump_trace(io::stdin().lock(), architecture)?
+            } else {
+                let file = File::open(&path).map_err(|source| CliError::FileRead {
+                    path: path.clone(),
+                    source,
+                })?;
+                verify_jump_trace(BufReader::new(file), architecture)?
+            };
+            if json {
+                print_json(&summary)?;
+            } else {
+                println!("architecture: {}", summary.architecture);
+                println!("lines: {}", summary.total_lines);
+                println!("jumps: {}", summary.observed_jumps);
+                println!("conditional-jumps: {}", summary.observed_conditional_jumps);
+                println!("compare-jumps: {}", summary.observed_compare_jumps);
+                println!("conditional-taken: {}", summary.conditional_taken);
+                println!("conditional-not-taken: {}", summary.conditional_not_taken);
+                println!("compare-taken: {}", summary.compare_taken);
+                println!("compare-not-taken: {}", summary.compare_not_taken);
+                println!("compare-signed: {}", summary.compare_signed);
+                println!("compare-unsigned: {}", summary.compare_unsigned);
+                println!(
+                    "compare-immediate-operands: {}",
+                    summary.compare_immediate_operands
+                );
+                println!(
+                    "compare-register-operands: {}",
+                    summary.compare_register_operands
+                );
+                println!("verified-immediate: {}", summary.verified_immediate_targets);
+                println!("verified-register: {}", summary.verified_register_targets);
+                println!(
+                    "unverified-register: {}",
+                    summary.unverified_register_targets
+                );
+                println!("mismatches: {}", summary.mismatches);
+                for issue in &summary.issues {
+                    println!("  line {}: {}", issue.line_number, issue.reason);
+                }
+            }
+            if summary.observed_jumps == 0 {
+                return Err(CliError::EmptyJumpTrace);
+            }
+            if summary.mismatches != 0 {
+                return Err(CliError::JumpTraceMismatch(summary.mismatches));
             }
         }
         Command::InspectProfStubStream {
@@ -740,6 +832,56 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
                     );
                 }
                 println!("omitted-records: {}", summary.omitted_records);
+            }
+        }
+        Command::InspectProfStubBranchEdges {
+            path,
+            architecture,
+            max_bytes,
+            max_issues,
+            json,
+        } => {
+            let bytes = read_bounded_file(&path, max_bytes)?;
+            let summary = inspect_prof_stub_branch_edges(&bytes, architecture, max_issues)?;
+            if json {
+                print_json(&summary)?;
+            } else {
+                println!("architecture: {}", summary.architecture);
+                println!(
+                    "type-21-instructions: {}",
+                    summary.type21_instruction_events
+                );
+                println!("branch-records: {}", summary.branch_records);
+                println!("unconditional-records: {}", summary.unconditional_records);
+                println!("conditional-records: {}", summary.conditional_records);
+                println!("compare-records: {}", summary.compare_records);
+                println!("unconditional-matches: {}", summary.unconditional_matches);
+                println!("taken-candidates: {}", summary.conditional_taken_candidates);
+                println!(
+                    "fallthrough-candidates: {}",
+                    summary.conditional_fallthrough_candidates
+                );
+                println!(
+                    "ambiguous-candidates: {}",
+                    summary.conditional_ambiguous_candidates
+                );
+                println!(
+                    "register-offset-unavailable: {}",
+                    summary.register_offset_unavailable
+                );
+                println!(
+                    "outside-candidate-edges: {}",
+                    summary.outside_candidate_edges
+                );
+                println!("no-successor: {}", summary.no_successor);
+                println!(
+                    "malformed-branch-records: {}",
+                    summary.malformed_branch_records
+                );
+                for issue in &summary.issues {
+                    println!("  {:?}", issue);
+                }
+                println!("omitted-issues: {}", summary.omitted_issues);
             }
         }
         Command::VerifyProfStubObject {
@@ -1054,6 +1196,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_bounded_prof_stub_branch_edge_inspection() {
+        let cli = Cli::try_parse_from([
+            "open-ascend-emulator",
+            "inspect-prof-stub-branch-edges",
+            "capture.bin",
+            "--architecture",
+            "dav_3510",
+            "--max-bytes",
+            "10000000",
+            "--max-issues",
+            "3",
+            "--json",
+        ])
+        .unwrap();
+        let Command::InspectProfStubBranchEdges {
+            path,
+            architecture,
+            max_bytes,
+            max_issues,
+            json,
+        } = cli.command
+        else {
+            panic!("unexpected command")
+        };
+        assert_eq!(path, PathBuf::from("capture.bin"));
+        assert_eq!(architecture, Architecture::Dav3510);
+        assert_eq!(max_bytes, 10_000_000);
+        assert_eq!(max_issues, 3);
+        assert!(json);
+    }
+
+    #[test]
     fn parses_object_bound_prof_stub_verification() {
         let cli = Cli::try_parse_from([
             "open-ascend-emulator",
@@ -1319,6 +1493,27 @@ mod tests {
             Command::VerifyScalarTrace {
                 path,
                 architecture: Architecture::Dav2201,
+                json: true,
+            } if path.as_os_str() == "-"
+        ));
+    }
+
+    #[test]
+    fn parses_jump_trace_verification_options() {
+        let cli = Cli::try_parse_from([
+            "open-ascend-emulator",
+            "verify-jump-trace",
+            "-",
+            "--architecture",
+            "dav_3510",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::VerifyJumpTrace {
+                path,
+                architecture: Architecture::Dav3510,
                 json: true,
             } if path.as_os_str() == "-"
         ));

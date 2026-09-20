@@ -215,6 +215,17 @@ impl AddressedReplayMemory {
             .write_known(location.region_index, location.offset, bytes)?)
     }
 
+    pub fn write_states_at(
+        &mut self,
+        address: u64,
+        states: &[MemoryByteState],
+    ) -> Result<(), ReplayAddressError> {
+        let location = self.resolve(address, states.len())?;
+        Ok(self
+            .memory
+            .write_states(location.region_index, location.offset, states)?)
+    }
+
     pub fn write_unknown_at(&mut self, address: u64, len: usize) -> Result<(), ReplayAddressError> {
         let location = self.resolve(address, len)?;
         Ok(self
@@ -340,6 +351,19 @@ mod tests {
                     }
                 ))
             );
+            addressed
+                .write_states_at(
+                    pointers[2] + 16,
+                    &[MemoryByteState::Known(3), MemoryByteState::Unknown],
+                )
+                .unwrap();
+            assert_eq!(addressed.read_known_at(pointers[2] + 16, 1).unwrap(), [3]);
+            assert!(matches!(
+                addressed.read_known_at(pointers[2] + 17, 1),
+                Err(ReplayAddressError::Memory(
+                    ReplayMemoryError::UnknownBytes { .. }
+                ))
+            ));
         }
     }
 

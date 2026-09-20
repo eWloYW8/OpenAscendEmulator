@@ -2,6 +2,8 @@ use crate::fp32_vector::{
     Fp32LaneOutcome, Fp32MaskLayout, Fp32VectorError, Fp32VectorOperation, Fp32WritebackOutcome,
     Fp32WritebackPolicy, apply_fp32_writeback, evaluate_masked_fp32_lanes,
 };
+use crate::replay_memory::MemoryByteState;
+use crate::ub_replay::{UbReplayError, UbReplayMemory};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -9,6 +11,136 @@ const MAX_ENCODED_V_REGISTERS: usize = 32;
 const MAX_ENCODED_P_REGISTERS: usize = 32;
 const MAX_FP32_WORDS_PER_REGISTER: usize = 64;
 const MAX_PREDICATE_BYTES: usize = 32;
+const CAPTURED_VECTOR_LOAD_BYTES: usize = 256;
+
+pub const C310_CAPTURED_VLD_V0_WORD: u32 = 0x0018_0008;
+pub const C310_CAPTURED_VLD_V1_WORD: u32 = 0x0220_0008;
+pub const C310_CAPTURED_VLDI_V0_WORD: u32 = 0x0008_0018;
+pub const C310_CAPTURED_VLDI_V1_WORD: u32 = 0x0210_0018;
+pub const C310_CAPTURED_VDUPS_WORD: u32 = 0x801a_2550;
+pub const C310_CAPTURED_VST_WORD: u32 = 0x4020_0108;
+pub const C310_CAPTURED_SUB_VST_WORD: u32 = 0x4028_0108;
+pub const C310_CAPTURED_PLT32_WORD: u32 = 0xa22c_0150;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct C310CapturedPltStep {
+    pub pc: u64,
+    pub word: u32,
+    pub vendor_isa_name: u16,
+    pub destination_p_register: u8,
+    pub lane_limit: usize,
+    pub predicate_bytes: [u8; MAX_PREDICATE_BYTES],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum C310CapturedPltError {
+    #[error("C310 PLT word {word:#010x} at PC {pc:#x} is outside the captured B32 path")]
+    UnsupportedWord { pc: u64, word: u32 },
+    #[error("C310 captured PLT requires a 256-byte V-register, got {actual} bytes")]
+    RegisterWidth { actual: usize },
+    #[error("C310 captured PLT requires a P-register bank")]
+    MissingPredicateBank,
+    #[error("C310 captured PLT requires P1 in the bank of {count}")]
+    MissingP1 { count: usize },
+    #[error("C310 captured PLT requires a 32-byte P1, got {actual} bytes")]
+    PredicateWidth { actual: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct C310CapturedVdupsStep {
+    pub pc: u64,
+    pub word: u32,
+    pub destination_v_register: u8,
+    pub scalar_word: u32,
+    pub written_lanes: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct C310CapturedVstStep {
+    pub pc: u64,
+    pub word: u32,
+    pub source_v_register: u8,
+    pub destination_address: u64,
+    pub stores: Vec<C310CapturedVstStore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct C310CapturedVstStore {
+    pub lane_index: usize,
+    pub buffer_address: u64,
+    pub data: [u8; 4],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum C310CapturedVectorError {
+    #[error("C310 vector word {word:#010x} at PC {pc:#x} is outside the captured path")]
+    UnsupportedWord { pc: u64, word: u32 },
+    #[error("C310 captured vector path requires a 256-byte register, got {actual} bytes")]
+    RegisterWidth { actual: usize },
+    #[error("C310 V-register {index} is outside the bank of {count}")]
+    RegisterIndex { index: usize, count: usize },
+    #[error("C310 VST address overflows at lane {lane} from base {base:#x}")]
+    AddressOverflow { base: u64, lane: usize },
+    #[error("cannot reserve {lanes} vector lanes")]
+    HostAllocationFailed { lanes: usize },
+    #[error(transparent)]
+    Ub(#[from] UbReplayError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct C310CapturedVectorLoadHint {
+    pub vendor_isa_name: u16,
+    pub destination_v_register: u8,
+    pub source_x_register: u8,
+    pub byte_count: usize,
+}
+
+impl C310CapturedVectorLoadHint {
+    pub const fn from_word(word: u32) -> Option<Self> {
+        let (destination_v_register, vendor_isa_name) = match word {
+            C310_CAPTURED_VLD_V0_WORD => (0, 282),
+            C310_CAPTURED_VLD_V1_WORD => (1, 282),
+            C310_CAPTURED_VLDI_V0_WORD => (0, 284),
+            C310_CAPTURED_VLDI_V1_WORD => (1, 284),
+            _ => return None,
+        };
+        Some(Self {
+            vendor_isa_name,
+            destination_v_register,
+            source_x_register: ((word >> 17) & 0x1f) as u8,
+            byte_count: CAPTURED_VECTOR_LOAD_BYTES,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct C310CapturedVectorLoadStep {
+    pub pc: u64,
+    pub word: u32,
+    pub hint: C310CapturedVectorLoadHint,
+    pub source_address: u64,
+    pub loaded_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum C310CapturedVectorLoadError {
+    #[error(
+        "C310 vector load word {word:#010x} at PC {pc:#x} is outside the captured normal-u8 path"
+    )]
+    UnsupportedWord { pc: u64, word: u32 },
+    #[error(
+        "C310 vector load requires a {CAPTURED_VECTOR_LOAD_BYTES}-byte V-register, got {actual} bytes"
+    )]
+    RegisterWidth { actual: usize },
+    #[error("C310 vector load destination V-register {index} is outside the bank of {count}")]
+    RegisterIndex { index: usize, count: usize },
+    #[error(transparent)]
+    Ub(#[from] UbReplayError),
+}
+
+pub type C310CapturedVldiHint = C310CapturedVectorLoadHint;
+pub type C310CapturedVldiStep = C310CapturedVectorLoadStep;
+pub type C310CapturedVldiError = C310CapturedVectorLoadError;
 
 pub const C310_MASK0_SPR_INDEX: u16 = 152;
 pub const C310_MASK1_SPR_INDEX: u16 = 153;
@@ -373,6 +505,8 @@ pub enum C310RvecValueError {
     PredicateRegisterIndex { index: usize, count: usize },
     #[error(transparent)]
     Fp32(#[from] Fp32VectorError),
+    #[error(transparent)]
+    Ub(#[from] UbReplayError),
 }
 
 impl C310RvecValueMachine {
@@ -434,6 +568,206 @@ impl C310RvecValueMachine {
             .as_ref()?
             .get(index)
             .map(Vec::as_slice)
+    }
+
+    pub fn execute_captured_plt32_word(
+        &mut self,
+        pc: u64,
+        word: u32,
+    ) -> Result<C310CapturedPltStep, C310CapturedPltError> {
+        if word != C310_CAPTURED_PLT32_WORD {
+            return Err(C310CapturedPltError::UnsupportedWord { pc, word });
+        }
+        let actual = self.words_per_register * 4;
+        if actual != CAPTURED_VECTOR_LOAD_BYTES {
+            return Err(C310CapturedPltError::RegisterWidth { actual });
+        }
+        let predicates = self
+            .predicate_registers
+            .as_mut()
+            .ok_or(C310CapturedPltError::MissingPredicateBank)?;
+        let count = predicates.len();
+        let destination = predicates
+            .get_mut(1)
+            .ok_or(C310CapturedPltError::MissingP1 { count })?;
+        if destination.len() != MAX_PREDICATE_BYTES {
+            return Err(C310CapturedPltError::PredicateWidth {
+                actual: destination.len(),
+            });
+        }
+        let mut predicate_bytes = [0_u8; MAX_PREDICATE_BYTES];
+        for lane in 0..32 {
+            predicate_bytes[lane / 2] |= 1 << (4 * (lane % 2));
+        }
+        destination.copy_from_slice(&predicate_bytes);
+        Ok(C310CapturedPltStep {
+            pc,
+            word,
+            vendor_isa_name: 412,
+            destination_p_register: 1,
+            lane_limit: 32,
+            predicate_bytes,
+        })
+    }
+
+    pub fn execute_captured_vdups_word(
+        &mut self,
+        pc: u64,
+        word: u32,
+        scalar_word: u32,
+        active_mask: &[u64; 4],
+    ) -> Result<C310CapturedVdupsStep, C310CapturedVectorError> {
+        if word != C310_CAPTURED_VDUPS_WORD {
+            return Err(C310CapturedVectorError::UnsupportedWord { pc, word });
+        }
+        let actual = self.words_per_register * 4;
+        if actual != CAPTURED_VECTOR_LOAD_BYTES {
+            return Err(C310CapturedVectorError::RegisterWidth { actual });
+        }
+        let destination_v_register = ((word >> 25) & 0x1f) as u8;
+        let index = usize::from(destination_v_register);
+        let count = self.vector_registers.len();
+        let destination = self
+            .vector_registers
+            .get_mut(index)
+            .ok_or(C310CapturedVectorError::RegisterIndex { index, count })?;
+        let mut written_lanes = Vec::new();
+        written_lanes
+            .try_reserve_exact(destination.len())
+            .map_err(|_| C310CapturedVectorError::HostAllocationFailed {
+                lanes: destination.len(),
+            })?;
+        for (lane, value) in destination.iter_mut().enumerate() {
+            let byte_bit = lane * 4;
+            if (active_mask[byte_bit / 64] >> (byte_bit % 64)) & 1 != 0 {
+                *value = scalar_word;
+                written_lanes.push(lane);
+            }
+        }
+        Ok(C310CapturedVdupsStep {
+            pc,
+            word,
+            destination_v_register,
+            scalar_word,
+            written_lanes,
+        })
+    }
+
+    pub fn execute_captured_vst_word(
+        &self,
+        pc: u64,
+        word: u32,
+        destination_address: u64,
+        active_mask: &[u64; 4],
+        ub: &mut UbReplayMemory,
+    ) -> Result<C310CapturedVstStep, C310CapturedVectorError> {
+        if !matches!(word, C310_CAPTURED_VST_WORD | C310_CAPTURED_SUB_VST_WORD) {
+            return Err(C310CapturedVectorError::UnsupportedWord { pc, word });
+        }
+        let actual = self.words_per_register * 4;
+        if actual != CAPTURED_VECTOR_LOAD_BYTES {
+            return Err(C310CapturedVectorError::RegisterWidth { actual });
+        }
+        let source_v_register = ((word >> 25) & 0x1f) as u8;
+        let index = usize::from(source_v_register);
+        let source =
+            self.vector_registers
+                .get(index)
+                .ok_or(C310CapturedVectorError::RegisterIndex {
+                    index,
+                    count: self.vector_registers.len(),
+                })?;
+        let mut stores = Vec::new();
+        stores.try_reserve_exact(source.len()).map_err(|_| {
+            C310CapturedVectorError::HostAllocationFailed {
+                lanes: source.len(),
+            }
+        })?;
+        for (lane_index, &value) in source.iter().enumerate() {
+            let byte_bit = lane_index * 4;
+            if (active_mask[byte_bit / 64] >> (byte_bit % 64)) & 1 == 0 {
+                continue;
+            }
+            let buffer_address = destination_address
+                .checked_add((lane_index * 4) as u64)
+                .ok_or(C310CapturedVectorError::AddressOverflow {
+                    base: destination_address,
+                    lane: lane_index,
+                })?;
+            stores.push(C310CapturedVstStore {
+                lane_index,
+                buffer_address,
+                data: value.to_le_bytes(),
+            });
+        }
+        let mut staged = ub.clone();
+        for store in &stores {
+            staged.write_states(
+                store.buffer_address,
+                &store.data.map(MemoryByteState::Known),
+            )?;
+        }
+        *ub = staged;
+        Ok(C310CapturedVstStep {
+            pc,
+            word,
+            source_v_register,
+            destination_address,
+            stores,
+        })
+    }
+
+    pub fn execute_captured_vector_load_word(
+        &mut self,
+        pc: u64,
+        word: u32,
+        xregs: &[u64; 32],
+        ub: &UbReplayMemory,
+    ) -> Result<C310CapturedVectorLoadStep, C310CapturedVectorLoadError> {
+        let hint = C310CapturedVectorLoadHint::from_word(word)
+            .ok_or(C310CapturedVectorLoadError::UnsupportedWord { pc, word })?;
+        let actual = self.words_per_register * 4;
+        if actual != hint.byte_count {
+            return Err(C310CapturedVectorLoadError::RegisterWidth { actual });
+        }
+        let destination = usize::from(hint.destination_v_register);
+        if destination >= self.vector_registers.len() {
+            return Err(C310CapturedVectorLoadError::RegisterIndex {
+                index: destination,
+                count: self.vector_registers.len(),
+            });
+        }
+        let source_address = xregs[usize::from(hint.source_x_register)];
+        let loaded_bytes = ub.read_known(source_address, hint.byte_count)?;
+        for (word, bytes) in self.vector_registers[destination]
+            .iter_mut()
+            .zip(loaded_bytes.chunks_exact(4))
+        {
+            *word = u32::from_le_bytes(bytes.try_into().expect("four bytes"));
+        }
+        Ok(C310CapturedVectorLoadStep {
+            pc,
+            word,
+            hint,
+            source_address,
+            loaded_bytes,
+        })
+    }
+
+    pub fn execute_captured_vldi_word(
+        &mut self,
+        pc: u64,
+        word: u32,
+        xregs: &[u64; 32],
+        ub: &UbReplayMemory,
+    ) -> Result<C310CapturedVldiStep, C310CapturedVldiError> {
+        if !matches!(
+            word,
+            C310_CAPTURED_VLDI_V0_WORD | C310_CAPTURED_VLDI_V1_WORD
+        ) {
+            return Err(C310CapturedVldiError::UnsupportedWord { pc, word });
+        }
+        self.execute_captured_vector_load_word(pc, word, xregs, ub)
     }
 
     pub fn execute_movp_u32_word(
@@ -603,12 +937,350 @@ impl C310RvecValueMachine {
         }
         Ok(stores)
     }
+
+    pub fn execute_normal_u32_vsti_to_ub(
+        &self,
+        word: u32,
+        buffer_start: u64,
+        ub: &mut UbReplayMemory,
+    ) -> Result<Vec<C310RvecVstiStore>, C310RvecValueError> {
+        let stores = self.plan_normal_u32_vsti(word, buffer_start)?;
+        let mut staged = ub.clone();
+        for store in &stores {
+            staged.write_states(
+                store.buffer_address,
+                &store.data.map(MemoryByteState::Known),
+            )?;
+        }
+        *ub = staged;
+        Ok(stores)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Architecture, ScalarMachine};
+    use crate::{Architecture, MemoryByteState, ScalarMachine};
+
+    #[test]
+    fn captured_duplicate_store_and_load_preserve_overlapping_ub_bytes() {
+        let old = (-123.0_f32).to_bits();
+        let active_mask = [u64::MAX, u64::MAX, 0, 0];
+        let mut machine =
+            C310RvecValueMachine::from_vector_words(vec![vec![7; 64], vec![0; 64]]).unwrap();
+        let duplicate = machine
+            .execute_captured_vdups_word(0x10d0_d908, C310_CAPTURED_VDUPS_WORD, old, &active_mask)
+            .unwrap();
+        assert_eq!(duplicate.written_lanes, (0..32).collect::<Vec<_>>());
+        assert_eq!(&machine.vector_register(0).unwrap()[..32], &[old; 32]);
+        assert_eq!(&machine.vector_register(0).unwrap()[32..], &[7; 32]);
+
+        let mut ub = UbReplayMemory::new(384, 256);
+        ub.write_states(0x80, &[MemoryByteState::Known(0x5a); 128])
+            .unwrap();
+        let store = machine
+            .execute_captured_vst_word(
+                0x10d0_d918,
+                C310_CAPTURED_VST_WORD,
+                0x100,
+                &active_mask,
+                &mut ub,
+            )
+            .unwrap();
+        assert_eq!(store.stores.len(), 32);
+        assert_eq!(store.stores[0].buffer_address, 0x100);
+        assert_eq!(store.stores[31].buffer_address, 0x17c);
+        assert_eq!(ub.read_known(0x80, 128).unwrap(), [0x5a; 128]);
+        assert_eq!(
+            ub.read_known(0x100, 128).unwrap(),
+            old.to_le_bytes().repeat(32)
+        );
+
+        let mut xregs = [0_u64; 32];
+        xregs[8] = 0x80;
+        let load = machine
+            .execute_captured_vldi_word(0x10d0_db04, C310_CAPTURED_VLDI_V1_WORD, &xregs, &ub)
+            .unwrap();
+        assert_eq!(&load.loaded_bytes[..128], &[0x5a; 128]);
+        assert_eq!(&load.loaded_bytes[128..], old.to_le_bytes().repeat(32));
+    }
+
+    #[test]
+    fn captured_sub_vld_and_vst_use_their_distinct_words() {
+        let bytes = (0..384)
+            .map(|index| (index & 0xff) as u8)
+            .collect::<Vec<_>>();
+        let mut ub = UbReplayMemory::new(384, 384);
+        ub.write_states(
+            0,
+            &bytes
+                .iter()
+                .copied()
+                .map(MemoryByteState::Known)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut xregs = [0_u64; 32];
+        xregs[12] = 0;
+        xregs[16] = 0x80;
+        let mut machine = C310RvecValueMachine::from_vector_words(vec![vec![0; 64]; 2]).unwrap();
+        for (pc, word, destination, source) in [
+            (0x10d0_d90c, C310_CAPTURED_VLD_V0_WORD, 0, 12),
+            (0x10d0_d910, C310_CAPTURED_VLD_V1_WORD, 1, 16),
+        ] {
+            let step = machine
+                .execute_captured_vector_load_word(pc, word, &xregs, &ub)
+                .unwrap();
+            assert_eq!(step.hint.vendor_isa_name, 282);
+            assert_eq!(step.hint.destination_v_register, destination);
+            assert_eq!(step.hint.source_x_register, source);
+            let start = xregs[source as usize] as usize;
+            assert_eq!(step.loaded_bytes, bytes[start..start + 256]);
+        }
+        let first = machine.vector_register(0).unwrap().to_vec();
+        let active_mask = [0x1111_1111_1111_1111, 0x1111_1111_1111_1111, 0, 0];
+        let stored = machine
+            .execute_captured_vst_word(
+                0x10d0_d91c,
+                C310_CAPTURED_SUB_VST_WORD,
+                0x100,
+                &active_mask,
+                &mut ub,
+            )
+            .unwrap();
+        assert_eq!(stored.stores.len(), 32);
+        assert_eq!(stored.source_v_register, 0);
+        assert_eq!(
+            ub.read_known(0x100, 128).unwrap(),
+            first[..32]
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            C310CapturedVectorLoadHint::from_word(C310_CAPTURED_VLD_V0_WORD)
+                .unwrap()
+                .vendor_isa_name,
+            282
+        );
+        let before = machine.clone();
+        assert_eq!(
+            machine.execute_captured_vldi_word(0x10d0_d90c, C310_CAPTURED_VLD_V0_WORD, &xregs, &ub),
+            Err(C310CapturedVldiError::UnsupportedWord {
+                pc: 0x10d0_d90c,
+                word: C310_CAPTURED_VLD_V0_WORD,
+            })
+        );
+        assert_eq!(machine, before);
+    }
+
+    #[test]
+    fn captured_plt32_writes_the_sub_predicate_without_partial_failure() {
+        let mut machine = C310RvecValueMachine::from_vector_and_predicate_bytes(
+            vec![vec![0; 64]],
+            vec![vec![0xff; 32], vec![0xff; 32]],
+        )
+        .unwrap();
+        let step = machine
+            .execute_captured_plt32_word(0x10d0_d914, C310_CAPTURED_PLT32_WORD)
+            .unwrap();
+        assert_eq!(step.vendor_isa_name, 412);
+        assert_eq!(step.destination_p_register, 1);
+        assert_eq!(step.lane_limit, 32);
+        assert_eq!(&step.predicate_bytes[..16], &[0x11; 16]);
+        assert_eq!(&step.predicate_bytes[16..], &[0; 16]);
+        assert_eq!(machine.predicate_register(0), Some([0xff; 32].as_slice()));
+        assert_eq!(
+            machine.predicate_register(1),
+            Some(step.predicate_bytes.as_slice())
+        );
+        let before = machine.clone();
+        assert_eq!(
+            machine.execute_captured_plt32_word(0x10d0_d914, C310_CAPTURED_PLT32_WORD ^ 1),
+            Err(C310CapturedPltError::UnsupportedWord {
+                pc: 0x10d0_d914,
+                word: C310_CAPTURED_PLT32_WORD ^ 1,
+            })
+        );
+        assert_eq!(machine, before);
+
+        let mut short = C310RvecValueMachine::from_vector_and_predicate_bytes(
+            vec![vec![0; 32]],
+            vec![vec![0; 32], vec![0; 32]],
+        )
+        .unwrap();
+        let before = short.clone();
+        assert_eq!(
+            short.execute_captured_plt32_word(0x10d0_d914, C310_CAPTURED_PLT32_WORD),
+            Err(C310CapturedPltError::RegisterWidth { actual: 128 })
+        );
+        assert_eq!(short, before);
+
+        let mut missing = C310RvecValueMachine::from_vector_and_predicate_bytes(
+            vec![vec![0; 64]],
+            vec![vec![0; 32]],
+        )
+        .unwrap();
+        assert_eq!(
+            missing.execute_captured_plt32_word(0x10d0_d914, C310_CAPTURED_PLT32_WORD),
+            Err(C310CapturedPltError::MissingP1 { count: 1 })
+        );
+    }
+
+    #[test]
+    fn captured_vector_steps_fail_without_partial_mutation() {
+        let active_mask = [u64::MAX, u64::MAX, 0, 0];
+        let mut machine = C310RvecValueMachine::from_vector_words(vec![vec![3; 64]]).unwrap();
+        let before_machine = machine.clone();
+        assert_eq!(
+            machine.execute_captured_vdups_word(
+                0x10d0_d908,
+                C310_CAPTURED_VDUPS_WORD ^ 1,
+                0,
+                &active_mask,
+            ),
+            Err(C310CapturedVectorError::UnsupportedWord {
+                pc: 0x10d0_d908,
+                word: C310_CAPTURED_VDUPS_WORD ^ 1,
+            })
+        );
+        assert_eq!(machine, before_machine);
+
+        let mut ub = UbReplayMemory::new(200, 256);
+        ub.write_states(0x80, &[MemoryByteState::Known(0x5a); 128])
+            .unwrap();
+        let before_ub = ub.clone();
+        assert_eq!(
+            machine.execute_captured_vst_word(
+                0x10d0_d918,
+                C310_CAPTURED_VST_WORD,
+                0x100,
+                &active_mask,
+                &mut ub,
+            ),
+            Err(C310CapturedVectorError::Ub(
+                UbReplayError::TrackedLimitExceeded { limit: 200 }
+            ))
+        );
+        assert_eq!(ub, before_ub);
+        assert_eq!(
+            machine.execute_captured_vst_word(
+                0x10d0_d918,
+                C310_CAPTURED_VST_WORD,
+                u64::MAX - 4,
+                &active_mask,
+                &mut ub,
+            ),
+            Err(C310CapturedVectorError::AddressOverflow {
+                base: u64::MAX - 4,
+                lane: 2,
+            })
+        );
+        assert_eq!(ub, before_ub);
+    }
+
+    #[test]
+    fn captured_vldi_reads_overlapping_ub_windows_into_distinct_v_registers() {
+        let bytes = (0..384)
+            .map(|index| (index & 0xff) as u8)
+            .collect::<Vec<_>>();
+        let mut ub = UbReplayMemory::new(384, 384);
+        ub.write_states(
+            0,
+            &bytes
+                .iter()
+                .copied()
+                .map(MemoryByteState::Known)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut xregs = [0_u64; 32];
+        xregs[4] = 0;
+        xregs[8] = 0x80;
+        let mut machine = C310RvecValueMachine::from_vector_words(vec![vec![0; 64]; 2]).unwrap();
+        for (pc, word, destination, source, expected) in [
+            (0x10d0_db00, C310_CAPTURED_VLDI_V0_WORD, 0, 4, &bytes[..256]),
+            (
+                0x10d0_db04,
+                C310_CAPTURED_VLDI_V1_WORD,
+                1,
+                8,
+                &bytes[128..384],
+            ),
+        ] {
+            let step = machine
+                .execute_captured_vldi_word(pc, word, &xregs, &ub)
+                .unwrap();
+            assert_eq!(step.hint.vendor_isa_name, 284);
+            assert_eq!(step.hint.destination_v_register, destination);
+            assert_eq!(step.hint.source_x_register, source);
+            assert_eq!(step.source_address, xregs[source as usize]);
+            assert_eq!(step.loaded_bytes, expected);
+            assert_eq!(
+                machine.vector_register(destination as usize).unwrap(),
+                expected
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn captured_vldi_rejects_unknown_bytes_without_mutating_registers() {
+        let mut ub = UbReplayMemory::new(256, 256);
+        ub.write_states(0, &[MemoryByteState::Known(7); 255])
+            .unwrap();
+        let xregs = [0_u64; 32];
+        let mut machine = C310RvecValueMachine::from_vector_words(vec![vec![9; 64]; 2]).unwrap();
+        let before = machine.clone();
+        assert_eq!(
+            machine.execute_captured_vldi_word(
+                0x10d0_db00,
+                C310_CAPTURED_VLDI_V0_WORD,
+                &xregs,
+                &ub,
+            ),
+            Err(C310CapturedVldiError::Ub(UbReplayError::UnknownByte {
+                address: 255
+            }))
+        );
+        assert_eq!(machine, before);
+        assert_eq!(
+            machine.execute_captured_vldi_word(0x10d0_db00, 0, &xregs, &ub),
+            Err(C310CapturedVldiError::UnsupportedWord {
+                pc: 0x10d0_db00,
+                word: 0,
+            })
+        );
+        assert_eq!(machine, before);
+    }
+
+    #[test]
+    fn captured_vldi_rejects_wrong_register_shape_or_bank() {
+        let ub = UbReplayMemory::new(256, 256);
+        let xregs = [0_u64; 32];
+        let mut short = C310RvecValueMachine::from_vector_words(vec![vec![0; 32]; 2]).unwrap();
+        let before = short.clone();
+        assert_eq!(
+            short.execute_captured_vldi_word(0x10d0_db00, C310_CAPTURED_VLDI_V0_WORD, &xregs, &ub,),
+            Err(C310CapturedVldiError::RegisterWidth { actual: 128 })
+        );
+        assert_eq!(short, before);
+
+        let mut one_register = C310RvecValueMachine::from_vector_words(vec![vec![0; 64]]).unwrap();
+        let before = one_register.clone();
+        assert_eq!(
+            one_register.execute_captured_vldi_word(
+                0x10d0_db04,
+                C310_CAPTURED_VLDI_V1_WORD,
+                &xregs,
+                &ub,
+            ),
+            Err(C310CapturedVldiError::RegisterIndex { index: 1, count: 1 })
+        );
+        assert_eq!(one_register, before);
+    }
 
     #[test]
     fn observed_c310_movemask_words_transfer_live_source_x_values_to_mask_sprs() {
@@ -713,6 +1385,45 @@ mod tests {
                 lane: 2,
             })
         );
+    }
+
+    #[test]
+    fn normal_u32_vsti_commits_only_selected_ub_lanes_atomically() {
+        let mut predicate = vec![0_u8; 32];
+        predicate[..16].fill(0x0f);
+        let machine = C310RvecValueMachine::from_vector_and_predicate_bytes(
+            vec![(0..64_u32).collect()],
+            vec![vec![0; 32], predicate],
+        )
+        .unwrap();
+        let mut ub = UbReplayMemory::new(128, 128);
+        ub.write_states(0x100, &[MemoryByteState::Known(0xa5); 128])
+            .unwrap();
+        let stores = machine
+            .execute_normal_u32_vsti_to_ub(0x4018_010a, 0x100, &mut ub)
+            .unwrap();
+        assert_eq!(stores.len(), 16);
+        for lane in 0..32_u32 {
+            let bytes = ub.read_known(0x100 + u64::from(lane) * 4, 4).unwrap();
+            if lane % 2 == 0 {
+                assert_eq!(bytes, lane.to_le_bytes());
+            } else {
+                assert_eq!(bytes, [0xa5; 4]);
+            }
+        }
+
+        let mut limited = UbReplayMemory::new(4, 4);
+        limited
+            .write_states(0x100, &[MemoryByteState::Known(0xa5)])
+            .unwrap();
+        let before = limited.clone();
+        assert_eq!(
+            machine.execute_normal_u32_vsti_to_ub(0x4018_010a, 0x100, &mut limited),
+            Err(C310RvecValueError::Ub(
+                UbReplayError::TrackedLimitExceeded { limit: 4 }
+            ))
+        );
+        assert_eq!(limited, before);
     }
 
     #[test]

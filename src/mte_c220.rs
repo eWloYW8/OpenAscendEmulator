@@ -7,6 +7,7 @@ pub const CAPTURED_C220_MOV_OUT_TO_UB_X_WORD: u32 = 0x711f_3188;
 pub const CAPTURED_C220_MOV_OUT_TO_UB_Y_WORD: u32 = 0x7124_f188;
 pub const CAPTURED_C220_SUB_MOV_OUT_TO_UB_X_WORD: u32 = 0x711b_1208;
 pub const CAPTURED_C220_SUB_MOV_OUT_TO_UB_Y_WORD: u32 = 0x7120_d208;
+pub const CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD: u32 = 0x7100_1108;
 pub const C220_MOV_UB_TO_OUT_UNIT_BYTES: u64 = 32;
 pub const MAX_C220_DMAMOV_SEGMENTS: u64 = 4096;
 
@@ -52,18 +53,19 @@ pub enum C220MovOutToUbError {
 
 impl C220MovOutToUbDescriptor {
     pub fn decode(instruction_word: u32, xm: u64) -> Result<Self, C220MovOutToUbError> {
-        if !matches!(
-            instruction_word,
+        let expected_xm = match instruction_word {
+            CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD => 0x10010,
             CAPTURED_C220_MOV_OUT_TO_UB_X_WORD
-                | CAPTURED_C220_MOV_OUT_TO_UB_Y_WORD
-                | CAPTURED_C220_SUB_MOV_OUT_TO_UB_X_WORD
-                | CAPTURED_C220_SUB_MOV_OUT_TO_UB_Y_WORD
-        ) {
-            return Err(C220MovOutToUbError::UnsupportedWord {
-                word: instruction_word,
-            });
-        }
-        if xm != 0x40010 {
+            | CAPTURED_C220_MOV_OUT_TO_UB_Y_WORD
+            | CAPTURED_C220_SUB_MOV_OUT_TO_UB_X_WORD
+            | CAPTURED_C220_SUB_MOV_OUT_TO_UB_Y_WORD => 0x40010,
+            _ => {
+                return Err(C220MovOutToUbError::UnsupportedWord {
+                    word: instruction_word,
+                });
+            }
+        };
+        if xm != expected_xm {
             return Err(C220MovOutToUbError::UnsupportedXm { xm });
         }
         Ok(Self {
@@ -76,22 +78,25 @@ impl C220MovOutToUbDescriptor {
         self,
         source_hbm: u64,
         destination_local: u64,
-    ) -> Result<[C220MovOutToUbSegment; 4], C220MovOutToUbError> {
-        let mut segments = [C220MovOutToUbSegment {
-            source_hbm: 0,
-            destination_local: 0,
-            bytes: 32,
-        }; 4];
-        for (index, segment) in segments.iter_mut().enumerate() {
+    ) -> Result<Vec<C220MovOutToUbSegment>, C220MovOutToUbError> {
+        Self::decode(self.instruction_word, self.xm)?;
+        let count = ((self.xm >> 16) & 0xffff) as usize;
+        let mut segments = Vec::with_capacity(count);
+        for index in 0..count {
             let offset = (index as u64) * 32;
-            segment.source_hbm = source_hbm
+            let source_hbm = source_hbm
                 .checked_add(offset)
                 .and_then(|value| value.checked_add(32).map(|_| value))
                 .ok_or(C220MovOutToUbError::AddressOverflow)?;
-            segment.destination_local = destination_local
+            let destination_local = destination_local
                 .checked_add(offset)
                 .and_then(|value| value.checked_add(32).map(|_| value))
                 .ok_or(C220MovOutToUbError::AddressOverflow)?;
+            segments.push(C220MovOutToUbSegment {
+                source_hbm,
+                destination_local,
+                bytes: 32,
+            });
         }
         Ok(segments)
     }
@@ -114,6 +119,8 @@ pub enum C220DmaMovError {
     EmptyDescriptor,
     #[error("C220 MOV_UB_TO_OUT requests {requested} segments, limit {limit}")]
     TooManySegments { requested: u64, limit: u64 },
+    #[error("C220 MOV_UB_TO_OUT descriptor fields disagree with XM")]
+    InconsistentDescriptor,
     #[error("C220 MOV_UB_TO_OUT source or destination address overflows")]
     AddressOverflow,
 }
@@ -165,6 +172,10 @@ impl C220DmaMovDescriptor {
         source_local: u64,
         destination_hbm: u64,
     ) -> Result<Vec<C220DmaMovSegment>, C220DmaMovError> {
+        let decoded = Self::decode(self.instruction_word, self.xm)?;
+        if self.burst_count != decoded.burst_count || self.burst_length != decoded.burst_length {
+            return Err(C220DmaMovError::InconsistentDescriptor);
+        }
         let capacity = usize::from(self.burst_count) * usize::from(self.burst_length);
         let mut segments = Vec::with_capacity(capacity);
         for burst_index in 0..self.burst_count {
@@ -281,6 +292,25 @@ mod tests {
     }
 
     #[test]
+    fn tiling_word_moves_one_32_byte_unit() {
+        let descriptor =
+            C220MovOutToUbDescriptor::decode(CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD, 0x10010)
+                .unwrap();
+        assert_eq!(
+            descriptor.segments(0x1251_5400, 0).unwrap(),
+            [C220MovOutToUbSegment {
+                source_hbm: 0x1251_5400,
+                destination_local: 0,
+                bytes: 32,
+            }]
+        );
+        assert_eq!(
+            C220MovOutToUbDescriptor::decode(CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD, 0x40010),
+            Err(C220MovOutToUbError::UnsupportedXm { xm: 0x40010 })
+        );
+    }
+
+    #[test]
     fn captured_mte2_plan_rejects_other_modes_and_overflow() {
         assert!(matches!(
             C220MovOutToUbDescriptor::decode(0, 0x40010),
@@ -299,6 +329,36 @@ mod tests {
         assert_eq!(
             descriptor.segments(0, u64::MAX - 32),
             Err(C220MovOutToUbError::AddressOverflow)
+        );
+        assert_eq!(
+            C220MovOutToUbDescriptor {
+                xm: 0x10010,
+                ..descriptor
+            }
+            .segments(0, 0),
+            Err(C220MovOutToUbError::UnsupportedXm { xm: 0x10010 })
+        );
+    }
+
+    #[test]
+    fn output_descriptor_revalidates_public_fields_before_planning() {
+        let descriptor =
+            C220DmaMovDescriptor::decode(CAPTURED_C220_MOV_UB_TO_OUT_WORD, 0x40010).unwrap();
+        assert_eq!(
+            C220DmaMovDescriptor {
+                burst_count: 4096,
+                ..descriptor
+            }
+            .segments(0, 0),
+            Err(C220DmaMovError::InconsistentDescriptor)
+        );
+        assert_eq!(
+            C220DmaMovDescriptor {
+                xm: 0x40011,
+                ..descriptor
+            }
+            .segments(0, 0),
+            Err(C220DmaMovError::UnsupportedMode { mode: 1 })
         );
     }
 }

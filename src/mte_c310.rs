@@ -4,6 +4,57 @@ use crate::architecture::Architecture;
 use crate::isa::AicDecoderHint;
 
 pub const MAX_C310_MOV_ALIGN_COORDINATES: usize = 4096;
+pub const C310_TILING_MOV_ALIGN_WORD: u32 = 0x748e_121c;
+pub const C310_ADD_MOV_ALIGN_X_WORD: u32 = 0x74b2_1022;
+pub const C310_ADD_MOV_ALIGN_Y_WORD: u32 = 0x7484_00a2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct C310MovAlignRegisterSelectors {
+    pub destination: u8,
+    pub source: u8,
+    pub shape: u8,
+    pub stride: u8,
+}
+
+impl C310MovAlignRegisterSelectors {
+    pub fn from_captured_word(word: u32) -> Result<Self, C310CapturedMovAlignError> {
+        if !matches!(
+            word,
+            C310_ADD_MOV_ALIGN_X_WORD
+                | C310_ADD_MOV_ALIGN_Y_WORD
+                | 0x74ad_8bae
+                | 0x74b3_6bae
+                | 0x74e1_192c
+                | 0x74c4_16a0
+        ) {
+            return Err(C310CapturedMovAlignError::UnsupportedWord);
+        }
+        Ok(Self {
+            destination: ((word >> 17) & 0x1f) as u8,
+            source: ((word >> 12) & 0x1f) as u8,
+            shape: ((word >> 7) & 0x1f) as u8,
+            stride: ((word >> 2) & 0x1f) as u8,
+        })
+    }
+
+    pub fn capture(
+        self,
+        xregs: &[u64; 32],
+        loop_spr: u64,
+        inner_stride_spr: u64,
+        outer_stride_spr: u64,
+    ) -> C310CapturedMovAlignRegisters {
+        C310CapturedMovAlignRegisters {
+            destination: xregs[self.destination as usize],
+            source: xregs[self.source as usize],
+            shape: xregs[self.shape as usize],
+            stride: xregs[self.stride as usize],
+            loop_spr,
+            inner_stride_spr,
+            outer_stride_spr,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct C310MovAlignParameters {
@@ -41,13 +92,23 @@ pub enum C310MovAlignCoordinateError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct C310CapturedMovAlignRegisters {
-    pub destination_xreg0: u64,
-    pub source_xreg4: u64,
-    pub shape_xreg6: u64,
-    pub stride_xreg8: u64,
+    pub destination: u64,
+    pub source: u64,
+    pub shape: u64,
+    pub stride: u64,
     pub loop_spr: u64,
     pub inner_stride_spr: u64,
     pub outer_stride_spr: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct C310TilingMovAlignRegisters {
+    pub source_xreg1: u64,
+    pub shape_xreg4: u64,
+    pub destination_and_stride_xreg7: u64,
+    pub loop_spr105: u64,
+    pub inner_stride_spr106: u64,
+    pub outer_stride_spr107: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,11 +129,14 @@ pub enum C310CapturedMovAlignError {
 }
 
 impl C310CapturedMovAlignRegisters {
-    pub fn decode_sub_word(
+    pub fn decode_hbm_to_ub_word(
         self,
         word: u32,
     ) -> Result<C310CapturedMovAlignDecode, C310CapturedMovAlignError> {
-        if !matches!(word, 0x74ad_8bae | 0x74b3_6bae | 0x74e1_192c) {
+        if !matches!(
+            word,
+            C310_ADD_MOV_ALIGN_X_WORD | C310_ADD_MOV_ALIGN_Y_WORD | 0x74ad_8bae | 0x74b3_6bae
+        ) {
             return Err(C310CapturedMovAlignError::UnsupportedWord);
         }
         self.decode_captured_word(word)
@@ -83,7 +147,9 @@ impl C310CapturedMovAlignRegisters {
         word: u32,
     ) -> Result<C310CapturedMovAlignDecode, C310CapturedMovAlignError> {
         let (spr_indices, expected_shape) = match word {
-            0x74ad_8bae | 0x74b3_6bae => ([105, 106, 107], 0x0400_0001_0000_0010),
+            C310_ADD_MOV_ALIGN_X_WORD | C310_ADD_MOV_ALIGN_Y_WORD | 0x74ad_8bae | 0x74b3_6bae => {
+                ([105, 106, 107], 0x0400_0001_0000_0010)
+            }
             0x74e1_192c | 0x74c4_16a0 => ([112, 113, 114], 0x0000_0001_0000_0010),
             _ => return Err(C310CapturedMovAlignError::UnsupportedWord),
         };
@@ -95,8 +161,8 @@ impl C310CapturedMovAlignRegisters {
         else {
             return Err(C310CapturedMovAlignError::UnsupportedWord);
         };
-        if self.shape_xreg6 != expected_shape
-            || self.stride_xreg8 != 0x0000_8000_0000_0080
+        if self.shape != expected_shape
+            || self.stride != 0x0000_8000_0000_0080
             || self.loop_spr != 0x20_0001
             || self.inner_stride_spr != 0
             || self.outer_stride_spr != 0
@@ -113,11 +179,11 @@ impl C310CapturedMovAlignRegisters {
             }
         };
         let parameters = C310MovAlignParameters {
-            source_base: self.source_xreg4,
-            destination_base: self.destination_xreg0,
-            burst_count: ((self.shape_xreg6 >> 4) & high_21_mask) as u32,
-            source_burst_stride: stride(self.stride_xreg8, source_memory_class),
-            destination_burst_stride: stride(self.stride_xreg8, destination_memory_class),
+            source_base: self.source,
+            destination_base: self.destination,
+            burst_count: ((self.shape >> 4) & high_21_mask) as u32,
+            source_burst_stride: stride(self.stride, source_memory_class),
+            destination_burst_stride: stride(self.stride, destination_memory_class),
             inner_count: self.loop_spr & high_21_mask,
             source_inner_stride: stride(self.inner_stride_spr, source_memory_class),
             destination_inner_stride: stride(self.inner_stride_spr, destination_memory_class),
@@ -127,10 +193,57 @@ impl C310CapturedMovAlignRegisters {
         };
         Ok(C310CapturedMovAlignDecode {
             parameters,
-            burst_bytes: ((self.shape_xreg6 >> 25) & high_21_mask) as u32,
+            burst_bytes: ((self.shape >> 25) & high_21_mask) as u32,
             source_memory_class,
             destination_memory_class,
             spr_indices,
+        })
+    }
+}
+
+impl C310TilingMovAlignRegisters {
+    pub fn decode(
+        self,
+        word: u32,
+    ) -> Result<C310CapturedMovAlignDecode, C310CapturedMovAlignError> {
+        if word != C310_TILING_MOV_ALIGN_WORD {
+            return Err(C310CapturedMovAlignError::UnsupportedWord);
+        }
+        let Some(AicDecoderHint::C310MovAlignV2 {
+            source_memory_class: 10,
+            destination_memory_class: 9,
+            dtype_field: 0,
+            ..
+        }) = AicDecoderHint::from_word(Architecture::Dav3510, word)
+        else {
+            return Err(C310CapturedMovAlignError::UnsupportedWord);
+        };
+        if self.shape_xreg4 != 0x4000_0010
+            || self.destination_and_stride_xreg7 != 0
+            || self.loop_spr105 != 0x20_0001
+            || self.inner_stride_spr106 != 0
+            || self.outer_stride_spr107 != 0
+        {
+            return Err(C310CapturedMovAlignError::UnsupportedRegisterMode);
+        }
+        Ok(C310CapturedMovAlignDecode {
+            parameters: C310MovAlignParameters {
+                source_base: self.source_xreg1,
+                destination_base: self.destination_and_stride_xreg7,
+                burst_count: 1,
+                source_burst_stride: 0,
+                destination_burst_stride: 0,
+                inner_count: 1,
+                source_inner_stride: 0,
+                destination_inner_stride: 0,
+                outer_count: 1,
+                source_outer_stride: 0,
+                destination_outer_stride: 0,
+            },
+            burst_bytes: 32,
+            source_memory_class: 10,
+            destination_memory_class: 9,
+            spr_indices: [105, 106, 107],
         })
     }
 }
@@ -231,14 +344,14 @@ mod tests {
 
     fn captured_registers(word: u32, source: u64, target: u64) -> C310CapturedMovAlignRegisters {
         C310CapturedMovAlignRegisters {
-            destination_xreg0: target,
-            source_xreg4: source,
-            shape_xreg6: if matches!(word, 0x74e1_192c | 0x74c4_16a0) {
+            destination: target,
+            source,
+            shape: if matches!(word, 0x74e1_192c | 0x74c4_16a0) {
                 0x0000_0001_0000_0010
             } else {
                 0x0400_0001_0000_0010
             },
-            stride_xreg8: 0x0000_8000_0000_0080,
+            stride: 0x0000_8000_0000_0080,
             loop_spr: 0x20_0001,
             inner_stride_spr: 0,
             outer_stride_spr: 0,
@@ -248,6 +361,20 @@ mod tests {
     #[test]
     fn captured_registers_predict_sub_and_add_coordinate_parameters() {
         for (word, source, target, classes, sprs) in [
+            (
+                C310_ADD_MOV_ALIGN_X_WORD,
+                0x1b92_da00,
+                0,
+                (10, 9),
+                [105, 106, 107],
+            ),
+            (
+                C310_ADD_MOV_ALIGN_Y_WORD,
+                0x1b92_ec00,
+                0x80,
+                (10, 9),
+                [105, 106, 107],
+            ),
             (0x74ad_8bae, 0x1b92_e200, 0, (10, 9), [105, 106, 107]),
             (0x74b3_6bae, 0x1b92_f400, 0x80, (10, 9), [105, 106, 107]),
             (0x74e1_192c, 0x100, 0x1b93_0600, (9, 10), [112, 113, 114]),
@@ -270,6 +397,58 @@ mod tests {
     }
 
     #[test]
+    fn first_tiling_word_uses_one_32_byte_hbm_to_ub_coordinate() {
+        let registers = C310TilingMovAlignRegisters {
+            source_xreg1: 0x1c93_1200,
+            shape_xreg4: 0x4000_0010,
+            destination_and_stride_xreg7: 0,
+            loop_spr105: 0x20_0001,
+            inner_stride_spr106: 0,
+            outer_stride_spr107: 0,
+        };
+        let decoded = registers.decode(C310_TILING_MOV_ALIGN_WORD).unwrap();
+        assert_eq!(
+            (
+                decoded.source_memory_class,
+                decoded.destination_memory_class
+            ),
+            (10, 9)
+        );
+        assert_eq!(decoded.spr_indices, [105, 106, 107]);
+        assert_eq!(decoded.burst_bytes, 32);
+        assert_eq!(
+            decoded.parameters.coordinates().unwrap(),
+            [C310MovAlignCoordinate {
+                source_address: 0x1c93_1200,
+                destination_address: 0,
+                burst_index: 0,
+                inner_index: 0,
+                outer_index: 0,
+            }]
+        );
+        assert_eq!(
+            registers.decode(C310_TILING_MOV_ALIGN_WORD ^ 1),
+            Err(C310CapturedMovAlignError::UnsupportedWord)
+        );
+        assert_eq!(
+            C310TilingMovAlignRegisters {
+                loop_spr105: 0,
+                ..registers
+            }
+            .decode(C310_TILING_MOV_ALIGN_WORD),
+            Err(C310CapturedMovAlignError::UnsupportedRegisterMode)
+        );
+        assert_eq!(
+            C310TilingMovAlignRegisters {
+                shape_xreg4: 0x4000_0030,
+                ..registers
+            }
+            .decode(C310_TILING_MOV_ALIGN_WORD),
+            Err(C310CapturedMovAlignError::UnsupportedRegisterMode)
+        );
+    }
+
+    #[test]
     fn rejects_other_words_and_register_modes() {
         let registers = captured_registers(0x74ad_8bae, 0, 0);
         assert_eq!(
@@ -277,13 +456,40 @@ mod tests {
             Err(C310CapturedMovAlignError::UnsupportedWord)
         );
         let mut modified = registers;
-        modified.shape_xreg6 ^= 1;
+        modified.shape ^= 1;
         assert_eq!(
             modified.decode_captured_word(0x74ad_8bae),
             Err(C310CapturedMovAlignError::UnsupportedRegisterMode)
         );
         assert_eq!(
-            captured_registers(0x74c4_16a0, 0x100, 0x1b93_0600).decode_sub_word(0x74c4_16a0),
+            captured_registers(0x74c4_16a0, 0x100, 0x1b93_0600).decode_hbm_to_ub_word(0x74c4_16a0),
+            Err(C310CapturedMovAlignError::UnsupportedWord)
+        );
+    }
+
+    #[test]
+    fn captured_words_select_their_own_physical_x_registers() {
+        for (word, expected) in [
+            (C310_ADD_MOV_ALIGN_X_WORD, [25, 1, 0, 8]),
+            (C310_ADD_MOV_ALIGN_Y_WORD, [2, 0, 1, 8]),
+            (0x74ad_8bae, [22, 24, 23, 11]),
+            (0x74b3_6bae, [25, 22, 23, 11]),
+            (0x74e1_192c, [16, 17, 18, 11]),
+            (0x74c4_16a0, [2, 1, 13, 8]),
+        ] {
+            let selectors = C310MovAlignRegisterSelectors::from_captured_word(word).unwrap();
+            assert_eq!(
+                [
+                    selectors.destination,
+                    selectors.source,
+                    selectors.shape,
+                    selectors.stride,
+                ],
+                expected
+            );
+        }
+        assert_eq!(
+            C310MovAlignRegisterSelectors::from_captured_word(0x74ad_8baf),
             Err(C310CapturedMovAlignError::UnsupportedWord)
         );
     }

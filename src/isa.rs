@@ -38,6 +38,7 @@ pub enum ScalarKey8Operation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ScalarKey0Operation {
     Add,
+    Subtract,
     Multiply,
     MultiplyAdd,
     And,
@@ -54,6 +55,13 @@ pub enum ScalarKey7Operation {
 pub enum ScalarLoadStoreOperation {
     Load,
     Store,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ScalarStoreImmediateValue {
+    Zero,
+    One,
+    Ones,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -106,6 +114,25 @@ impl ZeroExtendWidth {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum AicDecoderHint {
+    ScalarPairLoad {
+        vendor_isa_name: u16,
+        dtype_field: u8,
+        width_bytes: u8,
+        first_destination_register: u8,
+        second_destination_register: u8,
+        base_register: u8,
+        signed_offset: i8,
+        sign_extend: bool,
+    },
+    ScalarPairStore {
+        vendor_isa_name: u16,
+        dtype_field: u8,
+        width_bytes: u8,
+        first_source_register: u8,
+        second_source_register: u8,
+        base_register: u8,
+        signed_offset: i8,
+    },
     ScalarLoadStoreImmediate {
         operation: ScalarLoadStoreOperation,
         vendor_isa_name: u16,
@@ -117,6 +144,14 @@ pub enum AicDecoderHint {
         post_index: bool,
         sign_extend: Option<bool>,
     },
+    ScalarStoreImmediate {
+        vendor_isa_name: u16,
+        width_bytes: u8,
+        base_register: u8,
+        signed_offset: i16,
+        post_index: bool,
+        value: ScalarStoreImmediateValue,
+    },
     ScalarKey0 {
         operation: ScalarKey0Operation,
         vendor_isa_name: u16,
@@ -125,7 +160,44 @@ pub enum AicDecoderHint {
         first_source_register: u8,
         second_source_register: u8,
     },
+    ScalarCompare {
+        dtype_field: u8,
+        condition_field: u8,
+        first_source_register: u8,
+        second_source_register: u8,
+    },
+    ScalarCompareRegister {
+        dtype_field: u8,
+        condition_field: u8,
+        destination_register: u8,
+        first_source_register: u8,
+        second_source_register: u8,
+    },
+    ScalarCompareImmediate {
+        vendor_isa_name: u16,
+        condition_field: u8,
+        source_register: u8,
+        encoded_immediate: u16,
+    },
+    ScalarSelect {
+        vendor_isa_name: u16,
+        dtype_field: u8,
+        destination_register: u8,
+        first_source_register: u8,
+        second_source_register: u8,
+    },
+    ScalarMoveX8Immediate {
+        vendor_isa_name: u16,
+        destination_register: u8,
+        encoded_immediate: u16,
+    },
     ScalarKey2MoveRegister {
+        vendor_isa_name: u16,
+        dtype_field: u8,
+        destination_register: u8,
+        source_register: u8,
+    },
+    ScalarKey2Negate {
         vendor_isa_name: u16,
         dtype_field: u8,
         destination_register: u8,
@@ -153,6 +225,38 @@ pub enum AicDecoderHint {
         destination_register: u8,
         count_register: Option<u8>,
         encoded_immediate: u8,
+    },
+    ScalarKey2ShiftRight {
+        vendor_isa_name: u16,
+        dtype_field: u8,
+        destination_register: u8,
+        count_register: Option<u8>,
+        encoded_immediate: u8,
+    },
+    ScalarKey2FindFirst {
+        destination_register: u8,
+        source_register: u8,
+        find_set: bool,
+    },
+    ScalarKey2Insert {
+        vendor_isa_name: u16,
+        destination_register: u8,
+        source_register: u8,
+        least_significant_bit: u8,
+        width_bits: u8,
+    },
+    ScalarKey2InsertImmediate {
+        vendor_isa_name: u16,
+        destination_register: u8,
+        position: u8,
+        immediate: u8,
+        extended: bool,
+    },
+    ScalarKey2BitSet {
+        vendor_isa_name: u16,
+        destination_register: u8,
+        source_register: u8,
+        set_bit: bool,
     },
     ScalarKey7 {
         operation: ScalarKey7Operation,
@@ -204,6 +308,47 @@ impl AicDecoderHint {
     pub const fn from_word(architecture: Architecture, word: u32) -> Option<Self> {
         match AicClass::from_word(word) {
             AicClass::Scalar
+                if (matches!(architecture, Architecture::Dav2201)
+                    && ((word >> 24) & 0x1f) == 9
+                    || matches!(architecture, Architecture::Dav3510)
+                        && matches!((word >> 24) & 0x1f, 9 | 12 | 13)) =>
+            {
+                let raw_offset = ((word >> 1) & 0x3f) as i8;
+                let signed_offset = if raw_offset & 0x20 != 0 {
+                    raw_offset - 64
+                } else {
+                    raw_offset
+                };
+                let dtype_field = ((word >> 22) & 3) as u8;
+                let width_bytes = 1 << ((word >> 22) & 3);
+                let first_register = ((word >> 17) & 0x1f) as u8;
+                let second_register = ((word >> 7) & 0x1f) as u8;
+                let base_register = ((word >> 12) & 0x1f) as u8;
+                if word & 1 == 0 {
+                    Some(Self::ScalarPairLoad {
+                        vendor_isa_name: 51,
+                        dtype_field,
+                        width_bytes,
+                        first_destination_register: first_register,
+                        second_destination_register: second_register,
+                        base_register,
+                        signed_offset,
+                        sign_extend: matches!(architecture, Architecture::Dav3510)
+                            && word & (1 << 24) != 0,
+                    })
+                } else {
+                    Some(Self::ScalarPairStore {
+                        vendor_isa_name: 52,
+                        dtype_field,
+                        width_bytes,
+                        first_source_register: first_register,
+                        second_source_register: second_register,
+                        base_register,
+                        signed_offset,
+                    })
+                }
+            }
+            AicClass::Scalar
                 if matches!(architecture, Architecture::Dav2201)
                     && matches!((word >> 24) & 0x1f, 3 | 19 | 4 | 20) =>
             {
@@ -218,6 +363,27 @@ impl AicDecoderHint {
                     word & (1 << 28) != 0,
                     None,
                 ))
+            }
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 15 => {
+                let value = match word & 3 {
+                    0 => ScalarStoreImmediateValue::Zero,
+                    1 => ScalarStoreImmediateValue::One,
+                    2 => ScalarStoreImmediateValue::Ones,
+                    _ => return None,
+                };
+                let raw_offset = (((word >> 10) & 0xf80) | ((word >> 5) & 0x7f)) as i16;
+                Some(Self::ScalarStoreImmediate {
+                    vendor_isa_name: 56,
+                    width_bytes: 1 << ((word >> 22) & 3),
+                    base_register: ((word >> 12) & 0x1f) as u8,
+                    signed_offset: if raw_offset & 0x800 != 0 {
+                        raw_offset - 4096
+                    } else {
+                        raw_offset
+                    },
+                    post_index: word & 4 != 0,
+                    value,
+                })
             }
             AicClass::Scalar
                 if matches!(architecture, Architecture::Dav3510)
@@ -243,9 +409,55 @@ impl AicDecoderHint {
                     },
                 ))
             }
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 16 => Some(Self::ScalarMoveX8Immediate {
+                vendor_isa_name: 61,
+                destination_register: ((word >> 17) & 0x1f) as u8,
+                encoded_immediate: word as u16,
+            }),
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 10 => Some(Self::ScalarCompareImmediate {
+                vendor_isa_name: 50,
+                condition_field: ((word >> 22) & 7) as u8,
+                source_register: ((word >> 12) & 0x1f) as u8,
+                encoded_immediate: (word & 0xfff) as u16,
+            }),
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 0 && (word & 0xf) == 9 => {
+                let mut destination_register = ((word >> 17) & 0x1f) as u8;
+                let mut first_source_register = ((word >> 12) & 0x1f) as u8;
+                let mut second_source_register = ((word >> 7) & 0x1f) as u8;
+                if matches!(architecture, Architecture::Dav2201) {
+                    destination_register |= ((word >> 1) & 0x20) as u8;
+                    first_source_register |= (word & 0x20) as u8;
+                    second_source_register |= ((word << 1) & 0x20) as u8;
+                }
+                Some(Self::ScalarSelect {
+                    vendor_isa_name: 8,
+                    dtype_field: ((word >> 22) & 3) as u8,
+                    destination_register,
+                    first_source_register,
+                    second_source_register,
+                })
+            }
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 0 && (word & 0xf) == 14 => {
+                Some(Self::ScalarCompare {
+                    dtype_field: ((word >> 22) & 3) as u8,
+                    condition_field: ((word >> 4) & 7) as u8,
+                    first_source_register: ((word >> 12) & 0x1f) as u8,
+                    second_source_register: ((word >> 7) & 0x1f) as u8,
+                })
+            }
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 0 && (word & 0xf) == 15 => {
+                Some(Self::ScalarCompareRegister {
+                    dtype_field: ((word >> 22) & 3) as u8,
+                    condition_field: ((word >> 4) & 7) as u8,
+                    destination_register: ((word >> 17) & 0x1f) as u8,
+                    first_source_register: ((word >> 12) & 0x1f) as u8,
+                    second_source_register: ((word >> 7) & 0x1f) as u8,
+                })
+            }
             AicClass::Scalar if ((word >> 24) & 0x1f) == 0 => {
                 let (operation, vendor_isa_name) = match word & 0xf {
                     1 => (ScalarKey0Operation::Add, 0),
+                    2 => (ScalarKey0Operation::Subtract, 1),
                     3 => (ScalarKey0Operation::Multiply, 2),
                     4 => (ScalarKey0Operation::MultiplyAdd, 3),
                     10 => (ScalarKey0Operation::And, 9),
@@ -269,6 +481,16 @@ impl AicDecoderHint {
                     second_source_register,
                 })
             }
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 1 => {
+                let (destination_register, source_register) =
+                    scalar_key2_registers(architecture, word);
+                Some(Self::ScalarKey2Negate {
+                    vendor_isa_name: 22,
+                    dtype_field: ((word >> 22) & 3) as u8,
+                    destination_register,
+                    source_register,
+                })
+            }
             AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 4 => {
                 Some(Self::ScalarKey2ShiftLeft {
                     vendor_isa_name: 25,
@@ -280,6 +502,38 @@ impl AicDecoderHint {
                         None
                     },
                     encoded_immediate: (word & 0x3f) as u8,
+                })
+            }
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 5 => {
+                Some(Self::ScalarKey2ShiftRight {
+                    vendor_isa_name: 26,
+                    dtype_field: ((word >> 22) & 3) as u8,
+                    destination_register: ((word >> 17) & 0x1f) as u8,
+                    count_register: if word & 0x40 != 0 {
+                        Some(((word >> 12) & 0x1f) as u8)
+                    } else {
+                        None
+                    },
+                    encoded_immediate: (word & 0x3f) as u8,
+                })
+            }
+            AicClass::Scalar
+                if matches!(architecture, Architecture::Dav3510)
+                    && ((word >> 24) & 0x1f) == 2
+                    && ((word >> 7) & 0x1f) == 7 =>
+            {
+                Some(Self::ScalarKey2FindFirst {
+                    destination_register: ((word >> 17) & 0x1f) as u8,
+                    source_register: ((word >> 12) & 0x1f) as u8,
+                    find_set: word & 0x40 != 0,
+                })
+            }
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 8 => {
+                Some(Self::ScalarKey2BitSet {
+                    vendor_isa_name: 29,
+                    destination_register: ((word >> 17) & 0x1f) as u8,
+                    source_register: ((word >> 12) & 0x1f) as u8,
+                    set_bit: word & 0x40 != 0,
                 })
             }
             AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 16 => {
@@ -335,6 +589,28 @@ impl AicDecoderHint {
                     width,
                     destination_register,
                     source_register,
+                })
+            }
+            AicClass::Scalar
+                if ((word >> 24) & 0x1f) == 2 && matches!((word >> 7) & 0x1f, 22 | 23) =>
+            {
+                Some(Self::ScalarKey2InsertImmediate {
+                    vendor_isa_name: 39,
+                    destination_register: ((word >> 17) & 0x1f) as u8,
+                    position: (((word >> 17) & 0x20) | ((word >> 12) & 0x1f)) as u8,
+                    immediate: word as u8,
+                    extended: word & 0x80_0000 != 0,
+                })
+            }
+            AicClass::Scalar
+                if ((word >> 24) & 0x1f) == 2 && matches!((word >> 7) & 0x1f, 24..=27) =>
+            {
+                Some(Self::ScalarKey2Insert {
+                    vendor_isa_name: 38,
+                    destination_register: ((word >> 17) & 0x1f) as u8,
+                    source_register: ((word >> 12) & 0x1f) as u8,
+                    least_significant_bit: (((word >> 18) & 0x30) | ((word >> 5) & 0xf)) as u8,
+                    width_bits: ((word & 0x1f) + 1) as u8,
                 })
             }
             AicClass::Scalar if ((word >> 24) & 0x1f) == 7 => {
@@ -590,6 +866,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn movx8_immediate_fields_match_both_architectures() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x1004_2002),
+                Some(AicDecoderHint::ScalarMoveX8Immediate {
+                    vendor_isa_name: 61,
+                    destination_register: 2,
+                    encoded_immediate: 0x2002,
+                })
+            );
+            assert!(!matches!(
+                AicDecoderHint::from_word(architecture, 0x1204_2002),
+                Some(AicDecoderHint::ScalarMoveX8Immediate { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn ordinary_dispatch_classes_match_both_pem_implementations() {
         let expected = [
             AicClass::Scalar,
@@ -715,6 +1009,76 @@ mod tests {
         assert_eq!(
             AicDecoderHint::from_word(Architecture::Dav2201, 0x1cce_5db8),
             None
+        );
+    }
+
+    #[test]
+    fn pair_load_fields_and_opcode_groups_are_architecture_specific() {
+        let c310_word = 0x0cca_0190;
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav3510, c310_word),
+            Some(AicDecoderHint::ScalarPairLoad {
+                vendor_isa_name: 51,
+                dtype_field: 3,
+                width_bytes: 8,
+                first_destination_register: 5,
+                second_destination_register: 3,
+                base_register: 0,
+                signed_offset: 8,
+                sign_extend: false,
+            })
+        );
+        assert!(!matches!(
+            AicDecoderHint::from_word(Architecture::Dav2201, c310_word),
+            Some(AicDecoderHint::ScalarPairLoad { .. })
+        ));
+        let c220_word = (c310_word & !(0x1f << 24)) | (9 << 24);
+        assert!(matches!(
+            AicDecoderHint::from_word(Architecture::Dav2201, c220_word),
+            Some(AicDecoderHint::ScalarPairLoad {
+                signed_offset: 8,
+                sign_extend: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x09c4_00b0),
+            Some(AicDecoderHint::ScalarPairLoad {
+                first_destination_register: 2,
+                second_destination_register: 1,
+                base_register: 0,
+                signed_offset: 24,
+                ..
+            })
+        ));
+        assert!(matches!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x09c8_0190),
+            Some(AicDecoderHint::ScalarPairLoad {
+                first_destination_register: 4,
+                second_destination_register: 3,
+                base_register: 0,
+                signed_offset: 8,
+                ..
+            })
+        ));
+        assert!(matches!(
+            AicDecoderHint::from_word(Architecture::Dav3510, c310_word | (1 << 24)),
+            Some(AicDecoderHint::ScalarPairLoad {
+                sign_extend: true,
+                ..
+            })
+        ));
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav3510, c310_word | 1),
+            Some(AicDecoderHint::ScalarPairStore {
+                vendor_isa_name: 52,
+                dtype_field: 3,
+                width_bytes: 8,
+                first_source_register: 5,
+                second_source_register: 3,
+                base_register: 0,
+                signed_offset: 8,
+            })
         );
     }
 
@@ -976,6 +1340,7 @@ mod tests {
         for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
             for (word, operation, name, dtype, xd, xn, xm) in [
                 (0x003b_d781, ScalarKey0Operation::Add, 0, 0, 29, 29, 15),
+                (0x0002_1102, ScalarKey0Operation::Subtract, 1, 0, 1, 1, 2),
                 (0x000e_8383, ScalarKey0Operation::Multiply, 2, 0, 7, 8, 7),
                 (
                     0x003a_f884,
@@ -1047,6 +1412,65 @@ mod tests {
                     dtype_field: 3,
                     destination_register: 10,
                     count_register: Some(22),
+                    encoded_immediate: 0,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_negate_register_fields_match_both_architectures() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x0202_2080),
+                Some(AicDecoderHint::ScalarKey2Negate {
+                    vendor_isa_name: 22,
+                    dtype_field: 0,
+                    destination_register: 1,
+                    source_register: 2,
+                })
+            );
+        }
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x0202_20e0),
+            Some(AicDecoderHint::ScalarKey2Negate {
+                vendor_isa_name: 22,
+                dtype_field: 0,
+                destination_register: 33,
+                source_register: 34,
+            })
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav3510, 0x0202_20e0),
+            Some(AicDecoderHint::ScalarKey2Negate {
+                vendor_isa_name: 22,
+                dtype_field: 0,
+                destination_register: 1,
+                source_register: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn scalar_shift_right_decodes_immediate_and_register_counts() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x0252_028f),
+                Some(AicDecoderHint::ScalarKey2ShiftRight {
+                    vendor_isa_name: 26,
+                    dtype_field: 1,
+                    destination_register: 9,
+                    count_register: None,
+                    encoded_immediate: 15,
+                })
+            );
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x0212_62c0),
+                Some(AicDecoderHint::ScalarKey2ShiftRight {
+                    vendor_isa_name: 26,
+                    dtype_field: 0,
+                    destination_register: 9,
+                    count_register: Some(6),
                     encoded_immediate: 0,
                 })
             );
@@ -1286,6 +1710,210 @@ mod tests {
                     dtype_field,
                     source_memory_class,
                     destination_memory_class,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn insert_fields_follow_the_scalar_key_two_decoder_on_both_architectures() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x0202_7cc2),
+                Some(AicDecoderHint::ScalarKey2Insert {
+                    vendor_isa_name: 38,
+                    destination_register: 1,
+                    source_register: 7,
+                    least_significant_bit: 6,
+                    width_bits: 3,
+                })
+            );
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x0243_8b00),
+                Some(AicDecoderHint::ScalarKey2InsertImmediate {
+                    vendor_isa_name: 39,
+                    destination_register: 1,
+                    position: 56,
+                    immediate: 0,
+                    extended: false,
+                })
+            );
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x02c0_1400),
+                Some(AicDecoderHint::ScalarKey2BitSet {
+                    vendor_isa_name: 29,
+                    destination_register: 0,
+                    source_register: 1,
+                    set_bit: false,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_immediate_store_decodes_width_value_and_signed_offset_on_both_architectures() {
+        let word = 0x0f35_e580;
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, word),
+            Some(AicDecoderHint::ScalarStoreImmediate {
+                vendor_isa_name: 56,
+                width_bytes: 1,
+                base_register: 30,
+                signed_offset: -724,
+                post_index: false,
+                value: ScalarStoreImmediateValue::Zero,
+            })
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav3510, word),
+            AicDecoderHint::from_word(Architecture::Dav2201, word)
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav3510, 0x0f35_e900),
+            Some(AicDecoderHint::ScalarStoreImmediate {
+                vendor_isa_name: 56,
+                width_bytes: 1,
+                base_register: 30,
+                signed_offset: -696,
+                post_index: false,
+                value: ScalarStoreImmediateValue::Zero,
+            })
+        );
+
+        for (value_bits, value) in [
+            (0, ScalarStoreImmediateValue::Zero),
+            (1, ScalarStoreImmediateValue::One),
+            (2, ScalarStoreImmediateValue::Ones),
+        ] {
+            for (dtype, width_bytes) in [(0, 1), (1, 2), (2, 4), (3, 8)] {
+                let variant = (word & !(3 << 22)) | (dtype << 22) | value_bits;
+                for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+                    assert!(matches!(
+                        AicDecoderHint::from_word(architecture, variant),
+                        Some(AicDecoderHint::ScalarStoreImmediate {
+                            width_bytes: decoded_width,
+                            value: decoded_value,
+                            ..
+                        }) if decoded_width == width_bytes && decoded_value == value
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, word | 3),
+            None
+        );
+        assert!(matches!(
+            AicDecoderHint::from_word(Architecture::Dav2201, word | 4),
+            Some(AicDecoderHint::ScalarStoreImmediate {
+                post_index: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn scalar_compare_uses_two_sources_and_a_three_bit_condition() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x0000_011e),
+                Some(AicDecoderHint::ScalarCompare {
+                    dtype_field: 0,
+                    condition_field: 1,
+                    first_source_register: 0,
+                    second_source_register: 2,
+                })
+            );
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x0040_011e),
+                Some(AicDecoderHint::ScalarCompare {
+                    dtype_field: 1,
+                    condition_field: 1,
+                    first_source_register: 0,
+                    second_source_register: 2,
+                })
+            );
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x0000_039f),
+                Some(AicDecoderHint::ScalarCompareRegister {
+                    dtype_field: 0,
+                    condition_field: 1,
+                    destination_register: 0,
+                    first_source_register: 0,
+                    second_source_register: 7,
+                })
+            );
+        }
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x0040_222e),
+            Some(AicDecoderHint::ScalarCompare {
+                dtype_field: 1,
+                condition_field: 2,
+                first_source_register: 2,
+                second_source_register: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn c310_find_first_decodes_registers_and_match_bit() {
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav3510, 0x02d6_0380),
+            Some(AicDecoderHint::ScalarKey2FindFirst {
+                destination_register: 11,
+                source_register: 0,
+                find_set: false,
+            })
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav3510, 0x02d6_03c0),
+            Some(AicDecoderHint::ScalarKey2FindFirst {
+                destination_register: 11,
+                source_register: 0,
+                find_set: true,
+            })
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x02d6_0380),
+            None
+        );
+    }
+
+    #[test]
+    fn scalar_compare_immediate_decodes_signed_twelve_bit_operand() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x0a00_9000),
+                Some(AicDecoderHint::ScalarCompareImmediate {
+                    vendor_isa_name: 50,
+                    condition_field: 0,
+                    source_register: 9,
+                    encoded_immediate: 0,
+                })
+            );
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x0a80_9fff),
+                Some(AicDecoderHint::ScalarCompareImmediate {
+                    vendor_isa_name: 50,
+                    condition_field: 2,
+                    source_register: 9,
+                    encoded_immediate: 0xfff,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_select_decodes_the_three_x_registers() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x00d4_a289),
+                Some(AicDecoderHint::ScalarSelect {
+                    vendor_isa_name: 8,
+                    dtype_field: 3,
+                    destination_register: 10,
+                    first_source_register: 10,
+                    second_source_register: 5,
                 })
             );
         }

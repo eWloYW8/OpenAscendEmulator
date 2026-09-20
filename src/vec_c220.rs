@@ -5,6 +5,26 @@ use crate::fp32_vector::{
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct C220MovemaskHint {
+    pub source_register: u8,
+    pub destination_spr: u16,
+    pub vendor_isa_name: u16,
+}
+
+impl C220MovemaskHint {
+    pub const fn from_word(word: u32) -> Option<Self> {
+        if word & 0xffc0_0000 != 0x8040_0000 {
+            return None;
+        }
+        Some(Self {
+            source_register: ((word >> 2) & 0x1f) as u8,
+            destination_spr: 100 + ((word >> 7) & 1) as u16,
+            vendor_isa_name: 155,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum C220VecArithmeticOperation {
     Add,
@@ -82,6 +102,21 @@ impl C220VecArithmeticHint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn movemask_selects_source_and_mask_register() {
+        let first = C220MovemaskHint::from_word(0x8040_0000).unwrap();
+        assert_eq!(first.source_register, 0);
+        assert_eq!(first.destination_spr, 100);
+        assert_eq!(first.vendor_isa_name, 155);
+
+        let second = C220MovemaskHint::from_word(0x8040_008c).unwrap();
+        assert_eq!(second.source_register, 3);
+        assert_eq!(second.destination_spr, 101);
+        for word in [0x8040_0000 ^ (1 << 22), 0x8240_0000, 0x0040_0000] {
+            assert_eq!(C220MovemaskHint::from_word(word), None);
+        }
+    }
 
     #[test]
     fn vendor_add_and_sub_words_select_distinct_vec_handlers() {

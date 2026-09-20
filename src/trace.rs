@@ -17,6 +17,7 @@ pub struct ScalarTraceSummary {
     pub multiply_immediate: u64,
     pub subtract_immediate: u64,
     pub add_register: u64,
+    pub subtract_register: u64,
     pub multiply_register: u64,
     pub multiply_add_fields: u64,
     pub multiply_add_value_checked: u64,
@@ -26,9 +27,13 @@ pub struct ScalarTraceSummary {
     pub shift_left_fields: u64,
     pub shift_left_value_checked: u64,
     pub shift_left_unknown_prior: u64,
+    pub shift_right_fields: u64,
+    pub shift_right_value_checked: u64,
+    pub shift_right_unknown_prior: u64,
     pub checked_move_immediate: u64,
     pub checked_move_keep_lane: u64,
     pub checked_register_move: u64,
+    pub checked_negate: u64,
     pub zero_extend_u8: u64,
     pub zero_extend_u16: u64,
     pub zero_extend_u32: u64,
@@ -79,7 +84,7 @@ struct ScalarZeroExtendRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ScalarRegisterMoveRecord {
+struct ScalarRegisterUnaryRecord {
     pc: u64,
     word: u32,
     destination_register: u8,
@@ -102,9 +107,10 @@ struct ScalarRegisterBinaryRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ScalarShiftLeftRecord {
+struct ScalarShiftRecord {
     pc: u64,
     word: u32,
+    dtype_field: u8,
     destination_register: u8,
     destination_value: u64,
     count_register: Option<(u8, u64)>,
@@ -117,9 +123,11 @@ enum ParsedLine {
     Record(ScalarTraceRecord),
     MoveRecord(ScalarMoveRecord),
     ZeroExtendRecord(ScalarZeroExtendRecord),
-    RegisterMoveRecord(ScalarRegisterMoveRecord),
+    RegisterMoveRecord(ScalarRegisterUnaryRecord),
+    NegateRecord(ScalarRegisterUnaryRecord),
     RegisterBinaryRecord(ScalarRegisterBinaryRecord),
-    ShiftLeftRecord(ScalarShiftLeftRecord),
+    ShiftLeftRecord(ScalarShiftRecord),
+    ShiftRightRecord(ScalarShiftRecord),
 }
 
 enum TraceOperation {
@@ -127,8 +135,10 @@ enum TraceOperation {
     Move(ScalarKey7Operation),
     ZeroExtend,
     RegisterMove,
+    Negate,
     RegisterBinary(ScalarKey0Operation),
     ShiftLeft,
+    ShiftRight,
 }
 
 pub fn verify_scalar_trace<R: BufRead>(
@@ -143,6 +153,7 @@ pub fn verify_scalar_trace<R: BufRead>(
         multiply_immediate: 0,
         subtract_immediate: 0,
         add_register: 0,
+        subtract_register: 0,
         multiply_register: 0,
         multiply_add_fields: 0,
         multiply_add_value_checked: 0,
@@ -152,9 +163,13 @@ pub fn verify_scalar_trace<R: BufRead>(
         shift_left_fields: 0,
         shift_left_value_checked: 0,
         shift_left_unknown_prior: 0,
+        shift_right_fields: 0,
+        shift_right_value_checked: 0,
+        shift_right_unknown_prior: 0,
         checked_move_immediate: 0,
         checked_move_keep_lane: 0,
         checked_register_move: 0,
+        checked_negate: 0,
         zero_extend_u8: 0,
         zero_extend_u16: 0,
         zero_extend_u32: 0,
@@ -207,6 +222,12 @@ pub fn verify_scalar_trace<R: BufRead>(
                     add_mismatch(&mut summary, reason);
                 }
             }
+            Ok(ParsedLine::NegateRecord(record)) => {
+                summary.checked_negate += 1;
+                if let Err(reason) = check_negate_record(record, architecture) {
+                    add_mismatch(&mut summary, reason);
+                }
+            }
             Ok(ParsedLine::RegisterBinaryRecord(record)) => {
                 let prior_destination =
                     if record.first_source_register == record.destination_register {
@@ -221,6 +242,7 @@ pub fn verify_scalar_trace<R: BufRead>(
                     };
                 match record.operation {
                     ScalarKey0Operation::Add => summary.add_register += 1,
+                    ScalarKey0Operation::Subtract => summary.subtract_register += 1,
                     ScalarKey0Operation::Multiply => summary.multiply_register += 1,
                     ScalarKey0Operation::MultiplyAdd => {
                         summary.multiply_add_fields += 1;
@@ -241,14 +263,34 @@ pub fn verify_scalar_trace<R: BufRead>(
             }
             Ok(ParsedLine::ShiftLeftRecord(record)) => {
                 summary.shift_left_fields += 1;
-                let prior_destination = known_xregs[usize::from(record.destination_register)];
+                let prior_destination = known_xregs
+                    .get(usize::from(record.destination_register))
+                    .copied()
+                    .flatten();
                 if prior_destination.is_some() {
                     summary.shift_left_value_checked += 1;
                 } else {
                     summary.shift_left_unknown_prior += 1;
                 }
                 if let Err(reason) =
-                    check_shift_left_record(record, architecture, prior_destination)
+                    check_shift_record(record, architecture, prior_destination, false)
+                {
+                    add_mismatch(&mut summary, reason);
+                }
+            }
+            Ok(ParsedLine::ShiftRightRecord(record)) => {
+                summary.shift_right_fields += 1;
+                let prior_destination = known_xregs
+                    .get(usize::from(record.destination_register))
+                    .copied()
+                    .flatten();
+                if prior_destination.is_some() {
+                    summary.shift_right_value_checked += 1;
+                } else {
+                    summary.shift_right_unknown_prior += 1;
+                }
+                if let Err(reason) =
+                    check_shift_record(record, architecture, prior_destination, true)
                 {
                     add_mismatch(&mut summary, reason);
                 }
@@ -297,7 +339,11 @@ fn parse_line(line: &str) -> Result<ParsedLine, String> {
         "MOVK" => Some(TraceOperation::Move(ScalarKey7Operation::MoveKeep)),
         "ZEROEXT" => Some(TraceOperation::ZeroExtend),
         "MOV_XD_XN" => Some(TraceOperation::RegisterMove),
+        "NEG" => Some(TraceOperation::Negate),
         "ADD" => Some(TraceOperation::RegisterBinary(ScalarKey0Operation::Add)),
+        "SUB" => Some(TraceOperation::RegisterBinary(
+            ScalarKey0Operation::Subtract,
+        )),
         "MUL" => Some(TraceOperation::RegisterBinary(
             ScalarKey0Operation::Multiply,
         )),
@@ -307,6 +353,7 @@ fn parse_line(line: &str) -> Result<ParsedLine, String> {
         "AND" => Some(TraceOperation::RegisterBinary(ScalarKey0Operation::And)),
         "OR" => Some(TraceOperation::RegisterBinary(ScalarKey0Operation::Or)),
         "SHL" => Some(TraceOperation::ShiftLeft),
+        "SHR" => Some(TraceOperation::ShiftRight),
         _ => None,
     });
     let Some(operation) = operation else {
@@ -318,14 +365,22 @@ fn parse_line(line: &str) -> Result<ParsedLine, String> {
     {
         return Err("supported scalar record lacks SCALAR marker".to_owned());
     }
-    if matches!(operation, TraceOperation::ShiftLeft) {
+    if matches!(
+        operation,
+        TraceOperation::ShiftLeft | TraceOperation::ShiftRight
+    ) {
+        let right = matches!(operation, TraceOperation::ShiftRight);
+        let name = if right { "SHR" } else { "SHL" };
         let dtype = line
             .split_whitespace()
             .find(|token| token.starts_with("dtype:"))
-            .ok_or_else(|| "SHL record lacks dtype".to_owned())?;
-        if dtype.trim_end_matches(',') != "dtype:B64" {
-            return Ok(ParsedLine::UnsupportedDtype);
-        }
+            .ok_or_else(|| format!("{name} record lacks dtype"))?;
+        let dtype_field = match (right, dtype.trim_end_matches(',')) {
+            (false, "dtype:B64") => 3,
+            (true, "dtype:U64") => 1,
+            (true, "dtype:S64") => 0,
+            _ => return Ok(ParsedLine::UnsupportedDtype),
+        };
         let pc = parse_hex_between(line, "(PC: 0x", ')')?;
         let word = u32::try_from(parse_hex_between(line, "(Binary: 0x", ')')?)
             .map_err(|_| "instruction word exceeds 32 bits".to_owned())?;
@@ -333,22 +388,28 @@ fn parse_line(line: &str) -> Result<ParsedLine, String> {
         let data_source = line
             .split_whitespace()
             .find(|token| token.starts_with("DATA_SRC:"))
-            .ok_or_else(|| "SHL record lacks DATA_SRC".to_owned())?;
+            .ok_or_else(|| format!("{name} record lacks DATA_SRC"))?;
         let count_register = match data_source.trim_end_matches(',') {
             "DATA_SRC:IMM" => None,
             "DATA_SRC:XN" => Some(parse_register(line, "XN:X")?),
             _ => return Ok(ParsedLine::UnsupportedDtype),
         };
         let encoded_immediate = u8::try_from(parse_numeric_token(line, "IMM:")?)
-            .map_err(|_| "SHL immediate exceeds 8 bits".to_owned())?;
-        return Ok(ParsedLine::ShiftLeftRecord(ScalarShiftLeftRecord {
+            .map_err(|_| format!("{name} immediate exceeds 8 bits"))?;
+        let record = ScalarShiftRecord {
             pc,
             word,
+            dtype_field,
             destination_register,
             destination_value,
             count_register,
             encoded_immediate,
-        }));
+        };
+        return Ok(if right {
+            ParsedLine::ShiftRightRecord(record)
+        } else {
+            ParsedLine::ShiftLeftRecord(record)
+        });
     }
     if let TraceOperation::RegisterBinary(operation) = operation {
         let dtype = line
@@ -357,6 +418,7 @@ fn parse_line(line: &str) -> Result<ParsedLine, String> {
             .ok_or_else(|| "register-binary record lacks dtype".to_owned())?;
         let expected_dtype = match operation {
             ScalarKey0Operation::Add
+            | ScalarKey0Operation::Subtract
             | ScalarKey0Operation::Multiply
             | ScalarKey0Operation::MultiplyAdd => "dtype:S64",
             ScalarKey0Operation::And | ScalarKey0Operation::Or => "dtype:B64",
@@ -384,11 +446,14 @@ fn parse_line(line: &str) -> Result<ParsedLine, String> {
             },
         ));
     }
-    if matches!(operation, TraceOperation::RegisterMove) {
+    if matches!(
+        operation,
+        TraceOperation::RegisterMove | TraceOperation::Negate
+    ) {
         let dtype = line
             .split_whitespace()
             .find(|token| token.starts_with("dtype:"))
-            .ok_or_else(|| "MOV_XD_XN record lacks dtype".to_owned())?;
+            .ok_or_else(|| "register-unary record lacks dtype".to_owned())?;
         if dtype.trim_end_matches(',') != "dtype:S64" {
             return Ok(ParsedLine::UnsupportedDtype);
         }
@@ -397,14 +462,19 @@ fn parse_line(line: &str) -> Result<ParsedLine, String> {
             .map_err(|_| "instruction word exceeds 32 bits".to_owned())?;
         let (destination_register, destination_value) = parse_register(line, "XD:X")?;
         let (source_register, source_value) = parse_register(line, "XN:X")?;
-        return Ok(ParsedLine::RegisterMoveRecord(ScalarRegisterMoveRecord {
+        let record = ScalarRegisterUnaryRecord {
             pc,
             word,
             destination_register,
             destination_value,
             source_register,
             source_value,
-        }));
+        };
+        return Ok(if matches!(operation, TraceOperation::Negate) {
+            ParsedLine::NegateRecord(record)
+        } else {
+            ParsedLine::RegisterMoveRecord(record)
+        });
     }
     if matches!(operation, TraceOperation::ZeroExtend) {
         let dtype = line
@@ -567,7 +637,7 @@ fn check_zero_extend_record(
 }
 
 fn check_register_move_record(
-    record: ScalarRegisterMoveRecord,
+    record: ScalarRegisterUnaryRecord,
     architecture: Architecture,
 ) -> Result<(), String> {
     let Some(AicDecoderHint::ScalarKey2MoveRegister {
@@ -600,6 +670,41 @@ fn check_register_move_record(
     Ok(())
 }
 
+fn check_negate_record(
+    record: ScalarRegisterUnaryRecord,
+    architecture: Architecture,
+) -> Result<(), String> {
+    let Some(AicDecoderHint::ScalarKey2Negate {
+        dtype_field,
+        destination_register,
+        source_register,
+        ..
+    }) = AicDecoderHint::from_word(architecture, record.word)
+    else {
+        return Err(format!(
+            "word {:#010x} does not select scalar NEG",
+            record.word
+        ));
+    };
+    if dtype_field != 0
+        || destination_register != record.destination_register
+        || source_register != record.source_register
+    {
+        return Err(format!(
+            "NEG fields differ at PC {:#x}: decoded dtype={dtype_field} XD={destination_register} XN={source_register}, log S64 XD={} XN={}",
+            record.pc, record.destination_register, record.source_register
+        ));
+    }
+    let expected = record.source_value.wrapping_neg();
+    if expected != record.destination_value {
+        return Err(format!(
+            "NEG value differs at PC {:#x}: calculated {expected:#x}, log {:#x}",
+            record.pc, record.destination_value
+        ));
+    }
+    Ok(())
+}
+
 fn check_register_binary_record(
     record: ScalarRegisterBinaryRecord,
     architecture: Architecture,
@@ -621,6 +726,7 @@ fn check_register_binary_record(
     };
     let expected_dtype_field = match record.operation {
         ScalarKey0Operation::Add
+        | ScalarKey0Operation::Subtract
         | ScalarKey0Operation::Multiply
         | ScalarKey0Operation::MultiplyAdd => 0,
         ScalarKey0Operation::And | ScalarKey0Operation::Or => 3,
@@ -645,6 +751,11 @@ fn check_register_binary_record(
             record
                 .first_source_value
                 .wrapping_add(record.second_source_value),
+        ),
+        ScalarKey0Operation::Subtract => Some(
+            record
+                .first_source_value
+                .wrapping_sub(record.second_source_value),
         ),
         ScalarKey0Operation::Multiply => Some(
             record
@@ -672,32 +783,56 @@ fn check_register_binary_record(
     Ok(())
 }
 
-fn check_shift_left_record(
-    record: ScalarShiftLeftRecord,
+fn check_shift_record(
+    record: ScalarShiftRecord,
     architecture: Architecture,
     prior_destination: Option<u64>,
+    right: bool,
 ) -> Result<(), String> {
-    let Some(AicDecoderHint::ScalarKey2ShiftLeft {
-        dtype_field,
-        destination_register,
-        count_register,
-        encoded_immediate,
-        ..
-    }) = AicDecoderHint::from_word(architecture, record.word)
+    let name = if right { "SHR" } else { "SHL" };
+    let decoded = match AicDecoderHint::from_word(architecture, record.word) {
+        Some(AicDecoderHint::ScalarKey2ShiftLeft {
+            dtype_field,
+            destination_register,
+            count_register,
+            encoded_immediate,
+            ..
+        }) if !right => Some((
+            dtype_field,
+            destination_register,
+            count_register,
+            encoded_immediate,
+        )),
+        Some(AicDecoderHint::ScalarKey2ShiftRight {
+            dtype_field,
+            destination_register,
+            count_register,
+            encoded_immediate,
+            ..
+        }) if right => Some((
+            dtype_field,
+            destination_register,
+            count_register,
+            encoded_immediate,
+        )),
+        _ => None,
+    };
+    let Some((dtype_field, destination_register, count_register, encoded_immediate)) = decoded
     else {
         return Err(format!(
-            "word {:#010x} does not select scalar SHL",
+            "word {:#010x} does not select scalar {name}",
             record.word
         ));
     };
-    if dtype_field != 3
+    if dtype_field != record.dtype_field
         || destination_register != record.destination_register
         || count_register != record.count_register.map(|(register, _)| register)
         || encoded_immediate != record.encoded_immediate
     {
         return Err(format!(
-            "SHL fields differ at PC {:#x}: decoded dtype={dtype_field} XD={destination_register} XN={count_register:?} IMM={encoded_immediate:#x}, log XD={} XN={:?} IMM={:#x}",
+            "{name} fields differ at PC {:#x}: decoded dtype={dtype_field} XD={destination_register} XN={count_register:?} IMM={encoded_immediate:#x}, log dtype={} XD={} XN={:?} IMM={:#x}",
             record.pc,
+            record.dtype_field,
             record.destination_register,
             record.count_register.map(|(register, _)| register),
             record.encoded_immediate
@@ -709,10 +844,18 @@ fn check_shift_left_record(
             .map_or(u32::from(encoded_immediate), |(_, value)| {
                 (value & 0x3f) as u32
             });
-        let expected = prior << shift;
+        let expected = if right {
+            if dtype_field == 0 {
+                ((prior as i64) >> shift) as u64
+            } else {
+                prior >> shift
+            }
+        } else {
+            prior << shift
+        };
         if expected != record.destination_value {
             return Err(format!(
-                "SHL value differs at PC {:#x}: prior XD={prior:#x}, count={shift}, calculated {expected:#x}, log {:#x}",
+                "{name} value differs at PC {:#x}: prior XD={prior:#x}, count={shift}, calculated {expected:#x}, log {:#x}",
                 record.pc, record.destination_value
             ));
         }
@@ -833,6 +976,7 @@ mod tests {
 [info] [00004801] (PC: 0x126ed418) SCALAR   : (Binary: 0x02086800) MOV_XD_XN  dtype:S64, XD:X4=0, XN:X6=0, \n";
 
     const REGISTER_BINARY: &str = "[info] [00001249] (PC: 0x126ecb04) SCALAR   : (Binary: 0x003bd781) ADD  dtype:S64, XD:X29=0x107fa0, XN:X29=0x107fa0, XM:X15=0, \n\
+[info] [00004853] (PC: 0x126ed47c) SCALAR   : (Binary: 0x00021102) SUB  dtype:S64, XD:X1=0x2fa, XN:X1=0x2fa, XM:X2=0, \n\
 [info] [00003724] (PC: 0x126ed004) SCALAR   : (Binary: 0x000e8383) MUL  dtype:S64, XD:X7=0x209, XN:X8=0x209, XM:X7=0x1, \n\
 [info] [00001251] (PC: 0x126ecb14) SCALAR   : (Binary: 0x00def80a) AND  dtype:B64, XD:X15=0x18, XN:X15=0x18, XM:X16=0x7fff, \n\
 [info] [00004731] (PC: 0x126ed29c) SCALAR   : (Binary: 0x00c0100b) OR  dtype:B64, XD:X0=0xc000080808010101, XN:X1=0xc000000000000000, XM:X0=0x80808010101, \n";
@@ -974,10 +1118,39 @@ mod tests {
     }
 
     #[test]
+    fn negate_checks_signed_result_and_encoded_registers() {
+        let line = "[info] [1] (PC: 0x100) SCALAR : (Binary: 0x02022080) NEG dtype:S64, XD:X1=0xffffffffffffbee0, XN:X2=0x4120, \n";
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let summary = verify_scalar_trace(Cursor::new(line), architecture).unwrap();
+            assert_eq!(summary.checked_negate, 1);
+            assert_eq!(summary.mismatches, 0, "{:?}", summary.mismatch_examples);
+
+            let wrong = line.replace("XD:X1=0xffffffffffffbee0", "XD:X1=0xffffffffffffbee1");
+            let summary = verify_scalar_trace(Cursor::new(wrong), architecture).unwrap();
+            assert_eq!(summary.mismatches, 1);
+            assert!(
+                summary.mismatch_examples[0]
+                    .reason
+                    .contains("NEG value differs")
+            );
+
+            let wrong = line.replace("XN:X2=0x4120", "XN:X3=0x4120");
+            let summary = verify_scalar_trace(Cursor::new(wrong), architecture).unwrap();
+            assert_eq!(summary.mismatches, 1);
+            assert!(
+                summary.mismatch_examples[0]
+                    .reason
+                    .contains("NEG fields differ")
+            );
+        }
+    }
+
+    #[test]
     fn checks_observed_register_binary_fields_and_values() {
         for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
             let summary = verify_scalar_trace(Cursor::new(REGISTER_BINARY), architecture).unwrap();
             assert_eq!(summary.add_register, 1);
+            assert_eq!(summary.subtract_register, 1);
             assert_eq!(summary.multiply_register, 1);
             assert_eq!(summary.and_register, 1);
             assert_eq!(summary.or_register, 1);
@@ -1051,6 +1224,39 @@ mod tests {
                     .reason
                     .contains("SHL value differs")
             );
+        }
+    }
+
+    #[test]
+    fn shift_right_checks_signed_and_unsigned_results_when_prior_is_known() {
+        let unsigned = "[info] [1] (PC: 0x100) SCALAR : (Binary: 0x07128000) MOV_XD_IMM XD:X9=0x8000, IMM:0x8000, \n\
+[info] [2] (PC: 0x104) SCALAR : (Binary: 0x0252028f) SHR dtype:U64, XD:X9=0x1, DATA_SRC:IMM, IMM:0xf, \n";
+        let signed = "[info] [1] (PC: 0x100) SCALAR : (Binary: 0x07120001) MOV_XD_IMM XD:X9=0x1, IMM:0x1, \n\
+[info] [2] (PC: 0x104) SCALAR : (Binary: 0x02129080) NEG dtype:S64, XD:X9=0xffffffffffffffff, XN:X9=0x1, \n\
+[info] [3] (PC: 0x108) SCALAR : (Binary: 0x02120281) SHR dtype:S64, XD:X9=0xffffffffffffffff, DATA_SRC:IMM, IMM:0x1, \n";
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            for log in [unsigned, signed] {
+                let summary = verify_scalar_trace(Cursor::new(log), architecture).unwrap();
+                assert_eq!(summary.shift_right_fields, 1);
+                assert_eq!(summary.shift_right_value_checked, 1);
+                assert_eq!(summary.shift_right_unknown_prior, 0);
+                assert_eq!(summary.mismatches, 0, "{:?}", summary.mismatch_examples);
+            }
+
+            let wrong = unsigned.replace("XD:X9=0x1, DATA_SRC", "XD:X9=0x2, DATA_SRC");
+            let summary = verify_scalar_trace(Cursor::new(wrong), architecture).unwrap();
+            assert_eq!(summary.mismatches, 1);
+            assert!(
+                summary.mismatch_examples[0]
+                    .reason
+                    .contains("SHR value differs")
+            );
+
+            let unknown = unsigned.lines().nth(1).unwrap();
+            let summary = verify_scalar_trace(Cursor::new(unknown), architecture).unwrap();
+            assert_eq!(summary.shift_right_fields, 1);
+            assert_eq!(summary.shift_right_unknown_prior, 1);
+            assert_eq!(summary.mismatches, 0);
         }
     }
 

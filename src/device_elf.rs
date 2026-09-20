@@ -759,7 +759,22 @@ mod tests {
     use crate::device_loader::{DeviceKernelFetchError, DeviceKernelLoadError, load_named_kernel};
     use crate::device_pool::DeviceMemoryPoolManager;
     use crate::hbm_pv_memory::HbmPvMemory;
-    use crate::machine::ScalarMachine;
+    use crate::machine::{ScalarInstructionStep, ScalarMachine, ScalarMemoryBus};
+    use crate::stepper::{ScalarStepper, ScalarStepperError};
+
+    struct RejectMemoryBus;
+
+    impl ScalarMemoryBus for RejectMemoryBus {
+        type Error = std::io::Error;
+
+        fn read(&mut self, _address: u64, _destination: &mut [u8]) -> Result<(), Self::Error> {
+            Err(std::io::Error::other("unexpected data read"))
+        }
+
+        fn write(&mut self, _address: u64, _source: &[u8]) -> Result<(), Self::Error> {
+            Err(std::io::Error::other("unexpected data write"))
+        }
+    }
 
     fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
         bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -1178,6 +1193,27 @@ mod tests {
             let step = scalar.execute_spr_read_word(pc, word).unwrap();
             assert_eq!(step.value, 0x1022_be00);
             assert_eq!(scalar.xregs()[0], 0x1022_be00);
+            let mut stepper = ScalarStepper::new(ScalarMachine::new(architecture, [0; 32], 0), pc);
+            stepper.machine_mut().set_spr_value(4, 0x1022_be00).unwrap();
+            let program_step = stepper
+                .step_loaded(&loaded, &mut memory, &mut RejectMemoryBus)
+                .unwrap();
+            assert_eq!(program_step.word, 0x0200_4880);
+            assert_eq!(program_step.next_pc, pc + 4);
+            assert!(matches!(
+                program_step.instruction,
+                ScalarInstructionStep::SprRead(_)
+            ));
+            assert_eq!(stepper.machine().xregs()[0], 0x1022_be00);
+            let mut outside =
+                ScalarStepper::new(ScalarMachine::new(architecture, [0; 32], 0), pc + 20);
+            assert!(matches!(
+                outside.step_loaded(&loaded, &mut memory, &mut RejectMemoryBus),
+                Err(ScalarStepperError::Fetch(
+                    DeviceKernelFetchError::OutsideExecutableSection(_)
+                ))
+            ));
+            assert_eq!(outside.pc(), pc + 20);
             memory
                 .host_to_device(pc + 4, &0x0102_0304_u32.to_le_bytes())
                 .unwrap();
