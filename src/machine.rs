@@ -1,19 +1,22 @@
 use crate::architecture::Architecture;
+use crate::buffer_c310::C310BufferDisposition;
 use crate::flow::{
-    ConditionalJump, ConditionalJumpTarget, DcciInstruction, DcciStep, DsbStep, FlowEnd, FlowNop,
-    JumpCompare, JumpCompareError, JumpCompareTarget, JumpTarget, UnconditionalJump,
-    compare_values,
+    C310BufferInstruction, C310BufferStep, ConditionalJump, ConditionalJumpTarget, DcciInstruction,
+    DcciStep, DsbStep, FlowEnd, FlowNop, JumpCompare, JumpCompareError, JumpCompareTarget,
+    JumpTarget, PipelineBarrierStep, UnconditionalJump, compare_values,
 };
 use crate::isa::{
     AicClass, AicDecoderHint, ScalarKey0Operation, ScalarKey7Operation, ScalarKey8Operation,
     ScalarLoadStoreOperation, ScalarStoreImmediateValue,
 };
+use crate::predicate_buffer_c310::{C310PushPbDisposition, C310PushPbInstruction, C310PushPbStep};
 use crate::rvec::{C310ObservedMovemaskHint, C310ObservedMovemaskStep};
 use crate::scalar::{
     ScalarIntegerError, evaluate_scalar_integer_immediate, update_neg_overflow_spr2,
     update_overflow_spr2,
 };
 use crate::vec_c220::C220MovemaskHint;
+use crate::vec_queue_c310::{C310VfQueueDisposition, C310VfQueueInstruction, C310VfQueueStep};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -84,6 +87,8 @@ pub enum ScalarInstructionStep {
     ImmediateStore(ScalarImmediateStoreStep),
     PairLoad(ScalarPairLoadStep),
     PairStore(ScalarPairStoreStep),
+    IndexedLoad(ScalarIndexedLoadStep),
+    IndexedImmediateStore(ScalarIndexedImmediateStoreStep),
     Flow(ScalarFlowStep),
     CacheHint(ScalarCacheHintStep),
     C220Movemask(C220MovemaskStep),
@@ -94,6 +99,10 @@ pub enum ScalarInstructionStep {
     Select(ScalarSelectStep),
     Dcci(DcciStep),
     Dsb(DsbStep),
+    Barrier(PipelineBarrierStep),
+    Buffer(C310BufferStep),
+    PushPb(C310PushPbStep),
+    VfQueue(C310VfQueueStep),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -151,6 +160,31 @@ pub trait ScalarMemoryBus {
     fn synchronize_pipeline(&mut self, _step: DsbStep) -> Result<bool, Self::Error> {
         Ok(false)
     }
+
+    fn synchronize_barrier(&mut self, _step: PipelineBarrierStep) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    fn execute_c310_buffer(
+        &mut self,
+        _step: C310BufferStep,
+    ) -> Result<C310BufferDisposition, Self::Error> {
+        Ok(C310BufferDisposition::Unsupported)
+    }
+
+    fn execute_c310_push_pb(
+        &mut self,
+        _step: C310PushPbStep,
+    ) -> Result<C310PushPbDisposition, Self::Error> {
+        Ok(C310PushPbDisposition::Unsupported)
+    }
+
+    fn enqueue_c310_vf(
+        &mut self,
+        _step: C310VfQueueStep,
+    ) -> Result<C310VfQueueDisposition, Self::Error> {
+        Ok(C310VfQueueDisposition::Unsupported)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -168,6 +202,36 @@ pub struct ScalarMemoryStep {
     pub updated_base: Option<u64>,
     pub bytes: [u8; 8],
     pub sign_extension_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ScalarIndexedLoadStep {
+    pub pc: u64,
+    pub word: u32,
+    pub effective_address: u64,
+    pub width_bytes: u8,
+    pub destination_register: u8,
+    pub prior_destination_value: u64,
+    pub value: u64,
+    pub base_register: u8,
+    pub base_value: u64,
+    pub offset_register: u8,
+    pub offset_value: u64,
+    pub bytes: [u8; 8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ScalarIndexedImmediateStoreStep {
+    pub pc: u64,
+    pub word: u32,
+    pub effective_address: u64,
+    pub width_bytes: u8,
+    pub base_register: u8,
+    pub base_value: u64,
+    pub offset_register: u8,
+    pub offset_value: u64,
+    pub value: ScalarStoreImmediateValue,
+    pub bytes: [u8; 8],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -308,6 +372,34 @@ pub enum ScalarInstructionError<E: std::error::Error + 'static> {
     SynchronizationUnsupported { pc: u64, word: u32 },
     #[error("pipeline synchronization backend failed: {0}")]
     SynchronizationBackend(#[source] E),
+    #[error("buffer instruction {word:#010x} at PC {pc:#x} is not supported by this backend")]
+    BufferUnsupported { pc: u64, word: u32 },
+    #[error("buffer instruction {word:#010x} at PC {pc:#x} stalled")]
+    BufferStalled { pc: u64, word: u32 },
+    #[error("buffer instruction backend failed: {0}")]
+    BufferBackend(#[source] E),
+    #[error("predicate-buffer push {word:#010x} at PC {pc:#x} is not supported by this backend")]
+    PushPbUnsupported { pc: u64, word: u32 },
+    #[error("predicate-buffer push {word:#010x} at PC {pc:#x} stalled")]
+    PushPbStalled { pc: u64, word: u32 },
+    #[error("predicate-buffer backend failed: {0}")]
+    PushPbBackend(#[source] E),
+    #[error(
+        "vector queue words {first_word:#010x}/{second_word:#010x} at PC {pc:#x} are not supported by this backend"
+    )]
+    VfQueueUnsupported {
+        pc: u64,
+        first_word: u32,
+        second_word: u32,
+    },
+    #[error("vector queue words {first_word:#010x}/{second_word:#010x} at PC {pc:#x} stalled")]
+    VfQueueStalled {
+        pc: u64,
+        first_word: u32,
+        second_word: u32,
+    },
+    #[error("vector queue backend failed: {0}")]
+    VfQueueBackend(#[source] E),
     #[error("scalar program already ended before PC {pc:#x}")]
     ProgramEnded { pc: u64 },
 }
@@ -331,6 +423,41 @@ pub enum ScalarMachineError {
 }
 
 impl ScalarMachine {
+    pub fn enqueue_c310_vf<B: ScalarMemoryBus>(
+        &mut self,
+        pc: u64,
+        first_word: u32,
+        second_word: u32,
+        bus: &mut B,
+    ) -> Result<ScalarInstructionStep, ScalarInstructionError<B::Error>> {
+        let instruction =
+            C310VfQueueInstruction::decode(self.architecture, first_word, second_word).ok_or(
+                ScalarMachineError::UnsupportedWord {
+                    pc,
+                    word: first_word,
+                },
+            )?;
+        let step = instruction.resolve(pc, &self.xregs);
+        match bus
+            .enqueue_c310_vf(step)
+            .map_err(ScalarInstructionError::VfQueueBackend)?
+        {
+            C310VfQueueDisposition::Accepted => Ok(ScalarInstructionStep::VfQueue(step)),
+            C310VfQueueDisposition::Stalled => Err(ScalarInstructionError::VfQueueStalled {
+                pc,
+                first_word,
+                second_word,
+            }),
+            C310VfQueueDisposition::Unsupported => {
+                Err(ScalarInstructionError::VfQueueUnsupported {
+                    pc,
+                    first_word,
+                    second_word,
+                })
+            }
+        }
+    }
+
     pub const fn new(
         architecture: Architecture,
         xregs: [u64; SCALAR_X_REGISTER_COUNT],
@@ -1088,6 +1215,29 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
+            AicDecoderHint::ScalarKey2SignExtend {
+                width_bits,
+                destination_register,
+                source_register,
+            } => {
+                let Some(&source_value) = self.xregs.get(usize::from(source_register)) else {
+                    return Err(ScalarMachineError::UnsupportedWord { pc, word });
+                };
+                if self.xregs.get(usize::from(destination_register)).is_none() {
+                    return Err(ScalarMachineError::UnsupportedWord { pc, word });
+                }
+                let shift = 64 - u32::from(width_bits);
+                (
+                    destination_register,
+                    Some(source_register),
+                    Some(source_value),
+                    None,
+                    None,
+                    (((source_value << shift) as i64) >> shift) as u64,
+                    false,
+                    self.spr2,
+                )
+            }
             AicDecoderHint::ScalarKey2Insert {
                 destination_register,
                 source_register,
@@ -1245,7 +1395,46 @@ impl ScalarMachine {
         word: u32,
         bus: &mut B,
     ) -> Result<ScalarInstructionStep, ScalarInstructionError<B::Error>> {
+        if let Some(instruction) = C310PushPbInstruction::decode(self.architecture, word) {
+            let step = instruction.resolve(pc, &self.xregs);
+            return match bus
+                .execute_c310_push_pb(step)
+                .map_err(ScalarInstructionError::PushPbBackend)?
+            {
+                C310PushPbDisposition::Accepted => Ok(ScalarInstructionStep::PushPb(step)),
+                C310PushPbDisposition::Stalled => {
+                    Err(ScalarInstructionError::PushPbStalled { pc, word })
+                }
+                C310PushPbDisposition::Unsupported => {
+                    Err(ScalarInstructionError::PushPbUnsupported { pc, word })
+                }
+            };
+        }
+        if let Some(instruction) = C310BufferInstruction::decode(self.architecture, word) {
+            let step = instruction.resolve(pc, &self.xregs);
+            return match bus
+                .execute_c310_buffer(step)
+                .map_err(ScalarInstructionError::BufferBackend)?
+            {
+                C310BufferDisposition::Accepted => Ok(ScalarInstructionStep::Buffer(step)),
+                C310BufferDisposition::Stalled => {
+                    Err(ScalarInstructionError::BufferStalled { pc, word })
+                }
+                C310BufferDisposition::Unsupported => {
+                    Err(ScalarInstructionError::BufferUnsupported { pc, word })
+                }
+            };
+        }
         if matches!(AicClass::from_word(word), AicClass::FlowControl) {
+            if let Some(step) = PipelineBarrierStep::decode(self.architecture, pc, word) {
+                if !bus
+                    .synchronize_barrier(step)
+                    .map_err(ScalarInstructionError::SynchronizationBackend)?
+                {
+                    return Err(ScalarInstructionError::SynchronizationUnsupported { pc, word });
+                }
+                return Ok(ScalarInstructionStep::Barrier(step));
+            }
             if let Some(instruction) = DcciInstruction::decode(self.architecture, word) {
                 let step = instruction.resolve(pc, &self.xregs);
                 if !bus
@@ -1305,6 +1494,14 @@ impl ScalarMachine {
             Some(AicDecoderHint::ScalarPairStore { .. }) => Ok(ScalarInstructionStep::PairStore(
                 self.execute_pair_store_word(pc, word, bus)?,
             )),
+            Some(AicDecoderHint::ScalarIndexedLoad { .. }) => Ok(
+                ScalarInstructionStep::IndexedLoad(self.execute_indexed_load_word(pc, word, bus)?),
+            ),
+            Some(AicDecoderHint::ScalarIndexedImmediateStore { .. }) => {
+                Ok(ScalarInstructionStep::IndexedImmediateStore(
+                    self.execute_indexed_immediate_store_word(pc, word, bus)?,
+                ))
+            }
             Some(AicDecoderHint::ScalarKey8 {
                 operation: ScalarKey8Operation::DcPreload,
                 ..
@@ -1408,6 +1605,86 @@ impl ScalarMachine {
             updated_base: effect.updated_base,
             bytes,
             sign_extension_requested,
+        })
+    }
+
+    pub fn execute_indexed_load_word<B: ScalarMemoryBus>(
+        &mut self,
+        pc: u64,
+        word: u32,
+        bus: &mut B,
+    ) -> Result<ScalarIndexedLoadStep, ScalarMemoryExecutionError<B::Error>> {
+        let Some(AicDecoderHint::ScalarIndexedLoad {
+            width_bytes,
+            destination_register,
+            base_register,
+            offset_register,
+        }) = AicDecoderHint::from_word(self.architecture, word)
+        else {
+            return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
+        };
+        let base_value = self.xregs[usize::from(base_register)];
+        let offset_value = self.xregs[usize::from(offset_register)];
+        let effective_address = base_value.wrapping_add(offset_value * u64::from(width_bytes));
+        let mut bytes = [0_u8; 8];
+        bus.read(effective_address, &mut bytes[..usize::from(width_bytes)])
+            .map_err(ScalarMemoryExecutionError::Backend)?;
+        let value = u64::from_le_bytes(bytes);
+        let prior_destination_value = self.xregs[usize::from(destination_register)];
+        self.xregs[usize::from(destination_register)] = value;
+        Ok(ScalarIndexedLoadStep {
+            pc,
+            word,
+            effective_address,
+            width_bytes,
+            destination_register,
+            prior_destination_value,
+            value,
+            base_register,
+            base_value,
+            offset_register,
+            offset_value,
+            bytes,
+        })
+    }
+
+    pub fn execute_indexed_immediate_store_word<B: ScalarMemoryBus>(
+        &mut self,
+        pc: u64,
+        word: u32,
+        bus: &mut B,
+    ) -> Result<ScalarIndexedImmediateStoreStep, ScalarMemoryExecutionError<B::Error>> {
+        let Some(AicDecoderHint::ScalarIndexedImmediateStore {
+            width_bytes,
+            base_register,
+            offset_register,
+            value,
+        }) = AicDecoderHint::from_word(self.architecture, word)
+        else {
+            return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
+        };
+        let base_value = self.xregs[usize::from(base_register)];
+        let offset_value = self.xregs[usize::from(offset_register)];
+        let effective_address = base_value.wrapping_add(offset_value * u64::from(width_bytes));
+        let mut bytes = [0_u8; 8];
+        match value {
+            ScalarStoreImmediateValue::Zero => {}
+            ScalarStoreImmediateValue::One => bytes[0] = 1,
+            ScalarStoreImmediateValue::Ones => bytes.fill(0xff),
+        }
+        bus.write(effective_address, &bytes[..usize::from(width_bytes)])
+            .map_err(ScalarMemoryExecutionError::Backend)?;
+        Ok(ScalarIndexedImmediateStoreStep {
+            pc,
+            word,
+            effective_address,
+            width_bytes,
+            base_register,
+            base_value,
+            offset_register,
+            offset_value,
+            value,
+            bytes,
         })
     }
 
@@ -1582,6 +1859,232 @@ fn evaluate_integer_compare(
 mod tests {
     use super::*;
 
+    #[test]
+    fn captured_indexed_loads_scale_offset_and_preserve_machine_on_read_failure() {
+        for (architecture, pc, word, destination, base, offset, base_value) in [
+            (
+                Architecture::Dav2201,
+                0x1131_23c0,
+                0x011c_b600,
+                14,
+                11,
+                12,
+                0x001c_79c8,
+            ),
+            (
+                Architecture::Dav3510,
+                0x10d0_d660,
+                0x0103_2980,
+                1,
+                18,
+                19,
+                0x0010_7940,
+            ),
+            (
+                Architecture::Dav2201,
+                0x1131_243c,
+                0x0124_a880,
+                18,
+                10,
+                17,
+                0x001c_79d8,
+            ),
+            (
+                Architecture::Dav2201,
+                0x1131_25d4,
+                0x0126_f800,
+                19,
+                15,
+                16,
+                0x001c_79e8,
+            ),
+        ] {
+            let mut machine = ScalarMachine::new(architecture, [0; 32], 0);
+            machine.set_xreg(destination, 0x55).unwrap();
+            machine.set_xreg(base, base_value).unwrap();
+            machine.set_xreg(offset, 3).unwrap();
+            let before = machine.clone();
+            let mut bus = TestBus::new(base_value);
+            bus.bytes[3] = 0xa7;
+            bus.fail = true;
+            assert!(matches!(
+                machine.execute_instruction(pc, word, &mut bus),
+                Err(ScalarInstructionError::Memory(
+                    ScalarMemoryExecutionError::Backend(_)
+                ))
+            ));
+            assert_eq!(machine, before);
+            assert_eq!(bus.accesses, 0);
+
+            bus.fail = false;
+            let ScalarInstructionStep::IndexedLoad(step) =
+                machine.execute_instruction(pc, word, &mut bus).unwrap()
+            else {
+                panic!("expected indexed scalar load")
+            };
+            assert_eq!(step.effective_address, base_value + 3);
+            assert_eq!(step.width_bytes, 1);
+            assert_eq!(step.destination_register, destination);
+            assert_eq!(step.prior_destination_value, 0x55);
+            assert_eq!(step.value, 0xa7);
+            assert_eq!(step.base_register, base);
+            assert_eq!(step.base_value, base_value);
+            assert_eq!(step.offset_register, offset);
+            assert_eq!(step.offset_value, 3);
+            assert_eq!(step.bytes[0], 0xa7);
+            assert_eq!(machine.xregs()[usize::from(destination)], 0xa7);
+            assert_eq!(machine.xregs()[usize::from(base)], base_value);
+            assert_eq!(machine.xregs()[usize::from(offset)], 3);
+            assert_eq!(bus.accesses, 1);
+        }
+    }
+
+    #[test]
+    fn c310_indexed_loads_scale_offsets_by_width() {
+        for (dtype, width_bytes) in [(0, 1_u8), (1, 2), (2, 4), (3, 8)] {
+            let word = 0x0103_4b00 | (dtype << 22);
+            let mut machine = ScalarMachine::new(Architecture::Dav3510, [0; 32], 0);
+            machine.set_xreg(1, 0x55).unwrap();
+            machine.set_xreg(20, 0x1000).unwrap();
+            machine.set_xreg(22, 2).unwrap();
+            let mut bus = TestBus::new(0x1000);
+            for (index, byte) in bus.bytes.iter_mut().enumerate() {
+                *byte = index as u8;
+            }
+            let start = usize::from(width_bytes) * 2;
+            let width = usize::from(width_bytes);
+            let mut expected_bytes = [0_u8; 8];
+            expected_bytes[..width].copy_from_slice(&bus.bytes[start..start + width]);
+            let ScalarInstructionStep::IndexedLoad(step) = machine
+                .execute_instruction(0x10d0_d6b8, word, &mut bus)
+                .unwrap()
+            else {
+                panic!("expected indexed scalar load");
+            };
+            assert_eq!(step.effective_address, 0x1000 + start as u64);
+            assert_eq!(step.width_bytes, width_bytes);
+            assert_eq!(step.value, u64::from_le_bytes(expected_bytes));
+            assert_eq!(step.prior_destination_value, 0x55);
+            assert_eq!(machine.xregs()[1], step.value);
+            assert_eq!(machine.xregs()[20], 0x1000);
+            assert_eq!(machine.xregs()[22], 2);
+            assert_eq!(bus.accesses, 1);
+        }
+    }
+
+    #[test]
+    fn captured_indexed_immediate_stores_write_one_byte_and_preserve_machine() {
+        for (architecture, pc, word, base, offset, base_value) in [
+            (
+                Architecture::Dav2201,
+                0x1131_23cc,
+                0x0e00_b601,
+                11,
+                12,
+                0x001c_79c8,
+            ),
+            (
+                Architecture::Dav3510,
+                0x10d0_d66c,
+                0x0e01_2981,
+                18,
+                19,
+                0x0010_7940,
+            ),
+            (
+                Architecture::Dav2201,
+                0x1131_2448,
+                0x0e00_a881,
+                10,
+                17,
+                0x001c_79d8,
+            ),
+            (
+                Architecture::Dav2201,
+                0x1131_25e0,
+                0x0e00_f801,
+                15,
+                16,
+                0x001c_79e8,
+            ),
+        ] {
+            let mut machine = ScalarMachine::new(architecture, [0; 32], 0);
+            machine.set_xreg(base, base_value).unwrap();
+            machine.set_xreg(offset, 3).unwrap();
+            let before = machine.clone();
+            let mut bus = TestBus::new(base_value);
+            bus.bytes.fill(0xa5);
+            bus.fail = true;
+            assert!(matches!(
+                machine.execute_instruction(pc, word, &mut bus),
+                Err(ScalarInstructionError::Memory(
+                    ScalarMemoryExecutionError::Backend(_)
+                ))
+            ));
+            assert_eq!(machine, before);
+            assert_eq!(bus.bytes, [0xa5; 32]);
+            assert_eq!(bus.accesses, 0);
+
+            bus.fail = false;
+            let ScalarInstructionStep::IndexedImmediateStore(step) =
+                machine.execute_instruction(pc, word, &mut bus).unwrap()
+            else {
+                panic!("expected indexed immediate store")
+            };
+            assert_eq!(step.effective_address, base_value + 3);
+            assert_eq!(step.width_bytes, 1);
+            assert_eq!(step.base_register, base);
+            assert_eq!(step.base_value, base_value);
+            assert_eq!(step.offset_register, offset);
+            assert_eq!(step.offset_value, 3);
+            assert_eq!(step.value, ScalarStoreImmediateValue::One);
+            assert_eq!(step.bytes[0], 1);
+            assert_eq!(bus.bytes[3], 1);
+            assert!(bus.bytes[..3].iter().all(|byte| *byte == 0xa5));
+            assert!(bus.bytes[4..].iter().all(|byte| *byte == 0xa5));
+            assert_eq!(bus.accesses, 1);
+            assert_eq!(machine, before);
+        }
+    }
+
+    #[test]
+    fn c310_indexed_immediate_stores_scale_offsets_and_write_selected_width() {
+        for (dtype, width_bytes) in [(0, 1_u8), (1, 2), (2, 4), (3, 8)] {
+            for value_bits in 0..=2 {
+                let word = 0x0e01_4b00 | (dtype << 22) | value_bits;
+                let mut machine = ScalarMachine::new(Architecture::Dav3510, [0; 32], 0);
+                machine.set_xreg(20, 0x1000).unwrap();
+                machine.set_xreg(22, 2).unwrap();
+                let before = machine.clone();
+                let mut bus = TestBus::new(0x1000);
+                bus.bytes.fill(0xa5);
+                let ScalarInstructionStep::IndexedImmediateStore(step) = machine
+                    .execute_instruction(0x10d0_d6c8, word, &mut bus)
+                    .unwrap()
+                else {
+                    panic!("expected indexed immediate store");
+                };
+                let start = usize::from(width_bytes) * 2;
+                assert_eq!(step.effective_address, 0x1000 + start as u64);
+                assert_eq!(step.width_bytes, width_bytes);
+                let mut expected_bytes = [0_u8; 8];
+                match value_bits {
+                    1 => expected_bytes[0] = 1,
+                    2 => expected_bytes.fill(0xff),
+                    _ => {}
+                }
+                assert_eq!(
+                    &bus.bytes[start..start + usize::from(width_bytes)],
+                    &expected_bytes[..usize::from(width_bytes)]
+                );
+                assert_eq!(bus.bytes[start - 1], 0xa5);
+                assert_eq!(bus.bytes[start + usize::from(width_bytes)], 0xa5);
+                assert_eq!(machine, before);
+                assert_eq!(bus.accesses, 1);
+            }
+        }
+    }
+
     struct TestBus {
         base: u64,
         bytes: [u8; 32],
@@ -1591,6 +2094,8 @@ mod tests {
         cache_events: Vec<DcciStep>,
         supports_synchronization: bool,
         synchronization_events: Vec<DsbStep>,
+        supports_barrier: bool,
+        barrier_events: Vec<PipelineBarrierStep>,
     }
 
     impl TestBus {
@@ -1604,6 +2109,8 @@ mod tests {
                 cache_events: Vec::new(),
                 supports_synchronization: false,
                 synchronization_events: Vec::new(),
+                supports_barrier: false,
+                barrier_events: Vec::new(),
             }
         }
 
@@ -1663,6 +2170,56 @@ mod tests {
                 self.synchronization_events.push(step);
             }
             Ok(self.supports_synchronization)
+        }
+
+        fn synchronize_barrier(&mut self, step: PipelineBarrierStep) -> std::io::Result<bool> {
+            if self.fail {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            if self.supports_barrier {
+                self.barrier_events.push(step);
+            }
+            Ok(self.supports_barrier)
+        }
+    }
+
+    #[test]
+    fn barrier_requires_explicit_pipeline_completion() {
+        for (architecture, pc, word) in [
+            (Architecture::Dav2201, 0x1131_2090, 0x40e0_1800),
+            (Architecture::Dav2201, 0x1131_2638, 0x40e0_0400),
+            (Architecture::Dav3510, 0x10d0_d090, 0x40e0_1800),
+        ] {
+            let mut machine = ScalarMachine::from_pem_initial_state(architecture);
+            let before = machine.clone();
+            let mut bus = TestBus::new(0);
+            assert!(matches!(
+                machine.execute_instruction(pc, word, &mut bus),
+                Err(ScalarInstructionError::SynchronizationUnsupported { .. })
+            ));
+            assert_eq!(machine, before);
+            assert!(bus.barrier_events.is_empty());
+
+            bus.fail = true;
+            assert!(matches!(
+                machine.execute_instruction(pc, word, &mut bus),
+                Err(ScalarInstructionError::SynchronizationBackend(_))
+            ));
+            assert_eq!(machine, before);
+            assert!(bus.barrier_events.is_empty());
+
+            bus.fail = false;
+            bus.supports_barrier = true;
+            let ScalarInstructionStep::Barrier(step) =
+                machine.execute_instruction(pc, word, &mut bus).unwrap()
+            else {
+                panic!("expected barrier step")
+            };
+            assert_eq!(step.pc, pc);
+            assert_eq!(step.word, word);
+            assert_eq!(bus.barrier_events, vec![step]);
+            assert_eq!(bus.accesses, 0);
+            assert_eq!(machine, before);
         }
     }
 
@@ -2193,6 +2750,35 @@ mod tests {
     }
 
     #[test]
+    fn sign_extend_preserves_signed_values_at_eight_sixteen_and_thirty_two_bits() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut machine = ScalarMachine::new(architecture, [0; 32], 0x55);
+            for (word, source, expected) in [
+                (0x021c_f980, 0x1234_5678_0000_0080, (-128_i64) as u64),
+                (0x025c_f980, 0x1234_5678_0000_8000, (-32768_i64) as u64),
+                (0x029c_f980, 0x1234_5678_8000_0000, (-2147483648_i64) as u64),
+                (0x021c_f980, 0xffff_ffff_ffff_007f, 127),
+            ] {
+                machine.set_xreg(15, source).unwrap();
+                let step = machine.execute_word(0x1131_24fc, word).unwrap();
+                assert_eq!(step.destination_register, 14);
+                assert_eq!(step.source_register, Some(15));
+                assert_eq!(step.source_value, Some(source));
+                assert_eq!(step.value, expected);
+                assert_eq!(machine.xregs()[14], expected);
+                assert_eq!(machine.xregs()[15], source);
+                assert_eq!(machine.spr2(), 0x55);
+            }
+            let before = machine.clone();
+            assert!(matches!(
+                machine.execute_word(0x1131_24fc, 0x02dc_f980),
+                Err(ScalarMachineError::UnsupportedWord { .. })
+            ));
+            assert_eq!(machine, before);
+        }
+    }
+
+    #[test]
     fn register_move_copies_all_bits_without_modifying_spr2() {
         for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
             let mut machine = ScalarMachine::new(architecture, [0; 32], 0x55);
@@ -2499,6 +3085,25 @@ mod tests {
         assert_eq!(parameter_base.value, 0x1022_be00);
         assert_eq!(machine.xregs()[0], 0x1022_be00);
         assert_eq!(machine.spr2(), 0x55);
+    }
+
+    #[test]
+    fn c220_block_and_subblock_register_reads_use_independent_spr_values() {
+        let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+        machine.set_spr_value(1, 7).unwrap();
+        machine.set_spr_value(95, 1).unwrap();
+        machine.set_spr_value(96, 0).unwrap();
+        for (word, destination, source_spr, value) in [
+            (0x028f_f880, 7, 95, 1),
+            (0x020c_1880, 6, 1, 7),
+            (0x02d0_0880, 8, 96, 0),
+        ] {
+            let step = machine.execute_spr_read_word(0x1131_212c, word).unwrap();
+            assert_eq!(step.destination_register, destination);
+            assert_eq!(step.source_spr, source_spr);
+            assert_eq!(step.value, value);
+            assert_eq!(machine.xregs()[usize::from(destination)], value);
+        }
     }
 
     #[test]
@@ -2901,20 +3506,93 @@ mod tests {
     }
 
     #[test]
-    fn c220_flow_nop_preserves_registers_and_advances_pc() {
-        let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
-        machine.set_xreg(8, 0x1234).unwrap();
-        let before = machine.clone();
-        let mut bus = TestBus::new(0);
-        let ScalarInstructionStep::Flow(ScalarFlowStep::Nop(step)) = machine
-            .execute_instruction(0x11312160, 0x4140_0000, &mut bus)
-            .unwrap()
-        else {
-            panic!("expected flow NOP")
-        };
-        assert_eq!(step.target_pc, 0x11312164);
-        assert_eq!(bus.accesses, 0);
-        assert_eq!(machine, before);
+    fn flow_nop_preserves_registers_and_advances_pc_on_both_architectures() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut machine = ScalarMachine::from_pem_initial_state(architecture);
+            machine.set_xreg(8, 0x1234).unwrap();
+            let before = machine.clone();
+            let mut bus = TestBus::new(0);
+            let ScalarInstructionStep::Flow(ScalarFlowStep::Nop(step)) = machine
+                .execute_instruction(0x11312160, 0x4140_0000, &mut bus)
+                .unwrap()
+            else {
+                panic!("expected flow NOP")
+            };
+            assert_eq!(step.target_pc, 0x11312164);
+            assert_eq!(bus.accesses, 0);
+            assert_eq!(machine, before);
+        }
+    }
+
+    #[test]
+    fn c220_scalar_words_supply_vector_fill_and_mask_values() {
+        for (fill_halfword, mask_halfword, expected_fill, expected_mask) in [
+            (0x074d_c2f6, 0x074f_5555, 0xc2f6_0000, 0x5555_5555),
+            (0x074d_c2f7, 0x074f_5554, 0xc2f7_0000, 0x5554_5555),
+        ] {
+            let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+            let mut bus = TestBus::new(0);
+            for (pc, word) in [
+                (0x1131_2018, 0x0700_0001),
+                (0x1131_2024, 0x0200_0080),
+                (0x1131_202c, 0x8040_0000),
+                (0x1131_2030, 0x8040_0080),
+                (0x1131_2060, 0x0700_0000),
+                (0x1131_2314, 0x070c_0000),
+                (0x1131_2318, 0x070e_5555),
+                (0x1131_2330, fill_halfword),
+                (0x1131_2334, mask_halfword),
+                (0x1131_2340, 0x8040_0080),
+                (0x1131_265c, 0x8040_001c),
+            ] {
+                machine.execute_instruction(pc, word, &mut bus).unwrap();
+            }
+            assert_eq!(machine.xregs()[6], expected_fill);
+            assert_eq!(machine.xregs()[7], expected_mask);
+            assert_eq!(machine.spr_value(100), Some(expected_mask));
+            assert_eq!(machine.spr_value(101), Some(0));
+            assert_eq!(bus.accesses, 0);
+        }
+    }
+
+    #[test]
+    fn c220_scalar_words_select_count_mask_mode() {
+        for (count_word, expected_count, expected_mask) in [
+            (0x070a_0020, 32, 0xffff_ffff),
+            (0x070a_001f, 31, 0x7fff_ffff),
+        ] {
+            let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+            machine.set_xreg(17, 0x100_0000).unwrap();
+            let mut bus = TestBus::new(0);
+            for (pc, word) in [
+                (0x1131_2060, 0x0700_0000),
+                (0x1131_2264, 0x0704_0001),
+                (0x1131_22c0, 0x0204_2080),
+                (0x1131_22cc, 0x8040_0088),
+                (0x1131_22d4, 0x8040_0008),
+                (0x1131_2314, count_word),
+                (0x1131_2604, 0x8040_0080),
+                (0x1131_2618, 0x0222_3880),
+                (0x1131_261c, 0x0263_8b01),
+                (0x1131_2620, 0x0207_1900),
+                (0x1131_2624, 0x8040_0014),
+            ] {
+                machine.execute_instruction(pc, word, &mut bus).unwrap();
+            }
+            assert_eq!(machine.spr_value(3), Some(1 << 56));
+            assert_eq!(machine.spr_value(100), Some(expected_count));
+            assert_eq!(machine.spr_value(101), Some(0));
+            assert_eq!(
+                crate::vec_c220::decode_captured_c220_fp32_mask(
+                    machine.spr_value(3).unwrap(),
+                    machine.spr_value(100).unwrap(),
+                    machine.spr_value(101).unwrap(),
+                )
+                .unwrap(),
+                [expected_mask, 0, 0, 0]
+            );
+            assert_eq!(bus.accesses, 0);
+        }
     }
 
     #[test]
@@ -3173,6 +3851,32 @@ mod tests {
         assert_eq!(step.source_value, Some(0b1110));
         assert_eq!(step.value, 1);
         assert_eq!(machine.xregs()[11], 1);
+    }
+
+    #[test]
+    fn c220_captured_find_first_zero_matches_scalar_register_state() {
+        for (word, source_register, destination_register) in [
+            (0x02de_d380, 13, 15),
+            (0x02de_b380, 11, 15),
+            (0x02da_a380, 10, 13),
+            (0x02da_b380, 11, 13),
+            (0x02dc_d380, 13, 14),
+            (0x02e0_f380, 15, 16),
+        ] {
+            for (source, expected) in [(0_u64, 0), (0b111, 3), (u64::MAX, u64::MAX)] {
+                let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+                machine.set_xreg(source_register, source).unwrap();
+                machine.set_xreg(destination_register, 99).unwrap();
+                let step = machine.execute_word(0x1131_24dc, word).unwrap();
+                assert_eq!(step.destination_register, destination_register);
+                assert_eq!(step.prior_destination_value, 99);
+                assert_eq!(step.source_register, Some(source_register));
+                assert_eq!(step.source_value, Some(source));
+                assert_eq!(step.value, expected);
+                assert_eq!(machine.xregs()[usize::from(destination_register)], expected);
+                assert_eq!(machine.xregs()[usize::from(source_register)], source);
+            }
+        }
     }
 
     #[test]

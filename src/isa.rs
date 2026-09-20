@@ -114,6 +114,18 @@ impl ZeroExtendWidth {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum AicDecoderHint {
+    ScalarIndexedLoad {
+        width_bytes: u8,
+        destination_register: u8,
+        base_register: u8,
+        offset_register: u8,
+    },
+    ScalarIndexedImmediateStore {
+        width_bytes: u8,
+        base_register: u8,
+        offset_register: u8,
+        value: ScalarStoreImmediateValue,
+    },
     ScalarPairLoad {
         vendor_isa_name: u16,
         dtype_field: u8,
@@ -219,6 +231,11 @@ pub enum AicDecoderHint {
         destination_register: u8,
         source_register: u8,
     },
+    ScalarKey2SignExtend {
+        width_bits: u8,
+        destination_register: u8,
+        source_register: u8,
+    },
     ScalarKey2ShiftLeft {
         vendor_isa_name: u16,
         dtype_field: u8,
@@ -307,6 +324,71 @@ impl AicDecoderHint {
 
     pub const fn from_word(architecture: Architecture, word: u32) -> Option<Self> {
         match AicClass::from_word(word) {
+            AicClass::Scalar
+                if matches!(architecture, Architecture::Dav3510)
+                    && ((word >> 24) & 0x1f) == 1
+                    && word & 0x7f == 0 =>
+            {
+                Some(Self::ScalarIndexedLoad {
+                    width_bytes: 1 << ((word >> 22) & 3),
+                    destination_register: ((word >> 17) & 0x1f) as u8,
+                    base_register: ((word >> 12) & 0x1f) as u8,
+                    offset_register: ((word >> 7) & 0x1f) as u8,
+                })
+            }
+            AicClass::Scalar
+                if matches!(
+                    (architecture, word),
+                    (Architecture::Dav2201, 0x011c_b600)
+                        | (Architecture::Dav2201, 0x0118_9500)
+                        | (Architecture::Dav2201, 0x0120_8780)
+                        | (Architecture::Dav2201, 0x0122_d700)
+                        | (Architecture::Dav2201, 0x0124_a880)
+                        | (Architecture::Dav2201, 0x0126_f800)
+                ) =>
+            {
+                Some(Self::ScalarIndexedLoad {
+                    width_bytes: 1,
+                    destination_register: ((word >> 17) & 0x1f) as u8,
+                    base_register: ((word >> 12) & 0x1f) as u8,
+                    offset_register: ((word >> 7) & 0x1f) as u8,
+                })
+            }
+            AicClass::Scalar
+                if matches!(architecture, Architecture::Dav3510)
+                    && ((word >> 24) & 0x1f) == 14
+                    && word & 0x7c == 0
+                    && word & 3 != 3 =>
+            {
+                Some(Self::ScalarIndexedImmediateStore {
+                    width_bytes: 1 << ((word >> 22) & 3),
+                    base_register: ((word >> 12) & 0x1f) as u8,
+                    offset_register: ((word >> 7) & 0x1f) as u8,
+                    value: match word & 3 {
+                        0 => ScalarStoreImmediateValue::Zero,
+                        1 => ScalarStoreImmediateValue::One,
+                        _ => ScalarStoreImmediateValue::Ones,
+                    },
+                })
+            }
+            AicClass::Scalar
+                if matches!(
+                    (architecture, word),
+                    (Architecture::Dav2201, 0x0e00_b601)
+                        | (Architecture::Dav2201, 0x0e00_9501)
+                        | (Architecture::Dav2201, 0x0e00_8781)
+                        | (Architecture::Dav2201, 0x0e00_d701)
+                        | (Architecture::Dav2201, 0x0e00_a881)
+                        | (Architecture::Dav2201, 0x0e00_f801)
+                ) =>
+            {
+                Some(Self::ScalarIndexedImmediateStore {
+                    width_bytes: 1,
+                    base_register: ((word >> 12) & 0x1f) as u8,
+                    offset_register: ((word >> 7) & 0x1f) as u8,
+                    value: ScalarStoreImmediateValue::One,
+                })
+            }
             AicClass::Scalar
                 if (matches!(architecture, Architecture::Dav2201)
                     && ((word >> 24) & 0x1f) == 9
@@ -518,7 +600,20 @@ impl AicDecoderHint {
                 })
             }
             AicClass::Scalar
-                if matches!(architecture, Architecture::Dav3510)
+                if (matches!(architecture, Architecture::Dav3510)
+                    || matches!(
+                        (architecture, word),
+                        (Architecture::Dav2201, 0x02de_d380)
+                            | (Architecture::Dav2201, 0x02d6_9380)
+                            | (Architecture::Dav2201, 0x02d8_b380)
+                            | (Architecture::Dav2201, 0x02da_9380)
+                            | (Architecture::Dav2201, 0x02d6_8380)
+                            | (Architecture::Dav2201, 0x02de_b380)
+                            | (Architecture::Dav2201, 0x02da_a380)
+                            | (Architecture::Dav2201, 0x02da_b380)
+                            | (Architecture::Dav2201, 0x02dc_d380)
+                            | (Architecture::Dav2201, 0x02e0_f380)
+                    ))
                     && ((word >> 24) & 0x1f) == 2
                     && ((word >> 7) & 0x1f) == 7 =>
             {
@@ -572,6 +667,21 @@ impl AicDecoderHint {
                 Some(Self::ScalarKey2MoveToSpr {
                     vendor_isa_name: 35,
                     encoded_destination_spr,
+                    source_register,
+                })
+            }
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 19 => {
+                let width_bits = match (word >> 22) & 3 {
+                    0 => 8,
+                    1 => 16,
+                    2 => 32,
+                    _ => return None,
+                };
+                let (destination_register, source_register) =
+                    scalar_key2_registers(architecture, word);
+                Some(Self::ScalarKey2SignExtend {
+                    width_bits,
+                    destination_register,
                     source_register,
                 })
             }
@@ -1010,6 +1120,235 @@ mod tests {
             AicDecoderHint::from_word(Architecture::Dav2201, 0x1cce_5db8),
             None
         );
+    }
+
+    #[test]
+    fn captured_indexed_scalar_loads_decode_on_supported_architectures() {
+        for (architecture, other, word, destination, base, offset) in [
+            (
+                Architecture::Dav2201,
+                Architecture::Dav3510,
+                0x011c_b600,
+                14,
+                11,
+                12,
+            ),
+            (
+                Architecture::Dav3510,
+                Architecture::Dav2201,
+                0x0103_2980,
+                1,
+                18,
+                19,
+            ),
+            (
+                Architecture::Dav2201,
+                Architecture::Dav3510,
+                0x0118_9500,
+                12,
+                9,
+                10,
+            ),
+            (
+                Architecture::Dav2201,
+                Architecture::Dav3510,
+                0x0120_8780,
+                16,
+                8,
+                15,
+            ),
+            (
+                Architecture::Dav2201,
+                Architecture::Dav3510,
+                0x0122_d700,
+                17,
+                13,
+                14,
+            ),
+            (
+                Architecture::Dav2201,
+                Architecture::Dav3510,
+                0x0124_a880,
+                18,
+                10,
+                17,
+            ),
+            (
+                Architecture::Dav2201,
+                Architecture::Dav3510,
+                0x0126_f800,
+                19,
+                15,
+                16,
+            ),
+        ] {
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, word),
+                Some(AicDecoderHint::ScalarIndexedLoad {
+                    width_bytes: 1,
+                    destination_register: destination,
+                    base_register: base,
+                    offset_register: offset,
+                })
+            );
+            assert_eq!(
+                AicDecoderHint::from_word(other, word),
+                (other == Architecture::Dav3510).then_some(AicDecoderHint::ScalarIndexedLoad {
+                    width_bytes: 1,
+                    destination_register: destination,
+                    base_register: base,
+                    offset_register: offset,
+                })
+            );
+            assert_eq!(AicDecoderHint::from_word(architecture, word | 1), None);
+        }
+    }
+
+    #[test]
+    fn c310_indexed_loads_decode_supported_widths_and_reject_control_bits() {
+        let word = 0x0103_4b00;
+        for (dtype, width_bytes) in [(0, 1), (1, 2), (2, 4), (3, 8)] {
+            let encoded = word | (dtype << 22);
+            assert_eq!(
+                AicDecoderHint::from_word(Architecture::Dav3510, encoded),
+                Some(AicDecoderHint::ScalarIndexedLoad {
+                    width_bytes,
+                    destination_register: 1,
+                    base_register: 20,
+                    offset_register: 22,
+                })
+            );
+            assert_eq!(
+                AicDecoderHint::from_word(Architecture::Dav2201, encoded),
+                None
+            );
+        }
+        for changed in [word | 1, word | 2, word | 4, word | 8, word | 0x10] {
+            assert_eq!(
+                AicDecoderHint::from_word(Architecture::Dav3510, changed),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn captured_indexed_immediate_stores_decode_on_supported_architectures() {
+        for (architecture, other, word, base, offset) in [
+            (
+                Architecture::Dav2201,
+                Architecture::Dav3510,
+                0x0e00_d701,
+                13,
+                14,
+            ),
+            (
+                Architecture::Dav2201,
+                Architecture::Dav3510,
+                0x0e00_8781,
+                8,
+                15,
+            ),
+            (
+                Architecture::Dav2201,
+                Architecture::Dav3510,
+                0x0e00_9501,
+                9,
+                10,
+            ),
+            (
+                Architecture::Dav2201,
+                Architecture::Dav3510,
+                0x0e00_b601,
+                11,
+                12,
+            ),
+            (
+                Architecture::Dav2201,
+                Architecture::Dav3510,
+                0x0e00_a881,
+                10,
+                17,
+            ),
+            (
+                Architecture::Dav2201,
+                Architecture::Dav3510,
+                0x0e00_f801,
+                15,
+                16,
+            ),
+            (
+                Architecture::Dav3510,
+                Architecture::Dav2201,
+                0x0e01_2981,
+                18,
+                19,
+            ),
+        ] {
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, word),
+                Some(AicDecoderHint::ScalarIndexedImmediateStore {
+                    width_bytes: 1,
+                    base_register: base,
+                    offset_register: offset,
+                    value: ScalarStoreImmediateValue::One,
+                })
+            );
+            assert_eq!(
+                AicDecoderHint::from_word(other, word),
+                (other == Architecture::Dav3510).then_some(
+                    AicDecoderHint::ScalarIndexedImmediateStore {
+                        width_bytes: 1,
+                        base_register: base,
+                        offset_register: offset,
+                        value: ScalarStoreImmediateValue::One,
+                    }
+                )
+            );
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, word ^ 1),
+                (architecture == Architecture::Dav3510).then_some(
+                    AicDecoderHint::ScalarIndexedImmediateStore {
+                        width_bytes: 1,
+                        base_register: base,
+                        offset_register: offset,
+                        value: ScalarStoreImmediateValue::Zero,
+                    }
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn c310_indexed_immediate_stores_decode_width_and_value() {
+        let word = 0x0e01_4b00;
+        for (dtype, width_bytes) in [(0, 1), (1, 2), (2, 4), (3, 8)] {
+            for (value_bits, value) in [
+                (0, ScalarStoreImmediateValue::Zero),
+                (1, ScalarStoreImmediateValue::One),
+                (2, ScalarStoreImmediateValue::Ones),
+            ] {
+                let encoded = word | (dtype << 22) | value_bits;
+                assert_eq!(
+                    AicDecoderHint::from_word(Architecture::Dav3510, encoded),
+                    Some(AicDecoderHint::ScalarIndexedImmediateStore {
+                        width_bytes,
+                        base_register: 20,
+                        offset_register: 22,
+                        value,
+                    })
+                );
+                assert_eq!(
+                    AicDecoderHint::from_word(Architecture::Dav2201, encoded),
+                    None
+                );
+            }
+        }
+        for changed in [word | 3, word | 4, word | 8, word | 0x10] {
+            assert_eq!(
+                AicDecoderHint::from_word(Architecture::Dav3510, changed),
+                None
+            );
+        }
     }
 
     #[test]
@@ -1581,7 +1920,34 @@ mod tests {
         );
         for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
             assert_eq!(AicDecoderHint::from_word(architecture, 0x02c8_3a00), None);
-            assert_eq!(AicDecoderHint::from_word(architecture, 0x0288_3980), None);
+            assert_eq!(
+                AicDecoderHint::from_word(architecture, 0x0288_3980),
+                Some(AicDecoderHint::ScalarKey2SignExtend {
+                    width_bits: 32,
+                    destination_register: 4,
+                    source_register: 3,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn sign_extend_decodes_all_supported_source_widths_on_both_architectures() {
+        for (dtype, width_bits) in [(0_u32, 8_u8), (1, 16), (2, 32)] {
+            let word = 0x021c_f980 | (dtype << 22);
+            for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+                assert_eq!(
+                    AicDecoderHint::from_word(architecture, word),
+                    Some(AicDecoderHint::ScalarKey2SignExtend {
+                        width_bits,
+                        destination_register: 14,
+                        source_register: 15,
+                    })
+                );
+            }
+        }
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            assert_eq!(AicDecoderHint::from_word(architecture, 0x02dc_f980), None);
         }
     }
 
@@ -1856,7 +2222,75 @@ mod tests {
     }
 
     #[test]
-    fn c310_find_first_decodes_registers_and_match_bit() {
+    fn captured_find_first_decodes_registers_and_match_bit() {
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x02d6_9380),
+            Some(AicDecoderHint::ScalarKey2FindFirst {
+                destination_register: 11,
+                source_register: 9,
+                find_set: false,
+            })
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x02d8_b380),
+            Some(AicDecoderHint::ScalarKey2FindFirst {
+                destination_register: 12,
+                source_register: 11,
+                find_set: false,
+            })
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x02da_9380),
+            Some(AicDecoderHint::ScalarKey2FindFirst {
+                destination_register: 13,
+                source_register: 9,
+                find_set: false,
+            })
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x02d6_8380),
+            Some(AicDecoderHint::ScalarKey2FindFirst {
+                destination_register: 11,
+                source_register: 8,
+                find_set: false,
+            })
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x02de_d380),
+            Some(AicDecoderHint::ScalarKey2FindFirst {
+                destination_register: 15,
+                source_register: 13,
+                find_set: false,
+            })
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x02da_b380),
+            Some(AicDecoderHint::ScalarKey2FindFirst {
+                destination_register: 13,
+                source_register: 11,
+                find_set: false,
+            })
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x02dc_d380),
+            Some(AicDecoderHint::ScalarKey2FindFirst {
+                destination_register: 14,
+                source_register: 13,
+                find_set: false,
+            })
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x02e0_f380),
+            Some(AicDecoderHint::ScalarKey2FindFirst {
+                destination_register: 16,
+                source_register: 15,
+                find_set: false,
+            })
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x02de_d3c0),
+            None
+        );
         assert_eq!(
             AicDecoderHint::from_word(Architecture::Dav3510, 0x02d6_0380),
             Some(AicDecoderHint::ScalarKey2FindFirst {

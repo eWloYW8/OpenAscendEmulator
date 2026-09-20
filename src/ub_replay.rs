@@ -5,7 +5,9 @@ use thiserror::Error;
 
 use crate::acl_address_space::{AclAddressSpaceError, AclReplayAddressSpace};
 use crate::addressed_replay::{AddressedReplayMemory, ReplayAddressError};
-use crate::mte_c220::{C220MovOutToUbDescriptor, C220MovOutToUbError};
+use crate::mte_c220::{
+    C220DmaMovDescriptor, C220DmaMovError, C220MovOutToUbDescriptor, C220MovOutToUbError,
+};
 use crate::mte_c310::{C310CapturedMovAlignDecode, C310MovAlignCoordinateError};
 use crate::replay_memory::MemoryByteState;
 
@@ -39,6 +41,8 @@ pub enum UbReplayError {
     OutputCoordinateCount { count: usize },
     #[error(transparent)]
     C220Descriptor(#[from] C220MovOutToUbError),
+    #[error(transparent)]
+    C220OutputDescriptor(#[from] C220DmaMovError),
     #[error(transparent)]
     C310Coordinates(#[from] C310MovAlignCoordinateError),
     #[error(transparent)]
@@ -231,6 +235,38 @@ impl UbReplayMemory {
         })
     }
 
+    pub fn copy_c220_mov_ub_to_hbm(
+        &self,
+        destination: &mut AddressedReplayMemory,
+        descriptor: C220DmaMovDescriptor,
+        source_address: u64,
+        destination_address: u64,
+    ) -> Result<UbTransferResult, UbReplayError> {
+        let segments = descriptor.segments(source_address, destination_address)?;
+        let bytes = segments
+            .len()
+            .checked_mul(32)
+            .ok_or(UbReplayError::ResultSizeOverflow)?;
+        let mut states = Vec::new();
+        states
+            .try_reserve_exact(bytes)
+            .map_err(|_| UbReplayError::HostAllocationFailed { requested: bytes })?;
+        for segment in &segments {
+            states.extend(self.read_states(segment.source_local, segment.bytes as usize)?);
+        }
+        destination.write_states_at(destination_address, &states)?;
+        let known_bytes = states
+            .iter()
+            .filter(|state| matches!(state, MemoryByteState::Known(_)))
+            .count();
+        Ok(UbTransferResult {
+            segment_count: segments.len(),
+            bytes,
+            known_bytes,
+            unknown_bytes: bytes - known_bytes,
+        })
+    }
+
     fn copy_segments(
         &mut self,
         source: &AclReplayAddressSpace,
@@ -297,7 +333,8 @@ mod tests {
     use crate::architecture::Architecture;
     use crate::kernel_config::KernelConfigDocument;
     use crate::mte_c220::{
-        C220MovOutToUbDescriptor, CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,
+        C220DmaMovDescriptor, C220MovOutToUbDescriptor, CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,
+        CAPTURED_C220_MOV_UB_TO_OUT_WORD, CAPTURED_C220_SUB_MOV_UB_TO_OUT_WORD,
         CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD,
     };
     use crate::mte_c310::{
@@ -661,6 +698,72 @@ mod tests {
         assert_eq!(
             rejected.read_states_at(0x3000, 128).unwrap(),
             [MemoryByteState::Unknown; 128]
+        );
+    }
+
+    #[test]
+    fn c220_captured_output_route_commits_four_segments_atomically() {
+        let mut ub = UbReplayMemory::new(384, 32);
+        let bytes = (0..128_u8).collect::<Vec<_>>();
+        for (index, chunk) in bytes.chunks_exact(32).enumerate() {
+            ub.write_states(
+                0x100 + (index * 32) as u64,
+                &chunk
+                    .iter()
+                    .copied()
+                    .map(MemoryByteState::Known)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        }
+        for word in [
+            CAPTURED_C220_MOV_UB_TO_OUT_WORD,
+            CAPTURED_C220_SUB_MOV_UB_TO_OUT_WORD,
+        ] {
+            let descriptor = C220DmaMovDescriptor::decode(word, 0x40010).unwrap();
+            let mut destination = output_regions();
+            assert_eq!(
+                ub.copy_c220_mov_ub_to_hbm(&mut destination, descriptor, 0x100, 0x3000)
+                    .unwrap(),
+                UbTransferResult {
+                    segment_count: 4,
+                    bytes: 128,
+                    known_bytes: 128,
+                    unknown_bytes: 0,
+                }
+            );
+            assert_eq!(destination.read_known_at(0x3000, 128).unwrap(), bytes);
+
+            let mut malformed = descriptor;
+            malformed.burst_count = 2;
+            let before = destination.read_states_at(0x3000, 128).unwrap();
+            assert!(matches!(
+                ub.copy_c220_mov_ub_to_hbm(&mut destination, malformed, 0x100, 0x3000),
+                Err(UbReplayError::C220OutputDescriptor(_))
+            ));
+            assert_eq!(destination.read_states_at(0x3000, 128).unwrap(), before);
+
+            let mut outside = output_regions();
+            let before = outside.read_states_at(0x3000, 128).unwrap();
+            assert!(matches!(
+                ub.copy_c220_mov_ub_to_hbm(&mut outside, descriptor, 0x100, 0x3001),
+                Err(UbReplayError::Destination(_))
+            ));
+            assert_eq!(outside.read_states_at(0x3000, 128).unwrap(), before);
+        }
+
+        ub.write_states(0x17f, &[MemoryByteState::Unknown]).unwrap();
+        let descriptor =
+            C220DmaMovDescriptor::decode(CAPTURED_C220_MOV_UB_TO_OUT_WORD, 0x40010).unwrap();
+        let mut destination = output_regions();
+        let result = ub
+            .copy_c220_mov_ub_to_hbm(&mut destination, descriptor, 0x100, 0x3000)
+            .unwrap();
+        assert_eq!(result.known_bytes, 127);
+        assert_eq!(result.unknown_bytes, 1);
+        assert_eq!(
+            destination.read_states_at(0x307f, 1).unwrap(),
+            [MemoryByteState::Unknown]
         );
     }
 }

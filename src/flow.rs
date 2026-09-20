@@ -96,6 +96,210 @@ pub struct DsbStep {
     pub scope_field: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum PipelineBarrierScope {
+    Vector,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PipelineBarrierStep {
+    pub pc: u64,
+    pub word: u32,
+    pub scope: PipelineBarrierScope,
+}
+
+impl PipelineBarrierStep {
+    pub const fn decode(architecture: Architecture, pc: u64, word: u32) -> Option<Self> {
+        let scope = match (architecture, word) {
+            (Architecture::Dav2201, 0x40e0_0400) => PipelineBarrierScope::Vector,
+            (Architecture::Dav2201 | Architecture::Dav3510, 0x40e0_1800) => {
+                PipelineBarrierScope::All
+            }
+            _ => return None,
+        };
+        Some(Self { pc, word, scope })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum FlagOperation {
+    Set,
+    Wait,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum FlagIdSource {
+    Immediate(u8),
+    Register(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FlagInstruction {
+    pub architecture: Architecture,
+    pub word: u32,
+    pub operation: FlagOperation,
+    pub source_pipe_code: u8,
+    pub trigger_pipe_code: u8,
+    pub id_source: FlagIdSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FlagStep {
+    pub pc: u64,
+    pub instruction: FlagInstruction,
+    pub flag_id: u32,
+    pub source_value: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum BufferOperation {
+    Get,
+    Release,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum BufferEncoding {
+    FlowControl,
+    PushQueue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum BufferIdSource {
+    Immediate(u8),
+    Register(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct C310BufferInstruction {
+    pub word: u32,
+    pub encoding: BufferEncoding,
+    pub operation: BufferOperation,
+    pub vendor_isa_name: u16,
+    pub pipe_code: u8,
+    pub id_source: BufferIdSource,
+    pub mode_field: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct C310BufferStep {
+    pub pc: u64,
+    pub instruction: C310BufferInstruction,
+    pub buffer_id: u8,
+    pub source_value: Option<u64>,
+}
+
+impl C310BufferInstruction {
+    pub const fn decode(architecture: Architecture, word: u32) -> Option<Self> {
+        if !matches!(architecture, Architecture::Dav3510) {
+            return None;
+        }
+        if word & 0xffc0_3fff == 0x15c0_0001 {
+            let (operation, vendor_isa_name) = if word & 0x8000 != 0 {
+                (BufferOperation::Get, 92)
+            } else {
+                (BufferOperation::Release, 93)
+            };
+            let index = ((word >> 16) & 0x1f) as u8;
+            let id_source = if word & 0x0020_0000 != 0 {
+                BufferIdSource::Immediate(index)
+            } else {
+                BufferIdSource::Register(index)
+            };
+            return Some(Self {
+                word,
+                encoding: BufferEncoding::PushQueue,
+                operation,
+                vendor_isa_name,
+                pipe_code: 1,
+                id_source,
+                mode_field: ((word >> 14) & 1) as u8,
+            });
+        }
+        if !matches!(AicClass::from_word(word), AicClass::FlowControl) {
+            return None;
+        }
+        let (operation, vendor_isa_name) = match word & 0xffe0_0000 {
+            0x4200_0000 => (BufferOperation::Get, 92),
+            0x4220_0000 => (BufferOperation::Release, 93),
+            _ => return None,
+        };
+        let index = ((word >> 2) & 0x1f) as u8;
+        let id_source = if word & 0x0002_0000 != 0 {
+            BufferIdSource::Register(index)
+        } else {
+            BufferIdSource::Immediate(index)
+        };
+        Some(Self {
+            word,
+            encoding: BufferEncoding::FlowControl,
+            operation,
+            vendor_isa_name,
+            pipe_code: ((word >> 10) & 0xf) as u8,
+            id_source,
+            mode_field: (word & 1) as u8,
+        })
+    }
+
+    pub fn resolve(self, pc: u64, xregs: &[u64; 32]) -> C310BufferStep {
+        let (buffer_id, source_value) = match self.id_source {
+            BufferIdSource::Immediate(id) => (id, None),
+            BufferIdSource::Register(index) => {
+                let value = xregs[usize::from(index)];
+                ((value & 0x1f) as u8, Some(value))
+            }
+        };
+        C310BufferStep {
+            pc,
+            instruction: self,
+            buffer_id,
+            source_value,
+        }
+    }
+}
+
+impl FlagInstruction {
+    pub const fn decode(architecture: Architecture, word: u32) -> Option<Self> {
+        if !matches!(AicClass::from_word(word), AicClass::FlowControl) || word & 0x0200_0000 != 0 {
+            return None;
+        }
+        let operation = match (word >> 21) & 0xf {
+            5 => FlagOperation::Set,
+            6 => FlagOperation::Wait,
+            _ => return None,
+        };
+        let id_source = if word & 0x0002_0000 != 0 {
+            FlagIdSource::Register(((word >> 2) & 0x1f) as u8)
+        } else {
+            FlagIdSource::Immediate((((word >> 18) & 1) << 2 | (word & 3)) as u8)
+        };
+        Some(Self {
+            architecture,
+            word,
+            operation,
+            source_pipe_code: ((word >> 10) & 0xf) as u8,
+            trigger_pipe_code: (((word >> 7) & 7) | (((word >> 14) & 1) << 3)) as u8,
+            id_source,
+        })
+    }
+
+    pub fn resolve(self, pc: u64, xregs: &[u64; 32]) -> FlagStep {
+        let (flag_id, source_value) = match self.id_source {
+            FlagIdSource::Immediate(id) => (u32::from(id), None),
+            FlagIdSource::Register(index) => {
+                let value = xregs[usize::from(index)];
+                (value as u32, Some(value))
+            }
+        };
+        FlagStep {
+            pc,
+            instruction: self,
+            flag_id,
+            source_value,
+        }
+    }
+}
+
 impl DsbStep {
     pub const fn decode(pc: u64, word: u32) -> Option<Self> {
         if !matches!(AicClass::from_word(word), AicClass::FlowControl) || ((word >> 21) & 0xf) != 14
@@ -146,9 +350,8 @@ impl DcciInstruction {
 }
 
 impl FlowNop {
-    pub const fn decode(architecture: Architecture, pc: u64, word: u32) -> Option<Self> {
-        if !matches!(architecture, Architecture::Dav2201)
-            || !matches!(AicClass::from_word(word), AicClass::FlowControl)
+    pub const fn decode(_architecture: Architecture, pc: u64, word: u32) -> Option<Self> {
+        if !matches!(AicClass::from_word(word), AicClass::FlowControl)
             || ((word >> 27) & 3) == 1
             || ((word >> 21) & 0xf) != 10
         {
@@ -544,14 +747,168 @@ mod tests {
     }
 
     #[test]
-    fn c220_flow_nop_advances_one_word_without_matching_other_routes() {
-        let nop = FlowNop::decode(Architecture::Dav2201, 0x11312160, 0x4140_0000).unwrap();
-        assert_eq!(nop.vendor_isa_name, 80);
-        assert_eq!(nop.target_pc, 0x11312164);
-        assert!(FlowNop::decode(Architecture::Dav2201, 0x11312164, 0x4140_0000).is_some());
-        assert!(FlowNop::decode(Architecture::Dav3510, 0x11312160, 0x4140_0000).is_none());
-        assert!(FlowNop::decode(Architecture::Dav2201, 0x11312160, 0x4000_0000).is_none());
-        assert!(FlowNop::decode(Architecture::Dav2201, 0x11312160, 0x4940_0000).is_none());
+    fn barriers_decode_only_the_supported_scope_words() {
+        assert_eq!(
+            PipelineBarrierStep::decode(Architecture::Dav2201, 0x1131_2638, 0x40e0_0400),
+            Some(PipelineBarrierStep {
+                pc: 0x1131_2638,
+                word: 0x40e0_0400,
+                scope: PipelineBarrierScope::Vector,
+            })
+        );
+        assert_eq!(
+            PipelineBarrierStep::decode(Architecture::Dav2201, 0x1131_2090, 0x40e0_1800)
+                .unwrap()
+                .scope,
+            PipelineBarrierScope::All
+        );
+        assert_eq!(
+            PipelineBarrierStep::decode(Architecture::Dav3510, 0x10d0_d090, 0x40e0_1800)
+                .unwrap()
+                .scope,
+            PipelineBarrierScope::All
+        );
+        for word in [0x40e0_0401, 0x40e0_0800, 0x40e0_1801] {
+            assert!(PipelineBarrierStep::decode(Architecture::Dav2201, 0x1000, word).is_none());
+        }
+        for word in [0x40e0_0400, 0x40e0_1801] {
+            assert!(PipelineBarrierStep::decode(Architecture::Dav3510, 0x1000, word).is_none());
+        }
+    }
+
+    #[test]
+    fn flag_ids_use_the_live_encoded_register_on_both_architectures() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let instruction = FlagInstruction::decode(architecture, 0x40a2_0630).unwrap();
+            assert_eq!(instruction.operation, FlagOperation::Set);
+            assert_eq!(instruction.source_pipe_code, 1);
+            assert_eq!(instruction.trigger_pipe_code, 4);
+            assert_eq!(instruction.id_source, FlagIdSource::Register(12));
+            let mut xregs = [0_u64; 32];
+            assert_eq!(instruction.resolve(0x1131_26f8, &xregs).flag_id, 0);
+            xregs[12] = 1;
+            let step = instruction.resolve(0x1131_2704, &xregs);
+            assert_eq!(step.flag_id, 1);
+            assert_eq!(step.source_value, Some(1));
+
+            let output_set = FlagInstruction::decode(architecture, 0x40a2_06b8).unwrap();
+            assert_eq!(output_set.id_source, FlagIdSource::Register(14));
+            assert_eq!(
+                (output_set.source_pipe_code, output_set.trigger_pipe_code),
+                (1, 5)
+            );
+            let output_wait = FlagInstruction::decode(architecture, 0x40c2_06b4).unwrap();
+            assert_eq!(output_wait.operation, FlagOperation::Wait);
+            assert_eq!(output_wait.id_source, FlagIdSource::Register(13));
+            assert_eq!(
+                (output_wait.source_pipe_code, output_wait.trigger_pipe_code),
+                (1, 5)
+            );
+
+            let immediate = FlagInstruction::decode(architecture, 0x40a0_1000).unwrap();
+            assert_eq!(immediate.id_source, FlagIdSource::Immediate(0));
+            assert_eq!(immediate.resolve(0x1000, &xregs).source_value, None);
+            assert!(FlagInstruction::decode(architecture, 0x42a2_0630).is_none());
+            assert!(FlagInstruction::decode(architecture, 0x40e0_1800).is_none());
+        }
+    }
+
+    #[test]
+    fn c310_buffer_get_and_release_resolve_live_ids_and_pipe_codes() {
+        let mut xregs = [0_u64; 32];
+        xregs[0] = 1;
+        xregs[1] = 0x21;
+        xregs[25] = 7;
+        for (word, operation, isa_name, register, id, mode) in [
+            (0x4202_1004, BufferOperation::Get, 92, 1, 1, 0),
+            (0x4222_1004, BufferOperation::Release, 93, 1, 1, 0),
+            (0x4202_1000, BufferOperation::Get, 92, 0, 1, 0),
+            (0x4202_1005, BufferOperation::Get, 92, 1, 1, 1),
+            (0x4202_1065, BufferOperation::Get, 92, 25, 7, 1),
+        ] {
+            let instruction = C310BufferInstruction::decode(Architecture::Dav3510, word).unwrap();
+            assert_eq!(instruction.operation, operation);
+            assert_eq!(instruction.encoding, BufferEncoding::FlowControl);
+            assert_eq!(instruction.vendor_isa_name, isa_name);
+            assert_eq!(instruction.pipe_code, 4);
+            assert_eq!(instruction.id_source, BufferIdSource::Register(register));
+            assert_eq!(instruction.mode_field, mode);
+            let resolved = instruction.resolve(0x10d0_d690, &xregs);
+            assert_eq!(resolved.buffer_id, id);
+            assert_eq!(resolved.source_value, Some(xregs[usize::from(register)]));
+        }
+        let immediate = C310BufferInstruction::decode(Architecture::Dav3510, 0x4200_100c).unwrap();
+        assert_eq!(immediate.id_source, BufferIdSource::Immediate(3));
+        assert_eq!(immediate.resolve(0x1000, &xregs).buffer_id, 3);
+        assert_eq!(immediate.resolve(0x1000, &xregs).source_value, None);
+        for (word, operation) in [
+            (0x4202_1400, BufferOperation::Get),
+            (0x4222_1400, BufferOperation::Release),
+        ] {
+            let instruction = C310BufferInstruction::decode(Architecture::Dav3510, word).unwrap();
+            assert_eq!(instruction.operation, operation);
+            assert_eq!(instruction.pipe_code, 5);
+            assert_eq!(instruction.id_source, BufferIdSource::Register(0));
+        }
+        for word in [0x15c0_8001, 0x40a2_0630, 0x4202_1004] {
+            assert!(C310BufferInstruction::decode(Architecture::Dav2201, word).is_none());
+        }
+        assert!(C310BufferInstruction::decode(Architecture::Dav3510, 0x15c0_8021).is_none());
+    }
+
+    #[test]
+    fn c310_push_queue_buffer_forms_resolve_register_and_immediate_ids() {
+        let mut xregs = [0_u64; 32];
+        xregs[0] = 0x41;
+        for (word, operation, isa_name, mode) in [
+            (0x15c0_8001, BufferOperation::Get, 92, 0),
+            (0x15c0_0001, BufferOperation::Release, 93, 0),
+            (0x15c0_c001, BufferOperation::Get, 92, 1),
+        ] {
+            let instruction = C310BufferInstruction::decode(Architecture::Dav3510, word).unwrap();
+            assert_eq!(instruction.encoding, BufferEncoding::PushQueue);
+            assert_eq!(instruction.operation, operation);
+            assert_eq!(instruction.vendor_isa_name, isa_name);
+            assert_eq!(instruction.pipe_code, 1);
+            assert_eq!(instruction.id_source, BufferIdSource::Register(0));
+            assert_eq!(instruction.mode_field, mode);
+            let resolved = instruction.resolve(0x10d0_d768, &xregs);
+            assert_eq!(resolved.buffer_id, 1);
+            assert_eq!(resolved.source_value, Some(0x41));
+        }
+        for (word, operation) in [
+            (0x15e3_8001, BufferOperation::Get),
+            (0x15e3_0001, BufferOperation::Release),
+        ] {
+            let instruction = C310BufferInstruction::decode(Architecture::Dav3510, word).unwrap();
+            assert_eq!(instruction.operation, operation);
+            assert_eq!(instruction.id_source, BufferIdSource::Immediate(3));
+            let resolved = instruction.resolve(0x10d0_d768, &xregs);
+            assert_eq!(resolved.buffer_id, 3);
+            assert_eq!(resolved.source_value, None);
+        }
+        xregs[13] = 0x3f;
+        for (word, operation) in [
+            (0x15cd_8001, BufferOperation::Get),
+            (0x15cd_0001, BufferOperation::Release),
+        ] {
+            let instruction = C310BufferInstruction::decode(Architecture::Dav3510, word).unwrap();
+            assert_eq!(instruction.operation, operation);
+            assert_eq!(instruction.id_source, BufferIdSource::Register(13));
+            assert_eq!(instruction.resolve(0x10d0_d768, &xregs).buffer_id, 31);
+        }
+    }
+
+    #[test]
+    fn flow_nop_advances_one_word_on_both_architectures() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let nop = FlowNop::decode(architecture, 0x11312160, 0x4140_0000).unwrap();
+            assert_eq!(nop.vendor_isa_name, 80);
+            assert_eq!(nop.target_pc, 0x11312164);
+            assert!(FlowNop::decode(architecture, 0x11312164, 0x4140_0000).is_some());
+            assert!(FlowNop::decode(architecture, 0x11312160, 0x4000_0000).is_none());
+            assert!(FlowNop::decode(architecture, 0x11312160, 0x4940_0000).is_none());
+        }
     }
 
     #[test]

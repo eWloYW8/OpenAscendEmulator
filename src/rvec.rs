@@ -21,6 +21,23 @@ pub const C310_CAPTURED_VDUPS_WORD: u32 = 0x801a_2550;
 pub const C310_CAPTURED_VST_WORD: u32 = 0x4020_0108;
 pub const C310_CAPTURED_SUB_VST_WORD: u32 = 0x4028_0108;
 pub const C310_CAPTURED_PLT32_WORD: u32 = 0xa22c_0150;
+pub const C310_CAPTURED_SMOVI32_WORD: u32 = 0xc200_410d;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct C310CapturedSmoviStep {
+    pub pc: u64,
+    pub word: u32,
+    pub vendor_isa_name: u16,
+    pub destination_s_register: u8,
+    pub prior_value: Option<u32>,
+    pub value: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum C310CapturedSmoviError {
+    #[error("C310 SMOVI word {word:#010x} at PC {pc:#x} is outside the captured path")]
+    UnsupportedWord { pc: u64, word: u32 },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct C310CapturedPltStep {
@@ -29,6 +46,7 @@ pub struct C310CapturedPltStep {
     pub vendor_isa_name: u16,
     pub destination_p_register: u8,
     pub lane_limit: usize,
+    pub remaining_scalar_value: u32,
     pub predicate_bytes: [u8; MAX_PREDICATE_BYTES],
 }
 
@@ -44,6 +62,8 @@ pub enum C310CapturedPltError {
     MissingP1 { count: usize },
     #[error("C310 captured PLT requires a 32-byte P1, got {actual} bytes")]
     PredicateWidth { actual: usize },
+    #[error("C310 captured PLT requires a preceding S65 value")]
+    MissingScalarLimit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -445,6 +465,7 @@ impl C310RvecArithmeticHint {
 pub struct C310RvecValueMachine {
     vector_registers: Vec<Vec<u32>>,
     predicate_registers: Option<Vec<Vec<u8>>>,
+    captured_s65: Option<u32>,
     words_per_register: usize,
 }
 
@@ -534,6 +555,7 @@ impl C310RvecValueMachine {
         Ok(Self {
             vector_registers,
             predicate_registers: None,
+            captured_s65: None,
             words_per_register,
         })
     }
@@ -570,6 +592,31 @@ impl C310RvecValueMachine {
             .map(Vec::as_slice)
     }
 
+    pub fn captured_s65(&self) -> Option<u32> {
+        self.captured_s65
+    }
+
+    pub fn execute_captured_smovi_word(
+        &mut self,
+        pc: u64,
+        word: u32,
+    ) -> Result<C310CapturedSmoviStep, C310CapturedSmoviError> {
+        if word != C310_CAPTURED_SMOVI32_WORD {
+            return Err(C310CapturedSmoviError::UnsupportedWord { pc, word });
+        }
+        let value = (word >> 9) & 0xffff;
+        let destination_s_register = 64 + ((word >> 25) & 0x1f) as u8;
+        let prior_value = self.captured_s65.replace(value);
+        Ok(C310CapturedSmoviStep {
+            pc,
+            word,
+            vendor_isa_name: 495,
+            destination_s_register,
+            prior_value,
+            value,
+        })
+    }
+
     pub fn execute_captured_plt32_word(
         &mut self,
         pc: u64,
@@ -595,17 +642,26 @@ impl C310RvecValueMachine {
                 actual: destination.len(),
             });
         }
+        let scalar_limit = self
+            .captured_s65
+            .ok_or(C310CapturedPltError::MissingScalarLimit)?;
+        let lane_limit = usize::try_from(scalar_limit)
+            .unwrap_or(usize::MAX)
+            .min(self.words_per_register);
         let mut predicate_bytes = [0_u8; MAX_PREDICATE_BYTES];
-        for lane in 0..32 {
+        for lane in 0..lane_limit {
             predicate_bytes[lane / 2] |= 1 << (4 * (lane % 2));
         }
         destination.copy_from_slice(&predicate_bytes);
+        let remaining_scalar_value = scalar_limit.saturating_sub(self.words_per_register as u32);
+        self.captured_s65 = Some(remaining_scalar_value);
         Ok(C310CapturedPltStep {
             pc,
             word,
             vendor_isa_name: 412,
             destination_p_register: 1,
-            lane_limit: 32,
+            lane_limit,
+            remaining_scalar_value,
             predicate_bytes,
         })
     }
@@ -1081,12 +1137,28 @@ mod tests {
             vec![vec![0xff; 32], vec![0xff; 32]],
         )
         .unwrap();
+        let before = machine.clone();
+        assert_eq!(
+            machine.execute_captured_plt32_word(0x10d0_d914, C310_CAPTURED_PLT32_WORD),
+            Err(C310CapturedPltError::MissingScalarLimit)
+        );
+        assert_eq!(machine, before);
+        let smovi = machine
+            .execute_captured_smovi_word(0x10d0_d904, C310_CAPTURED_SMOVI32_WORD)
+            .unwrap();
+        assert_eq!(smovi.vendor_isa_name, 495);
+        assert_eq!(smovi.destination_s_register, 65);
+        assert_eq!(smovi.prior_value, None);
+        assert_eq!(smovi.value, 32);
+        assert_eq!(machine.captured_s65(), Some(32));
         let step = machine
             .execute_captured_plt32_word(0x10d0_d914, C310_CAPTURED_PLT32_WORD)
             .unwrap();
         assert_eq!(step.vendor_isa_name, 412);
         assert_eq!(step.destination_p_register, 1);
         assert_eq!(step.lane_limit, 32);
+        assert_eq!(step.remaining_scalar_value, 0);
+        assert_eq!(machine.captured_s65(), Some(0));
         assert_eq!(&step.predicate_bytes[..16], &[0x11; 16]);
         assert_eq!(&step.predicate_bytes[16..], &[0; 16]);
         assert_eq!(machine.predicate_register(0), Some([0xff; 32].as_slice()));
@@ -1103,6 +1175,20 @@ mod tests {
             })
         );
         assert_eq!(machine, before);
+        assert_eq!(
+            machine.execute_captured_smovi_word(0x10d0_d904, C310_CAPTURED_SMOVI32_WORD ^ 1),
+            Err(C310CapturedSmoviError::UnsupportedWord {
+                pc: 0x10d0_d904,
+                word: C310_CAPTURED_SMOVI32_WORD ^ 1,
+            })
+        );
+        assert_eq!(machine, before);
+
+        let repeated = machine
+            .execute_captured_smovi_word(0x10d0_d904, C310_CAPTURED_SMOVI32_WORD)
+            .unwrap();
+        assert_eq!(repeated.prior_value, Some(0));
+        assert_eq!(machine.captured_s65(), Some(32));
 
         let mut short = C310RvecValueMachine::from_vector_and_predicate_bytes(
             vec![vec![0; 32]],

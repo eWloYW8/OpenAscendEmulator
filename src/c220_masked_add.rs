@@ -17,7 +17,7 @@ pub const C220_CAPTURED_MASKED_ADD_BYTES: usize =
 const SEGMENT_BYTES: usize = 32;
 const DESTINATION: u64 = 0x100;
 const LOCAL_BYTES: usize = 0x180;
-const VADD_WORD: u32 = 0x85e0_d720;
+const VADD_WORD: u32 = crate::vec_c220::C220_CAPTURED_VADD_WORD;
 const MASK: [u64; 4] = [0x5555_5555, 0, 0, 0];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

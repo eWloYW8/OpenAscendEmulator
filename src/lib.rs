@@ -3,6 +3,7 @@ pub mod acl_args;
 pub mod addressed_replay;
 pub mod architecture;
 pub mod binary_alloc;
+pub mod buffer_c310;
 pub mod c220_masked_add;
 pub mod c220_sub;
 pub mod c310_masked_add;
@@ -18,6 +19,7 @@ pub mod hbm;
 pub mod hbm_pv_memory;
 pub mod ipc;
 pub mod isa;
+pub mod issue_queue_c310;
 pub mod kernel_config;
 pub mod kernel_record;
 pub mod machine;
@@ -25,6 +27,7 @@ pub mod mte_c220;
 pub mod mte_c310;
 pub mod mte_stepper;
 pub mod plan;
+pub mod predicate_buffer_c310;
 pub mod prof_stub_flow;
 pub mod prof_stub_object_verify;
 pub mod prof_stub_packet;
@@ -35,12 +38,35 @@ pub mod replay_memory;
 pub mod replay_seed;
 pub mod runner;
 pub mod rvec;
+pub mod rvec_pb_c310;
 pub mod scalar;
 pub mod stepper;
 pub mod trace;
 pub mod ub_replay;
 pub mod vec_c220;
+pub mod vec_queue_c310;
 pub mod workspace;
+
+pub use buffer_c310::{
+    C310BufferCounter, C310BufferCounterError, C310BufferCounters, C310BufferDisposition,
+    C310GetBufDispatch, C310GetBufGateResult, evaluate_c310_get_buf_gate,
+};
+pub use issue_queue_c310::{
+    C310DequeueOutcome, C310IssueQueue, C310IssueQueueError, C310IssueQueueSnapshot,
+    C310IssueQueueTransition,
+};
+pub use predicate_buffer_c310::{
+    C310_PB_DEFAULT_SLOTS, C310_PB_HALFWORDS_PER_SLOT, C310_PB_PUSH_BYTES, C310_PB_SLOT_BYTES,
+    C310PredicateBuffer, C310PredicateBufferError, C310PredicateBufferVfIssue,
+    C310PredicateBufferWrite, C310PushPbDisposition, C310PushPbInstruction, C310PushPbStep,
+};
+pub use rvec_pb_c310::{
+    C310PbRvecScalarProjection, C310RvecScalarWrite, project_c310_pb_rvec_scalar_init,
+};
+pub use vec_queue_c310::{
+    C310RvecAdmissionCounters, C310RvecAdmissionError, C310RvecAdmissionStep, C310SimdGateBlockers,
+    C310VfQueueDisposition, C310VfQueueInstruction, C310VfQueueStep,
+};
 
 pub use acl_address_space::{
     AclAddressSpaceBuildError, AclAddressSpaceError, AclArgumentImage, AclArgumentImageError,
@@ -94,9 +120,11 @@ pub use device_pool::{
     DeviceMemoryPoolManager, DevicePoolBlock, DevicePoolError, DevicePoolSummary,
 };
 pub use flow::{
-    ConditionalJump, ConditionalJumpTarget, DcciInstruction, DcciStep, DsbStep, FlowEnd, FlowNop,
-    JumpCompare, JumpCompareError, JumpCompareOffset, JumpCompareOperand, JumpCompareTarget,
-    JumpOffsetSource, JumpTarget, UnconditionalJump,
+    BufferEncoding, BufferIdSource, BufferOperation, C310BufferInstruction, C310BufferStep,
+    ConditionalJump, ConditionalJumpTarget, DcciInstruction, DcciStep, DsbStep, FlagIdSource,
+    FlagInstruction, FlagOperation, FlagStep, FlowEnd, FlowNop, JumpCompare, JumpCompareError,
+    JumpCompareOffset, JumpCompareOperand, JumpCompareTarget, JumpOffsetSource, JumpTarget,
+    PipelineBarrierScope, PipelineBarrierStep, UnconditionalJump,
 };
 pub use flow_trace::{JumpTraceIssue, JumpTraceSummary, verify_jump_trace};
 pub use fp32_vector::{
@@ -122,16 +150,17 @@ pub use kernel_record::{KernelRecordRequest, KernelRecordResponse, KernelRecordW
 pub use machine::{
     C220MovemaskStep, SCALAR_X_REGISTER_COUNT, ScalarCacheHintStep, ScalarCompareImmediateStep,
     ScalarCompareRegisterStep, ScalarCompareStep, ScalarFlowStep, ScalarImmediateStoreStep,
-    ScalarInstructionError, ScalarInstructionStep, ScalarMachine, ScalarMachineError,
-    ScalarMemoryBus, ScalarMemoryExecutionError, ScalarMemoryStep, ScalarPairLoadStep,
-    ScalarPairStoreStep, ScalarSelectStep, ScalarSprReadSource, ScalarSprReadStep, ScalarSprStep,
-    ScalarStep,
+    ScalarIndexedImmediateStoreStep, ScalarIndexedLoadStep, ScalarInstructionError,
+    ScalarInstructionStep, ScalarMachine, ScalarMachineError, ScalarMemoryBus,
+    ScalarMemoryExecutionError, ScalarMemoryStep, ScalarPairLoadStep, ScalarPairStoreStep,
+    ScalarSelectStep, ScalarSprReadSource, ScalarSprReadStep, ScalarSprStep, ScalarStep,
 };
 pub use mte_c220::{
     C220_MOV_UB_TO_OUT_UNIT_BYTES, C220DmaMovDescriptor, C220DmaMovError, C220DmaMovSegment,
     CAPTURED_C220_MOV_UB_TO_OUT_WORD, CAPTURED_C220_SUB_MOV_OUT_TO_UB_X_WORD,
     CAPTURED_C220_SUB_MOV_OUT_TO_UB_Y_WORD, CAPTURED_C220_SUB_MOV_UB_TO_OUT_WORD,
-    CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD, MAX_C220_DMAMOV_SEGMENTS,
+    CAPTURED_C220_SUB_TILING_MOV_OUT_TO_UB_WORD, CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD,
+    MAX_C220_DMAMOV_SEGMENTS,
 };
 pub use mte_c310::{
     C310_ADD_MOV_ALIGN_X_WORD, C310_ADD_MOV_ALIGN_Y_WORD, C310_TILING_MOV_ALIGN_WORD,
@@ -140,8 +169,19 @@ pub use mte_c310::{
     C310MovAlignRegisterSelectors, C310TilingMovAlignRegisters, MAX_C310_MOV_ALIGN_COORDINATES,
 };
 pub use mte_stepper::{
-    MAX_PENDING_MTE2_TRANSFERS, MTE2_TO_SCALAR_SET_FLAG0_WORD, MTE2_TO_SCALAR_WAIT_FLAG0_WORD,
-    MteAction, MteCoreStepper, MteProgramStep, MteStepperError,
+    C220_MTE3_TO_VECTOR_SET_FLAG_WORD, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD,
+    C220_SUB_MTE2_TO_VECTOR_SET_FLAG0_WORD, C220_SUB_MTE2_TO_VECTOR_SET_FLAG1_WORD,
+    C220_SUB_MTE2_TO_VECTOR_WAIT_FLAG0_WORD, C220_SUB_MTE3_TO_VECTOR_SET_FLAG_WORD,
+    C220_SUB_MTE3_TO_VECTOR_WAIT_FLAG_WORD, C220_SUB_VECTOR_TO_MTE2_SET_FLAG_WORD,
+    C220_SUB_VECTOR_TO_MTE2_WAIT_FLAG0_WORD, C220_SUB_VECTOR_TO_MTE2_WAIT_FLAG1_WORD,
+    C220_SUB_VECTOR_TO_MTE3_SET_FLAG_WORD, C220_SUB_VECTOR_TO_MTE3_WAIT_FLAG_WORD,
+    C220_VECTOR_TO_MTE2_SET_FLAG_WORD, C220_VECTOR_TO_MTE2_WAIT_DYNAMIC_WORD,
+    C220_VECTOR_TO_MTE2_WAIT_FLAG0_WORD, C220_VECTOR_TO_MTE2_WAIT_FLAG1_WORD,
+    C220_VECTOR_TO_MTE3_SET_FLAG_WORD, C220_VECTOR_TO_MTE3_WAIT_FLAG_WORD, C220OutputAction,
+    C220OutputStep, MAX_PENDING_MTE2_TRANSFERS, MTE2_TO_SCALAR_SET_FLAG0_WORD,
+    MTE2_TO_SCALAR_WAIT_FLAG0_WORD, MTE2_TO_VECTOR_SET_FLAG0_WORD, MTE2_TO_VECTOR_SET_FLAG1_WORD,
+    MTE2_TO_VECTOR_WAIT_FLAG0_WORD, MTE2_TO_VECTOR_WAIT_FLAG1_WORD, MteAction, MteCoreStepper,
+    MteProgramStep, MteStepperError, SCALAR_UB_ALIAS_BASE, SCALAR_UB_ALIAS_BYTES, UbScalarBusError,
 };
 pub use plan::{LaunchPlan, SimulatorRequest};
 pub use prof_stub_flow::{
@@ -174,22 +214,28 @@ pub use replay_seed::{
 };
 pub use runner::{ModelConfigLoad, RunOutcome};
 pub use rvec::{
-    C310_CAPTURED_PLT32_WORD, C310_CAPTURED_VDUPS_WORD, C310_CAPTURED_VLD_V0_WORD,
-    C310_CAPTURED_VLD_V1_WORD, C310_CAPTURED_VLDI_V0_WORD, C310_CAPTURED_VLDI_V1_WORD,
-    C310_CAPTURED_VST_WORD, C310_MASK0_SPR_INDEX, C310_MASK1_SPR_INDEX, C310CapturedPltError,
-    C310CapturedPltStep, C310CapturedVdupsStep, C310CapturedVectorError,
-    C310CapturedVectorLoadError, C310CapturedVectorLoadHint, C310CapturedVectorLoadStep,
-    C310CapturedVldiError, C310CapturedVldiHint, C310CapturedVldiStep, C310CapturedVstStep,
-    C310CapturedVstStore, C310ObservedMovemaskError, C310ObservedMovemaskHint,
-    C310ObservedMovemaskStep, C310RvecArithmeticHint, C310RvecArithmeticOperation,
-    C310RvecMaskSprState, C310RvecMovpHint, C310RvecMovpStep, C310RvecValueError,
-    C310RvecValueMachine, C310RvecValueStep, C310RvecVstiHint, C310RvecVstiStore,
-    c310_movp_u32_mask_to_predicate_bytes, c310_normal_u32_masked_store,
-    c310_predicate_bytes_to_mask,
+    C310_CAPTURED_PLT32_WORD, C310_CAPTURED_SMOVI32_WORD, C310_CAPTURED_VDUPS_WORD,
+    C310_CAPTURED_VLD_V0_WORD, C310_CAPTURED_VLD_V1_WORD, C310_CAPTURED_VLDI_V0_WORD,
+    C310_CAPTURED_VLDI_V1_WORD, C310_CAPTURED_VST_WORD, C310_MASK0_SPR_INDEX, C310_MASK1_SPR_INDEX,
+    C310CapturedPltError, C310CapturedPltStep, C310CapturedSmoviError, C310CapturedSmoviStep,
+    C310CapturedVdupsStep, C310CapturedVectorError, C310CapturedVectorLoadError,
+    C310CapturedVectorLoadHint, C310CapturedVectorLoadStep, C310CapturedVldiError,
+    C310CapturedVldiHint, C310CapturedVldiStep, C310CapturedVstStep, C310CapturedVstStore,
+    C310ObservedMovemaskError, C310ObservedMovemaskHint, C310ObservedMovemaskStep,
+    C310RvecArithmeticHint, C310RvecArithmeticOperation, C310RvecMaskSprState, C310RvecMovpHint,
+    C310RvecMovpStep, C310RvecValueError, C310RvecValueMachine, C310RvecValueStep,
+    C310RvecVstiHint, C310RvecVstiStore, c310_movp_u32_mask_to_predicate_bytes,
+    c310_normal_u32_masked_store, c310_predicate_bytes_to_mask,
 };
 pub use scalar::{ScalarIntegerError, ScalarIntegerOutcome, evaluate_scalar_integer_immediate};
 pub use stepper::{ScalarProgramStep, ScalarStepper, ScalarStepperError};
 pub use trace::{ScalarTraceMismatch, ScalarTraceSummary, verify_scalar_trace};
 pub use ub_replay::{UbReplayError, UbReplayMemory, UbTransferResult};
-pub use vec_c220::{C220MovemaskHint, C220VecArithmeticHint, C220VecArithmeticOperation};
+pub use vec_c220::{
+    C220_CAPTURED_MOVEV_CONTROL, C220_CAPTURED_MOVEV_WORD, C220_CAPTURED_VADD_CONTROL,
+    C220_CAPTURED_VADD_WORD, C220_CAPTURED_VSUB_WORD, C220CapturedFp32Step, C220CapturedMovevStep,
+    C220CapturedVectorError, C220CapturedVectorStore, C220MovemaskHint, C220VecArithmeticHint,
+    C220VecArithmeticOperation, decode_captured_c220_fp32_mask, execute_captured_c220_fp32_to_ub,
+    execute_captured_c220_movev_to_ub,
+};
 pub use workspace::{PreparedRun, WorkspaceOptions};

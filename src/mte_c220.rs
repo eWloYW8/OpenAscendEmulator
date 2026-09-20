@@ -8,6 +8,7 @@ pub const CAPTURED_C220_MOV_OUT_TO_UB_Y_WORD: u32 = 0x7124_f188;
 pub const CAPTURED_C220_SUB_MOV_OUT_TO_UB_X_WORD: u32 = 0x711b_1208;
 pub const CAPTURED_C220_SUB_MOV_OUT_TO_UB_Y_WORD: u32 = 0x7120_d208;
 pub const CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD: u32 = 0x7100_1108;
+pub const CAPTURED_C220_SUB_TILING_MOV_OUT_TO_UB_WORD: u32 = 0x7100_1188;
 pub const C220_MOV_UB_TO_OUT_UNIT_BYTES: u64 = 32;
 pub const MAX_C220_DMAMOV_SEGMENTS: u64 = 4096;
 
@@ -54,7 +55,8 @@ pub enum C220MovOutToUbError {
 impl C220MovOutToUbDescriptor {
     pub fn decode(instruction_word: u32, xm: u64) -> Result<Self, C220MovOutToUbError> {
         let expected_xm = match instruction_word {
-            CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD => 0x10010,
+            CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD
+            | CAPTURED_C220_SUB_TILING_MOV_OUT_TO_UB_WORD => 0x10010,
             CAPTURED_C220_MOV_OUT_TO_UB_X_WORD
             | CAPTURED_C220_MOV_OUT_TO_UB_Y_WORD
             | CAPTURED_C220_SUB_MOV_OUT_TO_UB_X_WORD
@@ -293,21 +295,24 @@ mod tests {
 
     #[test]
     fn tiling_word_moves_one_32_byte_unit() {
-        let descriptor =
-            C220MovOutToUbDescriptor::decode(CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD, 0x10010)
-                .unwrap();
-        assert_eq!(
-            descriptor.segments(0x1251_5400, 0).unwrap(),
-            [C220MovOutToUbSegment {
-                source_hbm: 0x1251_5400,
-                destination_local: 0,
-                bytes: 32,
-            }]
-        );
-        assert_eq!(
-            C220MovOutToUbDescriptor::decode(CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD, 0x40010),
-            Err(C220MovOutToUbError::UnsupportedXm { xm: 0x40010 })
-        );
+        for word in [
+            CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD,
+            CAPTURED_C220_SUB_TILING_MOV_OUT_TO_UB_WORD,
+        ] {
+            let descriptor = C220MovOutToUbDescriptor::decode(word, 0x10010).unwrap();
+            assert_eq!(
+                descriptor.segments(0x1251_5400, 0).unwrap(),
+                [C220MovOutToUbSegment {
+                    source_hbm: 0x1251_5400,
+                    destination_local: 0,
+                    bytes: 32,
+                }]
+            );
+            assert_eq!(
+                C220MovOutToUbDescriptor::decode(word, 0x40010),
+                Err(C220MovOutToUbError::UnsupportedXm { xm: 0x40010 })
+            );
+        }
     }
 
     #[test]
