@@ -38,6 +38,7 @@ pub struct C310BufferCounter {
     pub dispatch_count: u32,
     pub release_count: u32,
     pub total_dispatches: u32,
+    pub outstanding_get_bufs: u32,
     pub last_release_tick: u64,
 }
 
@@ -45,6 +46,38 @@ pub struct C310BufferCounter {
 pub struct C310GetBufDispatch {
     pub expected_release_count: u32,
     pub assigned_dispatch_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum C310GetBufIssueTickResult {
+    Primed { recorded_tick: u32 },
+    Continue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct C310GetBufIssueTick {
+    recorded_tick: u32,
+}
+
+impl C310GetBufIssueTick {
+    pub const fn new(recorded_tick: u32) -> Self {
+        Self { recorded_tick }
+    }
+
+    pub const fn recorded_tick(&self) -> u32 {
+        self.recorded_tick
+    }
+
+    pub fn step(&mut self, kind: u32, current_tick: u64) -> C310GetBufIssueTickResult {
+        if kind == 1 && self.recorded_tick == 0 {
+            self.recorded_tick = current_tick as u32;
+            C310GetBufIssueTickResult::Primed {
+                recorded_tick: self.recorded_tick,
+            }
+        } else {
+            C310GetBufIssueTickResult::Continue
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -78,6 +111,7 @@ impl C310BufferCounters {
                     dispatch_count: 0,
                     release_count: 0,
                     total_dispatches: 0,
+                    outstanding_get_bufs: 0,
                     last_release_tick: 0,
                 };
                 usize::from(buffer_count)
@@ -121,6 +155,7 @@ impl C310BufferCounters {
         let counter = &mut self.counters[usize::from(id)];
         counter.dispatch_count = next;
         counter.total_dispatches = counter.total_dispatches.wrapping_add(1);
+        counter.outstanding_get_bufs = counter.outstanding_get_bufs.wrapping_add(1);
         Ok(Some(C310GetBufDispatch {
             expected_release_count,
             assigned_dispatch_count: next,
@@ -130,6 +165,13 @@ impl C310BufferCounters {
     pub fn retire_release(&mut self, id: u8) -> Result<u32, C310BufferCounterError> {
         let next = self.next(self.counter(id)?.release_count);
         self.counters[usize::from(id)].release_count = next;
+        Ok(next)
+    }
+
+    pub fn consume_get_buf(&mut self, id: u8) -> Result<u32, C310BufferCounterError> {
+        let current = self.counter(id)?.outstanding_get_bufs;
+        let next = current.wrapping_sub(1);
+        self.counters[usize::from(id)].outstanding_get_bufs = next;
         Ok(next)
     }
 
@@ -244,6 +286,70 @@ mod tests {
     }
 
     #[test]
+    fn consumption_changes_outstanding_count_without_changing_dispatch_history() {
+        let mut counters = C310BufferCounters::new(2, 32).unwrap();
+        assert!(counters.record_get_buf_admission(0).unwrap().is_some());
+        assert_eq!(counters.counter(0).unwrap().outstanding_get_bufs, 1);
+        assert_eq!(counters.consume_get_buf(0), Ok(0));
+        assert_eq!(counters.counter(0).unwrap().dispatch_count, 1);
+        assert_eq!(counters.counter(0).unwrap().total_dispatches, 1);
+        assert_eq!(counters.counter(0).unwrap().release_count, 0);
+        assert_eq!(counters.retire_release(0), Ok(1));
+        assert!(counters.record_get_buf_admission(0).unwrap().is_some());
+        assert_eq!(counters.counter(0).unwrap().outstanding_get_bufs, 1);
+        assert_eq!(counters.counter(0).unwrap().total_dispatches, 2);
+        assert_eq!(counters.counter(1).unwrap().outstanding_get_bufs, 0);
+    }
+
+    #[test]
+    fn consumption_uses_wrapping_u32_arithmetic() {
+        let mut counters = C310BufferCounters::new(1, 32).unwrap();
+        assert_eq!(counters.consume_get_buf(0), Ok(u32::MAX));
+        assert_eq!(counters.counter(0).unwrap().outstanding_get_bufs, u32::MAX);
+        assert_eq!(
+            counters.consume_get_buf(1),
+            Err(C310BufferCounterError::InvalidBufferId { id: 1, count: 1 })
+        );
+    }
+
+    #[test]
+    fn issue_tick_is_initialized_once_before_dispatch() {
+        let mut tick = C310GetBufIssueTick::new(0);
+        assert_eq!(
+            tick.step(1, 1849),
+            C310GetBufIssueTickResult::Primed {
+                recorded_tick: 1849
+            }
+        );
+        assert_eq!(tick.recorded_tick(), 1849);
+        assert_eq!(tick.step(1, 1850), C310GetBufIssueTickResult::Continue);
+        assert_eq!(tick.recorded_tick(), 1849);
+
+        let mut other_kind = C310GetBufIssueTick::new(0);
+        assert_eq!(
+            other_kind.step(2, 1849),
+            C310GetBufIssueTickResult::Continue
+        );
+        assert_eq!(other_kind.recorded_tick(), 0);
+
+        let mut zero_time = C310GetBufIssueTick::new(0);
+        assert_eq!(
+            zero_time.step(1, 0),
+            C310GetBufIssueTickResult::Primed { recorded_tick: 0 }
+        );
+        assert_eq!(
+            zero_time.step(1, 1),
+            C310GetBufIssueTickResult::Primed { recorded_tick: 1 }
+        );
+
+        let mut truncation = C310GetBufIssueTick::new(0);
+        assert_eq!(
+            truncation.step(1, u64::from(u32::MAX) + 2),
+            C310GetBufIssueTickResult::Primed { recorded_tick: 1 }
+        );
+    }
+
+    #[test]
     fn buffer_ids_have_independent_counters_and_release_wraps() {
         let mut counters = C310BufferCounters::new(2, 3).unwrap();
         assert_eq!(counters.reserve_dispatch_slot(0), Ok(true));
@@ -306,6 +412,10 @@ mod tests {
         );
         assert_eq!(
             counters.retire_release(1),
+            Err(C310BufferCounterError::InvalidBufferId { id: 1, count: 1 })
+        );
+        assert_eq!(
+            counters.consume_get_buf(1),
             Err(C310BufferCounterError::InvalidBufferId { id: 1, count: 1 })
         );
         assert_eq!(

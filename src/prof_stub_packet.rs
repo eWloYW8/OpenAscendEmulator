@@ -1,9 +1,60 @@
 use thiserror::Error;
 
 pub const PROF_STUB_PACKET_HEADER_BYTES: usize = 8;
+pub const DATA_PATH_KERNEL_NAME_FIELD_BYTES: usize = 1024;
+pub const DATA_PATH_REQUEST_PAYLOAD_BYTES: usize = 1028;
+pub const MODEL_CONFIG_RESPONSE_BYTES: usize = 1620;
+pub const PROF_STUB_RESPONSE_READ_BYTES: usize = 1024;
+pub const PROF_STUB_RESPONSE_MAX_WAIT_ATTEMPTS: usize = 64;
 pub const LOG_TRANSLATE_OUTPUT_PATH_FIELD_BYTES: usize = 4096;
 pub const LOG_TRANSLATE_KERNEL_NAME_FIELD_BYTES: usize = 1024;
 pub const LOG_TRANSLATE_ACK_BYTES: &[u8; 3] = b"SUC";
+
+pub fn encode_model_config_request() -> Vec<u8> {
+    ProfStubPacket::new(0, &[])
+        .expect("registered zero-length model-config packet")
+        .encode_frame()
+}
+
+pub fn encode_data_path_request(
+    kernel_name: &[u8],
+    path_index: u32,
+) -> Result<Vec<u8>, ProfStubPacketError> {
+    if kernel_name.len() >= DATA_PATH_KERNEL_NAME_FIELD_BYTES {
+        return Err(ProfStubPacketError::FieldTooLong {
+            field: "kernel_name",
+            maximum: DATA_PATH_KERNEL_NAME_FIELD_BYTES - 1,
+            actual: kernel_name.len(),
+        });
+    }
+    let mut payload = [0_u8; DATA_PATH_REQUEST_PAYLOAD_BYTES];
+    payload[..kernel_name.len()].copy_from_slice(kernel_name);
+    payload[DATA_PATH_KERNEL_NAME_FIELD_BYTES..].copy_from_slice(&path_index.to_le_bytes());
+    Ok(ProfStubPacket::new(1, &payload)?.encode_frame())
+}
+
+pub fn decode_data_path_request(
+    packet: ProfStubPacket<'_>,
+) -> Result<(&[u8], u32), ProfStubPacketError> {
+    if packet.packet_type != 1 {
+        return Err(ProfStubPacketError::WrongType {
+            expected: 1,
+            actual: packet.packet_type,
+        });
+    }
+    if packet.payload.len() != DATA_PATH_REQUEST_PAYLOAD_BYTES {
+        return Err(ProfStubPacketError::InvalidPayloadLength {
+            packet_type: 1,
+            expected: DATA_PATH_REQUEST_PAYLOAD_BYTES,
+            actual: packet.payload.len(),
+        });
+    }
+    let (name, index) = packet.payload.split_at(DATA_PATH_KERNEL_NAME_FIELD_BYTES);
+    Ok((
+        name,
+        u32::from_le_bytes(index.try_into().expect("four-byte path index")),
+    ))
+}
 
 pub fn encode_log_translate_start(
     output_path: &[u8],
@@ -71,6 +122,64 @@ pub const fn max_prof_stub_payload_bytes(packet_type: u32) -> Option<usize> {
         22 => Some(40),
         23 => Some(64),
         _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfStubReply<'a> {
+    None,
+    ModelConfig {
+        config: &'a [u8; MODEL_CONFIG_RESPONSE_BYTES],
+        trailing: &'a [u8],
+    },
+    DataPath(&'a [u8]),
+    ClientTerminationFlag(bool),
+    Success,
+}
+
+impl<'a> ProfStubReply<'a> {
+    pub fn decode_for(packet_type: u32, bytes: &'a [u8]) -> Result<Self, ProfStubPacketError> {
+        match packet_type {
+            0 => {
+                if bytes.len() < MODEL_CONFIG_RESPONSE_BYTES {
+                    return Err(ProfStubPacketError::InvalidModelConfigResponseLength {
+                        minimum: MODEL_CONFIG_RESPONSE_BYTES,
+                        actual: bytes.len(),
+                    });
+                }
+                let (config, trailing) = bytes.split_at(MODEL_CONFIG_RESPONSE_BYTES);
+                Ok(Self::ModelConfig {
+                    config: config.try_into().expect("fixed-size config prefix"),
+                    trailing,
+                })
+            }
+            1 => {
+                if bytes.last() != Some(&b'\n') {
+                    return Err(ProfStubPacketError::InvalidDataPathResponse {
+                        actual: bytes.len(),
+                    });
+                }
+                Ok(Self::DataPath(&bytes[..bytes.len() - 1]))
+            }
+            2 => match bytes {
+                [0] => Ok(Self::ClientTerminationFlag(false)),
+                [1] => Ok(Self::ClientTerminationFlag(true)),
+                _ => Err(ProfStubPacketError::InvalidClientTerminationFlag {
+                    actual: bytes.len(),
+                }),
+            },
+            3 | 20 | 21 | 22 | 23 if bytes.is_empty() => Ok(Self::None),
+            3 | 20 | 21 | 22 | 23 => Err(ProfStubPacketError::UnexpectedResponse {
+                packet_type,
+                actual: bytes.len(),
+            }),
+            4 | 5 if bytes == LOG_TRANSLATE_ACK_BYTES => Ok(Self::Success),
+            4 | 5 => Err(ProfStubPacketError::InvalidSuccessResponse {
+                packet_type,
+                actual: bytes.len(),
+            }),
+            _ => Err(ProfStubPacketError::UnknownResponsePolicy(packet_type)),
+        }
     }
 }
 
@@ -173,6 +282,20 @@ pub enum ProfStubPacketError {
         expected: usize,
         actual: usize,
     },
+    #[error("model-config response requires at least {minimum} bytes, got {actual}")]
+    InvalidModelConfigResponseLength { minimum: usize, actual: usize },
+    #[error("data-path response requires a newline-terminated value, got {actual} bytes")]
+    InvalidDataPathResponse { actual: usize },
+    #[error("client-termination response requires a single 0 or 1 byte, got {actual} bytes")]
+    InvalidClientTerminationFlag { actual: usize },
+    #[error("ProfStub response to packet type {packet_type} must be empty, got {actual} bytes")]
+    UnexpectedResponse { packet_type: u32, actual: usize },
+    #[error(
+        "ProfStub packet type {packet_type} returned an invalid {actual}-byte success response"
+    )]
+    InvalidSuccessResponse { packet_type: u32, actual: usize },
+    #[error("ProfStub packet type {0} has no established response policy")]
+    UnknownResponsePolicy(u32),
 }
 
 #[cfg(test)]
@@ -180,7 +303,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_limits_match_the_inspected_constructor() {
+    fn registry_limits_cover_all_packet_types() {
         assert_eq!(
             [0, 1, 2, 3, 4, 5, 20, 21, 22, 23].map(max_prof_stub_payload_bytes),
             [
@@ -197,6 +320,129 @@ mod tests {
             ]
         );
         assert_eq!(max_prof_stub_payload_bytes(1001), None);
+    }
+
+    #[test]
+    fn model_config_request_is_an_empty_type_zero_packet() {
+        let frame = encode_model_config_request();
+        assert_eq!(frame, [0; PROF_STUB_PACKET_HEADER_BYTES]);
+        let packet = ProfStubPacket::decode_exact(&frame).unwrap();
+        assert_eq!(packet.packet_type(), 0);
+        assert!(packet.payload().is_empty());
+    }
+
+    #[test]
+    fn data_path_request_has_a_fixed_name_field_and_index() {
+        let frame = encode_data_path_request(b"VectorAdd", 7).unwrap();
+        assert_eq!(frame.len(), PROF_STUB_PACKET_HEADER_BYTES + 1028);
+        let packet = ProfStubPacket::decode_exact(&frame).unwrap();
+        let (name, index) = decode_data_path_request(packet).unwrap();
+        assert_eq!(&name[..10], b"VectorAdd\0");
+        assert!(name[10..].iter().all(|byte| *byte == 0));
+        assert_eq!(index, 7);
+        assert_eq!(
+            encode_data_path_request(&vec![b'x'; 1024], 0),
+            Err(ProfStubPacketError::FieldTooLong {
+                field: "kernel_name",
+                maximum: 1023,
+                actual: 1024,
+            })
+        );
+    }
+
+    #[test]
+    fn replies_are_raw_and_request_specific() {
+        let config = [0_u8; MODEL_CONFIG_RESPONSE_BYTES];
+        assert!(matches!(
+            ProfStubReply::decode_for(0, &config),
+            Ok(ProfStubReply::ModelConfig { trailing: [], .. })
+        ));
+        assert_eq!(
+            ProfStubReply::decode_for(1, b"/tmp/run/0/dump\n"),
+            Ok(ProfStubReply::DataPath(b"/tmp/run/0/dump"))
+        );
+        assert_eq!(
+            ProfStubReply::decode_for(4, b"SUC"),
+            Ok(ProfStubReply::Success)
+        );
+        assert_eq!(ProfStubReply::decode_for(20, b""), Ok(ProfStubReply::None));
+        assert_eq!(
+            ProfStubReply::decode_for(20, b"x"),
+            Err(ProfStubPacketError::UnexpectedResponse {
+                packet_type: 20,
+                actual: 1,
+            })
+        );
+        assert_eq!(
+            ProfStubReply::decode_for(2, b"\x00"),
+            Ok(ProfStubReply::ClientTerminationFlag(false))
+        );
+        assert_eq!(
+            ProfStubReply::decode_for(2, b"\x01"),
+            Ok(ProfStubReply::ClientTerminationFlag(true))
+        );
+        assert_eq!(
+            ProfStubReply::decode_for(2, b"\x02"),
+            Err(ProfStubPacketError::InvalidClientTerminationFlag { actual: 1 })
+        );
+        assert_eq!(
+            ProfStubReply::decode_for(2, b""),
+            Err(ProfStubPacketError::InvalidClientTerminationFlag { actual: 0 })
+        );
+        assert_eq!(
+            ProfStubReply::decode_for(2, b"\x00\x01"),
+            Err(ProfStubPacketError::InvalidClientTerminationFlag { actual: 2 })
+        );
+    }
+
+    #[test]
+    fn response_validation_rejects_truncated_or_malformed_values() {
+        assert_eq!(
+            ProfStubReply::decode_for(0, &[0; MODEL_CONFIG_RESPONSE_BYTES - 1]),
+            Err(ProfStubPacketError::InvalidModelConfigResponseLength {
+                minimum: MODEL_CONFIG_RESPONSE_BYTES,
+                actual: MODEL_CONFIG_RESPONSE_BYTES - 1,
+            })
+        );
+        assert_eq!(
+            ProfStubReply::decode_for(1, b"/tmp/no-newline"),
+            Err(ProfStubPacketError::InvalidDataPathResponse { actual: 15 })
+        );
+        assert_eq!(
+            ProfStubReply::decode_for(5, b"FAIL"),
+            Err(ProfStubPacketError::InvalidSuccessResponse {
+                packet_type: 5,
+                actual: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn response_can_span_multiple_reads() {
+        let mut config = vec![0; MODEL_CONFIG_RESPONSE_BYTES];
+        config.extend_from_slice(&[1, 2, 3]);
+        let ProfStubReply::ModelConfig {
+            config: prefix,
+            trailing,
+        } = ProfStubReply::decode_for(0, &config).unwrap()
+        else {
+            panic!("expected model configuration");
+        };
+        assert_eq!(prefix, &[0; MODEL_CONFIG_RESPONSE_BYTES]);
+        assert_eq!(trailing, &[1, 2, 3]);
+
+        let mut path = vec![b'x'; PROF_STUB_RESPONSE_READ_BYTES + 1];
+        path.push(b'\n');
+        assert_eq!(
+            ProfStubReply::decode_for(1, &path),
+            Ok(ProfStubReply::DataPath(&path[..path.len() - 1]))
+        );
+        let mut long_path = vec![b'x'; 65_536];
+        long_path.push(b'\n');
+        assert_eq!(
+            ProfStubReply::decode_for(1, &long_path),
+            Ok(ProfStubReply::DataPath(&long_path[..long_path.len() - 1]))
+        );
     }
 
     #[test]

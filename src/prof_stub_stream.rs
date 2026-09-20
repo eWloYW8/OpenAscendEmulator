@@ -1,4 +1,6 @@
-use crate::prof_stub_packet::{ProfStubPacket, ProfStubPacketError, decode_log_translate_start};
+use crate::prof_stub_packet::{
+    ProfStubPacket, ProfStubPacketError, decode_data_path_request, decode_log_translate_start,
+};
 use crate::prof_stub_trace::{ProfStubCoreKind, ProfStubTraceLog};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -23,6 +25,12 @@ pub struct ProfStubRecordSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProfStubRecordDetail {
+    ModelConfigRequest,
+    DataPathRequest {
+        kernel_name_bytes: usize,
+        kernel_name_utf8: Option<String>,
+        path_index: u32,
+    },
     LogTranslateStart {
         output_path_bytes: usize,
         kernel_name_bytes: usize,
@@ -90,6 +98,19 @@ pub fn inspect_prof_stub_stream(
 }
 
 fn record_detail(packet: ProfStubPacket<'_>) -> Result<ProfStubRecordDetail, ProfStubPacketError> {
+    if packet.packet_type() == 0 {
+        return Ok(ProfStubRecordDetail::ModelConfigRequest);
+    }
+    if packet.packet_type() == 1 {
+        let (name, path_index) = decode_data_path_request(packet)?;
+        return Ok(ProfStubRecordDetail::DataPathRequest {
+            kernel_name_bytes: nul_prefix(name).len(),
+            kernel_name_utf8: std::str::from_utf8(nul_prefix(name))
+                .ok()
+                .map(str::to_owned),
+            path_index,
+        });
+    }
     if packet.packet_type() == 4 {
         let (path, name) = decode_log_translate_start(packet)?;
         return Ok(ProfStubRecordDetail::LogTranslateStart {
@@ -147,7 +168,10 @@ fn nul_prefix(field: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prof_stub_packet::{encode_log_translate_start, encode_log_translate_stop};
+    use crate::prof_stub_packet::{
+        encode_data_path_request, encode_log_translate_start, encode_log_translate_stop,
+        encode_model_config_request,
+    };
 
     #[test]
     fn every_record_is_validated_even_when_preview_is_bounded() {
@@ -193,6 +217,29 @@ mod tests {
         assert_eq!(
             inspect_prof_stub_stream(&frame[..frame.len() - 1], 0),
             Err(ProfStubPacketError::Incomplete)
+        );
+    }
+
+    #[test]
+    fn startup_requests_are_exposed_as_typed_records() {
+        let bytes = [
+            encode_model_config_request(),
+            encode_data_path_request(b"VectorAdd", 3).unwrap(),
+        ]
+        .concat();
+        let summary = inspect_prof_stub_stream(&bytes, 2).unwrap();
+        assert_eq!(summary.packet_count, 2);
+        assert_eq!(
+            summary.records[0].detail,
+            ProfStubRecordDetail::ModelConfigRequest
+        );
+        assert_eq!(
+            summary.records[1].detail,
+            ProfStubRecordDetail::DataPathRequest {
+                kernel_name_bytes: 9,
+                kernel_name_utf8: Some("VectorAdd".to_owned()),
+                path_index: 3,
+            }
         );
     }
 }

@@ -1,7 +1,8 @@
 use thiserror::Error;
 
 use crate::architecture::Architecture;
-use crate::hbm::{CamodelHbmAllocator, HbmAllocationError};
+use crate::hbm::{CamodelHbmAllocator, HbmAllocationError, HbmResolveError};
+use crate::machine::ScalarMemoryBus;
 use crate::pv_memory::{PvMemory, PvMemoryError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -9,7 +10,30 @@ pub enum HbmPvMemoryError {
     #[error(transparent)]
     Allocation(#[from] HbmAllocationError),
     #[error(transparent)]
+    Resolve(#[from] HbmResolveError),
+    #[error(transparent)]
     Store(#[from] PvMemoryError),
+}
+
+impl ScalarMemoryBus for HbmPvMemory {
+    type Error = HbmPvMemoryError;
+
+    fn read(&mut self, address: u64, destination: &mut [u8]) -> Result<(), Self::Error> {
+        if destination.is_empty() {
+            return Ok(());
+        }
+        self.allocator
+            .resolve_live(address, destination.len() as u64)?;
+        self.device_to_host(address, destination)
+    }
+
+    fn write(&mut self, address: u64, source: &[u8]) -> Result<(), Self::Error> {
+        if source.is_empty() {
+            return Ok(());
+        }
+        self.allocator.resolve_live(address, source.len() as u64)?;
+        self.host_to_device(address, source)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +104,28 @@ impl HbmPvMemory {
 mod tests {
     use super::*;
     use crate::hbm::CAMODEL_HBM_BASE;
+
+    #[test]
+    fn scalar_bus_uses_one_live_hbm_allocation() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut memory = HbmPvMemory::new(architecture, 0, 1);
+            let address = memory.allocate(16).unwrap();
+            ScalarMemoryBus::write(&mut memory, address + 4, &[1, 2, 3, 4]).unwrap();
+            let mut bytes = [0; 4];
+            ScalarMemoryBus::read(&mut memory, address + 4, &mut bytes).unwrap();
+            assert_eq!(bytes, [1, 2, 3, 4]);
+            assert!(matches!(
+                ScalarMemoryBus::read(&mut memory, address + 14, &mut bytes),
+                Err(HbmPvMemoryError::Resolve(HbmResolveError::Unmapped { .. }))
+            ));
+            memory.free(address).unwrap();
+            assert!(matches!(
+                ScalarMemoryBus::write(&mut memory, address, &[5]),
+                Err(HbmPvMemoryError::Resolve(HbmResolveError::Unmapped { .. }))
+            ));
+            ScalarMemoryBus::read(&mut memory, address, &mut []).unwrap();
+        }
+    }
 
     #[test]
     fn host_copy_uses_absolute_hbm_address_on_both_architectures() {

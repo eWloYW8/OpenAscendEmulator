@@ -26,6 +26,7 @@ pub enum LogStream {
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticKind {
     AclApiFailure,
+    VectorExecutionError,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -168,6 +169,8 @@ impl PreparedRun {
             stdout_capture.kernel_start_observed || stderr_capture.kernel_start_observed;
         let model_stop_observed =
             stdout_capture.model_stop_observed || stderr_capture.model_stop_observed;
+        let acl_api_failure_observed =
+            stdout_capture.acl_api_failure_observed || stderr_capture.acl_api_failure_observed;
         let mut vendor_diagnostics = stdout_capture.vendor_diagnostics;
         vendor_diagnostics.extend(stderr_capture.vendor_diagnostics);
         let omitted_vendor_diagnostics =
@@ -184,7 +187,7 @@ impl PreparedRun {
         } else if !process_success {
             rejections.push(RunRejection::ProcessStatus);
         }
-        if !vendor_diagnostics.is_empty() || omitted_vendor_diagnostics != 0 {
+        if acl_api_failure_observed {
             rejections.push(RunRejection::VendorDiagnostic);
         }
         if kernel_start_observed && !model_stop_observed {
@@ -221,6 +224,7 @@ impl PreparedRun {
 struct StreamCapture {
     kernel_start_observed: bool,
     model_stop_observed: bool,
+    acl_api_failure_observed: bool,
     vendor_diagnostics: Vec<VendorDiagnostic>,
     omitted_vendor_diagnostics: usize,
     model_config_loads: Vec<ModelConfigLoad>,
@@ -278,10 +282,18 @@ fn inspect_line(capture: &mut StreamCapture, stream: LogStream, bytes: &[u8]) {
     }
     capture.kernel_start_observed |= line.contains("<ProfInit> Start profiling on kernel:");
     capture.model_stop_observed |= line.contains("[INFO] Model stopped successfully.");
-    if line.contains("[ERROR] <CheckResult>") && line.contains("failed") {
+    let kind = if line.contains("[ERROR] <CheckResult>") && line.contains("failed") {
+        capture.acl_api_failure_observed = true;
+        Some(DiagnosticKind::AclApiFailure)
+    } else if line.starts_with("[error] [core") && line.contains("[vec_err_") {
+        Some(DiagnosticKind::VectorExecutionError)
+    } else {
+        None
+    };
+    if let Some(kind) = kind {
         let diagnostic = VendorDiagnostic {
             stream,
-            kind: DiagnosticKind::AclApiFailure,
+            kind,
             line: line.trim_end_matches(['\r', '\n']).to_owned(),
         };
         if capture.vendor_diagnostics.len() < MAX_RETAINED_DIAGNOSTICS {
@@ -533,6 +545,56 @@ mod tests {
             DiagnosticKind::AclApiFailure
         );
         assert_eq!(outcome.rejections, vec![RunRejection::VendorDiagnostic]);
+    }
+
+    #[test]
+    fn retains_vector_error_without_conflating_it_with_acl_launch_failure() {
+        let tree = TempTree::new();
+        let output = tree.0.join("output");
+        let run = prepared(
+            &tree,
+            CommandSpec {
+                executable: PathBuf::from("/bin/sh"),
+                arguments: vec![
+                    "-c".into(),
+                    "printf '%s\n' '[INFO] <ProfInit> Start profiling on kernel: MulKernel'; printf '%s\n' '[error] [core0.veccore1] [vec_err_idata_inf_nan_t0] RV_VMUL Dtype: F32'; printf artifact > \"$1/z.bin\"; printf '%s\n' '[INFO] Model stopped successfully.'".into(),
+                    "runner-test".into(),
+                    output.display().to_string(),
+                ],
+            },
+            BTreeMap::new(),
+        );
+
+        let outcome = run.execute(Some(Duration::from_secs(2))).unwrap();
+        assert!(outcome.process_success);
+        assert!(outcome.success);
+        assert!(outcome.rejections.is_empty());
+        assert_eq!(outcome.vendor_diagnostics.len(), 1);
+        assert_eq!(
+            outcome.vendor_diagnostics[0].kind,
+            DiagnosticKind::VectorExecutionError
+        );
+        assert_eq!(outcome.changed_artifacts.len(), 1);
+    }
+
+    #[test]
+    fn diagnostic_limit_does_not_hide_a_later_acl_failure() {
+        let mut capture = StreamCapture::default();
+        for _ in 0..MAX_RETAINED_DIAGNOSTICS {
+            inspect_line(
+                &mut capture,
+                LogStream::Stdout,
+                b"[error] [core0.veccore1] [vec_err_idata_inf_nan_t0]\n",
+            );
+        }
+        inspect_line(
+            &mut capture,
+            LogStream::Stdout,
+            b"[ERROR] <CheckResult> Aclrt API call aclrtKernelArgsAppend() failed. error code: 100000\n",
+        );
+        assert_eq!(capture.vendor_diagnostics.len(), MAX_RETAINED_DIAGNOSTICS);
+        assert_eq!(capture.omitted_vendor_diagnostics, 1);
+        assert!(capture.acl_api_failure_observed);
     }
 
     #[test]

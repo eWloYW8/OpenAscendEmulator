@@ -1,5 +1,8 @@
 use crate::acl_args::{AclArgumentPlan, AclArgumentPlanError};
 use crate::architecture::{Architecture, all_device_profiles};
+use crate::captured_replay::{
+    CapturedReplayError, CapturedReplayOperation, execute_captured_replay,
+};
 use crate::device_elf::{
     DeviceElf, DeviceElfError, DeviceElfHeader, DeviceGlobalPatchSite, DeviceKernelSummary,
     DeviceLoadImageSummary,
@@ -8,22 +11,26 @@ use crate::flow_trace::verify_jump_trace;
 use crate::isa::{AicDecoderHint, AicFramingError, AicInstructionWord, AicWordFramer};
 use crate::kernel_config::{KernelConfigDocument, KernelConfigError};
 use crate::plan::{LaunchPlan, PlanError, SimulatorRequest};
+use crate::predicate_buffer_c310::C310_PB_SLOT_BYTES;
 use crate::prof_stub_flow::inspect_prof_stub_branch_edges;
 use crate::prof_stub_object_verify::{ProfStubObjectVerification, verify_prof_stub_object};
 use crate::prof_stub_packet::ProfStubPacketError;
 use crate::prof_stub_stream::inspect_prof_stub_stream;
 use crate::replay_seed::{ReplaySeed, ReplaySeedError};
 use crate::rvec::C310RvecArithmeticHint;
+use crate::rvec_pb_c310::project_c310_pb_rvec_scalar_init;
 use crate::trace::verify_scalar_trace;
 use crate::vec_c220::C220VecArithmeticHint;
 use crate::workspace::{PreparedRun, WorkspaceError, WorkspaceOptions};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::env;
+use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io;
 use std::io::BufReader;
 use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -132,6 +139,25 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Replay one bounded 4096-byte Add/Sub/Mul template")]
+    ReplayCaptured {
+        #[arg(long)]
+        architecture: Architecture,
+        #[arg(long, value_enum)]
+        operation: CapturedOperationArg,
+        #[arg(long)]
+        x: PathBuf,
+        #[arg(long)]
+        y: PathBuf,
+        #[arg(long, conflicts_with = "prior_fp32_bits")]
+        prior: Option<PathBuf>,
+        #[arg(long, value_parser = parse_u32_word)]
+        prior_fp32_bits: Option<u32>,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     InspectRvecWord {
         #[arg(value_parser = parse_u32_word)]
         word: u32,
@@ -141,6 +167,12 @@ enum Command {
     InspectC220VecWord {
         #[arg(value_parser = parse_u32_word)]
         word: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Inspect one 128-byte dav_3510 predicate-buffer slot")]
+    InspectC310PbSlot {
+        path: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -223,6 +255,23 @@ enum OnOff {
     Off,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CapturedOperationArg {
+    MaskedAdd,
+    Subtract,
+    Multiply,
+}
+
+impl From<CapturedOperationArg> for CapturedReplayOperation {
+    fn from(value: CapturedOperationArg) -> Self {
+        match value {
+            CapturedOperationArg::MaskedAdd => Self::MaskedAdd,
+            CapturedOperationArg::Subtract => Self::Subtract,
+            CapturedOperationArg::Multiply => Self::Multiply,
+        }
+    }
+}
+
 impl From<OnOff> for bool {
     fn from(value: OnOff) -> Self {
         matches!(value, OnOff::On)
@@ -289,6 +338,14 @@ pub enum CliError {
         #[source]
         source: io::Error,
     },
+    #[error("failed to create or write new output file {path}: {source}")]
+    FileWrite {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(transparent)]
+    CapturedReplay(#[from] CapturedReplayError),
     #[error("invalid simulator PC-start file {path}: {detail}")]
     InvalidPcStartAddrFile { path: PathBuf, detail: &'static str },
     #[error(transparent)]
@@ -299,6 +356,10 @@ pub enum CliError {
     ProfStubPacket(#[from] ProfStubPacketError),
     #[error("input file {path} exceeds explicit {limit}-byte read limit")]
     InputFileTooLarge { path: PathBuf, limit: u64 },
+    #[error(
+        "predicate-buffer slot file {path} contains {actual} bytes; expected {C310_PB_SLOT_BYTES}"
+    )]
+    InvalidPbSlotSize { path: PathBuf, actual: usize },
     #[error(
         "ProfStub object binding did not verify all instruction records: {checked}/{total} checked"
     )]
@@ -426,6 +487,60 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
                 }
             }
         }
+        Command::ReplayCaptured {
+            architecture,
+            operation,
+            x,
+            y,
+            prior,
+            prior_fp32_bits,
+            output,
+            json,
+        } => {
+            let x_bytes = read_bounded_file(&x, 4096)?;
+            let y_bytes = read_bounded_file(&y, 4096)?;
+            let prior_bytes = if let Some(path) = prior {
+                Some(read_bounded_file(&path, 4096)?)
+            } else {
+                prior_fp32_bits.map(|bits| {
+                    let mut image = vec![0; 4096];
+                    for word in image.chunks_exact_mut(4) {
+                        word.copy_from_slice(&bits.to_le_bytes());
+                    }
+                    image
+                })
+            };
+            let replay = execute_captured_replay(
+                architecture,
+                operation.into(),
+                &x_bytes,
+                &y_bytes,
+                prior_bytes.as_deref(),
+            )?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output)
+                .map_err(|source| CliError::FileWrite {
+                    path: output.clone(),
+                    source,
+                })?;
+            file.write_all(replay.output())
+                .and_then(|_| file.sync_all())
+                .map_err(|source| CliError::FileWrite {
+                    path: output.clone(),
+                    source,
+                })?;
+            if json {
+                print_json(&replay)?;
+            } else {
+                println!("scope: captured-template");
+                println!("architecture: {architecture}");
+                println!("tiles: {}", replay.tile_count());
+                println!("output-bytes: {}", replay.output().len());
+                println!("output: {}", output.display());
+            }
+        }
         Command::InspectRvecWord { word, json } => {
             let output = RvecWordInspection {
                 word,
@@ -449,7 +564,7 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
                 println!("fp32-value-path: {}", hint.has_fp32_value_path());
             } else {
                 println!("word: {:#010x}", output.word);
-                println!("C310 RVec VADD/VSUB opcode: unrecognized");
+                println!("C310 RVec FP32 arithmetic opcode: unrecognized");
             }
         }
         Command::InspectC220VecWord { word, json } => {
@@ -473,7 +588,34 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
                 println!("fp32-value-path: {}", hint.has_fp32_value_path());
             } else {
                 println!("word: {:#010x}", output.word);
-                println!("C220 Vec VADD/VSUB opcode: unrecognized");
+                println!("C220 Vec FP32 arithmetic opcode: unrecognized");
+            }
+        }
+        Command::InspectC310PbSlot { path, json } => {
+            let bytes = read_bounded_file(&path, C310_PB_SLOT_BYTES as u64)?;
+            let slot: [u8; C310_PB_SLOT_BYTES] =
+                bytes
+                    .try_into()
+                    .map_err(|bytes: Vec<u8>| CliError::InvalidPbSlotSize {
+                        path,
+                        actual: bytes.len(),
+                    })?;
+            let projection = project_c310_pb_rvec_scalar_init(&slot);
+            if json {
+                print_json(&projection)?;
+            } else {
+                println!("big-flags: {:#010x}", projection.big_flags);
+                println!(
+                    "consumed-payload-words: {}",
+                    projection.consumed_payload_words
+                );
+                println!("scalar-writes: {}", projection.writes.len());
+                for write in projection.writes {
+                    println!(
+                        "  register={} value={:#010x} payload-word={:?}",
+                        write.register_index, write.value, write.source_payload_word
+                    );
+                }
             }
         }
         Command::InspectElf {
@@ -1122,6 +1264,91 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn parses_captured_replay_and_rejects_conflicting_prior_sources() {
+        let cli = Cli::try_parse_from([
+            "open-ascend-emulator",
+            "replay-captured",
+            "--architecture",
+            "dav_3510",
+            "--operation",
+            "masked-add",
+            "--x",
+            "x.bin",
+            "--y",
+            "y.bin",
+            "--prior-fp32-bits",
+            "0xc2f60000",
+            "--output",
+            "result.bin",
+            "--json",
+        ])
+        .unwrap();
+        let Command::ReplayCaptured {
+            architecture,
+            operation,
+            prior,
+            prior_fp32_bits,
+            output,
+            json,
+            ..
+        } = cli.command
+        else {
+            panic!("unexpected command")
+        };
+        assert_eq!(architecture, Architecture::Dav3510);
+        assert!(matches!(operation, CapturedOperationArg::MaskedAdd));
+        assert!(prior.is_none());
+        assert_eq!(prior_fp32_bits, Some(0xc2f6_0000));
+        assert_eq!(output, PathBuf::from("result.bin"));
+        assert!(json);
+
+        let multiply = Cli::try_parse_from([
+            "open-ascend-emulator",
+            "replay-captured",
+            "--architecture",
+            "dav_2201",
+            "--operation",
+            "multiply",
+            "--x",
+            "x.bin",
+            "--y",
+            "y.bin",
+            "--output",
+            "result.bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            multiply.command,
+            Command::ReplayCaptured {
+                operation: CapturedOperationArg::Multiply,
+                ..
+            }
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "open-ascend-emulator",
+                "replay-captured",
+                "--architecture",
+                "dav_2201",
+                "--operation",
+                "subtract",
+                "--x",
+                "x.bin",
+                "--y",
+                "y.bin",
+                "--prior",
+                "old.bin",
+                "--prior-fp32-bits",
+                "0x00000000",
+                "--output",
+                "result.bin",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parses_reference_simulator_options() {
         let cli = Cli::try_parse_from([
             "open-ascend-emulator",
@@ -1340,6 +1567,24 @@ mod tests {
             Cli::try_parse_from(["open-ascend-emulator", "inspect-rvec-word", "0x100000000"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parses_c310_predicate_buffer_slot_inspection() {
+        let cli = Cli::try_parse_from([
+            "open-ascend-emulator",
+            "inspect-c310-pb-slot",
+            "slot.bin",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::InspectC310PbSlot {
+                path,
+                json: true,
+            } if path.as_os_str() == "slot.bin"
+        ));
     }
 
     #[test]

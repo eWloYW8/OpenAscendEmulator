@@ -373,8 +373,51 @@ fn validate_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::c220_scalar_address_space::C220ScalarAddressSpace;
     use crate::device_elf::DeviceLoadImageSummary;
     use crate::hbm::CAMODEL_HBM_BASE;
+    use crate::machine::{ScalarInstructionStep, ScalarMachine, ScalarMemoryBus};
+    use crate::stepper::{ScalarProgramStop, ScalarStepper};
+    use crate::vec_queue_c310::{C310VfQueueDisposition, C310VfQueueStep};
+    use std::io;
+
+    struct NoMemoryBus;
+
+    impl ScalarMemoryBus for NoMemoryBus {
+        type Error = io::Error;
+
+        fn read(&mut self, _address: u64, _destination: &mut [u8]) -> Result<(), Self::Error> {
+            Err(io::Error::other("unexpected data read"))
+        }
+
+        fn write(&mut self, _address: u64, _source: &[u8]) -> Result<(), Self::Error> {
+            Err(io::Error::other("unexpected data write"))
+        }
+    }
+
+    struct VfQueueBus {
+        steps: Vec<C310VfQueueStep>,
+    }
+
+    impl ScalarMemoryBus for VfQueueBus {
+        type Error = io::Error;
+
+        fn read(&mut self, _address: u64, _destination: &mut [u8]) -> Result<(), Self::Error> {
+            Err(io::Error::other("unexpected data read"))
+        }
+
+        fn write(&mut self, _address: u64, _source: &[u8]) -> Result<(), Self::Error> {
+            Err(io::Error::other("unexpected data write"))
+        }
+
+        fn enqueue_c310_vf(
+            &mut self,
+            step: C310VfQueueStep,
+        ) -> Result<C310VfQueueDisposition, Self::Error> {
+            self.steps.push(step);
+            Ok(C310VfQueueDisposition::Accepted)
+        }
+    }
 
     fn image(bytes: Vec<u8>) -> PreparedDeviceLoadImage {
         PreparedDeviceLoadImage {
@@ -389,6 +432,201 @@ mod tests {
             bytes,
             patches: Vec::new(),
         }
+    }
+
+    fn loaded_program(
+        architecture: Architecture,
+        words: &[u32],
+    ) -> (HbmPvMemory, LoadedDeviceKernel) {
+        let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let byte_count = bytes.len() as u64;
+        let prepared = image(bytes);
+        let plan = BinaryDeviceAllocationPlan::new(
+            architecture,
+            u32::try_from(byte_count).unwrap(),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut memory = HbmPvMemory::new(architecture, 0, 1);
+        let mut pools = DeviceMemoryPoolManager::new(architecture);
+        let load =
+            load_with_pool_preference(&mut memory, &mut pools, &plan, &prepared, false).unwrap();
+        let entry = load.placement.aligned_code_address;
+        (
+            memory,
+            LoadedDeviceKernel {
+                load,
+                kernel: DeviceKernelSummary {
+                    name: "ScalarProgram".to_owned(),
+                    section: ".text".to_owned(),
+                    section_virtual_address: 0,
+                    section_file_offset: 4096,
+                    section_byte_count: byte_count,
+                    virtual_address: 0,
+                    file_offset: 4096,
+                    byte_count,
+                },
+                entry_address: entry,
+                executable_start_address: entry,
+            },
+        )
+    }
+
+    #[test]
+    fn loaded_scalar_program_runs_until_end_and_resumes_after_budget() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let words = [0x0706_0001_u32, 0x4160_0000];
+            let (mut memory, kernel) = loaded_program(architecture, &words);
+            let entry = kernel.entry_address();
+            let mut bus = NoMemoryBus;
+            let mut stepper =
+                ScalarStepper::new(ScalarMachine::new(architecture, [0; 32], 0), entry);
+            let empty = stepper
+                .run_loaded(&kernel, &mut memory, &mut bus, 0)
+                .unwrap();
+            assert_eq!(empty.stop, ScalarProgramStop::StepBudgetReached);
+            assert!(empty.steps.is_empty());
+            assert_eq!(empty.next_pc, entry);
+            assert_eq!(stepper.pc(), entry);
+            let run = stepper
+                .run_loaded(&kernel, &mut memory, &mut bus, 2)
+                .unwrap();
+            assert_eq!(run.start_pc, entry);
+            assert_eq!(run.next_pc, entry + 8);
+            assert_eq!(run.steps.len(), 2);
+            assert_eq!(run.steps[0].word, words[0]);
+            assert_eq!(run.steps[1].word, words[1]);
+            assert!(run.steps[1].halted_after);
+            assert_eq!(run.stop, ScalarProgramStop::Halted);
+            assert!(stepper.is_halted());
+            assert!(
+                stepper
+                    .run_loaded(&kernel, &mut memory, &mut bus, 0)
+                    .unwrap()
+                    .steps
+                    .is_empty()
+            );
+
+            let mut resumed =
+                ScalarStepper::new(ScalarMachine::new(architecture, [0; 32], 0), entry);
+            let head = resumed
+                .run_loaded(&kernel, &mut memory, &mut bus, 1)
+                .unwrap();
+            assert_eq!(head.stop, ScalarProgramStop::StepBudgetReached);
+            assert_eq!(head.steps.len(), 1);
+            assert_eq!(head.steps[0].word, words[0]);
+            assert_eq!(head.next_pc, entry + 4);
+            assert_eq!(resumed.pc(), entry + 4);
+            let tail = resumed
+                .run_loaded(&kernel, &mut memory, &mut bus, 1)
+                .unwrap();
+            assert_eq!(tail.start_pc, entry + 4);
+            assert_eq!(tail.steps.len(), 1);
+            assert!(tail.steps[0].halted_after);
+            assert_eq!(tail.stop, ScalarProgramStop::Halted);
+
+            memory
+                .host_to_device(entry + 4, &0x6000_0000_u32.to_le_bytes())
+                .unwrap();
+            let mut failing =
+                ScalarStepper::new(ScalarMachine::new(architecture, [0; 32], 0), entry);
+            let mut observed = Vec::new();
+            assert!(
+                failing
+                    .run_loaded_with(&kernel, &mut memory, &mut bus, 2, |step| {
+                        observed.push(step);
+                    })
+                    .is_err()
+            );
+            assert_eq!(observed.len(), 1);
+            assert_eq!(observed[0].word, words[0]);
+            assert_eq!(failing.pc(), entry + 4);
+        }
+    }
+
+    #[test]
+    fn loaded_c310_vf_pair_consumes_one_step_and_eight_code_bytes() {
+        let words = [0x154d_0000, 0x15e0_0105, 0x4160_0000];
+        let (mut memory, kernel) = loaded_program(Architecture::Dav3510, &words);
+        let entry = kernel.entry_address();
+        let mut machine = ScalarMachine::new(Architecture::Dav3510, [0; 32], 0);
+        machine.set_xreg(13, 0x10d0_d900).unwrap();
+        let mut stepper = ScalarStepper::new(machine, entry);
+        let mut bus = VfQueueBus { steps: Vec::new() };
+        let first = stepper
+            .run_loaded(&kernel, &mut memory, &mut bus, 1)
+            .unwrap();
+        assert_eq!(first.stop, ScalarProgramStop::StepBudgetReached);
+        assert_eq!(first.steps.len(), 1);
+        assert_eq!(first.steps[0].word, words[0]);
+        assert_eq!(first.steps[0].next_pc, entry + 8);
+        assert_eq!(bus.steps.len(), 1);
+        assert_eq!(stepper.pc(), entry + 8);
+        let tail = stepper
+            .run_loaded(&kernel, &mut memory, &mut bus, 1)
+            .unwrap();
+        assert_eq!(tail.stop, ScalarProgramStop::Halted);
+        assert_eq!(tail.steps[0].word, words[2]);
+        assert_eq!(tail.next_pc, entry + 12);
+    }
+
+    #[test]
+    fn unified_loaded_program_reads_and_writes_live_hbm_on_both_architectures() {
+        for (architecture, pair_word, store_word) in [
+            (Architecture::Dav2201, 0x09ca_0180, 0x04c6_5000),
+            (Architecture::Dav3510, 0x0cca_0180, 0x03c6_5000),
+        ] {
+            let words = [pair_word, store_word, 0x4160_0000];
+            let (mut memory, kernel) = loaded_program(architecture, &words);
+            let args_address = memory.allocate(16).unwrap();
+            let output_address = memory.allocate(16).unwrap();
+            let expected = 0x1234_5678_9abc_def0_u64;
+            let arguments = [
+                output_address.to_le_bytes().as_slice(),
+                expected.to_le_bytes().as_slice(),
+            ]
+            .concat();
+            memory.host_to_device(args_address, &arguments).unwrap();
+            let mut machine = ScalarMachine::new(architecture, [0; 32], 0);
+            machine.set_xreg(0, args_address).unwrap();
+            let mut stepper = ScalarStepper::new(machine, kernel.entry_address());
+            let run = stepper.run_loaded_unified(&kernel, &mut memory, 3).unwrap();
+            assert_eq!(run.stop, ScalarProgramStop::Halted);
+            assert_eq!(run.steps.len(), 3);
+            assert!(matches!(
+                run.steps[0].instruction,
+                ScalarInstructionStep::PairLoad(_)
+            ));
+            assert!(matches!(
+                run.steps[1].instruction,
+                ScalarInstructionStep::Memory(_)
+            ));
+            let mut actual = [0; 8];
+            memory.device_to_host(output_address, &mut actual).unwrap();
+            assert_eq!(actual, expected.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn mapped_loaded_program_writes_c220_local_buffer_without_corrupting_code() {
+        let (hbm, kernel) = loaded_program(Architecture::Dav2201, &[0x04c6_7000, 0x4160_0000]);
+        let mut memory = C220ScalarAddressSpace::new(hbm, 0, 0).unwrap();
+        let mut machine = ScalarMachine::new(Architecture::Dav2201, [0; 32], 0);
+        machine.set_xreg(3, 0x1234_5678_9abc_def0).unwrap();
+        machine.set_xreg(7, 0x100000).unwrap();
+        let mut stepper = ScalarStepper::new(machine, kernel.entry_address());
+        let run = stepper.run_loaded_mapped(&kernel, &mut memory, 2).unwrap();
+        assert_eq!(run.stop, ScalarProgramStop::Halted);
+        let mut actual = [0; 8];
+        ScalarMemoryBus::read(&mut memory, 0x100000, &mut actual).unwrap();
+        assert_eq!(actual, 0x1234_5678_9abc_def0_u64.to_le_bytes());
+        assert_eq!(
+            kernel
+                .fetch_executable_word(memory.hbm_mut(), kernel.entry_address())
+                .unwrap(),
+            0x04c6_7000
+        );
     }
 
     #[test]

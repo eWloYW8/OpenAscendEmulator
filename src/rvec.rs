@@ -2,7 +2,10 @@ use crate::fp32_vector::{
     Fp32LaneOutcome, Fp32MaskLayout, Fp32VectorError, Fp32VectorOperation, Fp32WritebackOutcome,
     Fp32WritebackPolicy, apply_fp32_writeback, evaluate_masked_fp32_lanes,
 };
+use crate::predicate_buffer_c310::C310_PB_SLOT_BYTES;
 use crate::replay_memory::MemoryByteState;
+use crate::rvec_address_c310::C310RvecAddressState;
+use crate::rvec_pb_c310::{C310PbRvecScalarProjection, project_c310_pb_rvec_scalar_init};
 use crate::ub_replay::{UbReplayError, UbReplayMemory};
 use serde::Serialize;
 use thiserror::Error;
@@ -11,12 +14,14 @@ const MAX_ENCODED_V_REGISTERS: usize = 32;
 const MAX_ENCODED_P_REGISTERS: usize = 32;
 const MAX_FP32_WORDS_PER_REGISTER: usize = 64;
 const MAX_PREDICATE_BYTES: usize = 32;
+const C310_SCALAR_REGISTER_COUNT: usize = 96;
 const CAPTURED_VECTOR_LOAD_BYTES: usize = 256;
 
 pub const C310_CAPTURED_VLD_V0_WORD: u32 = 0x0018_0008;
 pub const C310_CAPTURED_VLD_V1_WORD: u32 = 0x0220_0008;
 pub const C310_CAPTURED_VLDI_V0_WORD: u32 = 0x0008_0018;
 pub const C310_CAPTURED_VLDI_V1_WORD: u32 = 0x0210_0018;
+pub const C310_CAPTURED_PSET_WORD: u32 = 0x8204_0155;
 pub const C310_CAPTURED_VDUPS_WORD: u32 = 0x801a_2550;
 pub const C310_CAPTURED_VST_WORD: u32 = 0x4020_0108;
 pub const C310_CAPTURED_SUB_VST_WORD: u32 = 0x4028_0108;
@@ -48,6 +53,27 @@ pub struct C310CapturedPltStep {
     pub lane_limit: usize,
     pub remaining_scalar_value: u32,
     pub predicate_bytes: [u8; MAX_PREDICATE_BYTES],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct C310CapturedPsetStep {
+    pub pc: u64,
+    pub word: u32,
+    pub vendor_isa_name: u16,
+    pub destination_p_register: u8,
+    pub predicate_bytes: [u8; MAX_PREDICATE_BYTES],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum C310CapturedPsetError {
+    #[error("C310 PSET word {word:#010x} at PC {pc:#x} is outside the captured path")]
+    UnsupportedWord { pc: u64, word: u32 },
+    #[error("C310 captured PSET requires a P-register bank")]
+    MissingPredicateBank,
+    #[error("C310 captured PSET requires P1 in the bank of {count}")]
+    MissingP1 { count: usize },
+    #[error("C310 captured PSET requires a 32-byte P1, got {actual} bytes")]
+    PredicateWidth { actual: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -111,23 +137,25 @@ pub enum C310CapturedVectorError {
 pub struct C310CapturedVectorLoadHint {
     pub vendor_isa_name: u16,
     pub destination_v_register: u8,
-    pub source_x_register: u8,
+    pub source_s_register: u8,
+    pub source_a_register: Option<u8>,
     pub byte_count: usize,
 }
 
 impl C310CapturedVectorLoadHint {
     pub const fn from_word(word: u32) -> Option<Self> {
-        let (destination_v_register, vendor_isa_name) = match word {
-            C310_CAPTURED_VLD_V0_WORD => (0, 282),
-            C310_CAPTURED_VLD_V1_WORD => (1, 282),
-            C310_CAPTURED_VLDI_V0_WORD => (0, 284),
-            C310_CAPTURED_VLDI_V1_WORD => (1, 284),
+        let (destination_v_register, vendor_isa_name, source_a_register) = match word {
+            C310_CAPTURED_VLD_V0_WORD => (0, 282, Some(0)),
+            C310_CAPTURED_VLD_V1_WORD => (1, 282, Some(0)),
+            C310_CAPTURED_VLDI_V0_WORD => (0, 284, None),
+            C310_CAPTURED_VLDI_V1_WORD => (1, 284, None),
             _ => return None,
         };
         Some(Self {
             vendor_isa_name,
             destination_v_register,
-            source_x_register: ((word >> 17) & 0x1f) as u8,
+            source_s_register: ((word >> 18) & 0x0f) as u8,
+            source_a_register,
             byte_count: CAPTURED_VECTOR_LOAD_BYTES,
         })
     }
@@ -142,6 +170,15 @@ pub struct C310CapturedVectorLoadStep {
     pub loaded_bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct C310CapturedVectorLoadAddress {
+    pub source_s_register: u8,
+    pub source_scalar_low: u32,
+    pub source_scalar_high: u32,
+    pub address_a0: Option<u32>,
+    pub effective_address: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum C310CapturedVectorLoadError {
     #[error(
@@ -154,6 +191,10 @@ pub enum C310CapturedVectorLoadError {
     RegisterWidth { actual: usize },
     #[error("C310 vector load destination V-register {index} is outside the bank of {count}")]
     RegisterIndex { index: usize, count: usize },
+    #[error("C310 vector load requires scalar register S{index}")]
+    MissingScalar { index: u8 },
+    #[error("C310 vector load requires address register A0")]
+    MissingAddressA0,
     #[error(transparent)]
     Ub(#[from] UbReplayError),
 }
@@ -193,6 +234,8 @@ impl C310ObservedMovemaskHint {
             0x15c0_0033 => (0, C310_MASK1_SPR_INDEX),
             0x15c0_0013 => (0, C310_MASK0_SPR_INDEX),
             0x15c3_0033 => (3, C310_MASK1_SPR_INDEX),
+            0x15c9_0033 => (9, C310_MASK1_SPR_INDEX),
+            0x15c9_0013 => (9, C310_MASK0_SPR_INDEX),
             0x15cd_0013 => (13, C310_MASK0_SPR_INDEX),
             _ => return None,
         };
@@ -400,6 +443,7 @@ impl C310RvecVstiHint {
 pub enum C310RvecArithmeticOperation {
     Add,
     Subtract,
+    Multiply,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -415,14 +459,16 @@ pub struct C310RvecArithmeticHint {
 
 impl C310RvecArithmeticHint {
     pub const fn from_word(word: u32) -> Option<Self> {
-        if (word >> 30) != 2 || (word >> 19) & 1 != 1 || (word >> 6) & 1 != 0 {
+        if (word >> 30) != 2 {
             return None;
         }
-        let (operation, vendor_isa_name) = match word & 0x3f {
-            0 => (C310RvecArithmeticOperation::Add, 319),
-            1 => (C310RvecArithmeticOperation::Subtract, 320),
-            _ => return None,
-        };
+        let (operation, vendor_isa_name) =
+            match (((word >> 19) & 1), ((word >> 6) & 1), word & 0x3f) {
+                (1, 0, 0) => (C310RvecArithmeticOperation::Add, 319),
+                (1, 0, 1) => (C310RvecArithmeticOperation::Subtract, 320),
+                (0, 1, 0) => (C310RvecArithmeticOperation::Multiply, 378),
+                _ => return None,
+            };
         Some(Self {
             operation,
             vendor_isa_name,
@@ -450,6 +496,7 @@ impl C310RvecArithmeticHint {
         let operation = match self.operation {
             C310RvecArithmeticOperation::Add => Fp32VectorOperation::Add,
             C310RvecArithmeticOperation::Subtract => Fp32VectorOperation::Subtract,
+            C310RvecArithmeticOperation::Multiply => Fp32VectorOperation::Multiply,
         };
         evaluate_masked_fp32_lanes(
             operation,
@@ -465,7 +512,7 @@ impl C310RvecArithmeticHint {
 pub struct C310RvecValueMachine {
     vector_registers: Vec<Vec<u32>>,
     predicate_registers: Option<Vec<Vec<u8>>>,
-    captured_s65: Option<u32>,
+    scalar_registers: Vec<Option<u32>>,
     words_per_register: usize,
 }
 
@@ -555,7 +602,7 @@ impl C310RvecValueMachine {
         Ok(Self {
             vector_registers,
             predicate_registers: None,
-            captured_s65: None,
+            scalar_registers: vec![None; C310_SCALAR_REGISTER_COUNT],
             words_per_register,
         })
     }
@@ -593,7 +640,22 @@ impl C310RvecValueMachine {
     }
 
     pub fn captured_s65(&self) -> Option<u32> {
-        self.captured_s65
+        self.scalar_register(65)
+    }
+
+    pub fn scalar_register(&self, index: usize) -> Option<u32> {
+        self.scalar_registers.get(index).copied().flatten()
+    }
+
+    pub fn apply_pb_scalar_init(
+        &mut self,
+        slot: &[u8; C310_PB_SLOT_BYTES],
+    ) -> C310PbRvecScalarProjection {
+        let projection = project_c310_pb_rvec_scalar_init(slot);
+        for write in &projection.writes {
+            self.scalar_registers[usize::from(write.register_index)] = Some(write.value);
+        }
+        projection
     }
 
     pub fn execute_captured_smovi_word(
@@ -606,7 +668,7 @@ impl C310RvecValueMachine {
         }
         let value = (word >> 9) & 0xffff;
         let destination_s_register = 64 + ((word >> 25) & 0x1f) as u8;
-        let prior_value = self.captured_s65.replace(value);
+        let prior_value = self.scalar_registers[usize::from(destination_s_register)].replace(value);
         Ok(C310CapturedSmoviStep {
             pc,
             word,
@@ -642,9 +704,8 @@ impl C310RvecValueMachine {
                 actual: destination.len(),
             });
         }
-        let scalar_limit = self
-            .captured_s65
-            .ok_or(C310CapturedPltError::MissingScalarLimit)?;
+        let scalar_limit =
+            self.scalar_registers[65].ok_or(C310CapturedPltError::MissingScalarLimit)?;
         let lane_limit = usize::try_from(scalar_limit)
             .unwrap_or(usize::MAX)
             .min(self.words_per_register);
@@ -654,7 +715,7 @@ impl C310RvecValueMachine {
         }
         destination.copy_from_slice(&predicate_bytes);
         let remaining_scalar_value = scalar_limit.saturating_sub(self.words_per_register as u32);
-        self.captured_s65 = Some(remaining_scalar_value);
+        self.scalar_registers[65] = Some(remaining_scalar_value);
         Ok(C310CapturedPltStep {
             pc,
             word,
@@ -662,6 +723,38 @@ impl C310RvecValueMachine {
             destination_p_register: 1,
             lane_limit,
             remaining_scalar_value,
+            predicate_bytes,
+        })
+    }
+
+    pub fn execute_captured_pset_word(
+        &mut self,
+        pc: u64,
+        word: u32,
+    ) -> Result<C310CapturedPsetStep, C310CapturedPsetError> {
+        if word != C310_CAPTURED_PSET_WORD {
+            return Err(C310CapturedPsetError::UnsupportedWord { pc, word });
+        }
+        let predicates = self
+            .predicate_registers
+            .as_mut()
+            .ok_or(C310CapturedPsetError::MissingPredicateBank)?;
+        let count = predicates.len();
+        let destination = predicates
+            .get_mut(1)
+            .ok_or(C310CapturedPsetError::MissingP1 { count })?;
+        if destination.len() != MAX_PREDICATE_BYTES {
+            return Err(C310CapturedPsetError::PredicateWidth {
+                actual: destination.len(),
+            });
+        }
+        let predicate_bytes = [0x11; MAX_PREDICATE_BYTES];
+        destination.copy_from_slice(&predicate_bytes);
+        Ok(C310CapturedPsetStep {
+            pc,
+            word,
+            vendor_isa_name: 408,
+            destination_p_register: 1,
             predicate_bytes,
         })
     }
@@ -777,11 +870,73 @@ impl C310RvecValueMachine {
         &mut self,
         pc: u64,
         word: u32,
-        xregs: &[u64; 32],
+        caller_addresses: &[u64; 32],
         ub: &UbReplayMemory,
     ) -> Result<C310CapturedVectorLoadStep, C310CapturedVectorLoadError> {
         let hint = C310CapturedVectorLoadHint::from_word(word)
             .ok_or(C310CapturedVectorLoadError::UnsupportedWord { pc, word })?;
+        let selector = usize::from(hint.source_s_register) * 2;
+        let source_address = caller_addresses[selector];
+        self.load_captured_vector_at_address(pc, word, hint, source_address, ub)
+    }
+
+    pub fn resolve_captured_vector_load_address(
+        &self,
+        pc: u64,
+        word: u32,
+        address_state: &C310RvecAddressState,
+    ) -> Result<C310CapturedVectorLoadAddress, C310CapturedVectorLoadError> {
+        let hint = C310CapturedVectorLoadHint::from_word(word)
+            .ok_or(C310CapturedVectorLoadError::UnsupportedWord { pc, word })?;
+        let low_index = hint.source_s_register;
+        let high_index = low_index + 1;
+        let low = self
+            .scalar_register(usize::from(low_index))
+            .ok_or(C310CapturedVectorLoadError::MissingScalar { index: low_index })?;
+        let high = self
+            .scalar_register(usize::from(high_index))
+            .ok_or(C310CapturedVectorLoadError::MissingScalar { index: high_index })?;
+        let address_a0 = if hint.source_a_register.is_some() {
+            Some(
+                address_state
+                    .address_a0()
+                    .ok_or(C310CapturedVectorLoadError::MissingAddressA0)?,
+            )
+        } else {
+            None
+        };
+        let base = low | high.wrapping_shl(16);
+        let effective_address = u64::from(base.wrapping_add(address_a0.unwrap_or(0)));
+        Ok(C310CapturedVectorLoadAddress {
+            source_s_register: low_index,
+            source_scalar_low: low,
+            source_scalar_high: high,
+            address_a0,
+            effective_address,
+        })
+    }
+
+    pub fn execute_captured_vector_load_from_scalar_state(
+        &mut self,
+        pc: u64,
+        word: u32,
+        address_state: &C310RvecAddressState,
+        ub: &UbReplayMemory,
+    ) -> Result<C310CapturedVectorLoadStep, C310CapturedVectorLoadError> {
+        let resolved = self.resolve_captured_vector_load_address(pc, word, address_state)?;
+        let hint = C310CapturedVectorLoadHint::from_word(word)
+            .ok_or(C310CapturedVectorLoadError::UnsupportedWord { pc, word })?;
+        self.load_captured_vector_at_address(pc, word, hint, resolved.effective_address, ub)
+    }
+
+    fn load_captured_vector_at_address(
+        &mut self,
+        pc: u64,
+        word: u32,
+        hint: C310CapturedVectorLoadHint,
+        source_address: u64,
+        ub: &UbReplayMemory,
+    ) -> Result<C310CapturedVectorLoadStep, C310CapturedVectorLoadError> {
         let actual = self.words_per_register * 4;
         if actual != hint.byte_count {
             return Err(C310CapturedVectorLoadError::RegisterWidth { actual });
@@ -793,7 +948,6 @@ impl C310RvecValueMachine {
                 count: self.vector_registers.len(),
             });
         }
-        let source_address = xregs[usize::from(hint.source_x_register)];
         let loaded_bytes = ub.read_known(source_address, hint.byte_count)?;
         for (word, bytes) in self.vector_registers[destination]
             .iter_mut()
@@ -1089,7 +1243,8 @@ mod tests {
                 .unwrap();
             assert_eq!(step.hint.vendor_isa_name, 282);
             assert_eq!(step.hint.destination_v_register, destination);
-            assert_eq!(step.hint.source_x_register, source);
+            assert_eq!(step.hint.source_s_register, source / 2);
+            assert_eq!(step.hint.source_a_register, Some(0));
             let start = xregs[source as usize] as usize;
             assert_eq!(step.loaded_bytes, bytes[start..start + 256]);
         }
@@ -1128,6 +1283,139 @@ mod tests {
             })
         );
         assert_eq!(machine, before);
+    }
+
+    #[test]
+    fn captured_loads_resolve_pb_scalars_and_only_vld_uses_a0() {
+        let mut machine = C310RvecValueMachine::from_vector_words(vec![vec![0; 64]; 2]).unwrap();
+        let mut slot = [0_u8; C310_PB_SLOT_BYTES];
+        slot[..4].copy_from_slice(&0x1e_u32.to_le_bytes());
+        for (index, value) in [0x100_u32, 0x80, 0, 0x80].into_iter().enumerate() {
+            let start = 4 + index * 4;
+            slot[start..start + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        machine.apply_pb_scalar_init(&slot);
+        let mut address = C310RvecAddressState::default();
+        address
+            .configure_vag_word(0x10d0_d900, crate::C310_CAPTURED_VAG_WORD)
+            .unwrap();
+        address.start_vloop_i1(&machine).unwrap();
+
+        let bytes = (0..640)
+            .map(|index| (index & 0xff) as u8)
+            .collect::<Vec<_>>();
+        let mut ub = UbReplayMemory::new(640, 640);
+        ub.write_states(
+            0,
+            &bytes
+                .iter()
+                .copied()
+                .map(MemoryByteState::Known)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for (pc, word, expected_s, expected_a, expected_address) in [
+            (0x10d0_db00, C310_CAPTURED_VLDI_V0_WORD, 2, None, 0x100),
+            (0x10d0_db04, C310_CAPTURED_VLDI_V1_WORD, 4, None, 0x80),
+            (0x10d0_d90c, C310_CAPTURED_VLD_V0_WORD, 6, Some(0), 0),
+            (0x10d0_d910, C310_CAPTURED_VLD_V1_WORD, 8, Some(0), 0x80),
+        ] {
+            let resolved = machine
+                .resolve_captured_vector_load_address(pc, word, &address)
+                .unwrap();
+            assert_eq!(resolved.source_s_register, expected_s);
+            assert_eq!(resolved.address_a0, expected_a);
+            assert_eq!(resolved.effective_address, expected_address);
+            let step = machine
+                .execute_captured_vector_load_from_scalar_state(pc, word, &address, &ub)
+                .unwrap();
+            assert_eq!(step.source_address, expected_address);
+            assert_eq!(step.loaded_bytes, bytes[expected_address as usize..][..256]);
+        }
+
+        address.update_i1(1, &machine).unwrap();
+        let vld = machine
+            .execute_captured_vector_load_from_scalar_state(
+                0x10d0_d910,
+                C310_CAPTURED_VLD_V1_WORD,
+                &address,
+                &ub,
+            )
+            .unwrap();
+        assert_eq!(vld.source_address, 0x180);
+        let vldi = machine
+            .execute_captured_vector_load_from_scalar_state(
+                0x10d0_db04,
+                C310_CAPTURED_VLDI_V1_WORD,
+                &address,
+                &ub,
+            )
+            .unwrap();
+        assert_eq!(vldi.source_address, 0x80);
+    }
+
+    #[test]
+    fn scalar_resolved_loads_fail_closed_before_touching_vector_state() {
+        let mut machine = C310RvecValueMachine::from_vector_words(vec![vec![9; 64]; 2]).unwrap();
+        let address = C310RvecAddressState::default();
+        let ub = UbReplayMemory::new(256, 256);
+        let before = machine.clone();
+        assert_eq!(
+            machine.execute_captured_vector_load_from_scalar_state(
+                0x10d0_db00,
+                C310_CAPTURED_VLDI_V0_WORD,
+                &address,
+                &ub,
+            ),
+            Err(C310CapturedVectorLoadError::MissingScalar { index: 2 })
+        );
+        assert_eq!(machine, before);
+
+        let mut slot = [0_u8; C310_PB_SLOT_BYTES];
+        slot[..4].copy_from_slice(&(1_u32 << 3).to_le_bytes());
+        machine.apply_pb_scalar_init(&slot);
+        let before = machine.clone();
+        assert_eq!(
+            machine.execute_captured_vector_load_from_scalar_state(
+                0x10d0_d90c,
+                C310_CAPTURED_VLD_V0_WORD,
+                &address,
+                &ub,
+            ),
+            Err(C310CapturedVectorLoadError::MissingAddressA0)
+        );
+        assert_eq!(machine, before);
+    }
+
+    #[test]
+    fn scalar_resolved_loads_combine_high_halves_and_wrap_with_a0() {
+        let mut machine = C310RvecValueMachine::from_vector_words(vec![vec![0; 64]; 2]).unwrap();
+        let mut slot = [0_u8; C310_PB_SLOT_BYTES];
+        slot[..4].copy_from_slice(&((1_u32 << 1) | (1_u32 << 3)).to_le_bytes());
+        slot[4..8].copy_from_slice(&0x0001_2345_u32.to_le_bytes());
+        slot[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        machine.apply_pb_scalar_init(&slot);
+        let mut address = C310RvecAddressState::default();
+        address
+            .configure_vag_word(0x10d0_d900, crate::C310_CAPTURED_VAG_WORD)
+            .unwrap();
+        address.update_i1(2, &machine).unwrap();
+
+        let immediate = machine
+            .resolve_captured_vector_load_address(0x10d0_db00, C310_CAPTURED_VLDI_V0_WORD, &address)
+            .unwrap();
+        assert_eq!(immediate.source_scalar_low, 0x2345);
+        assert_eq!(immediate.source_scalar_high, 1);
+        assert_eq!(immediate.address_a0, None);
+        assert_eq!(immediate.effective_address, 0x1_2345);
+
+        let normal = machine
+            .resolve_captured_vector_load_address(0x10d0_d90c, C310_CAPTURED_VLD_V0_WORD, &address)
+            .unwrap();
+        assert_eq!(normal.source_scalar_low, 0xffff);
+        assert_eq!(normal.source_scalar_high, 0xffff);
+        assert_eq!(normal.address_a0, Some(0x2_468a));
+        assert_eq!(normal.effective_address, 0x2_4689);
     }
 
     #[test]
@@ -1211,6 +1499,46 @@ mod tests {
             missing.execute_captured_plt32_word(0x10d0_d914, C310_CAPTURED_PLT32_WORD),
             Err(C310CapturedPltError::MissingP1 { count: 1 })
         );
+    }
+
+    #[test]
+    fn pb_scalar_init_preserves_unwritten_registers_and_feeds_vector_steps() {
+        let mut machine = C310RvecValueMachine::from_vector_and_predicate_bytes(
+            vec![vec![0; 64]],
+            vec![vec![0; 32], vec![0; 32]],
+        )
+        .unwrap();
+        let mut slot = [0_u8; C310_PB_SLOT_BYTES];
+        slot[..4].copy_from_slice(&((1_u32 << 1) | (1_u32 << 3)).to_le_bytes());
+        slot[4..8].copy_from_slice(&0x0000_0100_u32.to_le_bytes());
+        slot[8..12].copy_from_slice(&0x7654_3210_u32.to_le_bytes());
+        let projection = machine.apply_pb_scalar_init(&slot);
+        assert_eq!(projection.consumed_payload_words, 2);
+        assert_eq!(machine.scalar_register(2), Some(0x100));
+        assert_eq!(machine.scalar_register(3), Some(0));
+        assert_eq!(machine.scalar_register(65), Some(0x100));
+        assert_eq!(machine.scalar_register(6), Some(0x3210));
+        assert_eq!(machine.scalar_register(67), Some(0x7654_3210));
+        assert_eq!(machine.scalar_register(4), None);
+        assert_eq!(machine.scalar_register(C310_SCALAR_REGISTER_COUNT), None);
+
+        slot[..4].copy_from_slice(&(1_u32 << 3).to_le_bytes());
+        slot[4..8].copy_from_slice(&0x89ab_cdef_u32.to_le_bytes());
+        machine.apply_pb_scalar_init(&slot);
+        assert_eq!(machine.scalar_register(2), Some(0x100));
+        assert_eq!(machine.scalar_register(65), Some(0x100));
+        assert_eq!(machine.scalar_register(67), Some(0x89ab_cdef));
+
+        let smovi = machine
+            .execute_captured_smovi_word(0x10d0_d904, C310_CAPTURED_SMOVI32_WORD)
+            .unwrap();
+        assert_eq!(smovi.prior_value, Some(0x100));
+        assert_eq!(machine.scalar_register(65), Some(32));
+        machine
+            .execute_captured_plt32_word(0x10d0_d914, C310_CAPTURED_PLT32_WORD)
+            .unwrap();
+        assert_eq!(machine.scalar_register(65), Some(0));
+        assert_eq!(machine.scalar_register(67), Some(0x89ab_cdef));
     }
 
     #[test]
@@ -1299,7 +1627,8 @@ mod tests {
                 .unwrap();
             assert_eq!(step.hint.vendor_isa_name, 284);
             assert_eq!(step.hint.destination_v_register, destination);
-            assert_eq!(step.hint.source_x_register, source);
+            assert_eq!(step.hint.source_s_register, source / 2);
+            assert_eq!(step.hint.source_a_register, None);
             assert_eq!(step.source_address, xregs[source as usize]);
             assert_eq!(step.loaded_bytes, expected);
             assert_eq!(
@@ -1372,12 +1701,15 @@ mod tests {
     fn observed_c310_movemask_words_transfer_live_source_x_values_to_mask_sprs() {
         let mut xregs = [0_u64; 32];
         xregs[0] = u64::MAX;
+        xregs[9] = 0x8000_0000_0000_0001;
         xregs[13] = 0x5555_5555;
         let mut sprs = C310RvecMaskSprState::default();
         for (pc, word, source, destination, value) in [
             (0x10d0_d130, 0x15c0_0033, 0, 153, u64::MAX),
             (0x10d0_d134, 0x15c0_0013, 0, 152, u64::MAX),
             (0x10d0_d54c, 0x15c3_0033, 3, 153, 0),
+            (0x10d0_d560, 0x15c9_0033, 9, 153, 0x8000_0000_0000_0001),
+            (0x10d0_d564, 0x15c9_0013, 9, 152, 0x8000_0000_0000_0001),
             (0x10d0_d55c, 0x15cd_0013, 13, 152, 0x5555_5555),
         ] {
             let step = sprs
@@ -1389,7 +1721,7 @@ mod tests {
             assert_eq!(step.value, value);
         }
         assert_eq!(sprs.mask0, 0x5555_5555);
-        assert_eq!(sprs.mask1, 0);
+        assert_eq!(sprs.mask1, 0x8000_0000_0000_0001);
         let before = sprs;
         assert_eq!(
             sprs.execute_observed_movemask_word(0x10d0_d55c, 0x15ce_0013, &xregs),
@@ -1679,6 +2011,34 @@ mod tests {
         assert_eq!(add.dtype_selector, 7);
         assert!(add.has_fp32_value_path());
         assert!(subtract.has_fp32_value_path());
+    }
+
+    #[test]
+    fn multiply_word_selects_predicated_fp32_lane_path() {
+        let word = 0x8000_27c0;
+        let hint = C310RvecArithmeticHint::from_word(word).unwrap();
+        assert_eq!(hint.operation, C310RvecArithmeticOperation::Multiply);
+        assert_eq!(hint.vendor_isa_name, 378);
+        assert_eq!(hint.destination_v_register, 0);
+        assert_eq!(hint.first_source_v_register, 0);
+        assert_eq!(hint.second_source_v_register, 1);
+        assert_eq!(hint.predicate_register, 1);
+        assert!(hint.has_fp32_value_path());
+        let mut machine = C310RvecValueMachine::from_vector_and_predicate_bytes(
+            vec![
+                vec![2.0_f32.to_bits(), 0],
+                vec![3.0_f32.to_bits(), f32::INFINITY.to_bits()],
+            ],
+            vec![vec![0; 32], vec![0x11, 0, 0, 0]],
+        )
+        .unwrap();
+        let step = machine
+            .execute_fp32_word_from_predicate_registers(word)
+            .unwrap();
+        assert_eq!(step.writeback.words, [6.0_f32.to_bits(), 0x7fff_ffff]);
+        for wrong in [word ^ (1 << 6), word ^ (1 << 19), word | 1] {
+            assert_eq!(C310RvecArithmeticHint::from_word(wrong), None);
+        }
     }
 
     #[test]

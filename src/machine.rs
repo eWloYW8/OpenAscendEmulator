@@ -855,6 +855,7 @@ impl ScalarMachine {
         };
         let mask = match (self.architecture, encoded_destination_spr) {
             (Architecture::Dav2201, 3) | (Architecture::Dav3510, 3 | 105 | 112) => u64::MAX,
+            (Architecture::Dav3510, 11) => 1,
             (Architecture::Dav3510, 90) => 0xff,
             _ => return Err(ScalarMachineError::UnsupportedWord { pc, word }),
         };
@@ -3032,11 +3033,12 @@ mod tests {
     }
 
     #[test]
-    fn observed_c310_mov_spr_xn_applies_spr90_mask() {
+    fn observed_c310_mov_spr_xn_applies_register_masks() {
         let mut machine = ScalarMachine::new(Architecture::Dav3510, [0; 32], 0x55);
         machine.set_xreg(0, 0x1234_5678_9abc_def0).unwrap();
         for (word, destination, expected) in [
             (0x0206_0900, 3, 0x1234_5678_9abc_def0),
+            (0x0216_0900, 11, 0),
             (0x02b4_0900, 90, 0xf0),
             (0x02d2_0900, 105, 0x1234_5678_9abc_def0),
             (0x02e0_0900, 112, 0x1234_5678_9abc_def0),
@@ -3046,6 +3048,11 @@ mod tests {
             assert_eq!(step.value, expected);
             assert_eq!(machine.spr_value(destination), Some(expected));
         }
+        machine.set_xreg(0, 0x1234_5678_9abc_def1).unwrap();
+        let predicate = machine.execute_spr_word(0x10d0_d144, 0x0216_0900).unwrap();
+        assert_eq!(predicate.source_value, 0x1234_5678_9abc_def1);
+        assert_eq!(predicate.value, 1);
+        assert_eq!(machine.spr_value(11), Some(1));
         assert_eq!(machine.spr2(), 0x55);
     }
 

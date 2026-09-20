@@ -188,7 +188,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn instruction_fields_follow_the_vendor_offsets() {
+    fn instruction_fields_have_stable_offsets() {
         let mut payload = [0_u8; INSTRUCTION_LOG_PAYLOAD_BYTES];
         payload[0..8].copy_from_slice(&1290_u64.to_le_bytes());
         payload[8..16].copy_from_slice(&0x10d0d000_u64.to_le_bytes());

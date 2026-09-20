@@ -14,6 +14,8 @@ pub const C220_CAPTURED_MOVEV_CONTROL: u64 = 0x0100_0008_0001_0001;
 pub const C220_CAPTURED_VADD_WORD: u32 = 0x85e0_d720;
 pub const C220_CAPTURED_VADD_CONTROL: u64 = 0x0100_0808_0801_0101;
 pub const C220_CAPTURED_VSUB_WORD: u32 = 0x85dc_b619;
+pub const C220_CAPTURED_VMUL_WORD: u32 = 0x89dc_b618;
+pub const C220_CAPTURED_VMUL_CONTROL: u64 = C220_CAPTURED_VADD_CONTROL;
 const C220_COUNT_MASK_CONTROL: u64 = 1 << 56;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -65,6 +67,8 @@ pub enum C220CapturedVectorError {
     },
     #[error("C220 VADD control {control:#x} is outside the supported FP32 tile layout")]
     UnsupportedVaddControl { control: u64 },
+    #[error("C220 VMUL control {control:#x} is outside the supported FP32 tile layout")]
+    UnsupportedVmulControl { control: u64 },
     #[error(
         "C220 VADD requires the observed alternating mask, got CTRL={ctrl:?}, mask0={mask0:?}, mask1={mask1:?}"
     )]
@@ -77,6 +81,14 @@ pub enum C220CapturedVectorError {
         "C220 VSUB requires the observed count mask, got CTRL={ctrl:?}, mask0={mask0:?}, mask1={mask1:?}"
     )]
     UnsupportedVsubMask {
+        ctrl: Option<u64>,
+        mask0: Option<u64>,
+        mask1: Option<u64>,
+    },
+    #[error(
+        "C220 VMUL requires the observed count mask, got CTRL={ctrl:?}, mask0={mask0:?}, mask1={mask1:?}"
+    )]
+    UnsupportedVmulMask {
         ctrl: Option<u64>,
         mask0: Option<u64>,
         mask1: Option<u64>,
@@ -150,7 +162,10 @@ pub fn execute_captured_c220_fp32_to_ub(
     active_mask: &[u64; 4],
     ub: &mut UbReplayMemory,
 ) -> Result<C220CapturedFp32Step, C220CapturedVectorError> {
-    if !matches!(word, C220_CAPTURED_VADD_WORD | C220_CAPTURED_VSUB_WORD) {
+    if !matches!(
+        word,
+        C220_CAPTURED_VADD_WORD | C220_CAPTURED_VSUB_WORD | C220_CAPTURED_VMUL_WORD
+    ) {
         return Err(C220CapturedVectorError::UnsupportedWord { pc, word });
     }
     let hint = C220VecArithmeticHint::from_word(word)
@@ -230,6 +245,7 @@ impl C220MovemaskHint {
 pub enum C220VecArithmeticOperation {
     Add,
     Subtract,
+    Multiply,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -246,12 +262,13 @@ pub struct C220VecArithmeticHint {
 
 impl C220VecArithmeticHint {
     pub const fn from_word(word: u32) -> Option<Self> {
-        if (word >> 29) != 4 || ((word >> 25) & 0xf) != 2 {
+        if (word >> 29) != 4 {
             return None;
         }
-        let (operation, vendor_isa_name) = match word & 3 {
-            0 => (C220VecArithmeticOperation::Add, 189),
-            1 => (C220VecArithmeticOperation::Subtract, 190),
+        let (operation, vendor_isa_name) = match (((word >> 25) & 0xf), word & 3) {
+            (2, 0) => (C220VecArithmeticOperation::Add, 189),
+            (2, 1) => (C220VecArithmeticOperation::Subtract, 190),
+            (4, 0) => (C220VecArithmeticOperation::Multiply, 194),
             _ => return None,
         };
         let dtype_selector = ((word >> 22) & 3) as u8;
@@ -289,6 +306,7 @@ impl C220VecArithmeticHint {
         let operation = match self.operation {
             C220VecArithmeticOperation::Add => Fp32VectorOperation::Add,
             C220VecArithmeticOperation::Subtract => Fp32VectorOperation::Subtract,
+            C220VecArithmeticOperation::Multiply => Fp32VectorOperation::Multiply,
         };
         evaluate_masked_fp32_lanes(
             operation,
@@ -367,6 +385,31 @@ mod tests {
         assert_eq!(add.vendor_dtype_code, 14);
         assert!(add.has_fp32_value_path());
         assert!(subtract.has_fp32_value_path());
+    }
+
+    #[test]
+    fn multiply_word_selects_fp32_lane_path() {
+        let hint = C220VecArithmeticHint::from_word(C220_CAPTURED_VMUL_WORD).unwrap();
+        assert_eq!(hint.operation, C220VecArithmeticOperation::Multiply);
+        assert_eq!(hint.vendor_isa_name, 194);
+        assert_eq!(hint.x_register_index_0, 14);
+        assert_eq!(hint.x_register_index_4, 11);
+        assert_eq!(hint.x_register_index_6, 12);
+        assert_eq!(hint.x_register_index_8, 6);
+        assert!(hint.has_fp32_value_path());
+        let first = [2.0_f32.to_bits(), 0];
+        let second = [3.0_f32.to_bits(), f32::INFINITY.to_bits()];
+        let lanes = hint
+            .evaluate_fp32_lanes(&first, &second, &[3, 0, 0, 0])
+            .unwrap();
+        assert_eq!(lanes[0].bits, 6.0_f32.to_bits());
+        assert_eq!(lanes[1].bits, 0x7fff_ffff);
+        for wrong in [
+            C220_CAPTURED_VMUL_WORD ^ (1 << 25),
+            C220_CAPTURED_VMUL_WORD | 1,
+        ] {
+            assert_eq!(C220VecArithmeticHint::from_word(wrong), None);
+        }
     }
 
     #[test]

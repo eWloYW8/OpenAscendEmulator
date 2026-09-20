@@ -1,8 +1,10 @@
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::rvec::{C310_CAPTURED_PLT32_WORD, C310_CAPTURED_SMOVI32_WORD};
 use crate::{
-    Architecture, C310RvecValueError, C310RvecValueMachine, C310RvecVstiStore, PvMemory,
+    Architecture, C310CapturedPltError, C310CapturedPltStep, C310CapturedSmoviError,
+    C310CapturedSmoviStep, C310RvecValueError, C310RvecValueMachine, C310RvecVstiStore, PvMemory,
     PvMemoryError, c310_normal_u32_masked_store,
 };
 
@@ -14,16 +16,6 @@ pub const C310_CAPTURED_SUB_MTE2_Y_WORD: u32 = 0x74b3_6bae;
 pub const C310_CAPTURED_SUB_VSUB_WORD: u32 = 0x8008_2781;
 pub const C310_CAPTURED_SUB_VST_WORD: u32 = crate::rvec::C310_CAPTURED_SUB_VST_WORD;
 pub const C310_CAPTURED_SUB_MTE3_WORD: u32 = 0x74e1_192c;
-const fn observed_p1() -> [u8; 32] {
-    let mut image = [0_u8; 32];
-    let mut index = 0;
-    while index < 16 {
-        image[index] = 0x11;
-        index += 1;
-    }
-    image
-}
-pub const C310_CAPTURED_SUB_P1: [u8; 32] = observed_p1();
 const LOCAL_DESTINATION: u64 = 0x100;
 const VLD_BYTES: usize = 256;
 const WORDS_PER_TILE: usize = C310_CAPTURED_SUB_TILE_BYTES / 4;
@@ -51,6 +43,8 @@ pub struct C310CapturedSubTile {
     pub mte2_y: C310CapturedSubInputChunk,
     pub vld_x: Vec<u8>,
     pub vld_y: Vec<u8>,
+    pub smovi: C310CapturedSmoviStep,
+    pub plt: C310CapturedPltStep,
     pub vsub_source_4: Vec<u8>,
     pub vsub_source_6: Vec<u8>,
     pub vsub_v0: Vec<u8>,
@@ -75,10 +69,6 @@ pub enum C310CapturedSubError {
         "captured C310 Sub expects two {C310_CAPTURED_SUB_BYTES}-byte inputs; got X={x}, Y={y}"
     )]
     InputLengths { x: usize, y: usize },
-    #[error("captured C310 Sub P1 must contain exactly 32 bytes; got {actual}")]
-    PredicateLength { actual: usize },
-    #[error("captured C310 Sub P1 differs from the verified live image")]
-    PredicateImage,
     #[error("captured C310 VST produced {actual} writes, expected {WORDS_PER_TILE}")]
     StoreCount { actual: usize },
     #[error("captured C310 VST active-lane footprint differs from lanes 0..31")]
@@ -87,6 +77,10 @@ pub enum C310CapturedSubError {
     Memory(#[from] PvMemoryError),
     #[error(transparent)]
     Rvec(#[from] C310RvecValueError),
+    #[error(transparent)]
+    Smovi(#[from] C310CapturedSmoviError),
+    #[error(transparent)]
+    Plt(#[from] C310CapturedPltError),
 }
 
 fn words(bytes: &[u8]) -> Vec<u32> {
@@ -100,22 +94,11 @@ fn bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
-fn validate_p1(p1: &[u8]) -> Result<(), C310CapturedSubError> {
-    if p1.len() != 32 {
-        return Err(C310CapturedSubError::PredicateLength { actual: p1.len() });
-    }
-    if p1 != C310_CAPTURED_SUB_P1 {
-        return Err(C310CapturedSubError::PredicateImage);
-    }
-    Ok(())
-}
-
 fn execute_tile(
     group: usize,
     x: &[u8],
     y: &[u8],
     prior_destination: &[u8],
-    p1: &[u8],
 ) -> Result<C310CapturedSubTile, C310CapturedSubError> {
     let mut local = PvMemory::new(Architecture::Dav3510, 0, 1);
     let mte2_x = C310CapturedSubInputChunk {
@@ -141,8 +124,10 @@ fn execute_tile(
 
     let mut rvec = C310RvecValueMachine::from_vector_and_predicate_bytes(
         vec![words(&vld_x), words(&vld_y)],
-        vec![vec![0; 32], p1.to_vec()],
+        vec![vec![0; 32], vec![0; 32]],
     )?;
+    let smovi = rvec.execute_captured_smovi_word(0x10d0_d904, C310_CAPTURED_SMOVI32_WORD)?;
+    let plt = rvec.execute_captured_plt32_word(0x10d0_d914, C310_CAPTURED_PLT32_WORD)?;
     let step = rvec.execute_fp32_word_from_predicate_registers(C310_CAPTURED_SUB_VSUB_WORD)?;
     let vsub_source_4 = bytes(&step.first_source);
     let vsub_source_6 = bytes(&step.second_source);
@@ -150,7 +135,11 @@ fn execute_tile(
 
     let mut previous_bytes = [0_u8; VLD_BYTES];
     local.read_into(LOCAL_DESTINATION, &mut previous_bytes)?;
-    let stored = c310_normal_u32_masked_store(&words(&previous_bytes), &words(&vsub_v0), p1)?;
+    let stored = c310_normal_u32_masked_store(
+        &words(&previous_bytes),
+        &words(&vsub_v0),
+        &plt.predicate_bytes,
+    )?;
     if stored
         .written
         .iter()
@@ -192,6 +181,8 @@ fn execute_tile(
         mte2_y,
         vld_x,
         vld_y,
+        smovi,
+        plt,
         vsub_source_4,
         vsub_source_6,
         vsub_v0,
@@ -205,7 +196,6 @@ pub fn execute_captured_c310_sub(
     x: &[u8],
     y: &[u8],
     prior_destination: &[u8],
-    p1: &[u8],
 ) -> Result<C310CapturedSubRun, C310CapturedSubError> {
     if x.len() != C310_CAPTURED_SUB_BYTES
         || y.len() != C310_CAPTURED_SUB_BYTES
@@ -217,7 +207,6 @@ pub fn execute_captured_c310_sub(
             prior: prior_destination.len(),
         });
     }
-    validate_p1(p1)?;
     let mut tiles = Vec::with_capacity(C310_CAPTURED_SUB_TILES);
     let mut output = vec![0; C310_CAPTURED_SUB_BYTES];
     for group in 0..C310_CAPTURED_SUB_TILES {
@@ -228,7 +217,6 @@ pub fn execute_captured_c310_sub(
             &x[range.clone()],
             &y[range.clone()],
             &prior_destination[range.clone()],
-            p1,
         )?;
         output[range].copy_from_slice(&tile.output);
         tiles.push(tile);
@@ -239,7 +227,6 @@ pub fn execute_captured_c310_sub(
 pub fn execute_captured_c310_sub_predecessor_chains(
     x: &[u8],
     y: &[u8],
-    p1: &[u8],
 ) -> Result<C310CapturedSubRun, C310CapturedSubError> {
     if x.len() != C310_CAPTURED_SUB_BYTES || y.len() != C310_CAPTURED_SUB_BYTES {
         return Err(C310CapturedSubError::InputLengths {
@@ -247,7 +234,6 @@ pub fn execute_captured_c310_sub_predecessor_chains(
             y: y.len(),
         });
     }
-    validate_p1(p1)?;
     let mut tiles = Vec::with_capacity(C310_CAPTURED_SUB_TILES);
     let mut output = vec![0; C310_CAPTURED_SUB_BYTES];
     for group in 0..C310_CAPTURED_SUB_TILES {
@@ -259,7 +245,7 @@ pub fn execute_captured_c310_sub_predecessor_chains(
             output[(group - 1) * C310_CAPTURED_SUB_TILE_BYTES..group * C310_CAPTURED_SUB_TILE_BYTES]
                 .to_vec()
         };
-        let tile = execute_tile(group, &x[range.clone()], &y[range.clone()], &prior, p1)?;
+        let tile = execute_tile(group, &x[range.clone()], &y[range.clone()], &prior)?;
         output[range].copy_from_slice(&tile.output);
         tiles.push(tile);
     }
@@ -282,7 +268,7 @@ mod tests {
         let prior = vec![0x5a; 128];
         let mut p1 = [0_u8; 32];
         p1[..16].fill(0x11);
-        let tile = execute_tile(0, &x, &y, &prior, &p1).unwrap();
+        let tile = execute_tile(0, &x, &y, &prior).unwrap();
         assert_eq!(tile.mte2_x.instruction_word, C310_CAPTURED_SUB_MTE2_X_WORD);
         assert_eq!(tile.mte2_x.source_offset, 0);
         assert_eq!(tile.mte2_x.destination_local, 0);
@@ -295,6 +281,10 @@ mod tests {
         assert_eq!(&tile.vld_x[128..], y);
         assert_eq!(&tile.vld_y[..128], y);
         assert_eq!(&tile.vld_y[128..], prior);
+        assert_eq!(tile.smovi.value, 32);
+        assert_eq!(tile.plt.lane_limit, 32);
+        assert_eq!(tile.plt.remaining_scalar_value, 0);
+        assert_eq!(tile.plt.predicate_bytes, p1);
         assert_eq!(tile.vsub_source_4, tile.vld_x);
         assert_eq!(tile.vsub_source_6, tile.vld_y);
         assert_eq!(tile.vst_stores.len(), 32);
@@ -314,17 +304,9 @@ mod tests {
     }
 
     #[test]
-    fn wrong_shape_or_inactive_predicate_fails_closed() {
+    fn wrong_shape_fails_closed() {
         let tensor = vec![0; C310_CAPTURED_SUB_BYTES];
-        let mut p1 = [0_u8; 32];
-        p1[..16].fill(0x11);
-        assert!(execute_captured_c310_sub(&tensor[..127], &tensor, &tensor, &p1).is_err());
-        assert!(execute_captured_c310_sub(&tensor, &tensor, &tensor, &p1[..16]).is_err());
-        p1[0] = 0;
-        assert!(execute_captured_c310_sub(&tensor, &tensor, &tensor, &p1).is_err());
-        p1[0] = 0x11;
-        p1[16] = 0x11;
-        assert!(execute_captured_c310_sub(&tensor, &tensor, &tensor, &p1).is_err());
+        assert!(execute_captured_c310_sub(&tensor[..127], &tensor, &tensor).is_err());
     }
 
     #[test]
@@ -333,9 +315,7 @@ mod tests {
             .flat_map(|value| (value as f32).to_le_bytes())
             .collect::<Vec<_>>();
         let y = vec![0; C310_CAPTURED_SUB_BYTES];
-        let mut p1 = [0_u8; 32];
-        p1[..16].fill(0x11);
-        let run = execute_captured_c310_sub_predecessor_chains(&x, &y, &p1).unwrap();
+        let run = execute_captured_c310_sub_predecessor_chains(&x, &y).unwrap();
         assert_eq!(&run.tiles[0].vld_y[128..], &[0; 128]);
         assert_eq!(&run.tiles[1].vld_y[128..], run.tiles[0].output);
         assert_eq!(&run.tiles[4].vld_y[128..], &[0; 128]);

@@ -180,6 +180,28 @@ impl ProjectedDeviceKernel<'_> {
     }
 }
 
+#[cfg(test)]
+impl<'a> ProjectedDeviceKernel<'a> {
+    pub(crate) fn from_test_code(bytes: &'a [u8], entry_address: u64) -> Self {
+        Self {
+            summary: DeviceKernelSummary {
+                name: String::from("Kernel"),
+                section: String::from(".text"),
+                section_virtual_address: 0,
+                section_file_offset: 0,
+                section_byte_count: bytes.len() as u64,
+                virtual_address: 0,
+                file_offset: 0,
+                byte_count: bytes.len() as u64,
+            },
+            entry_address,
+            executable_start_address: entry_address,
+            bytes,
+            executable_bytes: bytes,
+        }
+    }
+}
+
 impl DeviceKernel<'_> {
     pub fn words(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
         self.bytes

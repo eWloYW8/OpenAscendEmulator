@@ -14,6 +14,7 @@ const MAX_FP32_LANES: usize = 64;
 pub enum Fp32VectorOperation {
     Add,
     Subtract,
+    Multiply,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -30,6 +31,7 @@ pub struct Fp32ValueStatus {
     pub nan_operand: bool,
     pub infinity_operand: bool,
     pub opposite_infinities: bool,
+    pub zero_times_infinity: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -66,7 +68,7 @@ pub enum Fp32VectorError {
     TooManyLanes { lanes: usize },
     #[error("FP32 destination has {destination} lanes but the result has {results}")]
     DestinationTooSmall { destination: usize, results: usize },
-    #[error("word does not select the verified FP32 VADD/VSUB template")]
+    #[error("word does not select a supported FP32 vector arithmetic path")]
     UnsupportedInstruction,
     #[error("cannot reserve memory for {lanes} FP32 lane results")]
     HostAllocationFailed { lanes: usize },
@@ -77,9 +79,13 @@ pub fn evaluate_fp32_value(
     first_bits: u32,
     second_bits: u32,
 ) -> Fp32ValueOutcome {
+    if operation == Fp32VectorOperation::Multiply {
+        return evaluate_fp32_product(first_bits, second_bits);
+    }
     let second_bits = match operation {
         Fp32VectorOperation::Add => second_bits,
         Fp32VectorOperation::Subtract => second_bits ^ SIGN_BIT,
+        Fp32VectorOperation::Multiply => unreachable!(),
     };
     let first_abs = first_bits & ABS_MASK;
     let second_abs = second_bits & ABS_MASK;
@@ -136,6 +142,41 @@ pub fn evaluate_fp32_value(
         bits = (bits & SIGN_BIT) | MAX_FINITE_BITS;
     }
     Fp32ValueOutcome { bits, status }
+}
+
+fn evaluate_fp32_product(first_bits: u32, second_bits: u32) -> Fp32ValueOutcome {
+    let first_abs = first_bits & ABS_MASK;
+    let second_abs = second_bits & ABS_MASK;
+    let first_infinite = first_abs == INFINITY_BITS;
+    let second_infinite = second_abs == INFINITY_BITS;
+    let mut status = Fp32ValueStatus {
+        nan_operand: first_abs > INFINITY_BITS || second_abs > INFINITY_BITS,
+        infinity_operand: first_infinite || second_infinite,
+        zero_times_infinity: (first_infinite && second_abs == 0)
+            || (second_infinite && first_abs == 0),
+        ..Fp32ValueStatus::default()
+    };
+    if status.nan_operand || status.zero_times_infinity {
+        return Fp32ValueOutcome {
+            bits: CANONICAL_NAN_BITS,
+            status,
+        };
+    }
+    if status.infinity_operand {
+        return Fp32ValueOutcome {
+            bits: ((first_bits ^ second_bits) & SIGN_BIT) | INFINITY_BITS,
+            status,
+        };
+    }
+    let first = f32::from_bits(first_bits);
+    let second = f32::from_bits(second_bits);
+    let product = first * second;
+    status.overflow = product.is_infinite();
+    status.underflow = (first as f64) * (second as f64) != 0.0 && product.abs() < f32::MIN_POSITIVE;
+    Fp32ValueOutcome {
+        bits: product.to_bits(),
+        status,
+    }
 }
 
 pub fn evaluate_masked_fp32_lanes(
@@ -276,6 +317,45 @@ mod tests {
         assert_eq!(evaluate_fp32_value(add, SIGN_BIT, 0).bits, 0);
         assert_eq!(evaluate_fp32_value(sub, 0, 0).bits, 0);
         assert_eq!(evaluate_fp32_value(sub, SIGN_BIT, 0).bits, SIGN_BIT);
+    }
+
+    #[test]
+    fn multiply_canonicalizes_nan_and_preserves_finite_sign_and_rounding() {
+        let multiply = Fp32VectorOperation::Multiply;
+        for (first, second, expected) in [
+            (0, INFINITY_BITS, CANONICAL_NAN_BITS),
+            (SIGN_BIT, SIGN_BIT | INFINITY_BITS, CANONICAL_NAN_BITS),
+            (0x7fc0_1234, 1.0_f32.to_bits(), CANONICAL_NAN_BITS),
+            (0xff80_0001, 0, CANONICAL_NAN_BITS),
+            (
+                SIGN_BIT | INFINITY_BITS,
+                (-2.0_f32).to_bits(),
+                INFINITY_BITS,
+            ),
+            (SIGN_BIT, 2.0_f32.to_bits(), SIGN_BIT),
+            (f32::MAX.to_bits(), 2.0_f32.to_bits(), INFINITY_BITS),
+            (1, 1.0_f32.to_bits(), 1),
+            (0x0080_0000, 0.5_f32.to_bits(), 0x0040_0000),
+            (1, 0.5_f32.to_bits(), 0),
+            (0x3f80_0001, 0x3f7f_ffff, 0x3f80_0000),
+        ] {
+            assert_eq!(evaluate_fp32_value(multiply, first, second).bits, expected);
+        }
+        assert!(
+            evaluate_fp32_value(multiply, 0, INFINITY_BITS)
+                .status
+                .zero_times_infinity
+        );
+        assert!(
+            evaluate_fp32_value(multiply, f32::MAX.to_bits(), 2.0_f32.to_bits())
+                .status
+                .overflow
+        );
+        assert!(
+            evaluate_fp32_value(multiply, 0x0080_0000, 0.5_f32.to_bits())
+                .status
+                .underflow
+        );
     }
 
     #[test]

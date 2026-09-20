@@ -4,10 +4,17 @@ use thiserror::Error;
 use crate::acl_address_space::AclReplayAddressSpace;
 use crate::architecture::Architecture;
 use crate::buffer_c310::C310BufferDisposition;
-use crate::flow::{
-    C310BufferStep, DcciStep, DsbStep, FlagInstruction, FlagOperation, PipelineBarrierStep,
+use crate::c220_scalar_address_space::{
+    C220_UB_BYTES, C220ScalarRoute, classify_c220_scalar_address,
 };
-use crate::machine::{ScalarInstructionError, ScalarMemoryBus};
+use crate::c310_scalar_address_space::{
+    C310_UB_ROUTE_BYTES, C310ScalarRoute, classify_c310_scalar_address,
+};
+use crate::flow::{
+    C310BufferStep, DcciStep, DsbStep, FlagInstruction, FlagOperation, PipelineBarrierScope,
+    PipelineBarrierStep,
+};
+use crate::machine::{ScalarInstructionError, ScalarInstructionStep, ScalarMemoryBus};
 use crate::mte_c220::{
     C220DmaMovDescriptor, C220MovOutToUbDescriptor, C220MovOutToUbError,
     CAPTURED_C220_MOV_OUT_TO_UB_X_WORD, CAPTURED_C220_MOV_OUT_TO_UB_Y_WORD,
@@ -16,9 +23,9 @@ use crate::mte_c220::{
     CAPTURED_C220_SUB_TILING_MOV_OUT_TO_UB_WORD, CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD,
 };
 use crate::mte_c310::{
-    C310_ADD_MOV_ALIGN_X_WORD, C310_ADD_MOV_ALIGN_Y_WORD, C310_TILING_MOV_ALIGN_WORD,
-    C310CapturedMovAlignDecode, C310CapturedMovAlignError, C310MovAlignRegisterSelectors,
-    C310TilingMovAlignRegisters,
+    C310_ADD_MOV_ALIGN_X_WORD, C310_ADD_MOV_ALIGN_Y_WORD, C310_SUB_TILING_MOV_ALIGN_WORD,
+    C310_TILING_MOV_ALIGN_WORD, C310CapturedMovAlignDecode, C310CapturedMovAlignError,
+    C310MovAlignRegisterSelectors,
 };
 use crate::predicate_buffer_c310::{C310PushPbDisposition, C310PushPbStep};
 use crate::replay_memory::MemoryByteState;
@@ -26,9 +33,10 @@ use crate::stepper::{ScalarProgramStep, ScalarStepper};
 use crate::ub_replay::{UbReplayError, UbReplayMemory, UbTransferResult};
 use crate::vec_c220::{
     C220_CAPTURED_MOVEV_CONTROL, C220_CAPTURED_MOVEV_WORD, C220_CAPTURED_VADD_CONTROL,
-    C220_CAPTURED_VADD_WORD, C220_CAPTURED_VSUB_WORD, C220CapturedFp32Step, C220CapturedMovevStep,
-    C220CapturedVectorError, C220VecArithmeticHint, decode_captured_c220_fp32_mask,
-    execute_captured_c220_fp32_to_ub, execute_captured_c220_movev_to_ub,
+    C220_CAPTURED_VADD_WORD, C220_CAPTURED_VMUL_CONTROL, C220_CAPTURED_VMUL_WORD,
+    C220_CAPTURED_VSUB_WORD, C220CapturedFp32Step, C220CapturedMovevStep, C220CapturedVectorError,
+    C220VecArithmeticHint, decode_captured_c220_fp32_mask, execute_captured_c220_fp32_to_ub,
+    execute_captured_c220_movev_to_ub,
 };
 use crate::vec_queue_c310::{C310VfQueueDisposition, C310VfQueueStep};
 
@@ -68,6 +76,10 @@ pub enum UbScalarBusError<E: std::error::Error + 'static> {
         "scalar address range at {address:#x} with {bytes} bytes crosses the UB alias boundary"
     )]
     AliasBoundary { address: u64, bytes: usize },
+    #[error("scalar local-address roots are unavailable")]
+    MissingLocalRoots,
+    #[error("scalar local address {address:#x} is unsupported")]
+    UnsupportedLocal { address: u64 },
     #[error(transparent)]
     Ub(#[from] UbReplayError),
     #[error("scalar memory backend: {0}")]
@@ -77,27 +89,71 @@ pub enum UbScalarBusError<E: std::error::Error + 'static> {
 struct UbScalarBus<'a, B> {
     ub: &'a mut UbReplayMemory,
     fallback: &'a mut B,
+    architecture: Architecture,
+    local_roots: Option<(u64, u64)>,
+}
+
+enum ScalarBusRoute {
+    Fallback(u64),
+    Ub(u64),
 }
 
 impl<B: ScalarMemoryBus> UbScalarBus<'_, B> {
-    fn alias_offset(
+    fn route(
         &self,
         address: u64,
         bytes: usize,
-    ) -> Result<Option<u64>, UbScalarBusError<B::Error>> {
+    ) -> Result<ScalarBusRoute, UbScalarBusError<B::Error>> {
+        if bytes == 0 {
+            return Ok(ScalarBusRoute::Fallback(address));
+        }
         let length = u64::try_from(bytes).map_err(|_| UbScalarBusError::AddressOverflow)?;
         let end = address
             .checked_add(length)
             .ok_or(UbScalarBusError::AddressOverflow)?;
-        let alias_end = SCALAR_UB_ALIAS_BASE + SCALAR_UB_ALIAS_BYTES;
-        if address < SCALAR_UB_ALIAS_BASE && end > SCALAR_UB_ALIAS_BASE
-            || address < alias_end && end > alias_end
-        {
-            return Err(UbScalarBusError::AliasBoundary { address, bytes });
+        let (spr67, spr68) = self
+            .local_roots
+            .ok_or(UbScalarBusError::MissingLocalRoots)?;
+        match self.architecture {
+            Architecture::Dav2201 => {
+                let start = classify_c220_scalar_address(address, spr67, spr68);
+                let last = classify_c220_scalar_address(end - 1, spr67, spr68);
+                match (start, last) {
+                    (C220ScalarRoute::Hbm, C220ScalarRoute::Hbm) => {
+                        Ok(ScalarBusRoute::Fallback(address))
+                    }
+                    (C220ScalarRoute::Ub(offset), C220ScalarRoute::Ub(_))
+                        if length <= C220_UB_BYTES.saturating_sub(offset) =>
+                    {
+                        Ok(ScalarBusRoute::Ub(offset))
+                    }
+                    (C220ScalarRoute::Unsupported, _) => {
+                        Err(UbScalarBusError::UnsupportedLocal { address })
+                    }
+                    _ => Err(UbScalarBusError::AliasBoundary { address, bytes }),
+                }
+            }
+            Architecture::Dav3510 => {
+                let start = classify_c310_scalar_address(address, spr67, spr68);
+                let last = classify_c310_scalar_address(end - 1, spr67, spr68);
+                match (start, last) {
+                    (C310ScalarRoute::Hbm(mapped), C310ScalarRoute::Hbm(last_mapped))
+                        if mapped.checked_add(length - 1) == Some(last_mapped) =>
+                    {
+                        Ok(ScalarBusRoute::Fallback(mapped))
+                    }
+                    (C310ScalarRoute::Ub(offset), C310ScalarRoute::Ub(_))
+                        if length <= C310_UB_ROUTE_BYTES.saturating_sub(offset) =>
+                    {
+                        Ok(ScalarBusRoute::Ub(offset))
+                    }
+                    (C310ScalarRoute::Unsupported, _) => {
+                        Err(UbScalarBusError::UnsupportedLocal { address })
+                    }
+                    _ => Err(UbScalarBusError::AliasBoundary { address, bytes }),
+                }
+            }
         }
-        Ok((SCALAR_UB_ALIAS_BASE..alias_end)
-            .contains(&address)
-            .then_some(address - SCALAR_UB_ALIAS_BASE))
     }
 }
 
@@ -105,29 +161,33 @@ impl<B: ScalarMemoryBus> ScalarMemoryBus for UbScalarBus<'_, B> {
     type Error = UbScalarBusError<B::Error>;
 
     fn read(&mut self, address: u64, destination: &mut [u8]) -> Result<(), Self::Error> {
-        if let Some(offset) = self.alias_offset(address, destination.len())? {
-            destination.copy_from_slice(&self.ub.read_known(offset, destination.len())?);
-            Ok(())
-        } else {
-            self.fallback
-                .read(address, destination)
-                .map_err(UbScalarBusError::Fallback)
+        match self.route(address, destination.len())? {
+            ScalarBusRoute::Ub(offset) => {
+                destination.copy_from_slice(&self.ub.read_known(offset, destination.len())?);
+                Ok(())
+            }
+            ScalarBusRoute::Fallback(mapped) => self
+                .fallback
+                .read(mapped, destination)
+                .map_err(UbScalarBusError::Fallback),
         }
     }
 
     fn write(&mut self, address: u64, source: &[u8]) -> Result<(), Self::Error> {
-        if let Some(offset) = self.alias_offset(address, source.len())? {
-            let states = source
-                .iter()
-                .copied()
-                .map(MemoryByteState::Known)
-                .collect::<Vec<_>>();
-            self.ub.write_states(offset, &states)?;
-            Ok(())
-        } else {
-            self.fallback
-                .write(address, source)
-                .map_err(UbScalarBusError::Fallback)
+        match self.route(address, source.len())? {
+            ScalarBusRoute::Ub(offset) => {
+                let states = source
+                    .iter()
+                    .copied()
+                    .map(MemoryByteState::Known)
+                    .collect::<Vec<_>>();
+                self.ub.write_states(offset, &states)?;
+                Ok(())
+            }
+            ScalarBusRoute::Fallback(mapped) => self
+                .fallback
+                .write(mapped, source)
+                .map_err(UbScalarBusError::Fallback),
         }
     }
 
@@ -324,6 +384,8 @@ pub enum MteStepperError {
     UnsupportedVectorFlagId { flag_id: u32 },
     #[error("MTE2 transfer byte count overflows usize")]
     TransferSizeOverflow,
+    #[error("pipeline barrier at PC {pc:#x} has outstanding modeled work")]
+    BarrierBusy { pc: u64 },
     #[error("C220 output tile was not produced before its flag")]
     OutputNotProduced,
     #[error("C220 output tile is still waiting for a flag")]
@@ -434,14 +496,44 @@ impl MteCoreStepper {
         self.scalar.step_word(word, bus)
     }
 
+    pub fn step_barrier_word(&mut self, word: u32) -> Result<ScalarProgramStep, MteStepperError> {
+        let pc = self.scalar.pc();
+        if self.scalar.is_halted() {
+            return Err(MteStepperError::ProgramEnded { pc });
+        }
+        let architecture = self.scalar.machine().architecture();
+        let barrier = PipelineBarrierStep::decode(architecture, pc, word)
+            .filter(|step| step.scope == PipelineBarrierScope::All)
+            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+        if !self.pending_mte2.is_empty()
+            || self.flag0_set
+            || self.vector_flags.iter().any(Option::is_some)
+            || self.output_buffer_busy()
+            || self.mte2_reuse_flags.iter().any(|set| *set)
+        {
+            return Err(MteStepperError::BarrierBusy { pc });
+        }
+        self.scalar.advance_sequential();
+        Ok(ScalarProgramStep {
+            pc,
+            word,
+            next_pc: self.scalar.pc(),
+            instruction: ScalarInstructionStep::Barrier(barrier),
+            halted_after: false,
+        })
+    }
+
     pub fn step_scalar_word_with_ub<B: ScalarMemoryBus>(
         &mut self,
         word: u32,
         fallback: &mut B,
     ) -> Result<ScalarProgramStep, ScalarInstructionError<UbScalarBusError<B::Error>>> {
+        let machine = self.scalar.machine();
         let mut bus = UbScalarBus {
             ub: &mut self.ub,
             fallback,
+            architecture: machine.architecture(),
+            local_roots: machine.spr_value(67).zip(machine.spr_value(68)),
         };
         self.scalar.step_word(word, &mut bus)
     }
@@ -452,9 +544,12 @@ impl MteCoreStepper {
         second_word: u32,
         fallback: &mut B,
     ) -> Result<ScalarProgramStep, ScalarInstructionError<UbScalarBusError<B::Error>>> {
+        let machine = self.scalar.machine();
         let mut bus = UbScalarBus {
             ub: &mut self.ub,
             fallback,
+            architecture: machine.architecture(),
+            local_roots: machine.spr_value(67).zip(machine.spr_value(68)),
         };
         self.scalar
             .step_c310_vf_words(first_word, second_word, &mut bus)
@@ -657,13 +752,29 @@ impl MteCoreStepper {
         self.step_c220_fp32_word(word)
     }
 
+    pub fn step_c220_vmul_word(
+        &mut self,
+        word: u32,
+    ) -> Result<C220CapturedFp32Step, MteStepperError> {
+        if word != C220_CAPTURED_VMUL_WORD {
+            return Err(MteStepperError::UnsupportedWord {
+                pc: self.scalar.pc(),
+                word,
+            });
+        }
+        self.step_c220_fp32_word(word)
+    }
+
     fn step_c220_fp32_word(&mut self, word: u32) -> Result<C220CapturedFp32Step, MteStepperError> {
         let pc = self.scalar.pc();
         if self.scalar.is_halted() {
             return Err(MteStepperError::ProgramEnded { pc });
         }
         if self.scalar.machine().architecture() != Architecture::Dav2201
-            || !matches!(word, C220_CAPTURED_VADD_WORD | C220_CAPTURED_VSUB_WORD)
+            || !matches!(
+                word,
+                C220_CAPTURED_VADD_WORD | C220_CAPTURED_VSUB_WORD | C220_CAPTURED_VMUL_WORD
+            )
         {
             return Err(MteStepperError::UnsupportedWord { pc, word });
         }
@@ -675,8 +786,19 @@ impl MteCoreStepper {
         let machine = self.scalar.machine();
         let xregs = machine.xregs();
         let control = xregs[usize::from(hint.x_register_index_8)];
-        if control != C220_CAPTURED_VADD_CONTROL {
-            return Err(C220CapturedVectorError::UnsupportedVaddControl { control }.into());
+        let expected_control = if word == C220_CAPTURED_VMUL_WORD {
+            C220_CAPTURED_VMUL_CONTROL
+        } else {
+            C220_CAPTURED_VADD_CONTROL
+        };
+        if control != expected_control {
+            return Err(match word {
+                C220_CAPTURED_VMUL_WORD => {
+                    C220CapturedVectorError::UnsupportedVmulControl { control }
+                }
+                _ => C220CapturedVectorError::UnsupportedVaddControl { control },
+            }
+            .into());
         }
         let ctrl = machine.spr_value(3);
         let mask0 = machine.spr_value(100);
@@ -694,6 +816,13 @@ impl MteCoreStepper {
             {
                 return Err(
                     C220CapturedVectorError::UnsupportedVsubMask { ctrl, mask0, mask1 }.into(),
+                );
+            }
+            C220_CAPTURED_VMUL_WORD
+                if (ctrl, mask0, mask1) != (Some(1 << 56), Some(32), Some(0)) =>
+            {
+                return Err(
+                    C220CapturedVectorError::UnsupportedVmulMask { ctrl, mask0, mask1 }.into(),
                 );
             }
             _ => {}
@@ -952,15 +1081,11 @@ impl MteCoreStepper {
                         .ok_or(MteStepperError::MissingSpr { pc, index })
                 };
                 let decoded = match word {
-                    C310_TILING_MOV_ALIGN_WORD => C310TilingMovAlignRegisters {
-                        source_xreg1: x[1],
-                        shape_xreg4: x[4],
-                        destination_and_stride_xreg7: x[7],
-                        loop_spr105: spr(105)?,
-                        inner_stride_spr106: spr(106)?,
-                        outer_stride_spr107: spr(107)?,
+                    C310_TILING_MOV_ALIGN_WORD | C310_SUB_TILING_MOV_ALIGN_WORD => {
+                        C310MovAlignRegisterSelectors::from_captured_word(word)?
+                            .capture(x, spr(105)?, spr(106)?, spr(107)?)
+                            .decode_tiling_word(word)?
                     }
-                    .decode(word)?,
                     C310_ADD_MOV_ALIGN_X_WORD
                     | C310_ADD_MOV_ALIGN_Y_WORD
                     | 0x74ad_8bae
@@ -1096,7 +1221,11 @@ mod tests {
         machine.set_xreg(1, source_address).unwrap();
         match architecture {
             Architecture::Dav2201 => machine.set_xreg(2, 0x10010).unwrap(),
-            Architecture::Dav3510 => machine.set_xreg(4, 0x4000_0010).unwrap(),
+            Architecture::Dav3510 => {
+                machine.set_xreg(4, 0x4000_0010).unwrap();
+                machine.set_spr_value(67, 0).unwrap();
+                machine.set_spr_value(68, 0).unwrap();
+            }
         }
         MteCoreStepper::new(
             ScalarStepper::new(machine, 0x1000),
@@ -1222,6 +1351,35 @@ mod tests {
     }
 
     #[test]
+    fn c310_sub_tiling_transfer_uses_selected_registers_and_wait_visibility() {
+        let fixture = Fixture::new(&1024_u32.to_le_bytes(), true);
+        let mut core = stepper(Architecture::Dav3510, 0);
+        core.scalar_mut().machine_mut().set_xreg(2, 0x3000).unwrap();
+        core.scalar_mut()
+            .machine_mut()
+            .set_xreg(3, 0x4000_0010)
+            .unwrap();
+        let issue = core
+            .step_mte_word(C310_SUB_TILING_MOV_ALIGN_WORD, &fixture.source)
+            .unwrap();
+        assert!(matches!(
+            issue.action,
+            MteAction::Issue {
+                source_address: 0x3000,
+                destination_address: 0,
+                planned_bytes: 32,
+                pending_count: 1,
+            }
+        ));
+        assert_eq!(core.ub().tracked_bytes(), 0);
+        core.step_mte_word(MTE2_TO_SCALAR_SET_FLAG0_WORD, &fixture.source)
+            .unwrap();
+        core.step_mte_word(MTE2_TO_SCALAR_WAIT_FLAG0_WORD, &fixture.source)
+            .unwrap();
+        assert_eq!(core.ub().read_known(0, 4).unwrap(), 1024_u32.to_le_bytes());
+    }
+
+    #[test]
     fn c220_sub_tiling_uses_its_own_descriptor_register() {
         let fixture = Fixture::new(&1024_u32.to_le_bytes(), true);
         let mut core = stepper(Architecture::Dav2201, 0x3000);
@@ -1315,12 +1473,114 @@ mod tests {
     }
 
     #[test]
+    fn c220_canonical_scalar_store_and_mte_share_ub_state() {
+        let mut core = stepper(Architecture::Dav2201, 0);
+        let pointer = 0x1000_2200_u64;
+        core.scalar_mut()
+            .machine_mut()
+            .set_xreg(3, pointer)
+            .unwrap();
+        core.scalar_mut()
+            .machine_mut()
+            .set_xreg(7, 0x100000)
+            .unwrap();
+        let step = core
+            .step_scalar_word_with_ub(0x04c6_7000, &mut NoMemoryBus)
+            .unwrap();
+        assert_eq!(step.pc, 0x1000);
+        assert_eq!(core.ub().read_known(0, 8).unwrap(), pointer.to_le_bytes());
+        let mut alias_bytes = [0; 8];
+        let mut bus = UbScalarBus {
+            ub: &mut core.ub,
+            fallback: &mut NoMemoryBus,
+            architecture: Architecture::Dav2201,
+            local_roots: Some((0, 0)),
+        };
+        bus.read(SCALAR_UB_ALIAS_BASE, &mut alias_bytes).unwrap();
+        assert_eq!(alias_bytes, pointer.to_le_bytes());
+        assert!(matches!(
+            bus.write(0x12_ffff, &[1, 2]),
+            Err(UbScalarBusError::AliasBoundary { .. })
+        ));
+        assert_eq!(bus.ub.read_known(0, 8).unwrap(), pointer.to_le_bytes());
+    }
+
+    #[test]
+    fn c310_canonical_scalar_store_and_alias_share_ub_state() {
+        let mut core = stepper(Architecture::Dav3510, 0);
+        core.scalar_mut()
+            .machine_mut()
+            .set_xreg(11, 0x107f40)
+            .unwrap();
+        core.scalar_mut()
+            .machine_mut()
+            .set_xreg(12, 0x3344)
+            .unwrap();
+        let step = core
+            .step_scalar_word_with_ub(0x0358_b000, &mut NoMemoryBus)
+            .unwrap();
+        assert_eq!(step.pc, 0x1000);
+        assert_eq!(core.ub().read_known(0x7f40, 2).unwrap(), [0x44, 0x33]);
+        let mut fallback = NoMemoryBus;
+        let mut bus = UbScalarBus {
+            ub: &mut core.ub,
+            fallback: &mut fallback,
+            architecture: Architecture::Dav3510,
+            local_roots: Some((0, 0)),
+        };
+        let mut actual = [0; 2];
+        bus.read(0x87f40, &mut actual).unwrap();
+        assert_eq!(actual, [0x44, 0x33]);
+        assert!(matches!(
+            bus.write(0x13ffff, &[1, 2]),
+            Err(UbScalarBusError::AliasBoundary { .. })
+        ));
+    }
+
+    #[test]
+    fn all_pipeline_barrier_requires_modeled_work_to_be_idle() {
+        let fixture = Fixture::new(&1024_u32.to_le_bytes(), true);
+        for (architecture, transfer_word) in [
+            (
+                Architecture::Dav2201,
+                CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD,
+            ),
+            (Architecture::Dav3510, C310_TILING_MOV_ALIGN_WORD),
+        ] {
+            let mut core = stepper(architecture, 0x3000);
+            core.step_mte_word(transfer_word, &fixture.source).unwrap();
+            let before = core.clone();
+            assert!(matches!(
+                core.step_barrier_word(0x40e0_1800),
+                Err(MteStepperError::BarrierBusy { pc: 0x1004 })
+            ));
+            assert_eq!(core, before);
+            core.step_mte_word(MTE2_TO_SCALAR_SET_FLAG0_WORD, &fixture.source)
+                .unwrap();
+            core.step_mte_word(MTE2_TO_SCALAR_WAIT_FLAG0_WORD, &fixture.source)
+                .unwrap();
+            let barrier = core.step_barrier_word(0x40e0_1800).unwrap();
+            assert_eq!(barrier.pc, 0x100c);
+            assert_eq!(barrier.next_pc, 0x1010);
+            assert!(matches!(
+                barrier.instruction,
+                ScalarInstructionStep::Barrier(PipelineBarrierStep {
+                    scope: PipelineBarrierScope::All,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
     fn scalar_ub_alias_writes_preserve_provenance_and_reject_crossings() {
         let mut ub = UbReplayMemory::new(64, 64);
         let mut fallback = NoMemoryBus;
         let mut bus = UbScalarBus {
             ub: &mut ub,
             fallback: &mut fallback,
+            architecture: Architecture::Dav3510,
+            local_roots: Some((0, 0)),
         };
         assert!(matches!(
             bus.read(SCALAR_UB_ALIAS_BASE + 4, &mut [0; 4]),
@@ -1335,10 +1595,10 @@ mod tests {
         assert_eq!(bus.ub.read_known(4, 4).unwrap(), bytes);
         assert!(matches!(
             bus.read(SCALAR_UB_ALIAS_BASE - 1, &mut [0; 2]),
-            Err(UbScalarBusError::AliasBoundary { .. })
+            Err(UbScalarBusError::UnsupportedLocal { .. })
         ));
         assert!(matches!(
-            bus.write(SCALAR_UB_ALIAS_BASE + SCALAR_UB_ALIAS_BYTES - 1, &[5, 6]),
+            bus.write(SCALAR_UB_ALIAS_BASE + C310_UB_ROUTE_BYTES - 1, &[5, 6]),
             Err(UbScalarBusError::AliasBoundary { .. })
         ));
         assert_eq!(bus.ub.read_known(4, 4).unwrap(), bytes);
@@ -1989,6 +2249,111 @@ mod tests {
         assert_eq!(
             fixture.source.regions().read_known_at(0x2000, 128).unwrap(),
             expected
+        );
+    }
+
+    #[test]
+    fn c220_vmul_uses_live_control_mask_addresses_and_ub_words() {
+        let mut core = stepper(Architecture::Dav2201, 0x3000);
+        let mut x = std::array::from_fn::<_, 32, _>(|lane| (lane as f32).to_bits());
+        let mut y = [0.5_f32.to_bits(); 32];
+        x[0] = 0;
+        y[0] = f32::INFINITY.to_bits();
+        x[1] = (-0.0_f32).to_bits();
+        y[1] = 2.0_f32.to_bits();
+        let input = x
+            .iter()
+            .chain(&y)
+            .flat_map(|word| word.to_le_bytes().map(MemoryByteState::Known))
+            .collect::<Vec<_>>();
+        core.ub.write_states(0, &input).unwrap();
+        core.ub
+            .write_states(0x100, &[MemoryByteState::Known(0); 128])
+            .unwrap();
+        let machine = core.scalar_mut().machine_mut();
+        machine.set_xreg(6, C220_CAPTURED_VMUL_CONTROL).unwrap();
+        machine.set_xreg(11, 0).unwrap();
+        machine.set_xreg(12, 0x80).unwrap();
+        machine.set_xreg(14, 0x100).unwrap();
+        machine.set_spr_value(3, 1 << 56).unwrap();
+        machine.set_spr_value(100, 31).unwrap();
+        machine.set_spr_value(101, 0).unwrap();
+        core.scalar_mut().machine_mut().set_xreg(6, 0).unwrap();
+        let before_control = core.clone();
+        assert!(matches!(
+            core.step_c220_vmul_word(C220_CAPTURED_VMUL_WORD),
+            Err(MteStepperError::Vector(
+                C220CapturedVectorError::UnsupportedVmulControl { control: 0 }
+            ))
+        ));
+        assert_eq!(core, before_control);
+        core.scalar_mut()
+            .machine_mut()
+            .set_xreg(6, C220_CAPTURED_VMUL_CONTROL)
+            .unwrap();
+        let before = core.clone();
+        assert!(matches!(
+            core.step_c220_vmul_word(C220_CAPTURED_VMUL_WORD),
+            Err(MteStepperError::Vector(
+                C220CapturedVectorError::UnsupportedVmulMask { .. }
+            ))
+        ));
+        assert_eq!(core, before);
+        core.scalar_mut()
+            .machine_mut()
+            .set_spr_value(100, 32)
+            .unwrap();
+        let step = core.step_c220_vmul_word(C220_CAPTURED_VMUL_WORD).unwrap();
+        assert_eq!(step.stores.len(), 32);
+        assert_eq!(step.source_0_address, 0);
+        assert_eq!(step.source_1_address, 0x80);
+        assert_eq!(step.destination_address, 0x100);
+        assert_eq!(step.lanes[0].bits, 0x7fff_ffff);
+        assert_eq!(step.lanes[1].bits, 0x8000_0000);
+        let output = core.ub().read_known(0x100, 128).unwrap();
+        assert_eq!(&output[..4], &0x7fff_ffff_u32.to_le_bytes());
+        assert_eq!(&output[4..8], &0x8000_0000_u32.to_le_bytes());
+        for lane in 2..32 {
+            let expected = ((lane as f32) * 0.5).to_le_bytes();
+            assert_eq!(&output[lane * 4..lane * 4 + 4], &expected);
+        }
+        let x_bytes = x
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let y_bytes = y
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut fixture = Fixture::two_inputs(&x_bytes, &y_bytes);
+        core.scalar_mut().machine_mut().set_xreg(12, 0).unwrap();
+        core.step_c220_output_word(C220_SUB_VECTOR_TO_MTE3_SET_FLAG_WORD, &mut fixture.source)
+            .unwrap();
+        core.step_c220_output_word(C220_SUB_VECTOR_TO_MTE3_WAIT_FLAG_WORD, &mut fixture.source)
+            .unwrap();
+        let machine = core.scalar_mut().machine_mut();
+        machine.set_xreg(12, 0x100).unwrap();
+        machine.set_xreg(8, 0x2000).unwrap();
+        machine.set_xreg(4, 0x40010).unwrap();
+        let copied = core
+            .step_c220_output_word(CAPTURED_C220_SUB_MOV_UB_TO_OUT_WORD, &mut fixture.source)
+            .unwrap();
+        assert!(matches!(
+            copied.action,
+            C220OutputAction::CopyToHbm {
+                source_address: 0x100,
+                destination_address: 0x2000,
+                transfer: UbTransferResult {
+                    bytes: 128,
+                    known_bytes: 128,
+                    unknown_bytes: 0,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(
+            fixture.source.regions().read_known_at(0x2000, 128).unwrap(),
+            output
         );
     }
 
