@@ -1,5 +1,6 @@
-
 use crate::device_elf::ProjectedDeviceKernel;
+use crate::device_loader::LoadedDeviceKernel;
+use crate::hbm_pv_memory::HbmPvMemory;
 use crate::prof_stub_packet::{ProfStubPacket, ProfStubPacketError};
 use crate::prof_stub_stream::inspect_prof_stub_stream;
 use crate::prof_stub_trace::ProfStubTraceLog;
@@ -11,6 +12,7 @@ pub struct ProfStubObjectVerification {
     pub stream_bytes: usize,
     pub instruction_events: usize,
     pub checked_events: usize,
+    pub synthetic_end_label_events: usize,
     pub unique_checked_pcs: usize,
     pub missing_text_pc: usize,
     pub missing_binary_word: usize,
@@ -48,7 +50,20 @@ pub fn verify_prof_stub_object(
     projected: &ProjectedDeviceKernel<'_>,
     max_examples: usize,
 ) -> Result<ProfStubObjectVerification, ProfStubPacketError> {
-    verify_with_word_source(stream, max_examples, |pc| projected.fetch_word(pc).ok())
+    verify_with_word_source(stream, max_examples, |pc| {
+        projected.fetch_executable_word(pc).ok()
+    })
+}
+
+pub fn verify_prof_stub_loaded_kernel(
+    stream: &[u8],
+    loaded: &LoadedDeviceKernel,
+    memory: &mut HbmPvMemory,
+    max_examples: usize,
+) -> Result<ProfStubObjectVerification, ProfStubPacketError> {
+    verify_with_word_source(stream, max_examples, |pc| {
+        loaded.fetch_executable_word(memory, pc).ok()
+    })
 }
 
 fn verify_with_word_source(
@@ -61,6 +76,7 @@ fn verify_with_word_source(
         stream_bytes: stream.len(),
         instruction_events: 0,
         checked_events: 0,
+        synthetic_end_label_events: 0,
         unique_checked_pcs: 0,
         missing_text_pc: 0,
         missing_binary_word: 0,
@@ -87,6 +103,15 @@ fn verify_with_word_source(
                 parse_hex_field(description, b"(PC: 0x", 16, false).map(|(value, _)| value);
             let text_word = parse_hex_field(description, b"Binary: 0x", 8, true)
                 .and_then(|(value, _)| u32::try_from(value).ok());
+            if log.pc() == 0x1111_1111
+                && text_pc == Some(0x1111_1111)
+                && text_word == Some(0x0000_1e00)
+                && description.ends_with(b"END_LABEL")
+            {
+                result.synthetic_end_label_events += 1;
+                offset += consumed;
+                continue;
+            }
             let object_word = fetch_word(log.pc());
             let issue = if text_pc.is_none() {
                 result.missing_text_pc += 1;
@@ -127,8 +152,8 @@ fn verify_with_word_source(
         offset += consumed;
     }
     result.unique_checked_pcs = checked_pcs.len();
-    result.all_instruction_words_match_object =
-        result.instruction_events != 0 && result.checked_events == result.instruction_events;
+    result.all_instruction_words_match_object = result.checked_events != 0
+        && result.checked_events + result.synthetic_end_label_events == result.instruction_events;
     Ok(result)
 }
 
@@ -243,6 +268,46 @@ mod tests {
         .concat();
         let result = verify_with_word_source(&stream, 1, |_| None).unwrap();
         assert_eq!(result.instruction_events, 0);
+        assert!(!result.all_instruction_words_match_object);
+    }
+
+    #[test]
+    fn exact_synthetic_end_label_is_counted_separately_from_device_fetches() {
+        let real = one_instruction_stream(b"(PC: 0x1000) (Binary: 0x073a7fa0)", 0x1000);
+        let marker = one_instruction_stream(
+            b"(PC: 0x11111111) FLOWCTRL : (Binary: 0x00001e00) (ID: 000001) END_LABEL",
+            0x1111_1111,
+        );
+        let stream = [real, marker].concat();
+        let result = verify_with_word_source(&stream, 1, |pc| {
+            assert_eq!(pc, 0x1000);
+            Some(0x073a_7fa0)
+        })
+        .unwrap();
+        assert_eq!(result.instruction_events, 2);
+        assert_eq!(result.checked_events, 1);
+        assert_eq!(result.synthetic_end_label_events, 1);
+        assert!(result.all_instruction_words_match_object);
+
+        let result = verify_with_word_source(
+            &one_instruction_stream(
+                b"(PC: 0x11111111) FLOWCTRL : (Binary: 0x00001e00) END_LABEL",
+                0x1111_1111,
+            ),
+            1,
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(result.synthetic_end_label_events, 1);
+        assert!(!result.all_instruction_words_match_object);
+
+        let invalid_marker = one_instruction_stream(
+            b"(PC: 0x11111111) FLOWCTRL : (Binary: 0x00001e01) END_LABEL",
+            0x1111_1111,
+        );
+        let result = verify_with_word_source(&invalid_marker, 1, |_| None).unwrap();
+        assert_eq!(result.synthetic_end_label_events, 0);
+        assert_eq!(result.pcs_not_fetchable, 1);
         assert!(!result.all_instruction_words_match_object);
     }
 }

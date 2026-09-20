@@ -1,4 +1,3 @@
-
 use thiserror::Error;
 
 use crate::ipc::{KERNEL_RECORD_REQUEST_PACKET, KERNEL_RECORD_RESPONSE_PACKET};

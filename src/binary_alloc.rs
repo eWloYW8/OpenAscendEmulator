@@ -1,4 +1,3 @@
-
 use crate::architecture::Architecture;
 use serde::Serialize;
 use thiserror::Error;

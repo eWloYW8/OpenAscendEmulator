@@ -1,4 +1,3 @@
-
 use crate::kernel_config::{DecodedKernelConfig, ReplayRunner};
 use serde::Serialize;
 use thiserror::Error;

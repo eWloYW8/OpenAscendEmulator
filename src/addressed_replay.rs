@@ -1,4 +1,3 @@
-
 use crate::machine::ScalarMemoryBus;
 use crate::replay_memory::{MemoryByteState, ReplayMemory, ReplayMemoryError};
 use crate::replay_seed::SeedArgument;

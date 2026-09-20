@@ -1,7 +1,8 @@
 use crate::acl_args::{AclArgumentPlan, AclArgumentPlanError};
 use crate::architecture::{Architecture, all_device_profiles};
 use crate::device_elf::{
-    DeviceElf, DeviceElfError, DeviceElfHeader, DeviceKernelSummary, DeviceLoadImageSummary,
+    DeviceElf, DeviceElfError, DeviceElfHeader, DeviceGlobalPatchSite, DeviceKernelSummary,
+    DeviceLoadImageSummary,
 };
 use crate::isa::{AicDecoderHint, AicFramingError, AicInstructionWord, AicWordFramer};
 use crate::kernel_config::{KernelConfigDocument, KernelConfigError};
@@ -469,6 +470,14 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
                 Ok(image) => (Some(image.summary), None),
                 Err(error) => (None, Some(error.to_string())),
             };
+            let (address_meta_flags, address_meta_error) = match elf.address_meta_flags() {
+                Ok(flags) => (Some(flags), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            let (global_patch_sites, global_patch_sites_error) = match elf.global_patch_sites() {
+                Ok(sites) => (Some(sites), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
             let kernels = elf.kernels()?;
             let code_base = if let Some(path) = pc_start_addr_file {
                 Some(CodeBaseEvidence::PcStartAddrFile {
@@ -540,6 +549,10 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
                 header: elf.header(),
                 load_image,
                 load_image_error,
+                address_meta_flags,
+                address_meta_error,
+                global_patch_sites,
+                global_patch_sites_error,
                 code_base,
                 kernels,
                 selected,
@@ -562,6 +575,23 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
                     );
                 } else if let Some(error) = &inspection.load_image_error {
                     println!("load-image: unavailable ({error})");
+                }
+                if let Some(flags) = inspection.address_meta_flags {
+                    println!("address-meta-flags: {flags:#x}");
+                } else if let Some(error) = &inspection.address_meta_error {
+                    println!("address-meta-flags: unavailable ({error})");
+                }
+                if let Some(sites) = &inspection.global_patch_sites {
+                    for site in sites {
+                        println!(
+                            "global-patch-site: {} file-offset={:#x} image-offset={:#x}",
+                            site.symbol.elf_name(),
+                            site.file_offset,
+                            site.image_offset
+                        );
+                    }
+                } else if let Some(error) = &inspection.global_patch_sites_error {
+                    println!("global-patch-sites: unavailable ({error})");
                 }
                 if let Some(base) = &inspection.code_base {
                     match base {
@@ -634,6 +664,15 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
                 println!("subtract-immediate: {}", summary.subtract_immediate);
                 println!("add-register: {}", summary.add_register);
                 println!("multiply-register: {}", summary.multiply_register);
+                println!("multiply-add-fields: {}", summary.multiply_add_fields);
+                println!(
+                    "multiply-add-value-checked: {}",
+                    summary.multiply_add_value_checked
+                );
+                println!(
+                    "multiply-add-unknown-prior: {}",
+                    summary.multiply_add_unknown_prior
+                );
                 println!("and-register: {}", summary.and_register);
                 println!("or-register: {}", summary.or_register);
                 println!("shift-left-fields: {}", summary.shift_left_fields);
@@ -660,6 +699,7 @@ fn run_with(cli: Cli) -> Result<(), CliError> {
             if summary.checked_s64
                 + summary.add_register
                 + summary.multiply_register
+                + summary.multiply_add_fields
                 + summary.and_register
                 + summary.or_register
                 + summary.shift_left_fields
@@ -914,6 +954,10 @@ struct ElfInspection {
     header: DeviceElfHeader,
     load_image: Option<DeviceLoadImageSummary>,
     load_image_error: Option<String>,
+    address_meta_flags: Option<u32>,
+    address_meta_error: Option<String>,
+    global_patch_sites: Option<Vec<DeviceGlobalPatchSite>>,
+    global_patch_sites_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     code_base: Option<CodeBaseEvidence>,
     kernels: Vec<DeviceKernelSummary>,

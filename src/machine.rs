@@ -1,4 +1,3 @@
-
 use crate::architecture::Architecture;
 use crate::isa::{
     AicDecoderHint, ScalarKey0Operation, ScalarKey7Operation, ScalarLoadStoreOperation,
@@ -16,6 +15,7 @@ pub struct ScalarMachine {
     xregs: [u64; SCALAR_X_REGISTER_COUNT],
     spr2: u64,
     spr_values: [Option<u64>; SCALAR_SPR_SNAPSHOT_CAPACITY],
+    model_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -43,6 +43,33 @@ pub struct ScalarSprStep {
     pub source_register: u8,
     pub source_value: u64,
     pub value: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ScalarSprReadSource {
+    RegisterSnapshot,
+    ProgramCounter,
+    ModelTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ScalarSprReadStep {
+    pub pc: u64,
+    pub word: u32,
+    pub destination_register: u8,
+    pub prior_destination_value: u64,
+    pub source_spr: u16,
+    pub source: ScalarSprReadSource,
+    pub source_value: u64,
+    pub value: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ScalarInstructionStep {
+    Register(ScalarStep),
+    SprRead(ScalarSprReadStep),
+    SprWrite(ScalarSprStep),
+    Memory(ScalarMemoryStep),
 }
 
 pub trait ScalarMemoryBus {
@@ -81,10 +108,24 @@ pub enum ScalarMemoryExecutionError<E: std::error::Error + 'static> {
     Backend(#[source] E),
 }
 
+#[derive(Debug, Error)]
+pub enum ScalarInstructionError<E: std::error::Error + 'static> {
+    #[error(transparent)]
+    Scalar(#[from] ScalarMachineError),
+    #[error(transparent)]
+    Memory(#[from] ScalarMemoryExecutionError<E>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ScalarMachineError {
     #[error("X-register index {0} is outside X0..X31")]
     RegisterOutOfRange(u8),
+    #[error("SPR index {0} is outside the modeled architecture's register range")]
+    SprRegisterOutOfRange(u16),
+    #[error("SPR {spr} has no supplied value at PC {pc:#x}")]
+    SprValueUnavailable { pc: u64, spr: u16 },
+    #[error("model time has no supplied value at PC {pc:#x}")]
+    ModelTimeUnavailable { pc: u64 },
     #[error("word {word:#010x} at PC {pc:#x} is not an implemented scalar instruction")]
     UnsupportedWord { pc: u64, word: u32 },
     #[error(transparent)]
@@ -102,6 +143,7 @@ impl ScalarMachine {
             xregs,
             spr2,
             spr_values: [None; SCALAR_SPR_SNAPSHOT_CAPACITY],
+            model_time: None,
         }
     }
 
@@ -119,6 +161,87 @@ impl ScalarMachine {
 
     pub fn spr_value(&self, index: u16) -> Option<u64> {
         self.spr_values.get(usize::from(index)).copied().flatten()
+    }
+
+    pub const fn model_time(&self) -> Option<u64> {
+        self.model_time
+    }
+
+    pub fn set_model_time(&mut self, ticks: u64) {
+        self.model_time = Some(ticks);
+    }
+
+    pub fn set_spr_value(&mut self, index: u16, value: u64) -> Result<(), ScalarMachineError> {
+        let limit = match self.architecture {
+            Architecture::Dav2201 => 187,
+            Architecture::Dav3510 => SCALAR_SPR_SNAPSHOT_CAPACITY,
+        };
+        let slot = self
+            .spr_values
+            .get_mut(usize::from(index))
+            .filter(|_| usize::from(index) < limit)
+            .ok_or(ScalarMachineError::SprRegisterOutOfRange(index))?;
+        *slot = Some(value);
+        Ok(())
+    }
+
+    pub fn execute_spr_read_word(
+        &mut self,
+        pc: u64,
+        word: u32,
+    ) -> Result<ScalarSprReadStep, ScalarMachineError> {
+        let Some(AicDecoderHint::ScalarKey2MoveFromSpr {
+            destination_register,
+            encoded_source_spr,
+            ..
+        }) = AicDecoderHint::from_word(self.architecture, word)
+        else {
+            return Err(ScalarMachineError::UnsupportedWord { pc, word });
+        };
+        let limit = match self.architecture {
+            Architecture::Dav2201 => 187,
+            Architecture::Dav3510 => SCALAR_SPR_SNAPSHOT_CAPACITY,
+        };
+        if usize::from(encoded_source_spr) >= limit {
+            return Err(ScalarMachineError::SprRegisterOutOfRange(
+                encoded_source_spr,
+            ));
+        }
+        let (source, source_value) = match (self.architecture, encoded_source_spr) {
+            (_, 0) => (ScalarSprReadSource::ProgramCounter, pc),
+            (Architecture::Dav3510, 72) => (
+                ScalarSprReadSource::ModelTime,
+                self.model_time
+                    .ok_or(ScalarMachineError::ModelTimeUnavailable { pc })?,
+            ),
+            _ => (
+                ScalarSprReadSource::RegisterSnapshot,
+                self.spr_values[usize::from(encoded_source_spr)].ok_or(
+                    ScalarMachineError::SprValueUnavailable {
+                        pc,
+                        spr: encoded_source_spr,
+                    },
+                )?,
+            ),
+        };
+        let value = if self.architecture == Architecture::Dav2201 && encoded_source_spr == 7 {
+            source_value & !1
+        } else {
+            source_value
+        };
+        let destination = &mut self.xregs[usize::from(destination_register)];
+        let prior_destination_value = *destination;
+        *destination = value;
+        Ok(ScalarSprReadStep {
+            pc,
+            word,
+            destination_register,
+            prior_destination_value,
+            source_spr: encoded_source_spr,
+            source,
+            source_value,
+            value,
+        })
     }
 
     pub fn execute_spr_word(
@@ -209,6 +332,14 @@ impl ScalarMachine {
                         let (value, overflow) =
                             (first_source_value as i64).overflowing_mul(second_source_value as i64);
                         (value as u64, overflow)
+                    }
+                    (ScalarKey0Operation::MultiplyAdd, 0) => {
+                        let (product, multiply_overflow) =
+                            (first_source_value as i64).overflowing_mul(second_source_value as i64);
+                        let (value, add_overflow) = (self.xregs[usize::from(destination_register)]
+                            as i64)
+                            .overflowing_add(product);
+                        (value as u64, multiply_overflow || add_overflow)
                     }
                     (ScalarKey0Operation::And, 3) => {
                         (first_source_value & second_source_value, false)
@@ -376,6 +507,28 @@ impl ScalarMachine {
         })
     }
 
+    pub fn execute_instruction<B: ScalarMemoryBus>(
+        &mut self,
+        pc: u64,
+        word: u32,
+        bus: &mut B,
+    ) -> Result<ScalarInstructionStep, ScalarInstructionError<B::Error>> {
+        match AicDecoderHint::from_word(self.architecture, word) {
+            Some(AicDecoderHint::ScalarLoadStoreImmediate { .. }) => Ok(
+                ScalarInstructionStep::Memory(self.execute_memory_word(pc, word, bus)?),
+            ),
+            Some(AicDecoderHint::ScalarKey2MoveFromSpr { .. }) => Ok(
+                ScalarInstructionStep::SprRead(self.execute_spr_read_word(pc, word)?),
+            ),
+            Some(AicDecoderHint::ScalarKey2MoveToSpr { .. }) => Ok(
+                ScalarInstructionStep::SprWrite(self.execute_spr_word(pc, word)?),
+            ),
+            _ => Ok(ScalarInstructionStep::Register(
+                self.execute_word(pc, word)?,
+            )),
+        }
+    }
+
     pub fn execute_memory_word<B: ScalarMemoryBus>(
         &mut self,
         pc: u64,
@@ -514,6 +667,76 @@ mod tests {
             self.bytes[range].copy_from_slice(source);
             self.accesses += 1;
             Ok(())
+        }
+    }
+
+    #[test]
+    fn unified_scalar_dispatch_preserves_spr_memory_dependency_on_both_architectures() {
+        for (architecture, load_word) in [
+            (Architecture::Dav2201, 0x03c2_0008),
+            (Architecture::Dav3510, 0x1cc2_0008),
+        ] {
+            let mut machine = ScalarMachine::new(architecture, [0; 32], 0x55);
+            machine.set_spr_value(4, 0x1000).unwrap();
+            let mut bus = TestBus::new(0x1000);
+            let expected = 0x1234_5678_9abc_def0_u64;
+            bus.bytes[8..16].copy_from_slice(&expected.to_le_bytes());
+
+            let read = machine
+                .execute_instruction(0x200, 0x0200_4880, &mut bus)
+                .unwrap();
+            let ScalarInstructionStep::SprRead(read) = read else {
+                panic!("expected SPR read");
+            };
+            assert_eq!(read.value, 0x1000);
+            assert_eq!(machine.xregs()[0], 0x1000);
+
+            bus.fail = true;
+            let before = machine.clone();
+            assert!(matches!(
+                machine.execute_instruction(0x204, load_word, &mut bus),
+                Err(ScalarInstructionError::Memory(
+                    ScalarMemoryExecutionError::Backend(_)
+                ))
+            ));
+            assert_eq!(machine, before);
+            bus.fail = false;
+
+            let load = machine
+                .execute_instruction(0x204, load_word, &mut bus)
+                .unwrap();
+            let ScalarInstructionStep::Memory(load) = load else {
+                panic!("expected memory load");
+            };
+            assert_eq!(load.effective_address, 0x1008);
+            assert_eq!(load.data_value, expected);
+            assert_eq!(machine.xregs()[1], expected);
+            assert_eq!(bus.accesses, 1);
+
+            let write = machine
+                .execute_instruction(0x208, 0x0206_1900, &mut bus)
+                .unwrap();
+            let ScalarInstructionStep::SprWrite(write) = write else {
+                panic!("expected SPR write");
+            };
+            assert_eq!(write.destination_spr, 3);
+            assert_eq!(write.value, expected);
+            assert_eq!(machine.spr_value(3), Some(expected));
+            assert_eq!(machine.spr2(), 0x55);
+
+            let register = machine
+                .execute_instruction(0x20c, 0x0706_0001, &mut bus)
+                .unwrap();
+            assert!(matches!(register, ScalarInstructionStep::Register(_)));
+            assert_eq!(machine.xregs()[3], 1);
+            let before = machine.clone();
+            assert!(matches!(
+                machine.execute_instruction(0x210, 0x6000_0000, &mut bus),
+                Err(ScalarInstructionError::Scalar(
+                    ScalarMachineError::UnsupportedWord { .. }
+                ))
+            ));
+            assert_eq!(machine, before);
         }
     }
 
@@ -832,6 +1055,46 @@ mod tests {
     }
 
     #[test]
+    fn multiply_add_uses_prior_destination_and_preserves_overflow_state() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut machine = ScalarMachine::new(architecture, [0; 32], 0x24);
+            machine.set_xreg(29, 0x107f80).unwrap();
+            machine.set_xreg(15, 0x18).unwrap();
+            machine.set_xreg(17, 0x8000).unwrap();
+            let step = machine.execute_word(0x112f5028, 0x003a_f884).unwrap();
+            assert_eq!(step.prior_destination_value, 0x107f80);
+            assert_eq!(step.source_register, Some(15));
+            assert_eq!(step.second_source_register, Some(17));
+            assert_eq!(step.value, 0x1c7f80);
+            assert!(!step.signed_overflow);
+            assert_eq!(step.spr2, 0x24);
+
+            machine.set_xreg(29, 0).unwrap();
+            machine.set_xreg(15, i64::MIN as u64).unwrap();
+            machine.set_xreg(17, u64::MAX).unwrap();
+            let product_overflow = machine.execute_word(0x100, 0x003a_f884).unwrap();
+            assert_eq!(product_overflow.value, i64::MIN as u64);
+            assert!(product_overflow.signed_overflow);
+            assert_eq!(product_overflow.spr2, 0x400034);
+
+            machine.set_xreg(29, i64::MAX as u64).unwrap();
+            machine.set_xreg(15, 1).unwrap();
+            machine.set_xreg(17, 1).unwrap();
+            let add_overflow = machine.execute_word(0x104, 0x003a_f884).unwrap();
+            assert_eq!(add_overflow.value, i64::MIN as u64);
+            assert!(add_overflow.signed_overflow);
+            assert_eq!(add_overflow.spr2, 0x410034);
+
+            let before = machine.clone();
+            assert!(matches!(
+                machine.execute_word(0x108, 0x00ba_f884),
+                Err(ScalarMachineError::UnsupportedWord { .. })
+            ));
+            assert_eq!(machine, before);
+        }
+    }
+
+    #[test]
     fn shift_left_uses_old_destination_and_masks_register_count() {
         for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
             let mut machine = ScalarMachine::new(architecture, [0; 32], 0x1234);
@@ -894,6 +1157,99 @@ mod tests {
             assert_eq!(machine.spr_value(destination), Some(expected));
         }
         assert_eq!(machine.spr2(), 0x55);
+    }
+
+    #[test]
+    fn c220_spr_reads_feed_the_captured_scalar_prefix() {
+        let mut machine = ScalarMachine::new(Architecture::Dav2201, [0; 32], 0x55);
+        machine.set_spr_value(67, 0).unwrap();
+        machine.set_spr_value(16, 0).unwrap();
+        machine.set_spr_value(4, 0x1022_be00).unwrap();
+        machine.execute_word(0x10d0_d000, 0x073a_7fa0).unwrap();
+        machine.execute_word(0x10d0_d004, 0x077b_0010).unwrap();
+        let read = machine
+            .execute_spr_read_word(0x10d0_d008, 0x029e_3880)
+            .unwrap();
+        assert_eq!(read.source_spr, 67);
+        assert_eq!(read.source, ScalarSprReadSource::RegisterSnapshot);
+        assert_eq!(read.destination_register, 15);
+        assert_eq!(read.value, 0);
+        assert_eq!(machine.xregs()[15], 0);
+        assert_eq!(
+            machine
+                .execute_word(0x10d0_d00c, 0x003b_d781)
+                .unwrap()
+                .value,
+            0x107fa0
+        );
+        assert_eq!(
+            machine
+                .execute_spr_read_word(0x10d0_d010, 0x021f_0880)
+                .unwrap()
+                .source_spr,
+            16
+        );
+        let parameter_base = machine
+            .execute_spr_read_word(0x10d0_d028, 0x0200_4880)
+            .unwrap();
+        assert_eq!(parameter_base.value, 0x1022_be00);
+        assert_eq!(machine.xregs()[0], 0x1022_be00);
+        assert_eq!(machine.spr2(), 0x55);
+    }
+
+    #[test]
+    fn spr_read_special_sources_and_missing_values_are_explicit() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut machine = ScalarMachine::new(architecture, [0; 32], 0);
+            let pc = 0x10d0_d000;
+            let read = machine.execute_spr_read_word(pc, 0x0200_0880).unwrap();
+            assert_eq!(read.source_spr, 0);
+            assert_eq!(read.source, ScalarSprReadSource::ProgramCounter);
+            assert_eq!(read.value, pc);
+            assert_eq!(machine.xregs()[0], pc);
+
+            let before = machine.clone();
+            assert_eq!(
+                machine.execute_spr_read_word(pc + 4, 0x0200_4880),
+                Err(ScalarMachineError::SprValueUnavailable { pc: pc + 4, spr: 4 })
+            );
+            assert_eq!(machine, before);
+            machine.set_spr_value(7, 0x1235).unwrap();
+            let read = machine.execute_spr_read_word(pc + 8, 0x0200_7880).unwrap();
+            assert_eq!(read.source_value, 0x1235);
+            assert_eq!(
+                read.value,
+                if architecture == Architecture::Dav2201 {
+                    0x1234
+                } else {
+                    0x1235
+                }
+            );
+            assert_eq!(machine.spr2(), 0);
+        }
+
+        let mut c310 = ScalarMachine::new(Architecture::Dav3510, [0; 32], 0);
+        let pc = 0x100;
+        assert_eq!(
+            c310.execute_spr_read_word(pc, 0x0280_8880),
+            Err(ScalarMachineError::ModelTimeUnavailable { pc })
+        );
+        c310.set_model_time(0x5678);
+        let read = c310.execute_spr_read_word(pc, 0x0280_8880).unwrap();
+        assert_eq!(read.source_spr, 72);
+        assert_eq!(read.source, ScalarSprReadSource::ModelTime);
+        assert_eq!(read.value, 0x5678);
+        assert_eq!(c310.xregs()[0], 0x5678);
+        assert_eq!(c310.model_time(), Some(0x5678));
+        assert_eq!(
+            c310.set_spr_value(243, 1),
+            Err(ScalarMachineError::SprRegisterOutOfRange(243))
+        );
+        let mut c220 = ScalarMachine::new(Architecture::Dav2201, [0; 32], 0);
+        assert_eq!(
+            c220.set_spr_value(187, 1),
+            Err(ScalarMachineError::SprRegisterOutOfRange(187))
+        );
     }
 
     #[test]

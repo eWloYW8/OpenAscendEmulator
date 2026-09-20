@@ -1,4 +1,3 @@
-
 use crate::fp32_vector::{
     Fp32LaneOutcome, Fp32MaskLayout, Fp32VectorError, Fp32VectorOperation,
     evaluate_masked_fp32_lanes,

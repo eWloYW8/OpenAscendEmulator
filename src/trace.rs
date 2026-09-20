@@ -1,4 +1,3 @@
-
 use crate::architecture::Architecture;
 use crate::isa::{
     AicDecoderHint, ScalarKey0Operation, ScalarKey7Operation, ScalarKey8Operation, ZeroExtendWidth,
@@ -19,6 +18,9 @@ pub struct ScalarTraceSummary {
     pub subtract_immediate: u64,
     pub add_register: u64,
     pub multiply_register: u64,
+    pub multiply_add_fields: u64,
+    pub multiply_add_value_checked: u64,
+    pub multiply_add_unknown_prior: u64,
     pub and_register: u64,
     pub or_register: u64,
     pub shift_left_fields: u64,
@@ -142,6 +144,9 @@ pub fn verify_scalar_trace<R: BufRead>(
         subtract_immediate: 0,
         add_register: 0,
         multiply_register: 0,
+        multiply_add_fields: 0,
+        multiply_add_value_checked: 0,
+        multiply_add_unknown_prior: 0,
         and_register: 0,
         or_register: 0,
         shift_left_fields: 0,
@@ -203,13 +208,34 @@ pub fn verify_scalar_trace<R: BufRead>(
                 }
             }
             Ok(ParsedLine::RegisterBinaryRecord(record)) => {
+                let prior_destination =
+                    if record.first_source_register == record.destination_register {
+                        Some(record.first_source_value)
+                    } else if record.second_source_register == record.destination_register {
+                        Some(record.second_source_value)
+                    } else {
+                        known_xregs
+                            .get(usize::from(record.destination_register))
+                            .copied()
+                            .flatten()
+                    };
                 match record.operation {
                     ScalarKey0Operation::Add => summary.add_register += 1,
                     ScalarKey0Operation::Multiply => summary.multiply_register += 1,
+                    ScalarKey0Operation::MultiplyAdd => {
+                        summary.multiply_add_fields += 1;
+                        if prior_destination.is_some() {
+                            summary.multiply_add_value_checked += 1;
+                        } else {
+                            summary.multiply_add_unknown_prior += 1;
+                        }
+                    }
                     ScalarKey0Operation::And => summary.and_register += 1,
                     ScalarKey0Operation::Or => summary.or_register += 1,
                 }
-                if let Err(reason) = check_register_binary_record(record, architecture) {
+                if let Err(reason) =
+                    check_register_binary_record(record, architecture, prior_destination)
+                {
                     add_mismatch(&mut summary, reason);
                 }
             }
@@ -275,6 +301,9 @@ fn parse_line(line: &str) -> Result<ParsedLine, String> {
         "MUL" => Some(TraceOperation::RegisterBinary(
             ScalarKey0Operation::Multiply,
         )),
+        "MADD" => Some(TraceOperation::RegisterBinary(
+            ScalarKey0Operation::MultiplyAdd,
+        )),
         "AND" => Some(TraceOperation::RegisterBinary(ScalarKey0Operation::And)),
         "OR" => Some(TraceOperation::RegisterBinary(ScalarKey0Operation::Or)),
         "SHL" => Some(TraceOperation::ShiftLeft),
@@ -327,7 +356,9 @@ fn parse_line(line: &str) -> Result<ParsedLine, String> {
             .find(|token| token.starts_with("dtype:"))
             .ok_or_else(|| "register-binary record lacks dtype".to_owned())?;
         let expected_dtype = match operation {
-            ScalarKey0Operation::Add | ScalarKey0Operation::Multiply => "dtype:S64",
+            ScalarKey0Operation::Add
+            | ScalarKey0Operation::Multiply
+            | ScalarKey0Operation::MultiplyAdd => "dtype:S64",
             ScalarKey0Operation::And | ScalarKey0Operation::Or => "dtype:B64",
         };
         if dtype.trim_end_matches(',') != expected_dtype {
@@ -572,6 +603,7 @@ fn check_register_move_record(
 fn check_register_binary_record(
     record: ScalarRegisterBinaryRecord,
     architecture: Architecture,
+    prior_destination: Option<u64>,
 ) -> Result<(), String> {
     let Some(AicDecoderHint::ScalarKey0 {
         operation,
@@ -588,7 +620,9 @@ fn check_register_binary_record(
         ));
     };
     let expected_dtype_field = match record.operation {
-        ScalarKey0Operation::Add | ScalarKey0Operation::Multiply => 0,
+        ScalarKey0Operation::Add
+        | ScalarKey0Operation::Multiply
+        | ScalarKey0Operation::MultiplyAdd => 0,
         ScalarKey0Operation::And | ScalarKey0Operation::Or => 3,
     };
     if operation != record.operation
@@ -607,16 +641,29 @@ fn check_register_binary_record(
         ));
     }
     let expected = match operation {
-        ScalarKey0Operation::Add => record
-            .first_source_value
-            .wrapping_add(record.second_source_value),
-        ScalarKey0Operation::Multiply => record
-            .first_source_value
-            .wrapping_mul(record.second_source_value),
-        ScalarKey0Operation::And => record.first_source_value & record.second_source_value,
-        ScalarKey0Operation::Or => record.first_source_value | record.second_source_value,
+        ScalarKey0Operation::Add => Some(
+            record
+                .first_source_value
+                .wrapping_add(record.second_source_value),
+        ),
+        ScalarKey0Operation::Multiply => Some(
+            record
+                .first_source_value
+                .wrapping_mul(record.second_source_value),
+        ),
+        ScalarKey0Operation::MultiplyAdd => prior_destination.map(|prior| {
+            prior.wrapping_add(
+                record
+                    .first_source_value
+                    .wrapping_mul(record.second_source_value),
+            )
+        }),
+        ScalarKey0Operation::And => Some(record.first_source_value & record.second_source_value),
+        ScalarKey0Operation::Or => Some(record.first_source_value | record.second_source_value),
     };
-    if expected != record.destination_value {
+    if let Some(expected) = expected
+        && expected != record.destination_value
+    {
         return Err(format!(
             "register-binary value differs at PC {:#x}: calculated {expected:#x}, log {:#x}",
             record.pc, record.destination_value
@@ -947,6 +994,37 @@ mod tests {
 
             let wrong = REGISTER_BINARY.replace("XD:X15=0x18", "XD:X15=0x19");
             let summary = verify_scalar_trace(Cursor::new(wrong), architecture).unwrap();
+            assert_eq!(summary.mismatches, 1);
+            assert!(
+                summary.mismatch_examples[0]
+                    .reason
+                    .contains("value differs")
+            );
+        }
+    }
+
+    #[test]
+    fn multiply_add_checks_prior_value_when_known_and_reports_unknown_prior() {
+        let prefix = "[info] [1] (PC: 0x100) SCALAR : (Binary: 0x073a7f80) MOV_XD_IMM XD:X29=0x7f80, IMM:0x7f80, \n\
+[info] [2] (PC: 0x104) SCALAR : (Binary: 0x077b0010) MOVK XD:X29=0x107f80, IMM:0x10, UIMM:0x1, \n";
+        let madd = "[info] [3] (PC: 0x108) SCALAR : (Binary: 0x003af884) MADD dtype:S64, XD:X29=0x1c7f80, XN:X15=0x18, XM:X17=0x8000, \n";
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let summary =
+                verify_scalar_trace(Cursor::new(format!("{prefix}{madd}")), architecture).unwrap();
+            assert_eq!(summary.multiply_add_fields, 1);
+            assert_eq!(summary.multiply_add_value_checked, 1);
+            assert_eq!(summary.multiply_add_unknown_prior, 0);
+            assert_eq!(summary.mismatches, 0, "{:?}", summary.mismatch_examples);
+
+            let unknown = verify_scalar_trace(Cursor::new(madd), architecture).unwrap();
+            assert_eq!(unknown.multiply_add_fields, 1);
+            assert_eq!(unknown.multiply_add_value_checked, 0);
+            assert_eq!(unknown.multiply_add_unknown_prior, 1);
+            assert_eq!(unknown.mismatches, 0);
+
+            let wrong = madd.replace("XD:X29=0x1c7f80", "XD:X29=0x1c7f81");
+            let summary =
+                verify_scalar_trace(Cursor::new(format!("{prefix}{wrong}")), architecture).unwrap();
             assert_eq!(summary.mismatches, 1);
             assert!(
                 summary.mismatch_examples[0]

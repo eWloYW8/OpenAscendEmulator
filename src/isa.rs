@@ -1,4 +1,3 @@
-
 use crate::architecture::Architecture;
 use serde::Serialize;
 use thiserror::Error;
@@ -40,6 +39,7 @@ pub enum ScalarKey8Operation {
 pub enum ScalarKey0Operation {
     Add,
     Multiply,
+    MultiplyAdd,
     And,
     Or,
 }
@@ -131,6 +131,11 @@ pub enum AicDecoderHint {
         destination_register: u8,
         source_register: u8,
     },
+    ScalarKey2MoveFromSpr {
+        vendor_isa_name: u16,
+        destination_register: u8,
+        encoded_source_spr: u16,
+    },
     ScalarKey2MoveToSpr {
         vendor_isa_name: u16,
         encoded_destination_spr: u16,
@@ -167,6 +172,8 @@ pub enum AicDecoderHint {
         vendor_isa_name: u16,
         direction_field: u8,
         dtype_field: u8,
+        source_memory_class: u8,
+        destination_memory_class: u8,
     },
 }
 
@@ -240,6 +247,7 @@ impl AicDecoderHint {
                 let (operation, vendor_isa_name) = match word & 0xf {
                     1 => (ScalarKey0Operation::Add, 0),
                     3 => (ScalarKey0Operation::Multiply, 2),
+                    4 => (ScalarKey0Operation::MultiplyAdd, 3),
                     10 => (ScalarKey0Operation::And, 9),
                     11 => (ScalarKey0Operation::Or, 10),
                     _ => return None,
@@ -282,6 +290,19 @@ impl AicDecoderHint {
                     dtype_field: ((word >> 22) & 3) as u8,
                     destination_register,
                     source_register,
+                })
+            }
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 17 => {
+                let high_bit = if matches!(architecture, Architecture::Dav3510) {
+                    (word & 1) << 7
+                } else {
+                    0
+                };
+                Some(Self::ScalarKey2MoveFromSpr {
+                    vendor_isa_name: 34,
+                    destination_register: ((word >> 17) & 0x1f) as u8,
+                    encoded_source_spr: (high_bit | ((word >> 17) & 0x60) | ((word >> 12) & 0x1f))
+                        as u16,
                 })
             }
             AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 18 => {
@@ -361,10 +382,19 @@ impl AicDecoderHint {
                     && ((word >> 27) & 3) == 2
                     && ((word >> 24) & 7) == 4 =>
             {
+                let direction_field = ((word >> 22) & 3) as u8;
+                let (source_memory_class, destination_memory_class) = match direction_field {
+                    0 => (10, 8),
+                    1 => (8, 10),
+                    2 => (10, 9),
+                    _ => (9, 10),
+                };
                 Some(Self::C310MovAlignV2 {
                     vendor_isa_name: 141,
-                    direction_field: ((word >> 22) & 3) as u8,
+                    direction_field,
                     dtype_field: (word & 3) as u8,
+                    source_memory_class,
+                    destination_memory_class,
                 })
             }
             _ => None,
@@ -947,6 +977,15 @@ mod tests {
             for (word, operation, name, dtype, xd, xn, xm) in [
                 (0x003b_d781, ScalarKey0Operation::Add, 0, 0, 29, 29, 15),
                 (0x000e_8383, ScalarKey0Operation::Multiply, 2, 0, 7, 8, 7),
+                (
+                    0x003a_f884,
+                    ScalarKey0Operation::MultiplyAdd,
+                    3,
+                    0,
+                    29,
+                    15,
+                    17,
+                ),
                 (0x00de_f80a, ScalarKey0Operation::And, 9, 3, 15, 15, 16),
                 (0x00c0_100b, ScalarKey0Operation::Or, 10, 3, 0, 1, 0),
             ] {
@@ -1041,6 +1080,39 @@ mod tests {
                 vendor_isa_name: 35,
                 encoded_destination_spr: 24,
                 source_register: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn scalar_key2_mov_xd_spr_uses_both_high_spr_encoding_fields() {
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            for (word, destination_register, encoded_source_spr) in [
+                (0x029e_3880, 15, 67),
+                (0x021f_0880, 15, 16),
+                (0x0200_4880, 0, 4),
+                (0x0280_8880, 0, 72),
+            ] {
+                assert_eq!(
+                    AicDecoderHint::from_word(architecture, word),
+                    Some(AicDecoderHint::ScalarKey2MoveFromSpr {
+                        vendor_isa_name: 34,
+                        destination_register,
+                        encoded_source_spr,
+                    })
+                );
+            }
+        }
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x029e_3881),
+            AicDecoderHint::from_word(Architecture::Dav2201, 0x029e_3880)
+        );
+        assert_eq!(
+            AicDecoderHint::from_word(Architecture::Dav3510, 0x029e_3881),
+            Some(AicDecoderHint::ScalarKey2MoveFromSpr {
+                vendor_isa_name: 34,
+                destination_register: 15,
+                encoded_source_spr: 195,
             })
         );
     }
@@ -1187,6 +1259,8 @@ mod tests {
                     vendor_isa_name: 141,
                     direction_field: 0,
                     dtype_field: 0,
+                    source_memory_class: 10,
+                    destination_memory_class: 8,
                 })
             );
             assert_eq!(AicDecoderHint::from_word(Architecture::Dav2201, word), None);
@@ -1199,5 +1273,21 @@ mod tests {
             AicDecoderHint::from_word(Architecture::Dav3510, 0x7302_7204),
             None
         );
+        for (word, direction_field, dtype_field, source_memory_class, destination_memory_class) in [
+            (0x74ad_8bae, 2, 2, 10, 9),
+            (0x74b3_6bae, 2, 2, 10, 9),
+            (0x74e1_192c, 3, 0, 9, 10),
+        ] {
+            assert_eq!(
+                AicDecoderHint::from_word(Architecture::Dav3510, word),
+                Some(AicDecoderHint::C310MovAlignV2 {
+                    vendor_isa_name: 141,
+                    direction_field,
+                    dtype_field,
+                    source_memory_class,
+                    destination_memory_class,
+                })
+            );
+        }
     }
 }

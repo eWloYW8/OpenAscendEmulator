@@ -1,4 +1,3 @@
-
 use crate::prof_stub_packet::{ProfStubPacket, ProfStubPacketError};
 use serde::Serialize;
 

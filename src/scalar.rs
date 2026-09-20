@@ -1,4 +1,3 @@
-
 use crate::isa::{AicDecoderHint, ScalarKey8Operation};
 use thiserror::Error;
 

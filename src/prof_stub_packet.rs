@@ -1,4 +1,3 @@
-
 use thiserror::Error;
 
 pub const PROF_STUB_PACKET_HEADER_BYTES: usize = 8;
