@@ -1,19 +1,22 @@
 # OpenAscendEmulator
 
-OpenAscendEmulator is a work-in-progress Rust implementation of selected
-operator-simulator interfaces for `dav_2201` and `dav_3510`.
+OpenAscendEmulator is a work-in-progress Rust instruction and timing emulator
+for `dav_2201` and `dav_3510`.
 
-It currently supports configuration handling, isolated run preparation, and
-selected instruction and memory operations, including bounded execution of
-loaded scalar code. It is not a complete native operator simulator; general
-kernel execution, cycle accuracy, and report equivalence are not yet available.
+The current focus is the `dav_2201` core. Its loaded-program execution path
+connects scalar, selected vector, and memory-transfer instructions with an
+explicit MTE2 timeline. The 16- and 32-bit MOVEV paths decode register
+operands and respect active lanes; vector stores also report their UB bank
+placement. Single-repeat vector instructions use their encoded per-block UB
+strides instead of requiring one fixed control word.
+Vector execution exposes per-block UB write demand and an uncontended
+writeback-latency fragment; bank conflicts and whole-pipeline timing remain
+unmodeled.
+The supported C220 MOV paths handle independent source and destination burst
+gaps, including segmented output writes.
+MTE timing rules must be supplied by the caller; cycle accuracy and full
+instruction coverage are not yet available.
 
 ```bash
-cargo test --all-targets
-cargo run -- devices
-cargo run -- op simulator --help
+cargo check --all-targets
 ```
-
-Use `cargo run -- --help` for the available commands and options. Running an
-operator requires an appropriate local Ascend software installation and an
-explicit `--execute` flag.
