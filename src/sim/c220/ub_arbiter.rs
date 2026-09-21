@@ -70,6 +70,7 @@ pub enum C220UbPort {
     VectorWrite,
     VectorRead0,
     VectorRead1,
+    VectorReadDestination,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +97,16 @@ impl C220UbCycle {
         read0: Option<&mut C220UbRequest>,
         read1: Option<&mut C220UbRequest>,
     ) -> Self {
+        Self::arbitrate_with_destination(tick, write, read0, read1, None)
+    }
+
+    pub fn arbitrate_with_destination(
+        tick: u64,
+        write: Option<&mut C220UbRequest>,
+        read0: Option<&mut C220UbRequest>,
+        read1: Option<&mut C220UbRequest>,
+        read_destination: Option<&mut C220UbRequest>,
+    ) -> Self {
         let mut cycle = Self {
             tick,
             bank_mask: 0,
@@ -112,13 +123,18 @@ impl C220UbCycle {
         if let Some(request) = read1 {
             cycle.arbitrate_port(C220UbPort::VectorRead1, request);
         }
+        if let Some(request) = read_destination {
+            cycle.arbitrate_port(C220UbPort::VectorReadDestination, request);
+        }
         cycle
     }
 
     fn arbitrate_port(&mut self, port: C220UbPort, request: &mut C220UbRequest) {
         let group_mask = match port {
             C220UbPort::VectorWrite => &mut self.write_group_mask,
-            C220UbPort::VectorRead0 | C220UbPort::VectorRead1 => &mut self.read_group_mask,
+            C220UbPort::VectorRead0
+            | C220UbPort::VectorRead1
+            | C220UbPort::VectorReadDestination => &mut self.read_group_mask,
         };
         for (index, (&block, grant)) in request
             .blocks

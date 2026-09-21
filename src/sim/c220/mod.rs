@@ -5,4 +5,5 @@ pub mod scalar;
 pub(crate) mod scalar_address;
 pub mod timing;
 pub mod ub_arbiter;
+pub mod va;
 pub mod vector;

@@ -1,4 +1,66 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220MoveVaInstruction {
+    pub destination_va: u8,
+    pub first_entry: u8,
+    pub source_0_register: u8,
+    pub source_1_register: u8,
+}
+
+impl C220MoveVaInstruction {
+    pub const fn decode(word: u32) -> Option<Self> {
+        if word & 0xfff0_004f != 0x8000_0000 {
+            return None;
+        }
+        Some(Self {
+            destination_va: ((word >> 17) & 7) as u8,
+            first_entry: ((word >> 3) & 7) as u8,
+            source_0_register: ((word >> 12) & 0x1f) as u8,
+            source_1_register: ((word >> 7) & 0x1f) as u8,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220NchwElement {
+    Byte,
+    Half,
+    Word,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220NchwInstruction {
+    pub element: C220NchwElement,
+    pub destination_va: u8,
+    pub source_va: u8,
+    pub control_register: u8,
+    pub destination_high: bool,
+    pub source_high: bool,
+}
+
+impl C220NchwInstruction {
+    pub const fn decode(word: u32) -> Option<Self> {
+        let fixed = word & !(0x000e_0000 | 0x0000_7000 | 0x0000_007c | 3);
+        let element = match fixed {
+            0x8200_0680 => C220NchwElement::Byte,
+            0x8240_0680 => C220NchwElement::Half,
+            0x8280_0680 => C220NchwElement::Word,
+            _ => return None,
+        };
+        if !matches!(element, C220NchwElement::Byte) && word & 3 != 0 {
+            return None;
+        }
+        Some(Self {
+            element,
+            destination_va: ((word >> 17) & 7) as u8,
+            source_va: ((word >> 12) & 7) as u8,
+            control_register: ((word >> 2) & 0x1f) as u8,
+            destination_high: word & 1 != 0,
+            source_high: word & 2 != 0,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220MovevInstruction {
     pub word: u32,
     pub dtype_selector: u8,
@@ -32,6 +94,48 @@ impl C220MovevInstruction {
             2 => Some(4),
             _ => None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220BroadcastInstruction {
+    pub element_bytes: u8,
+    pub destination_register: u8,
+    pub source_register: u8,
+    pub control_register: u8,
+}
+
+impl C220BroadcastInstruction {
+    pub const fn decode(word: u32) -> Option<Self> {
+        let element_bytes = match word & 0xffc0_007f {
+            0x8000_0044 => 2,
+            0x8000_004c => 4,
+            _ => return None,
+        };
+        Some(Self {
+            element_bytes,
+            destination_register: ((word >> 17) & 0x1f) as u8,
+            source_register: ((word >> 12) & 0x1f) as u8,
+            control_register: ((word >> 7) & 0x1f) as u8,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220TransposeInstruction {
+    pub destination_register: u8,
+    pub source_register: u8,
+}
+
+impl C220TransposeInstruction {
+    pub const fn decode(word: u32) -> Option<Self> {
+        if word & 0xffc0_0fff != 0x8240_0c00 {
+            return None;
+        }
+        Some(Self {
+            destination_register: ((word >> 17) & 0x1f) as u8,
+            source_register: ((word >> 12) & 0x1f) as u8,
+        })
     }
 }
 
@@ -95,12 +199,38 @@ impl C220ShiftInstruction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220CopyInstruction {
+    pub element_bytes: u8,
+    pub destination_register: u8,
+    pub source_register: u8,
+    pub control_register: u8,
+}
+
+impl C220CopyInstruction {
+    pub const fn decode(word: u32) -> Option<Self> {
+        let element_bytes = match word & 0xffc0_0f83 {
+            0x8240_0700 => 2,
+            0x8280_0700 => 4,
+            _ => return None,
+        };
+        Some(Self {
+            element_bytes,
+            destination_register: ((word >> 17) & 0x1f) as u8,
+            source_register: ((word >> 12) & 0x1f) as u8,
+            control_register: ((word >> 2) & 0x1f) as u8,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220VecArithmeticOperation {
     Absolute,
     Rectify,
     Not,
     Add,
     Subtract,
+    AddRectify,
+    SubtractRectify,
     Multiply,
     Divide,
     Maximum,
@@ -125,6 +255,8 @@ impl C220VecArithmeticHint {
             return None;
         }
         let operation = match word & 0xffc0_0003 {
+            0x9440_0000 | 0x9480_0000 | 0x94c0_0000 => C220VecArithmeticOperation::AddRectify,
+            0x9440_0001 | 0x9480_0001 | 0x94c0_0001 => C220VecArithmeticOperation::SubtractRectify,
             0x9a40_0000 => C220VecArithmeticOperation::Or,
             0x9a40_0001 => C220VecArithmeticOperation::And,
             _ if word & 0xffc0_0f83 == 0x8240_0800 => C220VecArithmeticOperation::Not,
@@ -145,9 +277,9 @@ impl C220VecArithmeticHint {
             },
         };
         let dtype_selector = match operation {
-            C220VecArithmeticOperation::Divide | C220VecArithmeticOperation::Rectify => {
-                ((word >> 22) & 7) as u8
-            }
+            C220VecArithmeticOperation::Divide
+            | C220VecArithmeticOperation::Rectify
+            | C220VecArithmeticOperation::Absolute => ((word >> 22) & 7) as u8,
             _ => ((word >> 22) & 3) as u8,
         };
         Some(Self {
@@ -167,9 +299,9 @@ impl C220VecArithmeticHint {
 
     pub const fn has_fp32_value_path(self) -> bool {
         match self.operation {
-            C220VecArithmeticOperation::Divide | C220VecArithmeticOperation::Rectify => {
-                self.dtype_selector == 7
-            }
+            C220VecArithmeticOperation::Divide
+            | C220VecArithmeticOperation::Rectify
+            | C220VecArithmeticOperation::Absolute => self.dtype_selector == 7,
             _ => self.dtype_selector == 3,
         }
     }
@@ -192,6 +324,8 @@ impl C220VecArithmeticHint {
                 self.operation,
                 C220VecArithmeticOperation::Add
                     | C220VecArithmeticOperation::Subtract
+                    | C220VecArithmeticOperation::AddRectify
+                    | C220VecArithmeticOperation::SubtractRectify
                     | C220VecArithmeticOperation::Multiply
                     | C220VecArithmeticOperation::Maximum
                     | C220VecArithmeticOperation::Minimum
@@ -199,15 +333,22 @@ impl C220VecArithmeticHint {
     }
 
     pub const fn has_f16_value_path(self) -> bool {
-        self.dtype_selector == 1
+        (self.dtype_selector == 5
             && matches!(
                 self.operation,
-                C220VecArithmeticOperation::Add
-                    | C220VecArithmeticOperation::Subtract
-                    | C220VecArithmeticOperation::Multiply
-                    | C220VecArithmeticOperation::Maximum
-                    | C220VecArithmeticOperation::Minimum
-            )
+                C220VecArithmeticOperation::Absolute | C220VecArithmeticOperation::Rectify
+            ))
+            || (self.dtype_selector == 1
+                && matches!(
+                    self.operation,
+                    C220VecArithmeticOperation::Add
+                        | C220VecArithmeticOperation::Subtract
+                        | C220VecArithmeticOperation::AddRectify
+                        | C220VecArithmeticOperation::SubtractRectify
+                        | C220VecArithmeticOperation::Multiply
+                        | C220VecArithmeticOperation::Maximum
+                        | C220VecArithmeticOperation::Minimum
+                ))
     }
 
     pub const fn has_bitwise_b16_value_path(self) -> bool {

@@ -2,6 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::architecture::c220::C220UbBank;
+use crate::isa::c220::gather::C220GatherKind;
+use crate::isa::c220::reduce::{
+    C220ExtremumOperation, C220ReductionInstruction, C220ReductionKind, C220ReductionWidth,
+};
+use crate::isa::c220::ternary::C220TernaryInstruction;
 use crate::isa::c220::vector::{
     C220MovevInstruction, C220VecArithmeticHint, C220VecArithmeticOperation,
 };
@@ -47,7 +52,10 @@ impl C220VectorUopStages {
             | C220VecArithmeticOperation::And => {
                 return None;
             }
-            C220VecArithmeticOperation::Add | C220VecArithmeticOperation::Subtract => 7,
+            C220VecArithmeticOperation::Add
+            | C220VecArithmeticOperation::Subtract
+            | C220VecArithmeticOperation::AddRectify
+            | C220VecArithmeticOperation::SubtractRectify => 7,
             C220VecArithmeticOperation::Maximum | C220VecArithmeticOperation::Minimum => 5,
             C220VecArithmeticOperation::Multiply => 8,
             C220VecArithmeticOperation::Divide => 11,
@@ -68,6 +76,8 @@ impl C220VectorUopStages {
             let execute_ticks = match hint.operation {
                 C220VecArithmeticOperation::Add
                 | C220VecArithmeticOperation::Subtract
+                | C220VecArithmeticOperation::AddRectify
+                | C220VecArithmeticOperation::SubtractRectify
                 | C220VecArithmeticOperation::Maximum
                 | C220VecArithmeticOperation::Minimum => 5,
                 C220VecArithmeticOperation::Multiply => 6,
@@ -77,12 +87,10 @@ impl C220VectorUopStages {
                 read_ticks: 6,
                 execute_ticks,
             })
-        } else if hint.has_f16_value_path() {
-            Self::floating_binary_arithmetic(hint.operation)
-        } else if hint.has_fp32_value_path() {
+        } else if hint.has_f16_value_path() || hint.has_fp32_value_path() {
             match hint.operation {
-                C220VecArithmeticOperation::Absolute => Some(Self::fp32_vabs()),
-                C220VecArithmeticOperation::Rectify => Some(Self::fp32_vrelu()),
+                C220VecArithmeticOperation::Absolute => Some(Self::abs()),
+                C220VecArithmeticOperation::Rectify => Some(Self::relu()),
                 operation => Self::floating_binary_arithmetic(operation),
             }
         } else {
@@ -90,14 +98,14 @@ impl C220VectorUopStages {
         }
     }
 
-    pub const fn fp32_vabs() -> Self {
+    pub const fn abs() -> Self {
         Self {
             read_ticks: 6,
             execute_ticks: 15,
         }
     }
 
-    pub const fn fp32_vrelu() -> Self {
+    pub const fn relu() -> Self {
         Self {
             read_ticks: 6,
             execute_ticks: 6,
@@ -108,6 +116,7 @@ impl C220VectorUopStages {
         Self {
             read_ticks: 6,
             execute_ticks: match (instruction.operation, instruction.dtype) {
+                (C220VectorScalarOperation::LeakyRelu, _) => 8,
                 (C220VectorScalarOperation::Maximum | C220VectorScalarOperation::Minimum, _) => 5,
                 (
                     C220VectorScalarOperation::Add,
@@ -136,6 +145,130 @@ impl C220VectorUopStages {
         }
     }
 
+    pub const fn copy() -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: 1,
+        }
+    }
+
+    pub const fn broadcast() -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: 2,
+        }
+    }
+
+    pub const fn transpose() -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: 1,
+        }
+    }
+
+    pub const fn packed_compare() -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: 5,
+        }
+    }
+
+    pub const fn select() -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: 1,
+        }
+    }
+
+    pub const fn reduction(instruction: C220ReductionInstruction) -> Self {
+        let execute_ticks = match (instruction.kind, instruction.width) {
+            (C220ReductionKind::WholeAdd { .. }, _) => 5,
+            (
+                C220ReductionKind::WholeExtremum {
+                    operation: C220ExtremumOperation::Maximum,
+                    ..
+                },
+                C220ReductionWidth::F16,
+            ) => 24,
+            (
+                C220ReductionKind::WholeExtremum {
+                    operation: C220ExtremumOperation::Maximum,
+                    ..
+                },
+                C220ReductionWidth::F32,
+            ) => 21,
+            (
+                C220ReductionKind::WholeExtremum {
+                    operation: C220ExtremumOperation::Minimum,
+                    ..
+                },
+                C220ReductionWidth::F16,
+            ) => 10,
+            (
+                C220ReductionKind::WholeExtremum {
+                    operation: C220ExtremumOperation::Minimum,
+                    ..
+                },
+                C220ReductionWidth::F32,
+            ) => 9,
+            (C220ReductionKind::GroupAdd, C220ReductionWidth::F16) => 7,
+            (C220ReductionKind::GroupAdd, C220ReductionWidth::F32) => 6,
+            (
+                C220ReductionKind::GroupExtremum {
+                    operation: C220ExtremumOperation::Maximum,
+                },
+                C220ReductionWidth::F16,
+            ) => 10,
+            (
+                C220ReductionKind::GroupExtremum {
+                    operation: C220ExtremumOperation::Maximum,
+                },
+                C220ReductionWidth::F32,
+            ) => 9,
+            (
+                C220ReductionKind::GroupExtremum {
+                    operation: C220ExtremumOperation::Minimum,
+                },
+                C220ReductionWidth::F16,
+            ) => 7,
+            (
+                C220ReductionKind::GroupExtremum {
+                    operation: C220ExtremumOperation::Minimum,
+                },
+                C220ReductionWidth::F32,
+            ) => 6,
+            (C220ReductionKind::PairAdd, _) => 1,
+        };
+        Self {
+            read_ticks: 6,
+            execute_ticks,
+        }
+    }
+
+    pub const fn ternary(_instruction: C220TernaryInstruction) -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: 11,
+        }
+    }
+
+    pub const fn gather(kind: C220GatherKind) -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: match kind {
+                C220GatherKind::Elements(_) => 1,
+                C220GatherKind::Blocks => 2,
+            },
+        }
+    }
+
+    pub const fn gather_index() -> Self {
+        Self {
+            read_ticks: 0,
+            execute_ticks: 0,
+        }
+    }
+
     /// Delay until write-lane release; a fully masked uop sends no UB request.
     pub const fn release_offset(self, writeback_ticks: usize) -> usize {
         self.read_ticks as usize + self.execute_ticks as usize + writeback_ticks
@@ -143,10 +276,18 @@ impl C220VectorUopStages {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220VectorUopKind {
+    Ordinary,
+    GatherIndex { group: u8 },
+    GatherData { group: u8 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220VectorUop {
     pub pc: u64,
     pub repeat_index: usize,
-    pub lane_group: u8,
+    pub lane_group: Option<u8>,
+    pub kind: C220VectorUopKind,
     pub stages: C220VectorUopStages,
     pub writeback_ticks: usize,
     pub writes_ub: bool,
@@ -157,7 +298,8 @@ pub struct C220VectorUop {
 pub struct C220VectorUopRelease {
     pub pc: u64,
     pub repeat_index: usize,
-    pub lane_group: u8,
+    pub lane_group: Option<u8>,
+    pub kind: C220VectorUopKind,
     pub admission_tick: u64,
     pub eligible_tick: u64,
     pub release_tick: u64,
@@ -209,7 +351,7 @@ pub struct C220VectorWriteBlock {
     pub base_address: u64,
     pub bank: C220UbBank,
     pub element_bytes: u8,
-    pub active_lane_mask: u16,
+    pub active_lane_mask: u32,
 }
 
 impl C220VectorWriteBlock {
@@ -219,7 +361,8 @@ impl C220VectorWriteBlock {
 
     pub const fn full(self) -> bool {
         match self.element_bytes {
-            2 => self.active_lane_mask == u16::MAX,
+            1 => self.active_lane_mask == u32::MAX,
+            2 => self.active_lane_mask == u16::MAX as u32,
             4 => self.active_lane_mask == 0xff,
             _ => false,
         }
@@ -248,7 +391,7 @@ impl C220VectorWritePlan {
         let mut blocks: BTreeMap<(usize, usize), C220VectorWriteBlock> = BTreeMap::new();
         for store in stores {
             let width = usize::from(store.width_bytes);
-            if !matches!(width, 2 | 4) {
+            if !matches!(width, 1 | 2 | 4) {
                 return Err(C220VectorWritePlanError::ElementWidth(store.width_bytes));
             }
             let lanes_per_block = C220_VECTOR_BLOCK_BYTES / width;
@@ -400,7 +543,7 @@ mod tests {
                 .execute_ticks,
             11
         );
-        assert_eq!(C220VectorUopStages::fp32_vrelu().execute_ticks, 6);
+        assert_eq!(C220VectorUopStages::relu().execute_ticks, 6);
     }
 
     #[test]

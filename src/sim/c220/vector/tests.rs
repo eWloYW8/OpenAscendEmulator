@@ -296,10 +296,20 @@ fn captured_fp32_words_reach_the_masked_value_stage() {
     let mask = [1, 0, 0, 0];
     let add = C220VecArithmeticHint::from_word(0x85dc_b618).unwrap();
     let sub = C220VecArithmeticHint::from_word(0x85dc_b619).unwrap();
+    let add_relu = C220VecArithmeticHint::from_word(0x94c0_0000).unwrap();
+    let sub_relu = C220VecArithmeticHint::from_word(0x94c0_0001).unwrap();
     let added = add.evaluate_fp32_lanes(&first, &second, &mask).unwrap();
     let subtracted = sub.evaluate_fp32_lanes(&first, &second, &mask).unwrap();
+    let added_rectified = add_relu
+        .evaluate_fp32_lanes(&first, &second, &mask)
+        .unwrap();
+    let subtracted_rectified = sub_relu
+        .evaluate_fp32_lanes(&first, &second, &mask)
+        .unwrap();
     assert_eq!(added[0].bits, 4.0_f32.to_bits());
     assert_eq!(subtracted[0].bits, (-2.0_f32).to_bits());
+    assert_eq!(added_rectified[0].bits, 4.0_f32.to_bits());
+    assert_eq!(subtracted_rectified[0].bits, 0);
     assert_eq!(added[1].bits, 0);
     assert_eq!(subtracted[1].bits, 0);
 }

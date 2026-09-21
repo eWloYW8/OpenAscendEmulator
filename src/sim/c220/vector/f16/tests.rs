@@ -15,8 +15,17 @@ use crate::sim::mte_stepper::MteCoreStepper;
 use crate::sim::stepper::ScalarStepper;
 
 #[test]
-fn f16_binary_arithmetic_captures_mode_and_commits_both_lane_groups() {
+fn f16_arithmetic_captures_mode_and_commits_both_lane_groups() {
     for (opcode, first, second, expected, mode, execute_ticks) in [
+        (0x9440_0000, 0xbc00, 0x3800, 0, C220Fp16Mode::Saturating, 7),
+        (
+            0x9440_0001,
+            0x4000,
+            0x3800,
+            0x3e00,
+            C220Fp16Mode::Saturating,
+            7,
+        ),
         (
             0x8540_0000,
             0x3c00_u16,
@@ -52,15 +61,49 @@ fn f16_binary_arithmetic_captures_mode_and_commits_both_lane_groups() {
             C220Fp16Mode::NonSaturating,
             7,
         ),
+        (0x8340_0180, 0xbc00, 0, 0, C220Fp16Mode::Saturating, 6),
+        (0x8340_0180, 0x8000, 0, 0, C220Fp16Mode::Saturating, 6),
+        (0x8340_0180, 0x7c00, 0, 0x7bff, C220Fp16Mode::Saturating, 6),
+        (0x8340_0180, 0x7e00, 0, 0, C220Fp16Mode::Saturating, 6),
+        (0x8340_0300, 0xbc00, 0, 0x3c00, C220Fp16Mode::Saturating, 15),
+        (0x8340_0300, 0x8000, 0, 0, C220Fp16Mode::Saturating, 15),
+        (0x8340_0300, 0xfc00, 0, 0x7bff, C220Fp16Mode::Saturating, 15),
+        (
+            0x8340_0300,
+            0x7e00,
+            0,
+            0x7fff,
+            C220Fp16Mode::NonSaturating,
+            15,
+        ),
+        (
+            0x8340_0180,
+            0x7e00,
+            0,
+            0x7fff,
+            C220Fp16Mode::NonSaturating,
+            6,
+        ),
     ] {
-        let word = opcode | (3 << 17) | (4 << 12) | (5 << 7) | (6 << 2);
+        let unary = matches!(opcode, 0x8340_0180 | 0x8340_0300);
+        let word =
+            opcode | (3 << 17) | (4 << 12) | if unary { 6 << 2 } else { (5 << 7) | (6 << 2) };
         let memory = SparseMemory::new(vec![MemoryRegion::unknown(256)], 512, 512);
         let memory = MappedMemory::bind(memory, &[0x2000]).unwrap();
         let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
         machine.set_xreg(3, 0x200).unwrap();
         machine.set_xreg(4, 0).unwrap();
         machine.set_xreg(5, 0x100).unwrap();
-        machine.set_xreg(6, 0x0100_0808_0801_0101).unwrap();
+        machine
+            .set_xreg(
+                6,
+                if unary {
+                    (1_u64 << 56) | (8 << 40) | (8 << 32) | (1 << 16) | 1
+                } else {
+                    0x0100_0808_0801_0101
+                },
+            )
+            .unwrap();
         let control_spr = if mode == C220Fp16Mode::NonSaturating {
             1_u64 << 48
         } else {

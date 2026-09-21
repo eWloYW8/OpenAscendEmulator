@@ -6,7 +6,10 @@ use crate::architecture::c220::C220UbBank;
 use crate::isa::c220::vector::{C220VecArithmeticHint, C220VecArithmeticOperation};
 use crate::isa::c220::vector_scalar::C220VectorScalarOperation;
 use crate::memory::ub::UbMemory;
-use crate::sim::c220::fp16::{C220Fp16Mode, C220Fp16Outcome, C220Fp16Status, evaluate_c220_fp16};
+use crate::sim::c220::fp16::{
+    C220Fp16Mode, C220Fp16Outcome, C220Fp16Status, evaluate_c220_fp16, evaluate_c220_fp16_abs,
+    evaluate_c220_fp16_relu,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct C220F16LaneOutcome {
@@ -103,21 +106,39 @@ fn evaluate_lane(
     second: u16,
     mode: C220Fp16Mode,
 ) -> C220Fp16Outcome {
+    if operation == C220VecArithmeticOperation::Absolute {
+        return evaluate_c220_fp16_abs(first, mode);
+    }
+    if operation == C220VecArithmeticOperation::Rectify {
+        return evaluate_c220_fp16_relu(first, mode);
+    }
+    let rectify_result = matches!(
+        operation,
+        C220VecArithmeticOperation::AddRectify | C220VecArithmeticOperation::SubtractRectify
+    );
     let mapped = match operation {
-        C220VecArithmeticOperation::Add | C220VecArithmeticOperation::Subtract => {
-            C220VectorScalarOperation::Add
-        }
+        C220VecArithmeticOperation::Add
+        | C220VecArithmeticOperation::Subtract
+        | C220VecArithmeticOperation::AddRectify
+        | C220VecArithmeticOperation::SubtractRectify => C220VectorScalarOperation::Add,
         C220VecArithmeticOperation::Multiply => C220VectorScalarOperation::Multiply,
         C220VecArithmeticOperation::Maximum => C220VectorScalarOperation::Maximum,
         C220VecArithmeticOperation::Minimum => C220VectorScalarOperation::Minimum,
         _ => unreachable!("F16 value path was checked"),
     };
-    let second = if operation == C220VecArithmeticOperation::Subtract {
+    let second = if matches!(
+        operation,
+        C220VecArithmeticOperation::Subtract | C220VecArithmeticOperation::SubtractRectify
+    ) {
         second ^ 0x8000
     } else {
         second
     };
-    evaluate_c220_fp16(mapped, first, second, mode)
+    let mut result = evaluate_c220_fp16(mapped, first, second, mode);
+    if rectify_result {
+        result.bits = evaluate_c220_fp16_relu(result.bits, mode).bits;
+    }
+    result
 }
 
 #[cfg(test)]

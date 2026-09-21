@@ -1,12 +1,34 @@
+use std::collections::BTreeMap;
+
 use thiserror::Error;
 
-use crate::isa::c220::vector::{C220ShiftInstruction, C220VecArithmeticHint};
+use crate::isa::c220::compare::{C220MoveMaskDirection, C220PackedCompareInstruction};
+use crate::isa::c220::vector::{
+    C220BroadcastInstruction, C220CopyInstruction, C220NchwElement, C220NchwInstruction,
+    C220ShiftInstruction, C220VecArithmeticHint,
+};
 use crate::isa::c220::vector_scalar::C220VectorScalarInstruction;
 use crate::memory::ub::UbMemory;
 use crate::numeric::fp32::Fp32ValueStatus;
 use crate::sim::c220::fp16::C220Fp16Status;
 use crate::sim::c220::ub_arbiter::{C220UbDecision, C220UbPort, C220UbRequest, C220UbRequestError};
+use crate::sim::c220::vector::broadcast::{
+    C220BroadcastControl, C220BroadcastIssue, evaluate_c220_broadcast_repeat,
+};
+use crate::sim::c220::vector::compare::{
+    C220CompareMask, C220CompareMaskIssue, C220CompareMaskUpdate, C220MoveMaskIssue,
+    C220PackedCompareIssue, C220PackedCompareValueInputs, evaluate_c220_compare_mask_uop,
+    evaluate_c220_packed_compare_uop,
+};
+use crate::sim::c220::vector::copy::{
+    C220CopyIssue, C220CopyValueInputs, evaluate_c220_copy_repeat,
+};
 use crate::sim::c220::vector::f16::{C220F16ValueInputs, evaluate_c220_f16_repeat_from_bytes};
+use crate::sim::c220::vector::gather::{C220GatherIssue, evaluate_c220_gather_data_uop};
+use crate::sim::c220::vector::nchw::{C220NchwIssue, C220NchwRows, evaluate_c220_nchw_repeat};
+use crate::sim::c220::vector::reduce::{
+    C220ReductionIssue, C220ReductionStateUpdate, evaluate_c220_reduction_repeat,
+};
 use crate::sim::c220::vector::s16::{
     C220S16ValueInputs, C220S16WidenInputs, evaluate_c220_s16_repeat_from_bytes,
     evaluate_c220_s16_widen_repeat_from_bytes,
@@ -16,19 +38,27 @@ use crate::sim::c220::vector::scalar::{
     C220VectorScalarIssue, C220VectorScalarOperand, C220VectorScalarValueInputs,
     evaluate_c220_vector_scalar_repeat,
 };
+use crate::sim::c220::vector::select::{
+    C220SelectIssue, C220SelectMode, C220SelectionMaskBlock, evaluate_c220_select_uop,
+};
 use crate::sim::c220::vector::shift::{
     C220ShiftIssue, C220ShiftValueInputs, evaluate_c220_shift_repeat,
 };
+use crate::sim::c220::vector::ternary::{C220TernaryIssue, evaluate_c220_ternary_repeat};
+use crate::sim::c220::vector::timing::C220VectorUopKind;
+use crate::sim::c220::vector::transpose::{C220TransposeIssue, evaluate_c220_transpose};
 use crate::sim::c220::vector::{
-    C220_VECTOR_BLOCK_BYTES, C220_VECTOR_TILE_BYTES, C220VectorAddresses,
-    C220VectorArithmeticIssue, C220VectorArithmeticModes, C220VectorControl, C220VectorError,
-    C220VectorReadAccess, C220VectorStore, evaluate_c220_fp32_repeat_from_bytes,
+    C220_VECTOR_TILE_BYTES, C220VectorAddresses, C220VectorArithmeticIssue,
+    C220VectorArithmeticModes, C220VectorControl, C220VectorError, C220VectorReadAccess,
+    C220VectorStore, evaluate_c220_fp32_repeat_from_bytes,
 };
 
 #[derive(Debug, Error)]
 pub enum C220VectorReadError {
     #[error("vector repeat has no iteration mask")]
     MissingRepeatMask,
+    #[error("vector uop lane scope does not match the instruction")]
+    InvalidUopScope,
     #[error(transparent)]
     ReadPlan(#[from] C220VectorError),
     #[error(transparent)]
@@ -44,17 +74,19 @@ pub(super) struct PendingVectorRead {
     addresses: C220VectorAddresses,
     mask: [u64; 4],
     repeat_index: usize,
-    lane_group: u8,
+    lane_group: Option<u8>,
     accesses: Vec<C220VectorReadAccess>,
     port0: ReadPort,
     port1: ReadPort,
+    destination_port: ReadPort,
     source_0_bytes: Vec<u8>,
     source_1_bytes: Vec<u8>,
+    destination_bytes: Vec<u8>,
     ready_tick: Option<u64>,
     sampled: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum C220VectorReadOperation {
     Arithmetic {
         hint: C220VecArithmeticHint,
@@ -68,6 +100,45 @@ enum C220VectorReadOperation {
         instruction: C220ShiftInstruction,
         shift: u32,
     },
+    Copy {
+        instruction: C220CopyInstruction,
+    },
+    Broadcast {
+        instruction: C220BroadcastInstruction,
+        control: C220BroadcastControl,
+    },
+    Transpose,
+    CompareMask {
+        issue: Box<C220CompareMaskIssue>,
+    },
+    MoveMask {
+        issue: C220MoveMaskIssue,
+    },
+    Select {
+        issue: Box<C220SelectIssue>,
+    },
+    SelectMaskLoad {
+        issue: Box<C220SelectIssue>,
+    },
+    PackedCompare {
+        instruction: C220PackedCompareInstruction,
+        scalar_bits: Option<u32>,
+    },
+    Reduction {
+        issue: Box<C220ReductionIssue>,
+    },
+    Ternary {
+        issue: Box<C220TernaryIssue>,
+    },
+    GatherIndex,
+    GatherData {
+        issue: Box<C220GatherIssue>,
+        group: u8,
+    },
+    Nchw {
+        instruction: C220NchwInstruction,
+        rows: Box<C220NchwRows>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,32 +146,102 @@ pub enum C220VectorReadIssue<'a> {
     Arithmetic(&'a C220VectorArithmeticIssue),
     VectorScalar(&'a C220VectorScalarIssue),
     Shift(&'a C220ShiftIssue),
+    Copy(&'a C220CopyIssue),
+    Broadcast(&'a C220BroadcastIssue),
+    Transpose(&'a C220TransposeIssue),
+    CompareMask(&'a C220CompareMaskIssue),
+    MoveMask(&'a C220MoveMaskIssue),
+    Select(&'a C220SelectIssue),
+    PackedCompare(&'a C220PackedCompareIssue),
+    Reduction(&'a C220ReductionIssue),
+    Ternary(&'a C220TernaryIssue),
+    Gather(&'a C220GatherIssue),
+    Nchw(&'a C220NchwIssue),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReadPort {
     request: C220UbRequest,
-    destination_offsets: Vec<usize>,
+    destinations: Vec<Vec<ReadDestination>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadDestination {
+    source_index: u8,
+    offset: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadSpan {
+    address: u64,
+    bytes: u16,
+    destinations: Vec<ReadDestination>,
 }
 
 impl ReadPort {
     fn new(accesses: &[C220VectorReadAccess]) -> Result<Self, C220UbRequestError> {
-        let spans = accesses
-            .iter()
-            .map(|access| (access.address, C220_VECTOR_BLOCK_BYTES))
-            .collect::<Vec<_>>();
-        let request = C220UbRequest::from_accesses(&spans)?;
-        let mut destination_offsets = Vec::with_capacity(request.blocks().len());
-        let mut next_block = 0;
+        Self::from_spans(
+            accesses
+                .iter()
+                .map(|access| ReadSpan {
+                    address: access.address,
+                    bytes: access.bytes,
+                    destinations: vec![ReadDestination {
+                        source_index: access.source_index,
+                        offset: usize::from(access.buffer_offset),
+                    }],
+                })
+                .collect(),
+        )
+    }
+
+    fn gather_pair(accesses: &[C220VectorReadAccess]) -> Result<(Self, Self), C220UbRequestError> {
+        let mut spans = [Vec::<ReadSpan>::new(), Vec::<ReadSpan>::new()];
+        let mut unique = BTreeMap::<(u64, u16), (usize, usize)>::new();
         for access in accesses {
-            let mut address = access.address;
-            let end = address + C220_VECTOR_BLOCK_BYTES as u64;
+            let destination = ReadDestination {
+                source_index: access.source_index,
+                offset: usize::from(access.buffer_offset),
+            };
+            if let Some(&(port, index)) = unique.get(&(access.address, access.bytes)) {
+                spans[port][index].destinations.push(destination);
+                continue;
+            }
+            let port = usize::from(access.source_index.min(1));
+            let index = spans[port].len();
+            spans[port].push(ReadSpan {
+                address: access.address,
+                bytes: access.bytes,
+                destinations: vec![destination],
+            });
+            unique.insert((access.address, access.bytes), (port, index));
+        }
+        let [port0, port1] = spans;
+        Ok((Self::from_spans(port0)?, Self::from_spans(port1)?))
+    }
+
+    fn from_spans(spans: Vec<ReadSpan>) -> Result<Self, C220UbRequestError> {
+        let requests = spans
+            .iter()
+            .map(|span| (span.address, usize::from(span.bytes)))
+            .collect::<Vec<_>>();
+        let request = C220UbRequest::from_accesses(&requests)?;
+        let mut destinations = Vec::with_capacity(request.blocks().len());
+        let mut next_block = 0;
+        for span in spans {
+            let mut address = span.address;
+            let end = address + u64::from(span.bytes);
             while address < end {
                 let block = request.blocks()[next_block];
                 debug_assert_eq!(block.address, address);
-                destination_offsets.push(
-                    usize::from(access.block_index) * C220_VECTOR_BLOCK_BYTES
-                        + (address - access.address) as usize,
+                destinations.push(
+                    span.destinations
+                        .iter()
+                        .map(|destination| ReadDestination {
+                            source_index: destination.source_index,
+                            offset: destination.offset + (address - span.address) as usize,
+                        })
+                        .collect(),
                 );
                 address += u64::from(block.bytes);
                 next_block += 1;
@@ -108,7 +249,7 @@ impl ReadPort {
         }
         Ok(Self {
             request,
-            destination_offsets,
+            destinations,
         })
     }
 }
@@ -117,8 +258,29 @@ impl PendingVectorRead {
     pub(super) fn new(
         issue: C220VectorReadIssue<'_>,
         repeat_index: usize,
-        lane_group: u8,
+        lane_group: Option<u8>,
+        kind: C220VectorUopKind,
     ) -> Result<Self, C220VectorReadError> {
+        let select_mask_load = matches!(
+            issue,
+            C220VectorReadIssue::Select(select)
+                if matches!(select.mode, C220SelectMode::TensorTensor) && lane_group.is_none()
+        );
+        if !matches!(issue, C220VectorReadIssue::Gather(_))
+            && (matches!(
+                issue,
+                C220VectorReadIssue::Broadcast(_)
+                    | C220VectorReadIssue::Transpose(_)
+                    | C220VectorReadIssue::MoveMask(_)
+                    | C220VectorReadIssue::PackedCompare(_)
+                    | C220VectorReadIssue::Reduction(_)
+                    | C220VectorReadIssue::Nchw(_)
+            ) || select_mask_load)
+                != lane_group.is_none()
+        {
+            return Err(C220VectorReadError::InvalidUopScope);
+        }
+        let ordinary_group = lane_group.unwrap_or_default();
         let (pc, word, control, addresses, mask, accesses, operation) = match issue {
             C220VectorReadIssue::Arithmetic(issue) => (
                 issue.pc,
@@ -129,7 +291,7 @@ impl PendingVectorRead {
                     .iteration_masks
                     .get(repeat_index)
                     .ok_or(C220VectorReadError::MissingRepeatMask)?,
-                issue.read_accesses_for_repeat(repeat_index, lane_group)?,
+                issue.read_accesses_for_repeat(repeat_index, ordinary_group)?,
                 C220VectorReadOperation::Arithmetic {
                     hint: issue.hint,
                     modes: issue.modes,
@@ -144,7 +306,7 @@ impl PendingVectorRead {
                     .iteration_masks
                     .get(repeat_index)
                     .ok_or(C220VectorReadError::MissingRepeatMask)?,
-                issue.read_accesses_for_repeat(repeat_index, lane_group)?,
+                issue.read_accesses_for_repeat(repeat_index, ordinary_group)?,
                 C220VectorReadOperation::VectorScalar {
                     instruction: issue.instruction,
                     scalar: issue.scalar,
@@ -159,12 +321,215 @@ impl PendingVectorRead {
                     .iteration_masks
                     .get(repeat_index)
                     .ok_or(C220VectorReadError::MissingRepeatMask)?,
-                issue.read_accesses_for_repeat(repeat_index, lane_group)?,
+                issue.read_accesses_for_repeat(repeat_index, ordinary_group)?,
                 C220VectorReadOperation::Shift {
                     instruction: issue.instruction,
                     shift: issue.shift,
                 },
             ),
+            C220VectorReadIssue::Copy(issue) => (
+                issue.pc,
+                issue.word,
+                issue.control,
+                issue.addresses,
+                *issue
+                    .iteration_masks
+                    .get(repeat_index)
+                    .ok_or(C220VectorReadError::MissingRepeatMask)?,
+                issue.read_accesses_for_repeat(repeat_index, ordinary_group)?,
+                C220VectorReadOperation::Copy {
+                    instruction: issue.instruction,
+                },
+            ),
+            C220VectorReadIssue::Broadcast(issue) => (
+                issue.pc,
+                issue.word,
+                issue.control.vector_control(),
+                issue.addresses(),
+                [u64::MAX; 4],
+                issue.read_accesses_for_repeat(repeat_index)?,
+                C220VectorReadOperation::Broadcast {
+                    instruction: issue.instruction,
+                    control: issue.control,
+                },
+            ),
+            C220VectorReadIssue::Transpose(issue) => (
+                issue.pc,
+                issue.word,
+                C220VectorControl {
+                    encoded_repeat_count: 0,
+                    destination_block_stride: 0,
+                    source_0_block_stride: 0,
+                    source_1_block_stride: 0,
+                    destination_repeat_stride: 0,
+                    source_0_repeat_stride: 0,
+                    source_1_repeat_stride: 0,
+                },
+                issue.addresses(),
+                [u64::MAX; 4],
+                issue.read_accesses()?,
+                C220VectorReadOperation::Transpose,
+            ),
+            C220VectorReadIssue::CompareMask(issue) => (
+                issue.pc,
+                issue.word,
+                issue.control,
+                issue.addresses,
+                issue.iteration_masks[repeat_index / issue.instruction.width.groups_per_repeat()],
+                issue.read_accesses_for_uop(repeat_index)?,
+                C220VectorReadOperation::CompareMask {
+                    issue: Box::new(issue.clone()),
+                },
+            ),
+            C220VectorReadIssue::MoveMask(issue) => (
+                issue.pc,
+                issue.word,
+                C220VectorControl {
+                    encoded_repeat_count: 1,
+                    destination_block_stride: 0,
+                    source_0_block_stride: 0,
+                    source_1_block_stride: 0,
+                    destination_repeat_stride: 0,
+                    source_0_repeat_stride: 0,
+                    source_1_repeat_stride: 0,
+                },
+                C220VectorAddresses {
+                    destination: issue.address,
+                    source_0: issue.address,
+                    source_1: 0,
+                },
+                [u64::MAX; 4],
+                issue.read_accesses(),
+                C220VectorReadOperation::MoveMask {
+                    issue: issue.clone(),
+                },
+            ),
+            C220VectorReadIssue::Select(issue) if select_mask_load => (
+                issue.pc,
+                issue.word,
+                issue.control,
+                issue.addresses,
+                [u64::MAX; 4],
+                issue.mask_block_accesses(repeat_index, 0)?,
+                C220VectorReadOperation::SelectMaskLoad {
+                    issue: Box::new(issue.clone()),
+                },
+            ),
+            C220VectorReadIssue::Select(issue) => (
+                issue.pc,
+                issue.word,
+                issue.control,
+                issue.addresses,
+                issue.iteration_masks[repeat_index],
+                issue.read_accesses_for_repeat(repeat_index, ordinary_group)?,
+                C220VectorReadOperation::Select {
+                    issue: Box::new(issue.clone()),
+                },
+            ),
+            C220VectorReadIssue::PackedCompare(issue) => (
+                issue.pc,
+                issue.word,
+                issue.control,
+                issue.addresses,
+                [u64::MAX; 4],
+                issue.read_accesses_for_uop(repeat_index)?,
+                C220VectorReadOperation::PackedCompare {
+                    instruction: issue.instruction,
+                    scalar_bits: issue.scalar_bits,
+                },
+            ),
+            C220VectorReadIssue::Reduction(issue) => (
+                issue.pc,
+                issue.word,
+                issue.control,
+                issue.addresses,
+                *issue
+                    .iteration_masks
+                    .get(repeat_index)
+                    .ok_or(C220VectorReadError::MissingRepeatMask)?,
+                issue.read_accesses_for_repeat(repeat_index)?,
+                C220VectorReadOperation::Reduction {
+                    issue: Box::new(issue.clone()),
+                },
+            ),
+            C220VectorReadIssue::Ternary(issue) => (
+                issue.pc,
+                issue.word,
+                issue.control,
+                issue.addresses,
+                *issue
+                    .iteration_masks
+                    .get(repeat_index)
+                    .ok_or(C220VectorReadError::MissingRepeatMask)?,
+                issue.read_accesses_for_repeat(repeat_index, ordinary_group)?,
+                C220VectorReadOperation::Ternary {
+                    issue: Box::new(issue.clone()),
+                },
+            ),
+            C220VectorReadIssue::Gather(issue) => {
+                let (accesses, operation) = match kind {
+                    C220VectorUopKind::GatherIndex { group } => (
+                        vec![issue.index_read_access(repeat_index, group)?],
+                        C220VectorReadOperation::GatherIndex,
+                    ),
+                    C220VectorUopKind::GatherData { group } if lane_group == Some(group) => (
+                        issue.data_read_accesses(repeat_index, group)?,
+                        C220VectorReadOperation::GatherData {
+                            issue: Box::new(issue.clone()),
+                            group,
+                        },
+                    ),
+                    _ => return Err(C220VectorReadError::InvalidUopScope),
+                };
+                (
+                    issue.pc,
+                    issue.word,
+                    C220VectorControl {
+                        encoded_repeat_count: issue.control.repeat_count,
+                        destination_block_stride: u16::from(issue.control.destination_block_stride),
+                        source_0_block_stride: 0,
+                        source_1_block_stride: 0,
+                        destination_repeat_stride: issue.control.destination_repeat_stride,
+                        source_0_repeat_stride: 0,
+                        source_1_repeat_stride: 0,
+                    },
+                    C220VectorAddresses {
+                        source_0: issue.index_address,
+                        source_1: 0,
+                        destination: issue.destination_address,
+                    },
+                    [u64::MAX; 4],
+                    accesses,
+                    operation,
+                )
+            }
+            C220VectorReadIssue::Nchw(issue) => {
+                let tile_index = repeat_index / 2;
+                (
+                    issue.pc,
+                    issue.word,
+                    C220VectorControl {
+                        encoded_repeat_count: issue.control.repeat_count,
+                        destination_block_stride: 0,
+                        source_0_block_stride: 0,
+                        source_1_block_stride: 0,
+                        destination_repeat_stride: issue.control.destination_repeat_stride,
+                        source_0_repeat_stride: issue.control.source_repeat_stride,
+                        source_1_repeat_stride: 0,
+                    },
+                    C220VectorAddresses {
+                        source_0: issue.rows[tile_index].source[0],
+                        source_1: 0,
+                        destination: issue.rows[tile_index].destination[0],
+                    },
+                    [u64::MAX; 4],
+                    issue.read_accesses_for_repeat(tile_index)?,
+                    C220VectorReadOperation::Nchw {
+                        instruction: issue.instruction,
+                        rows: Box::new(issue.rows[tile_index]),
+                    },
+                )
+            }
         };
         let port0_accesses = accesses
             .iter()
@@ -176,6 +541,30 @@ impl PendingVectorRead {
             .copied()
             .filter(|access| access.source_index == 1)
             .collect::<Vec<_>>();
+        let destination_accesses = accesses
+            .iter()
+            .copied()
+            .filter(|access| access.source_index == 2)
+            .collect::<Vec<_>>();
+        let source_0_bytes = vec![
+            0;
+            if matches!(
+                &operation,
+                C220VectorReadOperation::Transpose | C220VectorReadOperation::Nchw { .. }
+            ) {
+                512
+            } else {
+                C220_VECTOR_TILE_BYTES
+            }
+        ];
+        let (port0, port1) = if matches!(operation, C220VectorReadOperation::GatherData { .. }) {
+            ReadPort::gather_pair(&accesses)?
+        } else {
+            (
+                ReadPort::new(&port0_accesses)?,
+                ReadPort::new(&port1_accesses)?,
+            )
+        };
         Ok(Self {
             pc,
             word,
@@ -186,10 +575,12 @@ impl PendingVectorRead {
             repeat_index,
             lane_group,
             accesses,
-            port0: ReadPort::new(&port0_accesses)?,
-            port1: ReadPort::new(&port1_accesses)?,
-            source_0_bytes: vec![0; C220_VECTOR_TILE_BYTES],
+            port0,
+            port1,
+            destination_port: ReadPort::new(&destination_accesses)?,
+            source_0_bytes,
             source_1_bytes: vec![0; C220_VECTOR_TILE_BYTES],
+            destination_bytes: vec![0; C220_VECTOR_TILE_BYTES],
             ready_tick: None,
             sampled: false,
         })
@@ -199,6 +590,7 @@ impl PendingVectorRead {
         match port {
             C220UbPort::VectorRead0 => &self.port0,
             C220UbPort::VectorRead1 => &self.port1,
+            C220UbPort::VectorReadDestination => &self.destination_port,
             C220UbPort::VectorWrite => unreachable!("read request selected a write port"),
         }
     }
@@ -207,6 +599,7 @@ impl PendingVectorRead {
         match port {
             C220UbPort::VectorRead0 => &mut self.port0,
             C220UbPort::VectorRead1 => &mut self.port1,
+            C220UbPort::VectorReadDestination => &mut self.destination_port,
             C220UbPort::VectorWrite => unreachable!("read request selected a write port"),
         }
     }
@@ -231,6 +624,59 @@ impl PendingVectorRead {
         self.sampled
     }
 
+    pub(super) fn shares_read_with_next(&self) -> bool {
+        matches!(
+            &self.operation,
+            C220VectorReadOperation::Transpose | C220VectorReadOperation::Nchw { .. }
+        )
+    }
+
+    pub(super) fn writes_compare_mask(&self) -> bool {
+        matches!(self.operation, C220VectorReadOperation::CompareMask { .. })
+            || matches!(
+                &self.operation,
+                C220VectorReadOperation::MoveMask { issue }
+                    if matches!(issue.instruction.direction, C220MoveMaskDirection::FromMemory)
+            )
+    }
+
+    pub(super) fn uses_compare_mask(&self) -> bool {
+        matches!(
+            &self.operation,
+            C220VectorReadOperation::Select { issue }
+                if !matches!(issue.mode, C220SelectMode::TensorTensor)
+        ) || matches!(
+            &self.operation,
+            C220VectorReadOperation::SelectMaskLoad { issue }
+                if matches!(issue.mode, C220SelectMode::TensorTensor)
+        ) || matches!(
+            &self.operation,
+            C220VectorReadOperation::MoveMask { issue }
+                if matches!(issue.instruction.direction, C220MoveMaskDirection::ToMemory)
+        )
+    }
+
+    pub(super) fn writes_selection_mask(&self) -> bool {
+        matches!(
+            &self.operation,
+            C220VectorReadOperation::SelectMaskLoad { .. }
+        ) || matches!(
+            &self.operation,
+            C220VectorReadOperation::Select { issue }
+                if issue.loads_selection_mask(
+                    self.repeat_index,
+                    self.lane_group.unwrap_or_default()
+                )
+        )
+    }
+
+    pub(super) fn uses_selection_mask(&self) -> bool {
+        matches!(
+            &self.operation,
+            C220VectorReadOperation::Select { issue } if issue.mode.uses_tensor_mask()
+        )
+    }
+
     pub(super) fn mark_sampled(&mut self) {
         self.sampled = true;
     }
@@ -240,19 +686,74 @@ impl PendingVectorRead {
         decision: &C220UbDecision,
         ub: &UbMemory,
     ) -> Result<(), C220VectorError> {
-        let offset = self.port(decision.port).destination_offsets[decision.block_index];
-        let destination = match decision.port {
-            C220UbPort::VectorRead0 => &mut self.source_0_bytes,
-            C220UbPort::VectorRead1 => &mut self.source_1_bytes,
-            C220UbPort::VectorWrite => unreachable!("read request selected a write port"),
+        let destinations = self.port(decision.port).destinations[decision.block_index].clone();
+        if let C220VectorReadOperation::Nchw {
+            instruction:
+                C220NchwInstruction {
+                    element: C220NchwElement::Byte,
+                    source_high,
+                    ..
+                },
+            ..
+        } = &self.operation
+        {
+            let half_offset = usize::from(*source_high) * 16;
+            let bytes = ub.read_known(decision.block.address + half_offset as u64, 16)?;
+            for read_destination in destinations {
+                let destination = match read_destination.source_index {
+                    0 => &mut self.source_0_bytes,
+                    1 => &mut self.source_1_bytes,
+                    2 => &mut self.destination_bytes,
+                    _ => unreachable!("unknown vector read destination"),
+                };
+                let offset = read_destination.offset;
+                destination[offset + half_offset..offset + half_offset + 16]
+                    .copy_from_slice(&bytes);
+            }
+            return Ok(());
+        }
+        let first_offset = destinations
+            .first()
+            .map_or(0, |destination| destination.offset);
+        let length = match &self.operation {
+            C220VectorReadOperation::Broadcast { instruction, .. }
+                if instruction.element_bytes == 2 =>
+            {
+                16_usize
+                    .saturating_sub(first_offset)
+                    .min(usize::from(decision.block.bytes))
+            }
+            C220VectorReadOperation::MoveMask { issue }
+                if matches!(
+                    issue.instruction.direction,
+                    C220MoveMaskDirection::FromMemory
+                ) =>
+            {
+                16_usize
+                    .saturating_sub(first_offset)
+                    .min(usize::from(decision.block.bytes))
+            }
+            _ => usize::from(decision.block.bytes),
         };
-        let bytes = ub.read_known(decision.block.address, usize::from(decision.block.bytes))?;
-        destination[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        let bytes = ub.read_known(decision.block.address, length)?;
+        for read_destination in destinations {
+            let destination = match read_destination.source_index {
+                0 => &mut self.source_0_bytes,
+                1 => &mut self.source_1_bytes,
+                2 => &mut self.destination_bytes,
+                _ => unreachable!("unknown vector read destination"),
+            };
+            let offset = read_destination.offset;
+            destination[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        }
         Ok(())
     }
 
     pub(super) fn grant_tick(&self, admission_tick: u64) -> Option<u64> {
-        if !self.port0.request.is_complete() || !self.port1.request.is_complete() {
+        if !self.port0.request.is_complete()
+            || !self.port1.request.is_complete()
+            || !self.destination_port.request.is_complete()
+        {
             return None;
         }
         Some(
@@ -261,6 +762,7 @@ impl PendingVectorRead {
                 .completion_tick()
                 .into_iter()
                 .chain(self.port1.request.completion_tick())
+                .chain(self.destination_port.request.completion_tick())
                 .max()
                 .unwrap_or(admission_tick),
         )
@@ -269,8 +771,219 @@ impl PendingVectorRead {
     pub(super) fn sample(
         &self,
         ub: &UbMemory,
+        compare_mask: C220CompareMask,
+        selection_mask: Option<&C220SelectionMaskBlock>,
     ) -> Result<(C220VectorReadSample, Vec<C220VectorStore>), C220VectorError> {
-        let (lanes, stores) = match self.operation {
+        let lane_group = self.lane_group.unwrap_or_default();
+        let mut reduction_update = None;
+        let (lanes, stores) = match self.operation.clone() {
+            C220VectorReadOperation::Broadcast {
+                instruction,
+                control,
+            } => {
+                let (values, stores) = evaluate_c220_broadcast_repeat(
+                    instruction,
+                    control,
+                    self.addresses.destination,
+                    self.repeat_index,
+                    &self.source_0_bytes,
+                )?;
+                (
+                    values
+                        .into_iter()
+                        .map(|bits| C220VectorLaneOutcome {
+                            active: true,
+                            bits,
+                            fp16_status: None,
+                            fp32_status: None,
+                        })
+                        .collect(),
+                    stores,
+                )
+            }
+            C220VectorReadOperation::Transpose => {
+                let (values, stores) =
+                    evaluate_c220_transpose(self.addresses.destination, &self.source_0_bytes)?;
+                (
+                    values
+                        .into_iter()
+                        .map(|bits| C220VectorLaneOutcome {
+                            active: true,
+                            bits,
+                            fp16_status: None,
+                            fp32_status: None,
+                        })
+                        .collect(),
+                    stores,
+                )
+            }
+            C220VectorReadOperation::CompareMask { issue } => {
+                let values = evaluate_c220_compare_mask_uop(
+                    &issue,
+                    self.repeat_index,
+                    &self.source_0_bytes,
+                    &self.source_1_bytes,
+                )?;
+                (
+                    values
+                        .into_iter()
+                        .map(|(active, value)| C220VectorLaneOutcome {
+                            active,
+                            bits: u32::from(value),
+                            fp16_status: None,
+                            fp32_status: None,
+                        })
+                        .collect(),
+                    Vec::new(),
+                )
+            }
+            C220VectorReadOperation::MoveMask { issue } => (Vec::new(), issue.stores(compare_mask)),
+            C220VectorReadOperation::SelectMaskLoad { .. } => (Vec::new(), Vec::new()),
+            C220VectorReadOperation::Select { issue } => {
+                let loaded_selection_mask = issue
+                    .loads_selection_mask(self.repeat_index, lane_group)
+                    .then(|| C220SelectionMaskBlock {
+                        first_repeat: self.repeat_index,
+                        bytes: self.source_1_bytes[..C220_VECTOR_TILE_BYTES]
+                            .try_into()
+                            .expect("selection-mask block"),
+                    });
+                let (values, stores) = evaluate_c220_select_uop(
+                    &issue,
+                    self.repeat_index,
+                    lane_group,
+                    compare_mask,
+                    loaded_selection_mask.as_ref().or(selection_mask),
+                    &self.source_0_bytes,
+                    &self.source_1_bytes,
+                )?;
+                (
+                    values
+                        .into_iter()
+                        .map(|bits| C220VectorLaneOutcome {
+                            active: true,
+                            bits,
+                            fp16_status: None,
+                            fp32_status: None,
+                        })
+                        .collect(),
+                    stores,
+                )
+            }
+            C220VectorReadOperation::Nchw { instruction, rows } => {
+                let (values, stores) = evaluate_c220_nchw_repeat(
+                    instruction,
+                    self.repeat_index / 2,
+                    *rows,
+                    &self.source_0_bytes,
+                )?;
+                (
+                    values
+                        .into_iter()
+                        .map(|bits| C220VectorLaneOutcome {
+                            active: true,
+                            bits,
+                            fp16_status: None,
+                            fp32_status: None,
+                        })
+                        .collect(),
+                    stores,
+                )
+            }
+            C220VectorReadOperation::PackedCompare {
+                instruction,
+                scalar_bits,
+            } => {
+                let (values, stores) = evaluate_c220_packed_compare_uop(
+                    C220PackedCompareValueInputs {
+                        instruction,
+                        control: self.control,
+                        addresses: self.addresses,
+                        scalar_bits,
+                        uop_index: self.repeat_index,
+                    },
+                    &self.source_0_bytes,
+                    &self.source_1_bytes,
+                )?;
+                (
+                    values
+                        .into_iter()
+                        .map(|bits| C220VectorLaneOutcome {
+                            active: true,
+                            bits,
+                            fp16_status: None,
+                            fp32_status: None,
+                        })
+                        .collect(),
+                    stores,
+                )
+            }
+            C220VectorReadOperation::Reduction { issue } => {
+                let outcome = evaluate_c220_reduction_repeat(
+                    &issue,
+                    self.repeat_index,
+                    &self.source_0_bytes,
+                )?;
+                reduction_update = outcome.state_update;
+                (
+                    outcome
+                        .lanes
+                        .into_iter()
+                        .map(|lane| C220VectorLaneOutcome {
+                            active: lane.active,
+                            bits: lane.bits,
+                            fp16_status: lane.fp16_status,
+                            fp32_status: lane.fp32_status,
+                        })
+                        .collect(),
+                    outcome.stores,
+                )
+            }
+            C220VectorReadOperation::Ternary { issue } => {
+                let (values, stores) = evaluate_c220_ternary_repeat(
+                    &issue,
+                    self.repeat_index,
+                    lane_group,
+                    &self.source_0_bytes,
+                    &self.source_1_bytes,
+                    &self.destination_bytes,
+                    ub,
+                )?;
+                (
+                    values
+                        .into_iter()
+                        .map(|lane| C220VectorLaneOutcome {
+                            active: lane.active,
+                            bits: lane.bits,
+                            fp16_status: lane.fp16_status,
+                            fp32_status: lane.fp32_status,
+                        })
+                        .collect(),
+                    stores,
+                )
+            }
+            C220VectorReadOperation::GatherIndex => (Vec::new(), Vec::new()),
+            C220VectorReadOperation::GatherData { issue, group } => {
+                let (values, stores) = evaluate_c220_gather_data_uop(
+                    &issue,
+                    self.repeat_index,
+                    group,
+                    &self.source_0_bytes,
+                    &self.source_1_bytes,
+                )?;
+                (
+                    values
+                        .into_iter()
+                        .map(|lane| C220VectorLaneOutcome {
+                            active: lane.active,
+                            bits: lane.bits,
+                            fp16_status: None,
+                            fp32_status: None,
+                        })
+                        .collect(),
+                    stores,
+                )
+            }
             C220VectorReadOperation::Arithmetic { hint, modes, .. } if modes.widens(hint) => {
                 let (values, stores) = evaluate_c220_s16_widen_repeat_from_bytes(
                     C220S16WidenInputs {
@@ -306,7 +1019,7 @@ impl PendingVectorRead {
                         control: self.control,
                         addresses: self.addresses,
                         repeat_index: self.repeat_index,
-                        lane_group: self.lane_group,
+                        lane_group,
                         mask: self.mask,
                         mode: modes.fp16_mode,
                     },
@@ -336,7 +1049,7 @@ impl PendingVectorRead {
                         control: self.control,
                         addresses: self.addresses,
                         repeat_index: self.repeat_index,
-                        lane_group: self.lane_group,
+                        lane_group,
                         mask: self.mask,
                         saturating: modes.integer_saturating,
                     },
@@ -423,7 +1136,7 @@ impl PendingVectorRead {
                         addresses: self.addresses,
                         mask: self.mask,
                         repeat_index: self.repeat_index,
-                        lane_group: self.lane_group,
+                        lane_group,
                     },
                     &self.source_0_bytes,
                 )?;
@@ -432,7 +1145,7 @@ impl PendingVectorRead {
                         .into_iter()
                         .enumerate()
                         .map(|(index, value)| C220VectorLaneOutcome {
-                            active: index / 64 == usize::from(self.lane_group)
+                            active: index / 64 == usize::from(lane_group)
                                 && self.mask[index / 64] & (1_u64 << (index % 64)) != 0,
                             bits: value.bits,
                             fp16_status: value.fp16_status,
@@ -451,7 +1164,7 @@ impl PendingVectorRead {
                         addresses: self.addresses,
                         mask: self.mask,
                         repeat_index: self.repeat_index,
-                        lane_group: self.lane_group,
+                        lane_group,
                     },
                     &self.source_0_bytes,
                 )?;
@@ -460,7 +1173,7 @@ impl PendingVectorRead {
                         .into_iter()
                         .enumerate()
                         .map(|(index, bits)| C220VectorLaneOutcome {
-                            active: index / 64 == usize::from(self.lane_group)
+                            active: index / 64 == usize::from(lane_group)
                                 && self.mask[index / 64] & (1_u64 << (index % 64)) != 0,
                             bits,
                             fp16_status: None,
@@ -470,6 +1183,94 @@ impl PendingVectorRead {
                     stores,
                 )
             }
+            C220VectorReadOperation::Copy { instruction } => {
+                let (values, stores) = evaluate_c220_copy_repeat(
+                    C220CopyValueInputs {
+                        instruction,
+                        control: self.control,
+                        addresses: self.addresses,
+                        mask: self.mask,
+                        repeat_index: self.repeat_index,
+                        lane_group,
+                    },
+                    &self.source_0_bytes,
+                )?;
+                (
+                    values
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, bits)| C220VectorLaneOutcome {
+                            active: index / 64 == usize::from(lane_group)
+                                && self.mask[index / 64] & (1_u64 << (index % 64)) != 0,
+                            bits,
+                            fp16_status: None,
+                            fp32_status: None,
+                        })
+                        .collect(),
+                    stores,
+                )
+            }
+        };
+        let compare_update = match &self.operation {
+            C220VectorReadOperation::CompareMask { .. } => Some({
+                let mut write_mask = [0_u64; 2];
+                let mut values = [0_u64; 2];
+                let first_lane = usize::from(self.lane_group.unwrap_or_default()) * 64;
+                for (index, lane) in lanes.iter().enumerate() {
+                    if !lane.active {
+                        continue;
+                    }
+                    let bit = first_lane + index;
+                    write_mask[bit / 64] |= 1_u64 << (bit % 64);
+                    if lane.bits != 0 {
+                        values[bit / 64] |= 1_u64 << (bit % 64);
+                    }
+                }
+                C220CompareMaskUpdate { write_mask, values }
+            }),
+            C220VectorReadOperation::MoveMask { issue }
+                if matches!(
+                    issue.instruction.direction,
+                    C220MoveMaskDirection::FromMemory
+                ) =>
+            {
+                Some(C220CompareMaskUpdate {
+                    write_mask: [u64::MAX; 2],
+                    values: [
+                        u64::from_le_bytes(
+                            self.source_0_bytes[..8].try_into().expect("low mask word"),
+                        ),
+                        u64::from_le_bytes(
+                            self.source_0_bytes[8..16]
+                                .try_into()
+                                .expect("high mask word"),
+                        ),
+                    ],
+                })
+            }
+            _ => None,
+        };
+        let selection_update = match &self.operation {
+            C220VectorReadOperation::SelectMaskLoad { .. } => Some(C220SelectionMaskBlock {
+                first_repeat: self.repeat_index,
+                bytes: self.source_0_bytes[..C220_VECTOR_TILE_BYTES]
+                    .try_into()
+                    .expect("selection-mask block"),
+            }),
+            C220VectorReadOperation::Select { issue }
+                if issue.loads_selection_mask(
+                    self.repeat_index,
+                    self.lane_group.unwrap_or_default(),
+                ) =>
+            {
+                Some(C220SelectionMaskBlock {
+                    first_repeat: self.repeat_index,
+                    bytes: self.source_1_bytes[..C220_VECTOR_TILE_BYTES]
+                        .try_into()
+                        .expect("selection-mask block"),
+                })
+            }
+            _ => None,
         };
         Ok((
             C220VectorReadSample {
@@ -484,6 +1285,9 @@ impl PendingVectorRead {
                 source_0_bytes: self.source_0_bytes.clone(),
                 source_1_bytes: self.source_1_bytes.clone(),
                 lanes,
+                compare_update,
+                selection_update,
+                reduction_update,
             },
             stores,
         ))
@@ -495,7 +1299,7 @@ pub struct C220VectorReadSample {
     pub pc: u64,
     pub word: u32,
     pub repeat_index: usize,
-    pub lane_group: u8,
+    pub lane_group: Option<u8>,
     pub tick: u64,
     pub accesses: Vec<C220VectorReadAccess>,
     pub read0_grants: Vec<Option<u64>>,
@@ -503,6 +1307,9 @@ pub struct C220VectorReadSample {
     pub source_0_bytes: Vec<u8>,
     pub source_1_bytes: Vec<u8>,
     pub lanes: Vec<C220VectorLaneOutcome>,
+    pub(crate) compare_update: Option<C220CompareMaskUpdate>,
+    pub(crate) selection_update: Option<C220SelectionMaskBlock>,
+    pub(crate) reduction_update: Option<C220ReductionStateUpdate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

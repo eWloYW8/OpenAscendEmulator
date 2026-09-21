@@ -1,6 +1,9 @@
 use crate::architecture::Architecture;
 use crate::isa::c220::scalar::C220ScalarConversionHint;
-use crate::isa::c220::vector::{C220MovevInstruction, C220VecArithmeticHint};
+use crate::isa::c220::vector::{
+    C220BroadcastInstruction, C220CopyInstruction, C220MovevInstruction, C220ShiftInstruction,
+    C220TransposeInstruction, C220VecArithmeticHint,
+};
 use crate::isa::c220::vector_scalar::C220VectorScalarInstruction;
 use crate::isa::decode::{
     AicDecoderHint, ScalarKey0Operation, ScalarKey7Operation, ScalarLoadStoreOperation,
@@ -55,6 +58,30 @@ impl C220ScalarTimingLane {
             include(instruction.destination_register);
             include(instruction.source_register);
             include(instruction.control_register);
+            return resume_tick;
+        }
+        if let Some(instruction) = C220ShiftInstruction::decode(word) {
+            include(instruction.destination_register);
+            include(instruction.source_register);
+            include(instruction.shift_register);
+            include(instruction.control_register);
+            return resume_tick;
+        }
+        if let Some(instruction) = C220CopyInstruction::decode(word) {
+            include(instruction.destination_register);
+            include(instruction.source_register);
+            include(instruction.control_register);
+            return resume_tick;
+        }
+        if let Some(instruction) = C220BroadcastInstruction::decode(word) {
+            include(instruction.destination_register);
+            include(instruction.source_register);
+            include(instruction.control_register);
+            return resume_tick;
+        }
+        if let Some(instruction) = C220TransposeInstruction::decode(word) {
+            include(instruction.destination_register);
+            include(instruction.source_register);
             return resume_tick;
         }
         if let Some(instruction) = C220VecArithmeticHint::from_word(word) {
@@ -246,7 +273,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vector_scalar_waits_for_its_scalar_register() {
+    fn vector_issue_waits_for_scalar_register_retirement() {
         let mut lane = C220ScalarTimingLane::default();
         lane.issue(C220ScalarTimingTicket {
             issue_tick: 0,
@@ -257,6 +284,13 @@ mod tests {
         });
         for opcode in [0x9700_0000, 0x9700_0001] {
             let word = opcode | (3 << 17) | (4 << 12) | (6 << 7) | (5 << 2);
+            assert_eq!(lane.dependency_tick(word, 1), Some(4));
+            assert_eq!(lane.dependency_tick(word, 4), None);
+        }
+        for word in [
+            0x9c80_0003 | (3 << 17) | (4 << 12) | (6 << 7) | (5 << 2),
+            0x8240_0700 | (3 << 17) | (6 << 12) | (5 << 2),
+        ] {
             assert_eq!(lane.dependency_tick(word, 1), Some(4));
             assert_eq!(lane.dependency_tick(word, 4), None);
         }

@@ -157,6 +157,9 @@ pub fn evaluate_c220_vector_scalar_repeat(
                     C220VectorScalarOperation::Multiply => source.wrapping_mul(scalar),
                     C220VectorScalarOperation::Maximum => (source as i16).max(scalar as i16) as u16,
                     C220VectorScalarOperation::Minimum => (source as i16).min(scalar as i16) as u16,
+                    C220VectorScalarOperation::LeakyRelu => {
+                        unreachable!("integer VLRELU has no encoding")
+                    }
                 };
                 C220VectorScalarLaneOutcome {
                     bits: u32::from(bits),
@@ -181,6 +184,9 @@ pub fn evaluate_c220_vector_scalar_repeat(
                     C220VectorScalarOperation::Minimum => {
                         (source as i32).min(inputs.scalar.bits as i32) as u32
                     }
+                    C220VectorScalarOperation::LeakyRelu => {
+                        unreachable!("integer VLRELU has no encoding")
+                    }
                 };
                 C220VectorScalarLaneOutcome {
                     bits,
@@ -190,13 +196,19 @@ pub fn evaluate_c220_vector_scalar_repeat(
             }
             C220VectorScalarType::F32 => {
                 let source = u32::from_le_bytes(chunk.try_into().expect("four-byte lane"));
-                let operation = match inputs.instruction.operation {
-                    C220VectorScalarOperation::Add => Fp32VectorOperation::Add,
-                    C220VectorScalarOperation::Multiply => Fp32VectorOperation::Multiply,
-                    C220VectorScalarOperation::Maximum => Fp32VectorOperation::Maximum,
-                    C220VectorScalarOperation::Minimum => Fp32VectorOperation::Minimum,
+                let result = if inputs.instruction.operation == C220VectorScalarOperation::LeakyRelu
+                {
+                    evaluate_c220_fp32_lrelu(source, inputs.scalar.bits)
+                } else {
+                    let operation = match inputs.instruction.operation {
+                        C220VectorScalarOperation::Add => Fp32VectorOperation::Add,
+                        C220VectorScalarOperation::Multiply => Fp32VectorOperation::Multiply,
+                        C220VectorScalarOperation::Maximum => Fp32VectorOperation::Maximum,
+                        C220VectorScalarOperation::Minimum => Fp32VectorOperation::Minimum,
+                        C220VectorScalarOperation::LeakyRelu => unreachable!(),
+                    };
+                    evaluate_fp32_value(operation, source, inputs.scalar.bits)
                 };
-                let result = evaluate_fp32_value(operation, source, inputs.scalar.bits);
                 C220VectorScalarLaneOutcome {
                     bits: result.bits,
                     fp16_status: None,
@@ -222,4 +234,27 @@ pub fn evaluate_c220_vector_scalar_repeat(
         });
     }
     Ok((values, stores))
+}
+
+fn evaluate_c220_fp32_lrelu(
+    source_bits: u32,
+    slope_bits: u32,
+) -> crate::numeric::fp32::Fp32ValueOutcome {
+    if source_bits & 0x8000_0000 != 0 {
+        return evaluate_fp32_value(Fp32VectorOperation::Multiply, source_bits, slope_bits);
+    }
+    let nan_operand = source_bits & 0x7fff_ffff > 0x7f80_0000;
+    let infinity_operand = source_bits == 0x7f80_0000;
+    crate::numeric::fp32::Fp32ValueOutcome {
+        bits: if nan_operand {
+            0x7fff_ffff
+        } else {
+            source_bits
+        },
+        status: Fp32ValueStatus {
+            nan_operand,
+            infinity_operand,
+            ..Fp32ValueStatus::default()
+        },
+    }
 }

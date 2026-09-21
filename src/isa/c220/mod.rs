@@ -1,4 +1,9 @@
+pub mod compare;
+pub mod gather;
 pub mod mte;
+pub mod reduce;
 pub mod scalar;
+pub mod select;
+pub mod ternary;
 pub mod vector;
 pub mod vector_scalar;

@@ -158,6 +158,22 @@ pub(super) fn evaluate_c220_s16_repeat_from_bytes(
                 first.saturating_sub(second)
             }
             C220VecArithmeticOperation::Subtract => first.wrapping_sub(second),
+            C220VecArithmeticOperation::AddRectify => {
+                let sum = if inputs.saturating {
+                    first.saturating_add(second)
+                } else {
+                    first.wrapping_add(second)
+                };
+                sum.max(0)
+            }
+            C220VecArithmeticOperation::SubtractRectify => {
+                let difference = if inputs.saturating {
+                    first.saturating_sub(second)
+                } else {
+                    first.wrapping_sub(second)
+                };
+                difference.max(0)
+            }
             C220VecArithmeticOperation::Multiply if inputs.saturating => {
                 first.saturating_mul(second)
             }

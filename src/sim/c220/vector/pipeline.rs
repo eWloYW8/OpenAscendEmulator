@@ -3,16 +3,23 @@ use std::num::NonZeroU64;
 
 use thiserror::Error;
 
+use crate::isa::c220::gather::C220GatherKind;
 use crate::memory::ub::UbMemory;
 use crate::sim::c220::ub_arbiter::{C220UbCycle, C220UbPort, C220UbRequest, C220UbRequestError};
+use crate::sim::c220::vector::compare::{C220CompareMask, C220CompareMaskUpdate};
 use crate::sim::c220::vector::read::{
     C220VectorReadError, C220VectorReadIssue, C220VectorReadSample, PendingVectorRead,
 };
+use crate::sim::c220::vector::reduce::{
+    C220ReductionState, C220ReductionStateUpdate, C220ReductionValue,
+};
+use crate::sim::c220::vector::select::C220SelectionMaskBlock;
 use crate::sim::c220::vector::timing::{
     C220VectorTimelineError, C220VectorUop, C220VectorUopRelease, C220VectorWritePlan,
     C220VectorWritePlanError,
 };
 use crate::sim::c220::vector::{C220_VECTOR_BLOCK_BYTES, C220VectorError, C220VectorStore};
+use crate::sim::machine::ScalarMachineError;
 use crate::sim::mte_stepper::{MteCoreStepper, MteStepperError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,12 +55,26 @@ struct PendingVectorUop {
     admission_tick: u64,
     stores: Vec<C220VectorStore>,
     read: Option<PendingVectorRead>,
+    shared_read_from_previous: bool,
     write: Option<C220UbRequest>,
     execute_ready_tick: Option<u64>,
     eligible_tick: Option<u64>,
     release_tick: Option<u64>,
     visible_tick: Option<u64>,
     committed: bool,
+    compare_update: Option<C220CompareMaskUpdate>,
+    compare_update_applied: bool,
+    selection_update: Option<C220SelectionMaskBlock>,
+    selection_update_applied: bool,
+    reduction_update: Option<PendingReductionUpdate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingReductionUpdate {
+    group: u64,
+    update: Option<C220ReductionStateUpdate>,
+    last: bool,
+    applied: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +87,10 @@ pub struct C220VectorPipeline {
     pending: VecDeque<PendingVectorUop>,
     last_read_samples: Vec<C220VectorReadSample>,
     last_ub_cycles: Vec<C220UbCycle>,
+    compare_mask: C220CompareMask,
+    selection_mask: Option<C220SelectionMaskBlock>,
+    next_reduction_group: u64,
+    reduction_states: BTreeMap<u64, C220ReductionState>,
 }
 
 impl C220VectorPipeline {
@@ -79,6 +104,10 @@ impl C220VectorPipeline {
             pending: VecDeque::new(),
             last_read_samples: Vec::new(),
             last_ub_cycles: Vec::new(),
+            compare_mask: C220CompareMask::default(),
+            selection_mask: None,
+            next_reduction_group: 0,
+            reduction_states: BTreeMap::new(),
         }
     }
 
@@ -108,12 +137,39 @@ impl C220VectorPipeline {
         &self.last_ub_cycles
     }
 
+    pub const fn compare_mask(&self) -> C220CompareMask {
+        self.compare_mask
+    }
+
+    pub fn has_pending_compare_mask_write(&self) -> bool {
+        self.pending.iter().any(|entry| {
+            entry
+                .read
+                .as_ref()
+                .is_some_and(PendingVectorRead::writes_compare_mask)
+                && !entry.compare_update_applied
+        })
+    }
+
     fn predicted_ticks(&self) -> Vec<(u64, Option<u64>)> {
         let mut previous_release = self.last_release_tick;
+        let mut previous_read_ready = None;
         let mut predicted = Vec::with_capacity(self.pending.len());
         for entry in &self.pending {
             let release = entry.release_tick.unwrap_or_else(|| {
-                let read_ready = if let Some(read) = &entry.read {
+                let read_ready = if entry.shared_read_from_previous {
+                    entry
+                        .execute_ready_tick
+                        .map(|ready| {
+                            ready.saturating_sub(u64::from(entry.uop.stages.execute_ticks))
+                        })
+                        .or(previous_read_ready)
+                        .unwrap_or(
+                            entry
+                                .admission_tick
+                                .saturating_add(u64::from(entry.uop.stages.read_ticks)),
+                        )
+                } else if let Some(read) = &entry.read {
                     read.ready_tick().unwrap_or_else(|| {
                         let earliest_grant =
                             self.observed_tick.map_or(entry.admission_tick, |observed| {
@@ -126,6 +182,7 @@ impl C220VectorPipeline {
                         .admission_tick
                         .saturating_add(u64::from(entry.uop.stages.read_ticks))
                 };
+                previous_read_ready = Some(read_ready);
                 let mut eligible = read_ready
                     .saturating_add(u64::from(entry.uop.stages.execute_ticks))
                     .saturating_add(entry.uop.writeback_ticks as u64);
@@ -142,6 +199,11 @@ impl C220VectorPipeline {
                 }
                 eligible.max(previous_release.map_or(0, |tick| tick.saturating_add(1)))
             });
+            if entry.execute_ready_tick.is_some() {
+                previous_read_ready = entry
+                    .execute_ready_tick
+                    .map(|ready| ready.saturating_sub(u64::from(entry.uop.stages.execute_ticks)));
+            }
             previous_release = Some(release);
             let visible = if entry.stores.is_empty() {
                 None
@@ -182,6 +244,23 @@ impl C220VectorPipeline {
         stores: &[C220VectorStore],
         compute: Option<C220VectorReadIssue<'_>>,
     ) -> Result<Option<u64>, C220VectorPipelineError> {
+        if matches!(compute, Some(C220VectorReadIssue::Transpose(_)))
+            && (uops.len() != 2
+                || uops[0].repeat_index != 0
+                || uops[1].repeat_index != 1
+                || uops.iter().any(|uop| uop.lane_group.is_some()))
+        {
+            return Err(C220VectorPipelineError::StoreUopMismatch);
+        }
+        if let Some(C220VectorReadIssue::Nchw(issue)) = compute
+            && (uops.len() != issue.rows.len() * 2
+                || uops
+                    .iter()
+                    .enumerate()
+                    .any(|(index, uop)| uop.repeat_index != index || uop.lane_group.is_some()))
+        {
+            return Err(C220VectorPipelineError::StoreUopMismatch);
+        }
         if let Some(previous) = self.observed_tick
             && tick < previous
         {
@@ -194,15 +273,16 @@ impl C220VectorPipeline {
         let mut grouped = vec![Vec::new(); uops.len()];
         let mut indices = BTreeMap::new();
         for (index, uop) in uops.iter().enumerate() {
-            if indices
-                .insert((uop.repeat_index, uop.lane_group), index)
-                .is_some()
+            if uop.writes_ub
+                && indices
+                    .insert((uop.repeat_index, uop.lane_group), index)
+                    .is_some()
             {
                 return Err(C220VectorPipelineError::StoreUopMismatch);
             }
         }
         for &store in stores {
-            if !matches!(store.width_bytes, 2 | 4) {
+            if !matches!(store.width_bytes, 1 | 2 | 4) {
                 return Err(C220VectorPipelineError::UnsupportedStoreWidth(
                     store.width_bytes,
                 ));
@@ -211,10 +291,18 @@ impl C220VectorPipeline {
                 .address
                 .checked_add(u64::from(store.width_bytes))
                 .ok_or(C220VectorPipelineError::StoreAddressOverflow)?;
-            let lane_group = u8::try_from(store.lane_index / 64)
+            let lanes_per_group = match compute {
+                Some(C220VectorReadIssue::Gather(issue)) => match issue.instruction.kind {
+                    C220GatherKind::Elements(_) => 16,
+                    C220GatherKind::Blocks => usize::MAX,
+                },
+                _ => 64,
+            };
+            let lane_group = u8::try_from(store.lane_index / lanes_per_group)
                 .map_err(|_| C220VectorPipelineError::StoreUopMismatch)?;
             let index = indices
-                .get(&(store.repeat_index, lane_group))
+                .get(&(store.repeat_index, Some(lane_group)))
+                .or_else(|| indices.get(&(store.repeat_index, None)))
                 .ok_or(C220VectorPipelineError::StoreUopMismatch)?;
             grouped[*index].push(store);
         }
@@ -231,18 +319,48 @@ impl C220VectorPipeline {
             .ok_or(C220VectorPipelineError::TimeOverflow)?;
         let mut next_admission_tick = self.next_admission_tick;
         let mut entries = Vec::with_capacity(uops.len());
-        for (uop, stores) in uops.iter().copied().zip(grouped) {
+        let reduction_group = match compute {
+            Some(C220VectorReadIssue::Reduction(issue))
+                if issue.instruction.has_cross_repeat_state() && !uops.is_empty() =>
+            {
+                let group = self.next_reduction_group;
+                self.next_reduction_group = self
+                    .next_reduction_group
+                    .checked_add(1)
+                    .ok_or(C220VectorPipelineError::TimeOverflow)?;
+                self.reduction_states.insert(
+                    group,
+                    C220ReductionState::for_instruction(issue.instruction, issue.fp16_mode)
+                        .expect("stateful reduction has state"),
+                );
+                let synthetic_update = issue.iteration_masks.is_empty().then(|| {
+                    C220ReductionStateUpdate::Add(C220ReductionValue::zero(issue.instruction.width))
+                });
+                Some((group, synthetic_update))
+            }
+            _ => None,
+        };
+        for (uop_index, (uop, stores)) in uops.iter().copied().zip(grouped).enumerate() {
+            let shared_read_from_previous = match compute {
+                Some(C220VectorReadIssue::Transpose(_)) => uop.repeat_index == 1,
+                Some(C220VectorReadIssue::Nchw(_)) => uop.repeat_index % 2 == 1,
+                _ => false,
+            };
             let admission_tick = first_admission.max(next_admission_tick);
             next_admission_tick = admission_tick
                 .checked_add(self.rules.uop_issue_interval.get())
                 .ok_or(C220VectorPipelineError::TimeOverflow)?;
+            let synthetic_zero_reduction =
+                reduction_group.is_some_and(|(_, update)| update.is_some());
             let read = if let Some(issue) = compute
-                && !stores.is_empty()
+                && !shared_read_from_previous
+                && !synthetic_zero_reduction
             {
                 Some(PendingVectorRead::new(
                     issue,
                     uop.repeat_index,
                     uop.lane_group,
+                    uop.kind,
                 )?)
             } else {
                 None
@@ -258,7 +376,9 @@ impl C220VectorPipeline {
                     .collect::<Vec<_>>();
                 Some(C220UbRequest::from_accesses(&accesses)?)
             };
-            let execute_ready_tick = if read.is_none() {
+            let execute_ready_tick = if shared_read_from_previous {
+                None
+            } else if read.is_none() {
                 Some(
                     admission_tick
                         .checked_add(u64::from(uop.stages.read_ticks))
@@ -284,12 +404,23 @@ impl C220VectorPipeline {
                 admission_tick,
                 stores,
                 read,
+                shared_read_from_previous,
                 write,
                 execute_ready_tick,
                 eligible_tick,
                 release_tick: None,
                 visible_tick: None,
                 committed: false,
+                compare_update: None,
+                compare_update_applied: false,
+                selection_update: None,
+                selection_update_applied: false,
+                reduction_update: reduction_group.map(|(group, update)| PendingReductionUpdate {
+                    group,
+                    update,
+                    last: uop_index + 1 == uops.len(),
+                    applied: false,
+                }),
             });
         }
         self.next_admission_tick = next_admission_tick;
@@ -335,8 +466,14 @@ impl C220VectorPipeline {
                 continue;
             }
             self.commit_ready(cycle_tick, core)?;
+            self.apply_compare_updates(cycle_tick);
+            self.apply_selection_updates(cycle_tick);
+            self.apply_reduction_updates(cycle_tick, core)?;
             self.arbitrate_ub(cycle_tick, core.ub())?;
             self.finish_reads(cycle_tick, core.ub())?;
+            self.apply_compare_updates(cycle_tick);
+            self.apply_selection_updates(cycle_tick);
+            self.apply_reduction_updates(cycle_tick, core)?;
             self.finish_writes()?;
             self.release_ready(cycle_tick, &mut releases)?;
             self.commit_ready(cycle_tick, core)?;
@@ -377,7 +514,12 @@ impl C220VectorPipeline {
         };
         let port0_index = select(C220UbPort::VectorRead0);
         let port1_index = select(C220UbPort::VectorRead1);
-        if write_index.is_none() && port0_index.is_none() && port1_index.is_none() {
+        let destination_port_index = select(C220UbPort::VectorReadDestination);
+        if write_index.is_none()
+            && port0_index.is_none()
+            && port1_index.is_none()
+            && destination_port_index.is_none()
+        {
             return Ok(());
         }
         let mut write_request = write_index.map(|index| {
@@ -401,11 +543,21 @@ impl C220VectorPipeline {
                     .request_mut(C220UbPort::VectorRead1),
             )
         });
-        let cycle = C220UbCycle::arbitrate(
+        let mut destination_port_request = destination_port_index.map(|index| {
+            std::mem::take(
+                self.pending[index]
+                    .read
+                    .as_mut()
+                    .expect("selected read")
+                    .request_mut(C220UbPort::VectorReadDestination),
+            )
+        });
+        let cycle = C220UbCycle::arbitrate_with_destination(
             tick,
             write_request.as_mut(),
             port0_request.as_mut(),
             port1_request.as_mut(),
+            destination_port_request.as_mut(),
         );
         if let (Some(index), Some(request)) = (write_index, write_request) {
             self.pending[index].write = Some(request);
@@ -424,6 +576,13 @@ impl C220VectorPipeline {
                 .expect("selected read")
                 .request_mut(C220UbPort::VectorRead1) = request;
         }
+        if let (Some(index), Some(request)) = (destination_port_index, destination_port_request) {
+            *self.pending[index]
+                .read
+                .as_mut()
+                .expect("selected read")
+                .request_mut(C220UbPort::VectorReadDestination) = request;
+        }
         for decision in &cycle.decisions {
             if !decision.granted {
                 continue;
@@ -431,6 +590,7 @@ impl C220VectorPipeline {
             let index = match decision.port {
                 C220UbPort::VectorRead0 => port0_index,
                 C220UbPort::VectorRead1 => port1_index,
+                C220UbPort::VectorReadDestination => destination_port_index,
                 C220UbPort::VectorWrite => continue,
             }
             .expect("decision belongs to a selected read");
@@ -445,16 +605,46 @@ impl C220VectorPipeline {
     }
 
     fn finish_reads(&mut self, tick: u64, ub: &UbMemory) -> Result<(), C220VectorAdvanceError> {
-        for entry in &mut self.pending {
-            let Some(read) = entry.read.as_mut() else {
+        for index in 0..self.pending.len() {
+            let waits_for_compare_mask = self.pending[index]
+                .read
+                .as_ref()
+                .is_some_and(PendingVectorRead::uses_compare_mask)
+                && self.pending.iter().take(index).any(|entry| {
+                    entry
+                        .read
+                        .as_ref()
+                        .is_some_and(PendingVectorRead::writes_compare_mask)
+                        && !entry.compare_update_applied
+                });
+            if waits_for_compare_mask {
+                continue;
+            }
+            let waits_for_selection_mask = self.pending[index]
+                .read
+                .as_ref()
+                .is_some_and(PendingVectorRead::uses_selection_mask)
+                && self.pending.iter().take(index).any(|entry| {
+                    entry
+                        .read
+                        .as_ref()
+                        .is_some_and(PendingVectorRead::writes_selection_mask)
+                        && !entry.selection_update_applied
+                });
+            if waits_for_selection_mask {
+                continue;
+            }
+            let admission_tick = self.pending[index].admission_tick;
+            let read_ticks = self.pending[index].uop.stages.read_ticks;
+            let Some(read) = self.pending[index].read.as_mut() else {
                 continue;
             };
             if read.ready_tick().is_none()
-                && let Some(grant_tick) = read.grant_tick(entry.admission_tick)
+                && let Some(grant_tick) = read.grant_tick(admission_tick)
             {
                 read.set_ready_tick(
                     grant_tick
-                        .checked_add(u64::from(entry.uop.stages.read_ticks))
+                        .checked_add(u64::from(read_ticks))
                         .ok_or(C220VectorAdvanceError::TimeOverflow)?,
                 );
             }
@@ -464,24 +654,158 @@ impl C220VectorPipeline {
             if read.is_sampled() || ready_tick > tick {
                 continue;
             }
-            let (sample, stores) = read.sample(ub)?;
-            if stores.len() != entry.stores.len()
-                || stores.iter().zip(&entry.stores).any(|(actual, planned)| {
-                    actual.address != planned.address
-                        || actual.lane_index != planned.lane_index
-                        || actual.width_bytes != planned.width_bytes
-                })
+            let (sample, stores) =
+                read.sample(ub, self.compare_mask, self.selection_mask.as_ref())?;
+            let compare_update = sample.compare_update;
+            let selection_update = sample.selection_update.clone();
+            let reduction_update = sample.reduction_update;
+            let shares_read = read.shares_read_with_next();
+            let first_store_count = self.pending[index].stores.len();
+            if shares_read && (index + 1 >= self.pending.len() || stores.len() < first_store_count)
             {
                 return Err(C220VectorAdvanceError::WriteTargetMismatch);
             }
-            entry.stores = stores;
-            read.mark_sampled();
-            entry.execute_ready_tick = Some(
-                ready_tick
-                    .checked_add(u64::from(entry.uop.stages.execute_ticks))
-                    .ok_or(C220VectorAdvanceError::TimeOverflow)?,
-            );
+            let (first_stores, second_stores) = if shares_read {
+                stores.split_at(first_store_count)
+            } else {
+                (stores.as_slice(), &[][..])
+            };
+            if !write_targets_match(first_stores, &self.pending[index].stores)
+                || (shares_read
+                    && (!self.pending[index + 1].shared_read_from_previous
+                        || !write_targets_match(second_stores, &self.pending[index + 1].stores)))
+            {
+                return Err(C220VectorAdvanceError::WriteTargetMismatch);
+            }
+            self.pending[index]
+                .read
+                .as_mut()
+                .expect("read remains pending")
+                .mark_sampled();
+            self.pending[index].stores = first_stores.to_vec();
+            self.pending[index].compare_update = compare_update;
+            self.pending[index].selection_update = selection_update;
+            if let Some(update) = self.pending[index].reduction_update.as_mut() {
+                update.update = reduction_update;
+            }
+            let execute_ready_tick = ready_tick
+                .checked_add(u64::from(self.pending[index].uop.stages.execute_ticks))
+                .ok_or(C220VectorAdvanceError::TimeOverflow)?;
+            self.pending[index].execute_ready_tick = Some(execute_ready_tick);
+            if self.pending[index].write.is_none() {
+                self.pending[index].eligible_tick = Some(
+                    execute_ready_tick
+                        .checked_add(self.pending[index].uop.writeback_ticks as u64)
+                        .ok_or(C220VectorAdvanceError::TimeOverflow)?,
+                );
+            }
+            if shares_read {
+                self.pending[index + 1].stores = second_stores.to_vec();
+                self.pending[index + 1].execute_ready_tick = Some(
+                    ready_tick
+                        .checked_add(u64::from(self.pending[index + 1].uop.stages.execute_ticks))
+                        .ok_or(C220VectorAdvanceError::TimeOverflow)?,
+                );
+            }
             self.last_read_samples.push(sample);
+        }
+        Ok(())
+    }
+
+    fn apply_compare_updates(&mut self, tick: u64) {
+        for index in 0..self.pending.len() {
+            if self.pending[index].compare_update_applied
+                || self.pending[index]
+                    .execute_ready_tick
+                    .is_none_or(|ready| ready > tick)
+            {
+                continue;
+            }
+            let earlier_state_access_pending = self.pending.iter().take(index).any(|entry| {
+                let Some(read) = entry.read.as_ref() else {
+                    return false;
+                };
+                (read.uses_compare_mask() && !read.is_sampled())
+                    || (read.writes_compare_mask() && !entry.compare_update_applied)
+            });
+            if earlier_state_access_pending {
+                continue;
+            }
+            if let Some(update) = self.pending[index].compare_update {
+                self.compare_mask.apply(update);
+                self.pending[index].compare_update_applied = true;
+            }
+        }
+    }
+
+    fn apply_selection_updates(&mut self, tick: u64) {
+        for index in 0..self.pending.len() {
+            if self.pending[index].selection_update_applied
+                || self.pending[index]
+                    .execute_ready_tick
+                    .is_none_or(|ready| ready > tick)
+            {
+                continue;
+            }
+            let earlier_state_access_pending = self.pending.iter().take(index).any(|entry| {
+                let Some(read) = entry.read.as_ref() else {
+                    return false;
+                };
+                (read.uses_selection_mask() && !read.is_sampled())
+                    || (read.writes_selection_mask() && !entry.selection_update_applied)
+            });
+            if earlier_state_access_pending {
+                continue;
+            }
+            if let Some(update) = self.pending[index].selection_update.clone() {
+                self.selection_mask = Some(update);
+                self.pending[index].selection_update_applied = true;
+            }
+        }
+    }
+
+    fn apply_reduction_updates(
+        &mut self,
+        tick: u64,
+        core: &mut MteCoreStepper,
+    ) -> Result<(), C220VectorAdvanceError> {
+        for index in 0..self.pending.len() {
+            let Some(update) = self.pending[index].reduction_update else {
+                continue;
+            };
+            if update.applied
+                || update.update.is_none()
+                || self.pending[index]
+                    .execute_ready_tick
+                    .is_none_or(|ready| ready > tick)
+            {
+                continue;
+            }
+            if self.pending.iter().take(index).any(|entry| {
+                entry
+                    .reduction_update
+                    .is_some_and(|prior| prior.group == update.group && !prior.applied)
+            }) {
+                continue;
+            }
+            let mut state = self
+                .reduction_states
+                .remove(&update.group)
+                .expect("issued reduction has state");
+            state.apply(update.update.expect("checked reduction update"));
+            if update.last {
+                let (register, value) = state.result().expect("completed reduction has a result");
+                core.scalar_mut()
+                    .machine_mut()
+                    .set_spr_value(register, value)?;
+            } else {
+                self.reduction_states.insert(update.group, state);
+            }
+            self.pending[index]
+                .reduction_update
+                .as_mut()
+                .expect("reduction update remains pending")
+                .applied = true;
         }
         Ok(())
     }
@@ -518,6 +842,9 @@ impl C220VectorPipeline {
             if entry.release_tick.is_some() {
                 continue;
             }
+            if entry.reduction_update.is_some_and(|update| !update.applied) {
+                break;
+            }
             let Some(eligible_tick) = entry.eligible_tick else {
                 break;
             };
@@ -543,6 +870,7 @@ impl C220VectorPipeline {
                 pc: entry.uop.pc,
                 repeat_index: entry.uop.repeat_index,
                 lane_group: entry.uop.lane_group,
+                kind: entry.uop.kind,
                 admission_tick: entry.admission_tick,
                 eligible_tick,
                 release_tick,
@@ -567,6 +895,16 @@ impl C220VectorPipeline {
     }
 }
 
+fn write_targets_match(actual: &[C220VectorStore], planned: &[C220VectorStore]) -> bool {
+    actual.len() == planned.len()
+        && actual.iter().zip(planned).all(|(actual, planned)| {
+            actual.repeat_index == planned.repeat_index
+                && actual.address == planned.address
+                && actual.lane_index == planned.lane_index
+                && actual.width_bytes == planned.width_bytes
+        })
+}
+
 #[derive(Debug, Error)]
 pub enum C220VectorAdvanceError {
     #[error(transparent)]
@@ -575,6 +913,8 @@ pub enum C220VectorAdvanceError {
     Commit(#[from] MteStepperError),
     #[error(transparent)]
     Read(#[from] C220VectorError),
+    #[error(transparent)]
+    Scalar(#[from] ScalarMachineError),
     #[error("sampled vector stores disagree with their issue-time write targets")]
     WriteTargetMismatch,
     #[error("vector timeline computation overflowed")]
@@ -652,7 +992,8 @@ mod tests {
                 &[C220VectorUop {
                     pc: 0,
                     repeat_index: 0,
-                    lane_group: 0,
+                    lane_group: Some(0),
+                    kind: crate::sim::c220::vector::timing::C220VectorUopKind::Ordinary,
                     stages: crate::sim::c220::vector::timing::C220VectorUopStages {
                         read_ticks: 1,
                         execute_ticks: 0,
@@ -670,7 +1011,8 @@ mod tests {
                 &[C220VectorUop {
                     pc: 0,
                     repeat_index: 0,
-                    lane_group: 0,
+                    lane_group: Some(0),
+                    kind: crate::sim::c220::vector::timing::C220VectorUopKind::Ordinary,
                     stages: crate::sim::c220::vector::timing::C220VectorUopStages {
                         read_ticks: 6,
                         execute_ticks: 7,

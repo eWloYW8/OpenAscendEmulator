@@ -21,6 +21,7 @@ pub enum C220VectorScalarOperation {
     Multiply,
     Maximum,
     Minimum,
+    LeakyRelu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,14 @@ pub struct C220VectorScalarInstruction {
 impl C220VectorScalarInstruction {
     pub const fn decode(word: u32) -> Option<Self> {
         let (operation, dtype) = match word & 0xffc0_0003 {
+            0x9240_0000 => (
+                C220VectorScalarOperation::LeakyRelu,
+                C220VectorScalarType::F16,
+            ),
+            0x92c0_0000 => (
+                C220VectorScalarOperation::LeakyRelu,
+                C220VectorScalarType::F32,
+            ),
             0x9640_0000 => (
                 C220VectorScalarOperation::Maximum,
                 C220VectorScalarType::F16,

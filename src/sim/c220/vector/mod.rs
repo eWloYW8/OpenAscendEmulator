@@ -3,22 +3,31 @@ use crate::isa::c220::vector::{C220VecArithmeticHint, C220VecArithmeticOperation
 use crate::memory::sparse::MemoryByteState;
 use crate::memory::ub::{UbMemory, UbMemoryError};
 use crate::numeric::fp32::{
-    Fp32LaneOutcome, Fp32MaskLayout, Fp32VectorError, Fp32VectorOperation,
+    Fp32LaneOutcome, Fp32MaskLayout, Fp32VectorError, Fp32VectorOperation, evaluate_fp32_value,
     evaluate_masked_fp32_lanes,
 };
 use crate::sim::c220::fp16::C220Fp16Mode;
 use thiserror::Error;
 
+pub mod broadcast;
+pub mod compare;
+pub mod copy;
 mod f16;
+pub mod gather;
 mod movev;
+pub mod nchw;
 pub mod pipeline;
 pub mod read;
+pub mod reduce;
 mod s16;
 mod s32;
 pub mod scalar;
+pub mod select;
 pub mod shift;
 mod stepper;
+pub mod ternary;
 pub mod timing;
+pub mod transpose;
 
 pub use movev::{
     C220MovevControl, C220MovevStep, decode_c220_movev_control, execute_c220_movev_to_ub,
@@ -60,6 +69,8 @@ pub struct C220VectorStore {
 pub struct C220VectorReadAccess {
     pub source_index: u8,
     pub block_index: u8,
+    pub buffer_offset: u16,
+    pub bytes: u16,
     pub address: u64,
     pub active_lane_mask: u16,
 }
@@ -184,6 +195,14 @@ pub enum C220VectorError {
     RepeatLimitExceeded { count: u64, limit: usize },
     #[error("C220 vector mask state is incomplete")]
     MissingMaskState,
+    #[error("C220 VSEL mode {0} is unsupported")]
+    UnsupportedSelectMode(u8),
+    #[error("C220 VSEL tensor mask is not available")]
+    MissingSelectionMask,
+    #[error("C220 VA{register}[{index}] has not been initialized")]
+    MissingVaEntry { register: u8, index: u8 },
+    #[error("C220 vector repeat index {0} is out of range")]
+    InvalidRepeatIndex(usize),
     #[error("C220 vector source tile has {actual} bytes, expected {expected}")]
     InvalidSourceTile { actual: usize, expected: usize },
     #[error("unsupported C220 vector element width {0}")]
@@ -219,6 +238,13 @@ pub struct C220VectorControl {
     pub destination_repeat_stride: u16,
     pub source_0_repeat_stride: u16,
     pub source_1_repeat_stride: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220VectorMaskState {
+    pub control: u64,
+    pub low: u64,
+    pub high: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -494,9 +520,9 @@ pub(crate) fn evaluate_c220_fp32_repeat_with_accesses(
         } else {
             &mut source_1_bytes
         };
-        let offset = usize::from(access.block_index) * C220_VECTOR_BLOCK_BYTES;
-        destination[offset..offset + C220_VECTOR_BLOCK_BYTES]
-            .copy_from_slice(&ub.read_known(access.address, C220_VECTOR_BLOCK_BYTES)?);
+        let offset = usize::from(access.buffer_offset);
+        let bytes = usize::from(access.bytes);
+        destination[offset..offset + bytes].copy_from_slice(&ub.read_known(access.address, bytes)?);
     }
     evaluate_c220_fp32_repeat_from_bytes(
         hint,
@@ -764,6 +790,8 @@ pub(crate) fn plan_c220_vector_read_accesses(
             accesses.push(C220VectorReadAccess {
                 source_index,
                 block_index: block as u8,
+                buffer_offset: (block * C220_VECTOR_BLOCK_BYTES) as u16,
+                bytes: C220_VECTOR_BLOCK_BYTES as u16,
                 address,
                 active_lane_mask,
             });
@@ -782,11 +810,19 @@ impl C220VecArithmeticHint {
         if !self.has_fp32_value_path() {
             return Err(Fp32VectorError::UnsupportedInstruction);
         }
+        let rectify_result = matches!(
+            self.operation,
+            C220VecArithmeticOperation::AddRectify | C220VecArithmeticOperation::SubtractRectify
+        );
         let operation = match self.operation {
             C220VecArithmeticOperation::Absolute => Fp32VectorOperation::Absolute,
             C220VecArithmeticOperation::Rectify => Fp32VectorOperation::Rectify,
-            C220VecArithmeticOperation::Add => Fp32VectorOperation::Add,
-            C220VecArithmeticOperation::Subtract => Fp32VectorOperation::Subtract,
+            C220VecArithmeticOperation::Add | C220VecArithmeticOperation::AddRectify => {
+                Fp32VectorOperation::Add
+            }
+            C220VecArithmeticOperation::Subtract | C220VecArithmeticOperation::SubtractRectify => {
+                Fp32VectorOperation::Subtract
+            }
             C220VecArithmeticOperation::Multiply => Fp32VectorOperation::Multiply,
             C220VecArithmeticOperation::Divide => Fp32VectorOperation::Divide,
             C220VecArithmeticOperation::Maximum => Fp32VectorOperation::Maximum,
@@ -797,13 +833,22 @@ impl C220VecArithmeticHint {
                 return Err(Fp32VectorError::UnsupportedInstruction);
             }
         };
-        evaluate_masked_fp32_lanes(
+        let mut lanes = evaluate_masked_fp32_lanes(
             operation,
             Fp32MaskLayout::C220Lane,
             first,
             second,
             iteration_mask,
-        )
+        )?;
+        if rectify_result {
+            for lane in &mut lanes {
+                if lane.active {
+                    lane.bits =
+                        evaluate_fp32_value(Fp32VectorOperation::Rectify, lane.bits, 0).bits;
+                }
+            }
+        }
+        Ok(lanes)
     }
 }
 

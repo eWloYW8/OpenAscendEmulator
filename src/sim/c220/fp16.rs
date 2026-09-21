@@ -40,12 +40,79 @@ pub struct C220Fp16Outcome {
     pub status: C220Fp16Status,
 }
 
+pub fn evaluate_c220_fp16_relu(bits: u16, mode: C220Fp16Mode) -> C220Fp16Outcome {
+    let nan_operand = is_nan(bits);
+    let infinity_operand = is_infinite(bits);
+    let result = if nan_operand {
+        match mode {
+            C220Fp16Mode::Saturating => 0,
+            C220Fp16Mode::NonSaturating => CANONICAL_NAN,
+        }
+    } else if bits & SIGN != 0 {
+        0
+    } else if infinity_operand && mode == C220Fp16Mode::Saturating {
+        MAX_FINITE
+    } else {
+        bits
+    };
+    C220Fp16Outcome {
+        bits: result,
+        status: C220Fp16Status {
+            nan_operand,
+            infinity_operand,
+            ..C220Fp16Status::default()
+        },
+    }
+}
+
+pub fn evaluate_c220_fp16_abs(bits: u16, mode: C220Fp16Mode) -> C220Fp16Outcome {
+    let nan_operand = is_nan(bits);
+    let infinity_operand = is_infinite(bits);
+    let result = if nan_operand {
+        match mode {
+            C220Fp16Mode::Saturating => 0,
+            C220Fp16Mode::NonSaturating => CANONICAL_NAN,
+        }
+    } else if infinity_operand && mode == C220Fp16Mode::Saturating {
+        MAX_FINITE
+    } else {
+        bits & !SIGN
+    };
+    C220Fp16Outcome {
+        bits: result,
+        status: C220Fp16Status {
+            nan_operand,
+            infinity_operand,
+            ..C220Fp16Status::default()
+        },
+    }
+}
+
+pub fn evaluate_c220_fp16_lrelu(
+    source_bits: u16,
+    slope_bits: u16,
+    mode: C220Fp16Mode,
+) -> C220Fp16Outcome {
+    if source_bits & SIGN == 0 {
+        return evaluate_c220_fp16_abs(source_bits, mode);
+    }
+    evaluate_c220_fp16(
+        C220VectorScalarOperation::Multiply,
+        source_bits,
+        slope_bits,
+        mode,
+    )
+}
+
 pub fn evaluate_c220_fp16(
     operation: C220VectorScalarOperation,
     first_bits: u16,
     second_bits: u16,
     mode: C220Fp16Mode,
 ) -> C220Fp16Outcome {
+    if operation == C220VectorScalarOperation::LeakyRelu {
+        return evaluate_c220_fp16_lrelu(first_bits, second_bits, mode);
+    }
     let first_nan = is_nan(first_bits);
     let second_nan = is_nan(second_bits);
     let first_infinite = is_infinite(first_bits);
@@ -61,6 +128,9 @@ pub fn evaluate_c220_fp16(
             C220VectorScalarOperation::Add => opposite_infinities,
             C220VectorScalarOperation::Multiply => zero_times_infinity,
             C220VectorScalarOperation::Maximum | C220VectorScalarOperation::Minimum => false,
+            C220VectorScalarOperation::LeakyRelu => {
+                unreachable!("handled before binary evaluation")
+            }
         },
         ..C220Fp16Status::default()
     };
@@ -84,12 +154,14 @@ pub fn evaluate_c220_fp16(
             match operation {
                 C220VectorScalarOperation::Maximum => first_bits & SIGN <= second_bits & SIGN,
                 C220VectorScalarOperation::Minimum => first_bits & SIGN >= second_bits & SIGN,
+                C220VectorScalarOperation::LeakyRelu => unreachable!("not an extremum"),
                 _ => unreachable!(),
             }
         } else {
             match operation {
                 C220VectorScalarOperation::Maximum => first > second,
                 C220VectorScalarOperation::Minimum => first < second,
+                C220VectorScalarOperation::LeakyRelu => unreachable!("not an extremum"),
                 _ => unreachable!(),
             }
         };
@@ -118,6 +190,9 @@ pub fn evaluate_c220_fp16(
                 }
             }
             C220VectorScalarOperation::Multiply => (first_bits ^ second_bits) & SIGN,
+            C220VectorScalarOperation::LeakyRelu => {
+                unreachable!("handled before binary evaluation")
+            }
             _ => unreachable!(),
         };
         return C220Fp16Outcome {
@@ -135,6 +210,7 @@ pub fn evaluate_c220_fp16(
     let exact = match operation {
         C220VectorScalarOperation::Add => first + second,
         C220VectorScalarOperation::Multiply => first * second,
+        C220VectorScalarOperation::LeakyRelu => unreachable!("handled before binary evaluation"),
         _ => unreachable!(),
     };
     status.overflow = exact.abs() >= OVERFLOW_MIDPOINT;
@@ -194,7 +270,7 @@ fn round_finite_to_f16(value: f64) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use C220VectorScalarOperation::{Add, Maximum, Minimum, Multiply};
+    use C220VectorScalarOperation::{Add, LeakyRelu, Maximum, Minimum, Multiply};
 
     #[test]
     fn f16_rounding_and_nonfinite_modes_keep_their_distinct_bit_patterns() {
@@ -203,6 +279,7 @@ mod tests {
             (Add, 0x3c01, 0x1000, C220Fp16Mode::Saturating, 0x3c02),
             (Add, 0x8000, 0x8000, C220Fp16Mode::Saturating, 0x8000),
             (Multiply, 0x0001, 0x3800, C220Fp16Mode::Saturating, 0),
+            (LeakyRelu, 0xc400, 0x3800, C220Fp16Mode::Saturating, 0xc000),
             (Maximum, 0x8000, 0, C220Fp16Mode::Saturating, 0),
             (Minimum, 0x8000, 0, C220Fp16Mode::Saturating, 0x8000),
             (Add, 0x7c00, 0xfc00, C220Fp16Mode::Saturating, 0),
