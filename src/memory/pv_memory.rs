@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use thiserror::Error;
 
@@ -16,14 +16,12 @@ pub enum PvMemoryError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PvPage {
     bytes: Box<[u8]>,
-    dirty: Box<[u8]>,
 }
 
 impl PvPage {
     fn new(default_byte: u8) -> Self {
         Self {
             bytes: vec![default_byte; PV_PAGE_BYTES].into_boxed_slice(),
-            dirty: vec![0; PV_PAGE_BYTES].into_boxed_slice(),
         }
     }
 }
@@ -56,14 +54,6 @@ impl PvMemory {
             .map_or(self.default_byte, |page| page.bytes[page_offset])
     }
 
-    pub fn dirty_byte(&self, address: u64) -> Option<u8> {
-        let page_base = address & PV_PAGE_MASK;
-        let page_offset = (address - page_base) as usize;
-        self.pages
-            .get(&page_base)
-            .map(|page| page.dirty[page_offset])
-    }
-
     pub fn read_into(&self, address: u64, destination: &mut [u8]) -> Result<(), PvMemoryError> {
         self.check_range(address, destination.len())?;
         let mut done = 0;
@@ -92,45 +82,7 @@ impl PvMemory {
                 .entry(base)
                 .or_insert_with(|| PvPage::new(this.default_byte));
             page.bytes[offset..offset + range.len()].copy_from_slice(&source[range.clone()]);
-            page.dirty[offset..offset + range.len()].fill(1);
         });
-        Ok(())
-    }
-
-    pub fn copy(
-        &mut self,
-        destination_address: u64,
-        source_address: u64,
-        length: usize,
-    ) -> Result<(), PvMemoryError> {
-        self.check_range(destination_address, length)?;
-        self.check_range(source_address, length)?;
-        if length == 0 {
-            return Ok(());
-        }
-        let source_end = source_address + length as u64 - 1;
-        self.check_page_budget(destination_address, length)?;
-
-        const SCRATCH_BYTES: usize = 64 * 1024;
-        let mut scratch = [0_u8; SCRATCH_BYTES];
-        if destination_address > source_address && destination_address <= source_end {
-            let mut remaining = length;
-            while remaining != 0 {
-                let count = remaining.min(SCRATCH_BYTES);
-                let offset = remaining - count;
-                self.read_into(source_address + offset as u64, &mut scratch[..count])?;
-                self.write(destination_address + offset as u64, &scratch[..count])?;
-                remaining = offset;
-            }
-        } else {
-            let mut offset = 0;
-            while offset < length {
-                let count = (length - offset).min(SCRATCH_BYTES);
-                self.read_into(source_address + offset as u64, &mut scratch[..count])?;
-                self.write(destination_address + offset as u64, &scratch[..count])?;
-                offset += count;
-            }
-        }
         Ok(())
     }
 
@@ -146,32 +98,27 @@ impl PvMemory {
     }
 
     fn check_page_budget(&self, address: u64, length: usize) -> Result<(), PvMemoryError> {
-        self.check_page_budget_for_ranges(&[(address, length)])
-    }
-
-    fn check_page_budget_for_ranges(&self, ranges: &[(u64, usize)]) -> Result<(), PvMemoryError> {
-        let mut missing = BTreeSet::new();
-        for &(address, length) in ranges {
-            if length == 0 {
-                continue;
-            }
-            let final_address = address + length as u64 - 1;
-            let mut base = address & PV_PAGE_MASK;
-            let last_base = final_address & PV_PAGE_MASK;
-            loop {
-                if !self.pages.contains_key(&base) {
-                    missing.insert(base);
-                    if missing.len() > self.max_pages.saturating_sub(self.pages.len()) {
-                        return Err(PvMemoryError::PageLimit {
-                            limit: self.max_pages,
-                        });
-                    }
+        if length == 0 {
+            return Ok(());
+        }
+        let final_address = address + length as u64 - 1;
+        let mut base = address & PV_PAGE_MASK;
+        let last_base = final_address & PV_PAGE_MASK;
+        let available = self.max_pages.saturating_sub(self.pages.len());
+        let mut missing = 0;
+        loop {
+            if !self.pages.contains_key(&base) {
+                missing += 1;
+                if missing > available {
+                    return Err(PvMemoryError::PageLimit {
+                        limit: self.max_pages,
+                    });
                 }
-                if base == last_base {
-                    break;
-                }
-                base += PV_PAGE_BYTES as u64;
             }
+            if base == last_base {
+                break;
+            }
+            base += PV_PAGE_BYTES as u64;
         }
         Ok(())
     }
@@ -211,16 +158,13 @@ mod tests {
     }
 
     #[test]
-    fn cross_page_write_changes_bytes_and_dirty_flags() {
+    fn cross_page_write_changes_only_addressed_bytes() {
         let mut memory = PvMemory::new(0x7f, 2);
         let address = PV_PAGE_BYTES as u64 - 1;
         memory.write(address, &[3, 4, 5]).unwrap();
         let mut result = [0; 5];
         memory.read_into(address - 1, &mut result).unwrap();
         assert_eq!(result, [0x7f, 3, 4, 5, 0x7f]);
-        assert_eq!(memory.dirty_byte(address - 1), Some(0));
-        assert_eq!(memory.dirty_byte(address), Some(1));
-        assert_eq!(memory.dirty_byte(address + 2), Some(1));
     }
 
     #[test]
@@ -242,46 +186,5 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, [0; 2]);
         assert_eq!(memory.page_count(), 0);
-    }
-
-    #[test]
-    fn overlapping_copy_matches_staged_bytes() {
-        let mut memory = PvMemory::new(0, 1);
-        let pattern: [u8; 16] = [
-            0x01, 0x80, 0x00, 0xff, 0x5a, 0xa5, 0x12, 0x34, 0xde, 0xad, 0xbe, 0xef, 0x7f, 0x20,
-            0x09, 0xc3,
-        ];
-        memory.write(0x10000003, &pattern).unwrap();
-        memory.copy(0x10000007, 0x10000003, 16).unwrap();
-        let mut result = [0; 20];
-        memory.read_into(0x10000003, &mut result).unwrap();
-        assert_eq!(&result[..4], &pattern[..4]);
-        assert_eq!(&result[4..], &pattern);
-    }
-
-    #[test]
-    fn overlapping_copy_across_scratch_chunks_keeps_original_source() {
-        let mut memory = PvMemory::new(0, 1);
-        let source: Vec<u8> = (0..64 * 1024 + 37)
-            .map(|index| (index % 251) as u8)
-            .collect();
-        memory.write(0x10001000, &source).unwrap();
-        memory.copy(0x10001005, 0x10001000, source.len()).unwrap();
-        let mut result = vec![0; source.len() + 5];
-        memory.read_into(0x10001000, &mut result).unwrap();
-        assert_eq!(&result[..5], &source[..5]);
-        assert_eq!(&result[5..], source);
-    }
-
-    #[test]
-    fn copy_page_limit_rejects_without_partial_mutation() {
-        let mut memory = PvMemory::new(0, 1);
-        memory.write(0x10000000, &[1, 2, 3, 4]).unwrap();
-        let before = memory.clone();
-        assert_eq!(
-            memory.copy(0x11000000, 0x10000000, 4),
-            Err(PvMemoryError::PageLimit { limit: 1 })
-        );
-        assert_eq!(memory, before);
     }
 }

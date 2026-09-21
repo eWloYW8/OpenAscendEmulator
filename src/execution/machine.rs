@@ -1,11 +1,13 @@
 use crate::device::architecture::Architecture;
-use crate::execution::buffer_c310::C310BufferDisposition;
-use crate::execution::predicate_buffer_c310::{
+use crate::execution::c310::buffer::C310BufferDisposition;
+use crate::execution::c310::predicate_buffer::{
     C310PushPbDisposition, C310PushPbInstruction, C310PushPbStep,
 };
-use crate::execution::vec_queue_c310::{
+use crate::execution::c310::vector_queue::{
     C310VfQueueDisposition, C310VfQueueInstruction, C310VfQueueStep,
 };
+use crate::instruction::c220::vector::C220MovemaskHint;
+use crate::instruction::c310::vector::{C310ObservedMovemaskHint, C310ObservedMovemaskStep};
 use crate::instruction::flow::{
     C310BufferInstruction, C310BufferStep, ConditionalJump, ConditionalJumpTarget, DcciInstruction,
     DcciStep, DsbStep, FlowEnd, FlowNop, JumpCompare, JumpCompareError, JumpCompareTarget,
@@ -15,13 +17,10 @@ use crate::instruction::isa::{
     AicClass, AicDecoderHint, ScalarKey0Operation, ScalarKey7Operation, ScalarKey8Operation,
     ScalarLoadStoreOperation, ScalarStoreImmediateValue,
 };
-use crate::instruction::rvec::{C310ObservedMovemaskHint, C310ObservedMovemaskStep};
 use crate::instruction::scalar::{
     ScalarIntegerError, evaluate_scalar_integer_immediate, update_neg_overflow_spr2,
     update_overflow_spr2,
 };
-use crate::instruction::vec_c220::C220MovemaskHint;
-use serde::Serialize;
 use thiserror::Error;
 
 pub const SCALAR_X_REGISTER_COUNT: usize = 32;
@@ -36,7 +35,7 @@ pub struct ScalarMachine {
     model_time: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarStep {
     pub pc: u64,
     pub word: u32,
@@ -52,7 +51,7 @@ pub struct ScalarStep {
     pub spr2: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarSprStep {
     pub pc: u64,
     pub word: u32,
@@ -63,14 +62,14 @@ pub struct ScalarSprStep {
     pub value: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarSprReadSource {
     RegisterSnapshot,
     ProgramCounter,
     ModelTime,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarSprReadStep {
     pub pc: u64,
     pub word: u32,
@@ -82,7 +81,7 @@ pub struct ScalarSprReadStep {
     pub value: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarInstructionStep {
     Register(ScalarStep),
     SprRead(ScalarSprReadStep),
@@ -109,7 +108,7 @@ pub enum ScalarInstructionStep {
     VfQueue(C310VfQueueStep),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220MovemaskStep {
     pub pc: u64,
     pub word: u32,
@@ -119,7 +118,7 @@ pub struct C220MovemaskStep {
     pub prior_destination_value: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarCacheHintStep {
     pub pc: u64,
     pub word: u32,
@@ -130,7 +129,7 @@ pub struct ScalarCacheHintStep {
     pub requested_bytes: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFlowStep {
     Nop(FlowNop),
     End(FlowEnd),
@@ -191,7 +190,7 @@ pub trait ScalarMemoryBus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarMemoryStep {
     pub pc: u64,
     pub word: u32,
@@ -208,7 +207,7 @@ pub struct ScalarMemoryStep {
     pub sign_extension_requested: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarIndexedLoadStep {
     pub pc: u64,
     pub word: u32,
@@ -224,7 +223,7 @@ pub struct ScalarIndexedLoadStep {
     pub bytes: [u8; 8],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarIndexedImmediateStoreStep {
     pub pc: u64,
     pub word: u32,
@@ -238,7 +237,7 @@ pub struct ScalarIndexedImmediateStoreStep {
     pub bytes: [u8; 8],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarImmediateStoreStep {
     pub pc: u64,
     pub word: u32,
@@ -250,7 +249,7 @@ pub struct ScalarImmediateStoreStep {
     pub bytes: [u8; 8],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarCompareStep {
     pub pc: u64,
     pub word: u32,
@@ -264,7 +263,7 @@ pub struct ScalarCompareStep {
     pub spr11: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarCompareRegisterStep {
     pub pc: u64,
     pub word: u32,
@@ -279,7 +278,7 @@ pub struct ScalarCompareRegisterStep {
     pub value: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarCompareImmediateStep {
     pub pc: u64,
     pub word: u32,
@@ -292,7 +291,7 @@ pub struct ScalarCompareImmediateStep {
     pub spr11: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarSelectStep {
     pub pc: u64,
     pub word: u32,
@@ -307,7 +306,7 @@ pub struct ScalarSelectStep {
     pub value: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarPairLoadStep {
     pub pc: u64,
     pub word: u32,
@@ -327,7 +326,7 @@ pub struct ScalarPairLoadStep {
     pub sign_extension_requested: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarPairStoreStep {
     pub pc: u64,
     pub word: u32,
@@ -1025,11 +1024,58 @@ impl ScalarMachine {
                             .overflowing_add(product);
                         (value as u64, multiply_overflow || add_overflow)
                     }
+                    (ScalarKey0Operation::Divide, 0) => {
+                        let dividend = first_source_value as i64;
+                        let divisor = second_source_value as i64;
+                        let quotient = if divisor == 0 {
+                            if dividend < 0 { i64::MIN } else { i64::MAX }
+                        } else if dividend == i64::MIN && divisor == -1 {
+                            i64::MIN
+                        } else {
+                            dividend / divisor
+                        };
+                        (quotient as u64, false)
+                    }
+                    (ScalarKey0Operation::Divide, 1) => (
+                        first_source_value
+                            .checked_div(second_source_value)
+                            .unwrap_or(u64::MAX),
+                        false,
+                    ),
+                    (ScalarKey0Operation::Remainder, 0) => {
+                        let dividend = first_source_value as i64;
+                        let divisor = second_source_value as i64;
+                        let remainder = if divisor == 0 {
+                            dividend
+                        } else if dividend == i64::MIN && divisor == -1 {
+                            0
+                        } else {
+                            dividend % divisor
+                        };
+                        (remainder as u64, false)
+                    }
+                    (ScalarKey0Operation::Remainder, 1) => (
+                        first_source_value
+                            .checked_rem(second_source_value)
+                            .unwrap_or(first_source_value),
+                        false,
+                    ),
+                    (ScalarKey0Operation::Minimum, 0) => (
+                        (first_source_value as i64).min(second_source_value as i64) as u64,
+                        false,
+                    ),
+                    (ScalarKey0Operation::Maximum, 0) => (
+                        (first_source_value as i64).max(second_source_value as i64) as u64,
+                        false,
+                    ),
                     (ScalarKey0Operation::And, 3) => {
                         (first_source_value & second_source_value, false)
                     }
                     (ScalarKey0Operation::Or, 3) => {
                         (first_source_value | second_source_value, false)
+                    }
+                    (ScalarKey0Operation::Xor, 3) => {
+                        (first_source_value ^ second_source_value, false)
                     }
                     _ => return Err(ScalarMachineError::UnsupportedWord { pc, word }),
                 };
@@ -1189,6 +1235,85 @@ impl ScalarMachine {
                     source_value.wrapping_neg(),
                     signed_overflow,
                     update_neg_overflow_spr2(self.architecture, self.spr2, pc, signed_overflow),
+                )
+            }
+            AicDecoderHint::ScalarKey2Absolute {
+                dtype_field,
+                destination_register,
+                source_register,
+            } => {
+                if dtype_field != 0 {
+                    return Err(ScalarMachineError::UnsupportedWord { pc, word });
+                }
+                let Some(&source_value) = self.xregs.get(usize::from(source_register)) else {
+                    return Err(ScalarMachineError::UnsupportedWord { pc, word });
+                };
+                if self.xregs.get(usize::from(destination_register)).is_none() {
+                    return Err(ScalarMachineError::UnsupportedWord { pc, word });
+                }
+                (
+                    destination_register,
+                    Some(source_register),
+                    Some(source_value),
+                    None,
+                    None,
+                    if (source_value as i64) < 0 {
+                        source_value.wrapping_neg()
+                    } else {
+                        source_value
+                    },
+                    false,
+                    self.spr2,
+                )
+            }
+            AicDecoderHint::ScalarKey2IntegerSqrt {
+                dtype_field,
+                destination_register,
+                source_register,
+            } => {
+                if dtype_field != 0 {
+                    return Err(ScalarMachineError::UnsupportedWord { pc, word });
+                }
+                let Some(&source_value) = self.xregs.get(usize::from(source_register)) else {
+                    return Err(ScalarMachineError::UnsupportedWord { pc, word });
+                };
+                if self.xregs.get(usize::from(destination_register)).is_none() {
+                    return Err(ScalarMachineError::UnsupportedWord { pc, word });
+                }
+                (
+                    destination_register,
+                    Some(source_register),
+                    Some(source_value),
+                    None,
+                    None,
+                    (source_value as i64).unsigned_abs().isqrt(),
+                    false,
+                    self.spr2,
+                )
+            }
+            AicDecoderHint::ScalarKey2BitwiseNot {
+                dtype_field,
+                destination_register,
+                source_register,
+            } => {
+                if dtype_field != 3 {
+                    return Err(ScalarMachineError::UnsupportedWord { pc, word });
+                }
+                let Some(&source_value) = self.xregs.get(usize::from(source_register)) else {
+                    return Err(ScalarMachineError::UnsupportedWord { pc, word });
+                };
+                if self.xregs.get(usize::from(destination_register)).is_none() {
+                    return Err(ScalarMachineError::UnsupportedWord { pc, word });
+                }
+                (
+                    destination_register,
+                    Some(source_register),
+                    Some(source_value),
+                    None,
+                    None,
+                    !source_value,
+                    false,
+                    self.spr2,
                 )
             }
             AicDecoderHint::ScalarKey2ZeroExtend {
@@ -2957,6 +3082,126 @@ mod tests {
     }
 
     #[test]
+    fn absolute_preserves_minimum_integer_and_overflow_state() {
+        let word = 0x0200_0100 | (2 << 12) | (1 << 17);
+        let in_place = 0x0200_0100 | (1 << 12) | (1 << 17);
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut machine = ScalarMachine::new(architecture, [0; 32], 0x00f5_00ff);
+            for (input, expected) in [
+                (5_u64, 5_u64),
+                ((-5_i64) as u64, 5),
+                (i64::MIN as u64, i64::MIN as u64),
+            ] {
+                machine.set_xreg(2, input).unwrap();
+                let step = machine.execute_word(0x100, word).unwrap();
+                assert_eq!(step.source_register, Some(2));
+                assert_eq!(step.destination_register, 1);
+                assert_eq!(step.value, expected);
+                assert!(!step.signed_overflow);
+                assert_eq!(step.spr2, 0x00f5_00ff);
+            }
+            machine.set_xreg(1, (-9_i64) as u64).unwrap();
+            assert_eq!(machine.execute_word(0x104, in_place).unwrap().value, 9);
+        }
+    }
+
+    #[test]
+    fn integer_sqrt_uses_signed_magnitude_and_rounds_down() {
+        let word = 0x0200_0000 | (2 << 12) | (1 << 17);
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut machine = ScalarMachine::new(architecture, [0; 32], 0x55);
+            for (input, expected) in [
+                (0_i64, 0_u64),
+                (15, 3),
+                (-9, 3),
+                (i64::MAX, 3037000499),
+                (i64::MIN, 3037000499),
+            ] {
+                machine.set_xreg(2, input as u64).unwrap();
+                let step = machine.execute_word(0x100, word).unwrap();
+                assert_eq!(step.value, expected);
+                assert_eq!(step.spr2, 0x55);
+            }
+        }
+    }
+
+    #[test]
+    fn signed_minimum_and_maximum_preserve_scalar_status() {
+        let operands = (2 << 7) | (1 << 12) | (3 << 17);
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut machine = ScalarMachine::new(architecture, [0; 32], 0x5a5a);
+            machine.set_xreg(1, (-7_i64) as u64).unwrap();
+            machine.set_xreg(2, 5).unwrap();
+            let minimum = machine.execute_word(0x100, operands | 8).unwrap();
+            assert_eq!(minimum.destination_register, 3);
+            assert_eq!(minimum.source_register, Some(1));
+            assert_eq!(minimum.second_source_register, Some(2));
+            assert_eq!(minimum.value, (-7_i64) as u64);
+            assert_eq!(minimum.spr2, 0x5a5a);
+
+            let maximum = machine.execute_word(0x104, operands | 7).unwrap();
+            assert_eq!(maximum.value, 5);
+            assert_eq!(maximum.spr2, 0x5a5a);
+
+            machine.set_xreg(1, i64::MIN as u64).unwrap();
+            machine.set_xreg(2, i64::MAX as u64).unwrap();
+            assert_eq!(
+                machine.execute_word(0x108, operands | 8).unwrap().value,
+                i64::MIN as u64
+            );
+            assert_eq!(
+                machine.execute_word(0x10c, operands | 7).unwrap().value,
+                i64::MAX as u64
+            );
+        }
+    }
+
+    #[test]
+    fn division_and_remainder_cover_signed_unsigned_and_exceptional_inputs() {
+        let operands = (2 << 7) | (1 << 12) | (3 << 17);
+        let cases = [
+            (0, (-13_i64) as u64, 5, (-2_i64) as u64, (-3_i64) as u64),
+            (1, u64::MAX, 2, u64::MAX / 2, 1),
+            (0, (-5_i64) as u64, 0, i64::MIN as u64, (-5_i64) as u64),
+            (0, 5, 0, i64::MAX as u64, 5),
+            (1, 7, 0, u64::MAX, 7),
+            (0, i64::MIN as u64, u64::MAX, i64::MIN as u64, 0),
+        ];
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut machine = ScalarMachine::new(architecture, [0; 32], 0x55);
+            for (dtype, dividend, divisor, quotient, remainder) in cases {
+                machine.set_xreg(1, dividend).unwrap();
+                machine.set_xreg(2, divisor).unwrap();
+                let divide = machine
+                    .execute_word(0x100, operands | (dtype << 22) | 5)
+                    .unwrap();
+                let rem = machine
+                    .execute_word(0x104, operands | (dtype << 22) | 6)
+                    .unwrap();
+                assert_eq!(divide.value, quotient);
+                assert_eq!(rem.value, remainder);
+                assert_eq!(rem.spr2, 0x55);
+            }
+        }
+    }
+
+    #[test]
+    fn xor_then_not_uses_live_register_bits() {
+        let xor = 0x00c0_000c | (2 << 7) | (1 << 12) | (3 << 17);
+        let not_in_place = 0x02c0_0180 | (3 << 12) | (3 << 17);
+        for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
+            let mut machine = ScalarMachine::new(architecture, [0; 32], 0x55);
+            machine.set_xreg(1, 0xf0).unwrap();
+            machine.set_xreg(2, 0xaa).unwrap();
+            assert_eq!(machine.execute_word(0x100, xor).unwrap().value, 0x5a);
+            let inverted = machine.execute_word(0x104, not_in_place).unwrap();
+            assert_eq!(inverted.source_value, Some(0x5a));
+            assert_eq!(inverted.value, !0x5a_u64);
+            assert_eq!(inverted.spr2, 0x55);
+        }
+    }
+
+    #[test]
     fn shift_left_uses_old_destination_and_masks_register_count() {
         for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
             let mut machine = ScalarMachine::new(architecture, [0; 32], 0x1234);
@@ -3588,7 +3833,7 @@ mod tests {
             assert_eq!(machine.spr_value(100), Some(expected_count));
             assert_eq!(machine.spr_value(101), Some(0));
             assert_eq!(
-                crate::instruction::vec_c220::decode_c220_fp32_mask(
+                crate::instruction::c220::vector::decode_c220_fp32_mask(
                     machine.spr_value(3).unwrap(),
                     machine.spr_value(100).unwrap(),
                     machine.spr_value(101).unwrap(),

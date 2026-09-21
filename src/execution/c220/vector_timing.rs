@@ -1,16 +1,129 @@
-use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-use crate::instruction::vec_c220::{
-    C220_VECTOR_BLOCK_BYTES, C220_VECTOR_BLOCK_COUNT, C220VectorStore,
+use crate::execution::c220::ub_arbiter::{C220UbCycle, C220UbRequest};
+use crate::instruction::c220::vector::{
+    C220_VECTOR_BLOCK_BYTES, C220_VECTOR_BLOCK_COUNT, C220MovevInstruction,
+    C220VecArithmeticOperation, C220VectorStore,
 };
 use crate::memory::ub_bank_c220::C220UbBank;
 
-const UNCONTENDED_FULL_WRITE_TICKS: u8 = 1;
-const UNCONTENDED_PARTIAL_WRITE_TICKS: u8 = 7;
+const PARTIAL_WRITE_OCCUPANCY_TICKS: usize = 6;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Latency components before the UB write stage of an admitted vector uop.
+pub struct C220VectorUopStages {
+    pub read_ticks: u8,
+    pub execute_ticks: u8,
+}
+
+impl C220VectorUopStages {
+    pub const fn empty() -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: 1,
+        }
+    }
+
+    pub const fn movev(instruction: C220MovevInstruction) -> Option<Self> {
+        if instruction.supported_element_bytes().is_none() {
+            return None;
+        }
+        Some(Self {
+            read_ticks: 6,
+            execute_ticks: 1,
+        })
+    }
+
+    pub const fn fp32_binary_arithmetic(operation: C220VecArithmeticOperation) -> Option<Self> {
+        let execute_ticks = match operation {
+            C220VecArithmeticOperation::Absolute => return None,
+            C220VecArithmeticOperation::Add | C220VecArithmeticOperation::Subtract => 7,
+            C220VecArithmeticOperation::Maximum | C220VecArithmeticOperation::Minimum => 5,
+            C220VecArithmeticOperation::Multiply => 8,
+        };
+        Some(Self {
+            read_ticks: 6,
+            execute_ticks,
+        })
+    }
+
+    pub const fn fp32_vabs() -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: 5,
+        }
+    }
+
+    /// Delay until write-lane release; a fully masked uop sends no UB request.
+    pub const fn release_offset(self, writeback_ticks: usize) -> usize {
+        self.read_ticks as usize + self.execute_ticks as usize + writeback_ticks
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220VectorUop {
+    pub pc: u64,
+    pub repeat_index: usize,
+    pub lane_group: u8,
+    pub stages: C220VectorUopStages,
+    pub writeback_ticks: usize,
+    pub writes_ub: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Departure from the vector write lane, not completion of the UB write.
+pub struct C220VectorUopRelease {
+    pub pc: u64,
+    pub repeat_index: usize,
+    pub lane_group: u8,
+    pub admission_tick: u64,
+    pub eligible_tick: u64,
+    pub release_tick: u64,
+    pub ub_write_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum C220VectorTimelineError {
+    #[error("vector timeline moved backward from tick {previous} to {requested}")]
+    TimeReversed { previous: u64, requested: u64 },
+}
+
+#[derive(Default)]
+struct GroupWriteState {
+    next_slot: usize,
+    completion: usize,
+    partial_slots: BTreeSet<usize>,
+}
+
+impl GroupWriteState {
+    fn accept(&mut self, full: bool) {
+        let slot = self.next_slot;
+        if !full {
+            self.partial_slots.insert(slot);
+        }
+        let mut next_slot = slot + 1;
+        if slot >= PARTIAL_WRITE_OCCUPANCY_TICKS {
+            let mut prior_slot = slot - PARTIAL_WRITE_OCCUPANCY_TICKS;
+            let limit = slot + PARTIAL_WRITE_OCCUPANCY_TICKS;
+            while self.partial_slots.contains(&prior_slot) {
+                next_slot += 1;
+                if next_slot > limit {
+                    break;
+                }
+                prior_slot += 1;
+            }
+        }
+        self.next_slot = next_slot;
+        self.completion = self
+            .completion
+            .max(next_slot + usize::from(!full) * PARTIAL_WRITE_OCCUPANCY_TICKS);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220VectorWriteBlock {
+    pub repeat_index: usize,
     pub block_index: u8,
     pub base_address: u64,
     pub bank: C220UbBank,
@@ -32,7 +145,7 @@ impl C220VectorWriteBlock {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220VectorWritePlan {
     pub blocks: Vec<C220VectorWriteBlock>,
 }
@@ -43,16 +156,15 @@ pub enum C220VectorWritePlanError {
     ElementWidth(u8),
     #[error("C220 vector store lane {lane} is outside its tile")]
     LaneOutsideTile { lane: usize },
-    #[error("C220 vector stores disagree on the address or width of block {block}")]
-    InconsistentBlock { block: usize },
+    #[error("C220 vector stores disagree on the address or width of repeat {repeat} block {block}")]
+    InconsistentBlock { repeat: usize, block: usize },
     #[error("C220 vector store address underflows at lane {lane}")]
     AddressUnderflow { lane: usize },
 }
 
 impl C220VectorWritePlan {
     pub fn from_stores(stores: &[C220VectorStore]) -> Result<Self, C220VectorWritePlanError> {
-        let mut blocks: [Option<C220VectorWriteBlock>; C220_VECTOR_BLOCK_COUNT] =
-            [None; C220_VECTOR_BLOCK_COUNT];
+        let mut blocks: BTreeMap<(usize, usize), C220VectorWriteBlock> = BTreeMap::new();
         for store in stores {
             let width = usize::from(store.width_bytes);
             if !matches!(width, 2 | 4) {
@@ -71,59 +183,142 @@ impl C220VectorWritePlan {
                     lane: store.lane_index,
                 },
             )?;
-            let slot = &mut blocks[block];
-            match slot {
+            let key = (store.repeat_index, block);
+            match blocks.get_mut(&key) {
                 Some(existing) => {
                     if existing.base_address != base_address
                         || existing.element_bytes != store.width_bytes
                     {
-                        return Err(C220VectorWritePlanError::InconsistentBlock { block });
+                        return Err(C220VectorWritePlanError::InconsistentBlock {
+                            repeat: store.repeat_index,
+                            block,
+                        });
                     }
                     existing.active_lane_mask |= 1 << lane;
                 }
                 None => {
-                    *slot = Some(C220VectorWriteBlock {
-                        block_index: block as u8,
-                        base_address,
-                        bank: C220UbBank::from_address(base_address),
-                        element_bytes: store.width_bytes,
-                        active_lane_mask: 1 << lane,
-                    });
+                    blocks.insert(
+                        key,
+                        C220VectorWriteBlock {
+                            repeat_index: store.repeat_index,
+                            block_index: block as u8,
+                            base_address,
+                            bank: C220UbBank::from_address(base_address),
+                            element_bytes: store.width_bytes,
+                            active_lane_mask: 1 << lane,
+                        },
+                    );
                 }
             }
         }
         Ok(Self {
-            blocks: blocks.into_iter().flatten().collect(),
+            blocks: blocks.into_values().collect(),
         })
     }
 
-    pub fn uncontended_writeback_ticks(&self) -> Option<u8> {
-        let mut seen_groups = [false; 16];
-        let mut ticks = UNCONTENDED_FULL_WRITE_TICKS;
-        for block in &self.blocks {
-            let group = usize::from(block.bank.group);
-            let seen = seen_groups.get_mut(group)?;
-            if *seen {
-                return None;
-            }
-            *seen = true;
-            ticks = ticks.max(if block.full() {
-                UNCONTENDED_FULL_WRITE_TICKS
-            } else {
-                UNCONTENDED_PARTIAL_WRITE_TICKS
-            });
+    pub fn writeback_ticks(&self) -> Option<usize> {
+        let repeat = self.blocks.first()?.repeat_index;
+        if self.blocks.iter().any(|block| block.repeat_index != repeat) {
+            return None;
         }
-        Some(ticks)
+        self.writeback_ticks_for_repeat(repeat)
+    }
+
+    pub fn writeback_ticks_for_repeat(&self, repeat_index: usize) -> Option<usize> {
+        self.writeback_ticks_matching(repeat_index, None)
+    }
+
+    pub fn writeback_ticks_for_lane_group(
+        &self,
+        repeat_index: usize,
+        lane_group: u8,
+    ) -> Option<usize> {
+        self.writeback_ticks_matching(repeat_index, Some(lane_group))
+    }
+
+    fn writeback_ticks_matching(
+        &self,
+        repeat_index: usize,
+        lane_group: Option<u8>,
+    ) -> Option<usize> {
+        let blocks = self
+            .blocks
+            .iter()
+            .filter(|block| block.repeat_index == repeat_index)
+            .filter(|block| {
+                let first_lane = usize::from(block.block_index)
+                    * (C220_VECTOR_BLOCK_BYTES / usize::from(block.element_bytes));
+                lane_group.is_none_or(|group| first_lane / 64 == usize::from(group))
+            })
+            .collect::<Vec<_>>();
+        if blocks.is_empty() {
+            return None;
+        }
+        if blocks.iter().all(|block| block.full()) {
+            let accesses = blocks
+                .iter()
+                .map(|block| (block.base_address, C220_VECTOR_BLOCK_BYTES))
+                .collect::<Vec<_>>();
+            let mut request = C220UbRequest::from_accesses(&accesses).ok()?;
+            let mut tick = 0_u64;
+            while !request.is_complete() {
+                C220UbCycle::arbitrate(tick, Some(&mut request), None, None);
+                tick = tick.checked_add(1)?;
+            }
+            return usize::try_from(tick).ok();
+        }
+        let mut groups: [GroupWriteState; 16] = std::array::from_fn(|_| GroupWriteState::default());
+        for block in blocks {
+            groups
+                .get_mut(usize::from(block.bank.group))?
+                .accept(block.full());
+        }
+        groups.iter().map(|group| group.completion).max()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instruction::c220::vector::C220_CAPTURED_MOVEV_WORD;
 
     #[test]
-    fn block_masks_and_bank_groups_bound_uncontended_writeback() {
+    fn supported_vector_uops_have_distinct_execution_stages() {
+        let movev = C220VectorUopStages::movev(
+            C220MovevInstruction::decode(C220_CAPTURED_MOVEV_WORD).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(movev.release_offset(1), 8);
+        assert_eq!(
+            C220VectorUopStages::fp32_binary_arithmetic(C220VecArithmeticOperation::Add)
+                .unwrap()
+                .release_offset(1),
+            14
+        );
+        assert_eq!(
+            C220VectorUopStages::fp32_binary_arithmetic(C220VecArithmeticOperation::Multiply)
+                .unwrap()
+                .release_offset(1),
+            15
+        );
+        assert_eq!(
+            C220VectorUopStages::fp32_binary_arithmetic(C220VecArithmeticOperation::Maximum)
+                .unwrap()
+                .execute_ticks,
+            5
+        );
+        assert_eq!(
+            C220VectorUopStages::fp32_binary_arithmetic(C220VecArithmeticOperation::Minimum)
+                .unwrap()
+                .execute_ticks,
+            5
+        );
+    }
+
+    #[test]
+    fn block_masks_and_bank_groups_determine_writeback() {
         let store = |lane_index, address| C220VectorStore {
+            repeat_index: 0,
             lane_index,
             address,
             bank: C220UbBank::from_address(address),
@@ -135,17 +330,61 @@ mod tests {
             .collect::<Vec<_>>();
         let plan = C220VectorWritePlan::from_stores(&full).unwrap();
         assert_eq!(plan.blocks[0].active_lane_mask, 0xff);
-        assert_eq!(plan.uncontended_writeback_ticks(), Some(1));
+        assert_eq!(plan.writeback_ticks(), Some(1));
+
+        let unaligned = (0..16)
+            .map(|lane| {
+                let block_base = if lane < 8 { 0x1f } else { 0x3f };
+                store(lane, block_base + (lane % 8) as u64 * 4)
+            })
+            .collect::<Vec<_>>();
+        let unaligned = C220VectorWritePlan::from_stores(&unaligned).unwrap();
+        assert_eq!(unaligned.writeback_ticks(), Some(2));
 
         let partial = C220VectorWritePlan::from_stores(&[store(0, 0), store(8, 0x20)]).unwrap();
         assert_eq!(partial.blocks.len(), 2);
-        assert_eq!(partial.uncontended_writeback_ticks(), Some(7));
+        assert_eq!(partial.writeback_ticks(), Some(7));
 
         let contended = C220VectorWritePlan::from_stores(&[store(0, 0), store(8, 0x200)]).unwrap();
         assert_eq!(
             contended.blocks[0].bank.group,
             contended.blocks[1].bank.group
         );
-        assert_eq!(contended.uncontended_writeback_ticks(), None);
+        assert_eq!(contended.writeback_ticks(), Some(8));
+
+        let mut second_repeat = store(0, 0x100);
+        second_repeat.repeat_index = 1;
+        let repeated = C220VectorWritePlan::from_stores(&[store(0, 0), second_repeat]).unwrap();
+        assert_eq!(repeated.blocks.len(), 2);
+        assert_eq!(repeated.writeback_ticks(), None);
+        assert_eq!(repeated.writeback_ticks_for_repeat(0), Some(7));
+        assert_eq!(repeated.writeback_ticks_for_repeat(1), Some(7));
+    }
+
+    #[test]
+    fn same_group_writes_serialize_and_partial_slots_delay_later_writes() {
+        let make_stores = |partial_count: usize| {
+            (0..7)
+                .flat_map(|block| {
+                    let width = if block < partial_count { 1 } else { 8 };
+                    (0..width).map(move |lane| {
+                        let address = block as u64 * 0x200 + lane as u64 * 4;
+                        C220VectorStore {
+                            repeat_index: 0,
+                            lane_index: block * 8 + lane,
+                            address,
+                            bank: C220UbBank::from_address(address),
+                            width_bytes: 4,
+                            data: [0; 4],
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let full = C220VectorWritePlan::from_stores(&make_stores(0)).unwrap();
+        assert_eq!(full.writeback_ticks(), Some(7));
+
+        let partial = C220VectorWritePlan::from_stores(&make_stores(6)).unwrap();
+        assert_eq!(partial.writeback_ticks(), Some(13));
     }
 }

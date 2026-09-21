@@ -1,4 +1,3 @@
-use serde::Serialize;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -25,13 +24,13 @@ fn mov_offset(burst_index: u16, unit_index: u16, burst_length: u16, gap: u16) ->
         .checked_mul(C220_MOV_UB_TO_OUT_UNIT_BYTES)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220MovDirection {
     HbmToUb,
     UbToHbm,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220MovInstruction {
     pub word: u32,
     pub direction: C220MovDirection,
@@ -60,7 +59,7 @@ impl C220MovInstruction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220DmaMovDescriptor {
     pub instruction_word: u32,
     pub xm: u64,
@@ -70,7 +69,7 @@ pub struct C220DmaMovDescriptor {
     pub destination_gap: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220DmaMovSegment {
     pub burst_index: u16,
     pub unit_index: u16,
@@ -79,7 +78,7 @@ pub struct C220DmaMovSegment {
     pub bytes: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220MovOutToUbDescriptor {
     pub instruction_word: u32,
     pub xm: u64,
@@ -89,7 +88,7 @@ pub struct C220MovOutToUbDescriptor {
     pub destination_gap: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220MovOutToUbSegment {
     pub burst_index: u16,
     pub unit_index: u16,

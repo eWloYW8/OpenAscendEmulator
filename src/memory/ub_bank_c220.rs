@@ -1,6 +1,4 @@
-use serde::Serialize;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220UbBank {
     pub group: u8,
     pub id: u8,

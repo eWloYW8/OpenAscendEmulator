@@ -1,8 +1,7 @@
-use serde::Serialize;
 use std::collections::VecDeque;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310IssueQueueSnapshot {
     pub capacity: usize,
     pub depth: usize,
@@ -18,7 +17,7 @@ impl C310IssueQueueSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310IssueQueueTransition {
     pub before: C310IssueQueueSnapshot,
     pub after: C310IssueQueueSnapshot,

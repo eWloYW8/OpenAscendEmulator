@@ -1,8 +1,7 @@
 use crate::device::architecture::Architecture;
-use serde::Serialize;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AicClass {
     Scalar,
     FlowControl,
@@ -27,7 +26,7 @@ impl AicClass {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarKey8Operation {
     AddImmediate,
     MultiplyImmediate,
@@ -35,42 +34,47 @@ pub enum ScalarKey8Operation {
     DcPreload,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarKey0Operation {
     Add,
     Subtract,
     Multiply,
     MultiplyAdd,
+    Divide,
+    Remainder,
+    Minimum,
+    Maximum,
     And,
     Or,
+    Xor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarKey7Operation {
     MoveImmediate,
     MoveKeep,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarLoadStoreOperation {
     Load,
     Store,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarStoreImmediateValue {
     Zero,
     One,
     Ones,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarAddressEffect {
     pub effective_address: u64,
     pub updated_base: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarDirectBiuRoute {
     pub effective_address: u64,
     pub bit_24_set: bool,
@@ -95,7 +99,7 @@ impl ScalarAddressEffect {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZeroExtendWidth {
     U8,
     U16,
@@ -112,7 +116,7 @@ impl ZeroExtendWidth {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AicDecoderHint {
     ScalarIndexedLoad {
         width_bytes: u8,
@@ -201,6 +205,21 @@ pub enum AicDecoderHint {
         source_register: u8,
     },
     ScalarKey2Negate {
+        dtype_field: u8,
+        destination_register: u8,
+        source_register: u8,
+    },
+    ScalarKey2Absolute {
+        dtype_field: u8,
+        destination_register: u8,
+        source_register: u8,
+    },
+    ScalarKey2IntegerSqrt {
+        dtype_field: u8,
+        destination_register: u8,
+        source_register: u8,
+    },
+    ScalarKey2BitwiseNot {
         dtype_field: u8,
         destination_register: u8,
         source_register: u8,
@@ -515,8 +534,13 @@ impl AicDecoderHint {
                     2 => ScalarKey0Operation::Subtract,
                     3 => ScalarKey0Operation::Multiply,
                     4 => ScalarKey0Operation::MultiplyAdd,
+                    5 => ScalarKey0Operation::Divide,
+                    6 => ScalarKey0Operation::Remainder,
+                    7 => ScalarKey0Operation::Maximum,
+                    8 => ScalarKey0Operation::Minimum,
                     10 => ScalarKey0Operation::And,
                     11 => ScalarKey0Operation::Or,
+                    12 => ScalarKey0Operation::Xor,
                     _ => return None,
                 };
                 let mut destination_register = ((word >> 17) & 0x1f) as u8;
@@ -535,10 +559,37 @@ impl AicDecoderHint {
                     second_source_register,
                 })
             }
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 0 => {
+                let (destination_register, source_register) =
+                    scalar_key2_registers(architecture, word);
+                Some(Self::ScalarKey2IntegerSqrt {
+                    dtype_field: ((word >> 22) & 3) as u8,
+                    destination_register,
+                    source_register,
+                })
+            }
             AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 1 => {
                 let (destination_register, source_register) =
                     scalar_key2_registers(architecture, word);
                 Some(Self::ScalarKey2Negate {
+                    dtype_field: ((word >> 22) & 3) as u8,
+                    destination_register,
+                    source_register,
+                })
+            }
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 2 => {
+                let (destination_register, source_register) =
+                    scalar_key2_registers(architecture, word);
+                Some(Self::ScalarKey2Absolute {
+                    dtype_field: ((word >> 22) & 3) as u8,
+                    destination_register,
+                    source_register,
+                })
+            }
+            AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 3 => {
+                let (destination_register, source_register) =
+                    scalar_key2_registers(architecture, word);
+                Some(Self::ScalarKey2BitwiseNot {
                     dtype_field: ((word >> 22) & 3) as u8,
                     destination_register,
                     source_register,
@@ -780,7 +831,7 @@ const fn scalar_key2_registers(architecture: Architecture, word: u32) -> (u8, u8
     (destination_register, source_register)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AicInstructionWord {
     Ordinary {
         pc: u64,

@@ -1,4 +1,3 @@
-use serde::Serialize;
 use thiserror::Error;
 
 const SIGN_BIT: u32 = 0x8000_0000;
@@ -9,22 +8,23 @@ const CANONICAL_NAN_BITS: u32 = 0x7fff_ffff;
 const MASK_WORDS: usize = 4;
 const MAX_FP32_LANES: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fp32VectorOperation {
+    Absolute,
     Add,
     Subtract,
     Multiply,
+    Maximum,
+    Minimum,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fp32MaskLayout {
     C220Lane,
     C310ByteStart,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Fp32ValueStatus {
     pub overflow: bool,
     pub underflow: bool,
@@ -34,27 +34,26 @@ pub struct Fp32ValueStatus {
     pub zero_times_infinity: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fp32ValueOutcome {
     pub bits: u32,
     pub status: Fp32ValueStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fp32LaneOutcome {
     pub active: bool,
     pub bits: u32,
     pub status: Option<Fp32ValueStatus>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fp32WritebackPolicy {
     C220Masked { write_even_when_mask_clear: bool },
     C310WholeResult,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fp32WritebackOutcome {
     pub words: Vec<u32>,
     pub written: Vec<bool>,
@@ -79,13 +78,38 @@ pub fn evaluate_fp32_value(
     first_bits: u32,
     second_bits: u32,
 ) -> Fp32ValueOutcome {
+    if operation == Fp32VectorOperation::Absolute {
+        let magnitude = first_bits & ABS_MASK;
+        let status = Fp32ValueStatus {
+            nan_operand: magnitude > INFINITY_BITS,
+            infinity_operand: magnitude == INFINITY_BITS,
+            ..Fp32ValueStatus::default()
+        };
+        return Fp32ValueOutcome {
+            bits: if status.nan_operand {
+                CANONICAL_NAN_BITS
+            } else {
+                magnitude
+            },
+            status,
+        };
+    }
     if operation == Fp32VectorOperation::Multiply {
         return evaluate_fp32_product(first_bits, second_bits);
     }
+    if matches!(
+        operation,
+        Fp32VectorOperation::Maximum | Fp32VectorOperation::Minimum
+    ) {
+        return evaluate_fp32_extremum(operation, first_bits, second_bits);
+    }
     let second_bits = match operation {
+        Fp32VectorOperation::Absolute => unreachable!(),
         Fp32VectorOperation::Add => second_bits,
         Fp32VectorOperation::Subtract => second_bits ^ SIGN_BIT,
-        Fp32VectorOperation::Multiply => unreachable!(),
+        Fp32VectorOperation::Multiply
+        | Fp32VectorOperation::Maximum
+        | Fp32VectorOperation::Minimum => unreachable!(),
     };
     let first_abs = first_bits & ABS_MASK;
     let second_abs = second_bits & ABS_MASK;
@@ -125,8 +149,7 @@ pub fn evaluate_fp32_value(
     let exact_sum = (first as f64) + (second as f64);
     let rounded_abs = exact_sum.abs() as f32;
     status.overflow = rounded_abs.is_infinite();
-    status.underflow =
-        rounded_abs > 0.0 && (rounded_abs as f64) <= (f32::from_bits(1) as f64) / 2.0;
+    status.underflow = exact_sum != 0.0 && exact_sum.abs() <= (f32::from_bits(1) as f64) * 0.5;
     if status.overflow {
         return Fp32ValueOutcome {
             bits: (first_bits & second_bits & SIGN_BIT) | INFINITY_BITS,
@@ -142,6 +165,49 @@ pub fn evaluate_fp32_value(
         bits = (bits & SIGN_BIT) | MAX_FINITE_BITS;
     }
     Fp32ValueOutcome { bits, status }
+}
+
+fn evaluate_fp32_extremum(
+    operation: Fp32VectorOperation,
+    first_bits: u32,
+    second_bits: u32,
+) -> Fp32ValueOutcome {
+    let first_abs = first_bits & ABS_MASK;
+    let second_abs = second_bits & ABS_MASK;
+    let status = Fp32ValueStatus {
+        nan_operand: first_abs > INFINITY_BITS || second_abs > INFINITY_BITS,
+        infinity_operand: first_abs == INFINITY_BITS || second_abs == INFINITY_BITS,
+        ..Fp32ValueStatus::default()
+    };
+    if status.nan_operand {
+        return Fp32ValueOutcome {
+            bits: CANONICAL_NAN_BITS,
+            status,
+        };
+    }
+    let first = f32::from_bits(first_bits);
+    let second = f32::from_bits(second_bits);
+    let choose_first = if first == second {
+        match operation {
+            Fp32VectorOperation::Maximum => (first_bits & SIGN_BIT) <= (second_bits & SIGN_BIT),
+            Fp32VectorOperation::Minimum => (first_bits & SIGN_BIT) >= (second_bits & SIGN_BIT),
+            _ => unreachable!(),
+        }
+    } else {
+        match operation {
+            Fp32VectorOperation::Maximum => first > second,
+            Fp32VectorOperation::Minimum => first < second,
+            _ => unreachable!(),
+        }
+    };
+    Fp32ValueOutcome {
+        bits: if choose_first {
+            first_bits
+        } else {
+            second_bits
+        },
+        status,
+    }
 }
 
 fn evaluate_fp32_product(first_bits: u32, second_bits: u32) -> Fp32ValueOutcome {
@@ -170,9 +236,17 @@ fn evaluate_fp32_product(first_bits: u32, second_bits: u32) -> Fp32ValueOutcome 
     }
     let first = f32::from_bits(first_bits);
     let second = f32::from_bits(second_bits);
+    let exact_product = (first as f64) * (second as f64);
+    let half_min_subnormal = (f32::from_bits(1) as f64) * 0.5;
+    if exact_product != 0.0 && exact_product.abs() <= half_min_subnormal {
+        status.underflow = true;
+        return Fp32ValueOutcome {
+            bits: (first_bits ^ second_bits) & SIGN_BIT,
+            status,
+        };
+    }
     let product = first * second;
     status.overflow = product.is_infinite();
-    status.underflow = (first as f64) * (second as f64) != 0.0 && product.abs() < f32::MIN_POSITIVE;
     Fp32ValueOutcome {
         bits: product.to_bits(),
         status,
@@ -352,10 +426,13 @@ mod tests {
                 .overflow
         );
         assert!(
-            evaluate_fp32_value(multiply, 0x0080_0000, 0.5_f32.to_bits())
+            !evaluate_fp32_value(multiply, 0x0080_0000, 0.5_f32.to_bits())
                 .status
                 .underflow
         );
+        let tiny = evaluate_fp32_value(multiply, 1, 0.5_f32.to_bits());
+        assert_eq!(tiny.bits, 0);
+        assert!(tiny.status.underflow);
     }
 
     #[test]

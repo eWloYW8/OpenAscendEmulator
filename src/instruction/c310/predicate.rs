@@ -1,14 +1,13 @@
-use crate::execution::predicate_buffer_c310::C310_PB_SLOT_BYTES;
-use serde::Serialize;
+use crate::instruction::c310::layout::C310_PB_SLOT_BYTES;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310RvecScalarWrite {
     pub register_index: u8,
     pub value: u32,
     pub source_payload_word: Option<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C310PbRvecScalarProjection {
     pub big_flags: u32,
     pub consumed_payload_words: u8,

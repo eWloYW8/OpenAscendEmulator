@@ -1,12 +1,11 @@
 use std::num::NonZeroU64;
 
-use serde::Serialize;
 use thiserror::Error;
 
 use crate::execution::c220::dma_uop::{C220DmaUopError, C220DmaUopRequest, mte3_requests};
-use crate::execution::mte_stepper::C220Mte3TransferPlan;
+use crate::execution::c220::transfer::C220Mte3TransferPlan;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220Mte3TimingRules {
     pub issue_interval: NonZeroU64,
     pub startup_ticks: u64,
@@ -14,7 +13,7 @@ pub struct C220Mte3TimingRules {
     pub retire_ticks: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220Mte3Ticket {
     pub issue_tick: u64,
     pub data_ready_tick: u64,

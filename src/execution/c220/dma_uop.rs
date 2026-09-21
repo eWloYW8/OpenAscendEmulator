@@ -1,13 +1,11 @@
-use serde::Serialize;
 use thiserror::Error;
 
-use crate::execution::mte_stepper::{C220Mte2TransferPlan, C220Mte3TransferPlan};
-use crate::instruction::mte_c220::{
+use crate::execution::c220::transfer::{C220Mte2TransferPlan, C220Mte3TransferPlan};
+use crate::instruction::c220::mte::{
     C220DmaMovDescriptor, C220DmaMovError, C220MovOutToUbDescriptor, C220MovOutToUbError,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220DmaUopMode {
     Wide512,
     Wide256,
@@ -29,8 +27,7 @@ impl C220DmaUopMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220DmaUopRoute {
     Ordinary,
     ContiguousBatch,
@@ -38,7 +35,7 @@ pub enum C220DmaUopRoute {
     SourceGapGather,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220DmaUopRequest {
     pub route: C220DmaUopRoute,
     pub burst_index: u16,
@@ -327,7 +324,7 @@ fn split_requests(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instruction::mte_c220::{
+    use crate::instruction::c220::mte::{
         CAPTURED_C220_MOV_OUT_TO_UB_X_WORD, CAPTURED_C220_MOV_UB_TO_OUT_WORD,
     };
 

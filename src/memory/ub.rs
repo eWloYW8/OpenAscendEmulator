@@ -1,12 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
 use thiserror::Error;
 
-use crate::instruction::mte_c220::{
+use crate::instruction::c220::mte::{
     C220DmaMovDescriptor, C220DmaMovError, C220MovOutToUbDescriptor, C220MovOutToUbError,
 };
-use crate::instruction::mte_c310::{C310CapturedMovAlignDecode, C310MovAlignCoordinateError};
+use crate::instruction::c310::mte::{C310MovAlignCoordinateError, C310MovAlignDecode};
 use crate::memory::mapped::{MappedMemory, MappedMemoryError};
 use crate::memory::sparse::MemoryByteState;
 
@@ -31,13 +30,6 @@ pub enum UbMemoryError {
         source_class: u8,
         destination_class: u8,
     },
-    #[error("MOV_ALIGN_V2 route {source_class}->{destination_class} is not UB-to-HBM")]
-    UnsupportedOutputRoute {
-        source_class: u8,
-        destination_class: u8,
-    },
-    #[error("captured UB-to-HBM route requires one coordinate, got {count}")]
-    OutputCoordinateCount { count: usize },
     #[error(transparent)]
     C220Descriptor(#[from] C220MovOutToUbError),
     #[error(transparent)]
@@ -50,7 +42,7 @@ pub enum UbMemoryError {
     Destination(#[from] MappedMemoryError),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UbTransferResult {
     pub segment_count: usize,
     pub bytes: usize,
@@ -214,7 +206,7 @@ impl UbMemory {
     pub fn copy_c310_mov_align_hbm_to_ub(
         &mut self,
         source: &MappedMemory,
-        decoded: C310CapturedMovAlignDecode,
+        decoded: C310MovAlignDecode,
     ) -> Result<UbTransferResult, UbMemoryError> {
         if decoded.source_memory_class != 10 || decoded.destination_memory_class != 9 {
             return Err(UbMemoryError::UnsupportedRoute {
@@ -236,41 +228,6 @@ impl UbMemory {
                 )
             }),
         )
-    }
-
-    pub fn copy_c310_mov_align_ub_to_hbm(
-        &self,
-        destination: &mut MappedMemory,
-        decoded: C310CapturedMovAlignDecode,
-    ) -> Result<UbTransferResult, UbMemoryError> {
-        if decoded.source_memory_class != 9 || decoded.destination_memory_class != 10 {
-            return Err(UbMemoryError::UnsupportedOutputRoute {
-                source_class: decoded.source_memory_class,
-                destination_class: decoded.destination_memory_class,
-            });
-        }
-        if decoded.burst_bytes == 0 {
-            return Err(UbMemoryError::ZeroTransferLength);
-        }
-        let coordinates = decoded.parameters.coordinates()?;
-        if coordinates.len() != 1 {
-            return Err(UbMemoryError::OutputCoordinateCount {
-                count: coordinates.len(),
-            });
-        }
-        let coordinate = coordinates[0];
-        let states = self.read_states(coordinate.source_address, decoded.burst_bytes as usize)?;
-        destination.write_states_at(coordinate.destination_address, &states)?;
-        let known_bytes = states
-            .iter()
-            .filter(|state| matches!(state, MemoryByteState::Known(_)))
-            .count();
-        Ok(UbTransferResult {
-            segment_count: 1,
-            bytes: states.len(),
-            known_bytes,
-            unknown_bytes: states.len() - known_bytes,
-        })
     }
 
     pub fn copy_c220_mov_ub_to_hbm(
@@ -382,13 +339,13 @@ impl UbMemory {
 mod tests {
     use super::*;
     use crate::device::architecture::Architecture;
-    use crate::instruction::mte_c220::{
+    use crate::instruction::c220::mte::{
         C220DmaMovDescriptor, C220MovOutToUbDescriptor, CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,
         CAPTURED_C220_MOV_UB_TO_OUT_WORD, CAPTURED_C220_SUB_MOV_UB_TO_OUT_WORD,
         CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD,
     };
-    use crate::instruction::mte_c310::{
-        C310_TILING_MOV_ALIGN_WORD, C310CapturedMovAlignRegisters, C310TilingMovAlignRegisters,
+    use crate::instruction::c310::mte::{
+        C310_TILING_MOV_ALIGN_WORD, C310MovAlignDecode, C310MovAlignRegisters,
     };
     use crate::memory::mapped::MappedMemory;
     use crate::memory::pv_memory::PvMemory;
@@ -424,6 +381,20 @@ mod tests {
         MappedMemory::bind(memory, &[0x3000]).unwrap()
     }
 
+    fn c310_tiling_decode(source: u64) -> C310MovAlignDecode {
+        C310MovAlignRegisters {
+            destination: 0,
+            source,
+            shape: 0x4000_0010,
+            stride: 0,
+            loop_spr: 0x20_0001,
+            inner_stride_spr: 0,
+            outer_stride_spr: 0,
+        }
+        .decode_hbm_to_ub(C310_TILING_MOV_ALIGN_WORD)
+        .unwrap()
+    }
+
     #[test]
     fn tiling_transfer_preserves_unknown_padding_and_separate_local_namespace() {
         for (architecture, tiling_pointer) in [
@@ -441,16 +412,7 @@ mod tests {
                 ub.copy_c220_mov_out_to_ub(&hbm, descriptor, tiling_pointer, 0)
                     .unwrap()
             } else {
-                let decoded = C310TilingMovAlignRegisters {
-                    source_xreg1: tiling_pointer,
-                    shape_xreg4: 0x4000_0010,
-                    destination_and_stride_xreg7: 0,
-                    loop_spr105: 0x20_0001,
-                    inner_stride_spr106: 0,
-                    outer_stride_spr107: 0,
-                }
-                .decode(C310_TILING_MOV_ALIGN_WORD)
-                .unwrap();
+                let decoded = c310_tiling_decode(tiling_pointer);
                 ub.copy_c310_mov_align_hbm_to_ub(&hbm, decoded).unwrap()
             };
             assert_eq!(
@@ -511,7 +473,7 @@ mod tests {
     fn multi_segment_copy_is_atomic_when_later_source_is_unmapped() {
         let hbm = input_space(0x3000, &[0x5a; 32]);
         let descriptor = C220MovOutToUbDescriptor::decode(
-            crate::instruction::mte_c220::CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,
+            crate::instruction::c220::mte::CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,
             0x40010,
         )
         .unwrap();
@@ -524,16 +486,7 @@ mod tests {
         ));
         assert_eq!(ub, before);
 
-        let mut c310 = C310TilingMovAlignRegisters {
-            source_xreg1: 0x3000,
-            shape_xreg4: 0x4000_0010,
-            destination_and_stride_xreg7: 0,
-            loop_spr105: 0x20_0001,
-            inner_stride_spr106: 0,
-            outer_stride_spr107: 0,
-        }
-        .decode(C310_TILING_MOV_ALIGN_WORD)
-        .unwrap();
+        let mut c310 = c310_tiling_decode(0x3000);
         c310.parameters.burst_count = 2;
         c310.parameters.source_burst_stride = 32;
         assert!(matches!(
@@ -564,7 +517,7 @@ mod tests {
         );
         assert_eq!(ub.read_known(0x80, 128).unwrap(), input);
 
-        let c310 = C310CapturedMovAlignRegisters {
+        let c310 = C310MovAlignRegisters {
             destination: 0x180,
             source: 0x3000,
             shape: 0x0400_0001_0000_0010,
@@ -573,7 +526,7 @@ mod tests {
             inner_stride_spr: 0,
             outer_stride_spr: 0,
         }
-        .decode_hbm_to_ub_word(0x74ad_8bae)
+        .decode_hbm_to_ub(0x74ad_8bae)
         .unwrap();
         assert_eq!(
             ub.copy_c310_mov_align_hbm_to_ub(&hbm, c310).unwrap(),
@@ -591,16 +544,7 @@ mod tests {
     #[test]
     fn c310_hbm_to_ub_rejects_other_memory_routes_without_changes() {
         let hbm = tiling_space(0x3000);
-        let mut decoded = C310TilingMovAlignRegisters {
-            source_xreg1: 0x3000,
-            shape_xreg4: 0x4000_0010,
-            destination_and_stride_xreg7: 0,
-            loop_spr105: 0x20_0001,
-            inner_stride_spr106: 0,
-            outer_stride_spr107: 0,
-        }
-        .decode(C310_TILING_MOV_ALIGN_WORD)
-        .unwrap();
+        let mut decoded = c310_tiling_decode(0x3000);
         decoded.destination_memory_class = 10;
         let mut ub = UbMemory::new(64, 32);
         assert_eq!(
@@ -618,90 +562,6 @@ mod tests {
             Err(UbMemoryError::ZeroTransferLength)
         );
         assert_eq!(ub.tracked_bytes(), 0);
-    }
-
-    #[test]
-    fn c310_captured_output_route_moves_one_ub_span_to_hbm() {
-        let mut ub = UbMemory::new(384, 128);
-        let bytes = (0..128_u8).collect::<Vec<_>>();
-        ub.write_states(
-            0x100,
-            &bytes
-                .iter()
-                .copied()
-                .map(MemoryByteState::Known)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let mut destination = output_regions();
-        let decoded = C310CapturedMovAlignRegisters {
-            destination: 0x3000,
-            source: 0x100,
-            shape: 0x0000_0001_0000_0010,
-            stride: 0x0000_8000_0000_0080,
-            loop_spr: 0x20_0001,
-            inner_stride_spr: 0,
-            outer_stride_spr: 0,
-        }
-        .decode_captured_word(0x74c4_16a0)
-        .unwrap();
-        assert_eq!(
-            ub.copy_c310_mov_align_ub_to_hbm(&mut destination, decoded)
-                .unwrap(),
-            UbTransferResult {
-                segment_count: 1,
-                bytes: 128,
-                known_bytes: 128,
-                unknown_bytes: 0,
-            }
-        );
-        assert_eq!(destination.read_known_at(0x3000, 128).unwrap(), bytes);
-
-        ub.write_states(0x17f, &[MemoryByteState::Unknown]).unwrap();
-        let mut mixed = output_regions();
-        assert_eq!(
-            ub.copy_c310_mov_align_ub_to_hbm(&mut mixed, decoded)
-                .unwrap(),
-            UbTransferResult {
-                segment_count: 1,
-                bytes: 128,
-                known_bytes: 127,
-                unknown_bytes: 1,
-            }
-        );
-        assert_eq!(
-            mixed.read_states_at(0x307f, 1).unwrap(),
-            [MemoryByteState::Unknown]
-        );
-
-        let mut rejected = output_regions();
-        let mut wrong_route = decoded;
-        wrong_route.source_memory_class = 10;
-        assert_eq!(
-            ub.copy_c310_mov_align_ub_to_hbm(&mut rejected, wrong_route),
-            Err(UbMemoryError::UnsupportedOutputRoute {
-                source_class: 10,
-                destination_class: 10,
-            })
-        );
-        let mut two_coordinates = decoded;
-        two_coordinates.parameters.burst_count = 2;
-        assert_eq!(
-            ub.copy_c310_mov_align_ub_to_hbm(&mut rejected, two_coordinates),
-            Err(UbMemoryError::OutputCoordinateCount { count: 2 })
-        );
-        let mut outside = decoded;
-        outside.parameters.destination_base = 0x4000;
-        assert!(matches!(
-            ub.copy_c310_mov_align_ub_to_hbm(&mut rejected, outside),
-            Err(UbMemoryError::Destination(
-                MappedMemoryError::Unmapped { .. }
-            ))
-        ));
-        assert_eq!(
-            rejected.read_states_at(0x3000, 128).unwrap(),
-            [MemoryByteState::Unknown; 128]
-        );
     }
 
     #[test]

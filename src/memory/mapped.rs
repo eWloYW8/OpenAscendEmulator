@@ -1,16 +1,14 @@
-use crate::execution::machine::ScalarMemoryBus;
 use crate::memory::sparse::{MemoryByteState, SparseMemory, SparseMemoryError};
-use serde::Serialize;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryMapping {
     pub region_index: usize,
     pub base: u64,
     pub allocation_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedAddress {
     pub region_index: usize,
     pub offset: u64,
@@ -188,20 +186,6 @@ impl MappedMemory {
         Ok(self
             .memory
             .write_unknown(location.region_index, location.offset, len)?)
-    }
-}
-
-impl ScalarMemoryBus for MappedMemory {
-    type Error = MappedMemoryError;
-
-    fn read(&mut self, effective_address: u64, destination: &mut [u8]) -> Result<(), Self::Error> {
-        let bytes = self.read_known_at(effective_address, destination.len())?;
-        destination.copy_from_slice(&bytes);
-        Ok(())
-    }
-
-    fn write(&mut self, effective_address: u64, source: &[u8]) -> Result<(), Self::Error> {
-        self.write_known_at(effective_address, source)
     }
 }
 

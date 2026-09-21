@@ -1,15 +1,14 @@
-use crate::execution::predicate_buffer_c310::C310_PB_SLOT_BYTES;
+use crate::instruction::c310::address::C310RvecAddressState;
+use crate::instruction::c310::layout::C310_PB_SLOT_BYTES;
+use crate::instruction::c310::predicate::{
+    C310PbRvecScalarProjection, project_c310_pb_rvec_scalar_init,
+};
 use crate::instruction::fp32_vector::{
     Fp32LaneOutcome, Fp32MaskLayout, Fp32VectorError, Fp32VectorOperation, Fp32WritebackOutcome,
     Fp32WritebackPolicy, apply_fp32_writeback, evaluate_masked_fp32_lanes,
 };
-use crate::instruction::rvec_address_c310::C310RvecAddressState;
-use crate::instruction::rvec_pb_c310::{
-    C310PbRvecScalarProjection, project_c310_pb_rvec_scalar_init,
-};
 use crate::memory::sparse::MemoryByteState;
 use crate::memory::ub::{UbMemory, UbMemoryError};
-use serde::Serialize;
 use thiserror::Error;
 
 const MAX_ENCODED_V_REGISTERS: usize = 32;
@@ -30,7 +29,7 @@ pub const C310_CAPTURED_SUB_VST_WORD: u32 = 0x4028_0108;
 pub const C310_CAPTURED_PLT32_WORD: u32 = 0xa22c_0150;
 pub const C310_CAPTURED_SMOVI32_WORD: u32 = 0xc200_410d;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310CapturedSmoviStep {
     pub pc: u64,
     pub word: u32,
@@ -45,7 +44,7 @@ pub enum C310CapturedSmoviError {
     UnsupportedWord { pc: u64, word: u32 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C310CapturedPltStep {
     pub pc: u64,
     pub word: u32,
@@ -55,7 +54,7 @@ pub struct C310CapturedPltStep {
     pub predicate_bytes: [u8; MAX_PREDICATE_BYTES],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C310CapturedPsetStep {
     pub pc: u64,
     pub word: u32,
@@ -91,7 +90,7 @@ pub enum C310CapturedPltError {
     MissingScalarLimit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C310CapturedVdupsStep {
     pub pc: u64,
     pub word: u32,
@@ -100,7 +99,7 @@ pub struct C310CapturedVdupsStep {
     pub written_lanes: Vec<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C310CapturedVstStep {
     pub pc: u64,
     pub word: u32,
@@ -109,7 +108,7 @@ pub struct C310CapturedVstStep {
     pub stores: Vec<C310CapturedVstStore>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310CapturedVstStore {
     pub lane_index: usize,
     pub buffer_address: u64,
@@ -132,7 +131,7 @@ pub enum C310CapturedVectorError {
     Ub(#[from] UbMemoryError),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310CapturedVectorLoadHint {
     pub destination_v_register: u8,
     pub source_s_register: u8,
@@ -158,7 +157,7 @@ impl C310CapturedVectorLoadHint {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C310CapturedVectorLoadStep {
     pub pc: u64,
     pub word: u32,
@@ -167,7 +166,7 @@ pub struct C310CapturedVectorLoadStep {
     pub loaded_bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310CapturedVectorLoadAddress {
     pub source_s_register: u8,
     pub source_scalar_low: u32,
@@ -199,7 +198,7 @@ pub enum C310CapturedVectorLoadError {
 pub const C310_MASK0_SPR_INDEX: u16 = 152;
 pub const C310_MASK1_SPR_INDEX: u16 = 153;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310RvecMaskSprState {
     pub mask0: u64,
     pub mask1: u64,
@@ -214,7 +213,7 @@ impl Default for C310RvecMaskSprState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310ObservedMovemaskHint {
     pub source_x_register: u8,
     pub destination_spr: u16,
@@ -238,7 +237,7 @@ impl C310ObservedMovemaskHint {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310ObservedMovemaskStep {
     pub pc: u64,
     pub word: u32,
@@ -301,7 +300,7 @@ pub fn c310_movp_u32_mask_to_predicate_bytes(scalar_mask: u64) -> [u8; MAX_PREDI
     bytes
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310RvecMovpHint {
     pub destination_p_register: u8,
     pub btype: u8,
@@ -384,7 +383,7 @@ pub fn c310_normal_u32_masked_store(
     Ok(Fp32WritebackOutcome { words, written })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310RvecVstiHint {
     pub source_v_register: u8,
     pub scalar_register: u8,
@@ -394,7 +393,7 @@ pub struct C310RvecVstiHint {
     pub distance: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310RvecVstiStore {
     pub lane_index: usize,
     pub buffer_address: u64,
@@ -425,15 +424,14 @@ impl C310RvecVstiHint {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C310RvecArithmeticOperation {
     Add,
     Subtract,
     Multiply,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310RvecArithmeticHint {
     pub operation: C310RvecArithmeticOperation,
     pub destination_v_register: u8,
@@ -492,7 +490,7 @@ impl C310RvecArithmeticHint {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C310RvecValueMachine {
     vector_registers: Vec<Vec<u32>>,
     predicate_registers: Option<Vec<Vec<u8>>>,
@@ -500,7 +498,7 @@ pub struct C310RvecValueMachine {
     words_per_register: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C310RvecValueStep {
     pub hint: C310RvecArithmeticHint,
     pub active_mask: [u64; 4],
@@ -510,7 +508,7 @@ pub struct C310RvecValueStep {
     pub writeback: Fp32WritebackOutcome,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C310RvecMovpStep {
     pub hint: C310RvecMovpHint,
     pub scalar_mask: u64,
@@ -1250,7 +1248,7 @@ mod tests {
         address
             .configure_vag_word(
                 0x10d0_d900,
-                crate::instruction::rvec_address_c310::C310_CAPTURED_VAG_WORD,
+                crate::instruction::c310::address::C310_CAPTURED_VAG_WORD,
             )
             .unwrap();
         address.start_vloop_i1(&machine).unwrap();
@@ -1353,7 +1351,7 @@ mod tests {
         address
             .configure_vag_word(
                 0x10d0_d900,
-                crate::instruction::rvec_address_c310::C310_CAPTURED_VAG_WORD,
+                crate::instruction::c310::address::C310_CAPTURED_VAG_WORD,
             )
             .unwrap();
         address.update_i1(2, &machine).unwrap();

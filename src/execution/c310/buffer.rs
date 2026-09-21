@@ -1,14 +1,13 @@
-use serde::Serialize;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C310BufferDisposition {
     Accepted,
     Stalled,
     Unsupported,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C310GetBufGateResult {
     Ready,
     AwaitReleaseCount { expected: u32, observed: u32 },
@@ -33,7 +32,7 @@ pub const fn evaluate_c310_get_buf_gate(
     C310GetBufGateResult::Ready
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310BufferCounter {
     pub dispatch_count: u32,
     pub release_count: u32,
@@ -42,19 +41,19 @@ pub struct C310BufferCounter {
     pub last_release_tick: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310GetBufDispatch {
     pub expected_release_count: u32,
     pub assigned_dispatch_count: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C310GetBufIssueTickResult {
     Primed { recorded_tick: u32 },
     Continue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310GetBufIssueTick {
     recorded_tick: u32,
 }
@@ -80,19 +79,19 @@ impl C310GetBufIssueTick {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C310BufferCounters {
     ring_size: u32,
     counters: Vec<C310BufferCounter>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct C310ReleaseEntry {
     pub valid: bool,
     pub pipe_code: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C310ReleaseEntries {
     entries: Vec<C310ReleaseEntry>,
 }
@@ -156,7 +155,7 @@ impl C310ReleaseEntries {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C310GetBufAdmission {
     RingFull,
     PipeStalled,
@@ -164,7 +163,7 @@ pub enum C310GetBufAdmission {
     Queued(C310GetBufDispatch),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C310ReleaseAdmission {
     NoPipe,
     PipeStalled,
@@ -175,7 +174,7 @@ const fn is_c310_buffer_issue_pipe(pipe_code: u8) -> bool {
     matches!(pipe_code, 1 | 2 | 3 | 4 | 5 | 10)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C310BufferAdmissionState {
     counters: C310BufferCounters,
     release_entries: C310ReleaseEntries,
@@ -448,7 +447,7 @@ impl C310BufferCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::issue_queue_c310::{C310DequeueOutcome, C310IssueQueue};
+    use crate::execution::c310::issue_queue::{C310DequeueOutcome, C310IssueQueue};
 
     #[test]
     fn admission_checks_ring_before_queue_and_preserves_state_on_pipe_stall() {

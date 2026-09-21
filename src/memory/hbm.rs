@@ -1,18 +1,17 @@
 use crate::device::architecture::Architecture;
-use serde::Serialize;
 use thiserror::Error;
 
 pub const DEFAULT_HBM_BASE: u64 = 0x1000_0000;
 pub const DEFAULT_HBM_BYTES: u64 = 0x5_0000_0000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HbmSpan {
     pub base: u64,
     pub bytes: u64,
     pub allocated: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HbmResolvedSpan {
     pub allocation_base: u64,
     pub allocation_bytes: u64,

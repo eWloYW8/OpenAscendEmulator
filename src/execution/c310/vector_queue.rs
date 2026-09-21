@@ -1,8 +1,7 @@
 use crate::device::architecture::Architecture;
-use serde::Serialize;
 use thiserror::Error;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct C310RvecAdmissionCounters {
     pub simd_issues: u32,
     pub simt_issues: u32,
@@ -11,7 +10,7 @@ pub struct C310RvecAdmissionCounters {
     pub sfu_executions: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310SimdGateBlockers {
     pub simd_issue: bool,
     pub simt_issue: bool,
@@ -25,7 +24,7 @@ impl C310SimdGateBlockers {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310RvecAdmissionStep {
     pub before: C310RvecAdmissionCounters,
     pub after: C310RvecAdmissionCounters,
@@ -104,21 +103,21 @@ impl C310RvecAdmissionCounters {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C310VfQueueDisposition {
     Accepted,
     Stalled,
     Unsupported,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310VfQueueInstruction {
     pub words: [u32; 2],
     pub vector_pc_register: u8,
     pub encoded_field: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310VfQueueStep {
     pub pc: u64,
     pub instruction: C310VfQueueInstruction,

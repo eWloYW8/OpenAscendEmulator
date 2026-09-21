@@ -1,9 +1,8 @@
 use crate::memory::region::MemoryRegion;
-use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryByteState {
     Known(u8),
     Unknown,

@@ -1,10 +1,9 @@
 use crate::device::device_loader::{DeviceKernelFetchError, LoadedDeviceKernel};
+use crate::execution::c310::vector_queue::C310VfQueueInstruction;
 use crate::execution::machine::{
     ScalarFlowStep, ScalarInstructionError, ScalarInstructionStep, ScalarMachine, ScalarMemoryBus,
 };
-use crate::execution::vec_queue_c310::C310VfQueueInstruction;
-use crate::memory::hbm_pv_memory::{HbmPvMemory, HbmPvMemoryError};
-use serde::Serialize;
+use crate::memory::hbm_pv_memory::HbmPvMemory;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,28 +13,13 @@ pub struct ScalarStepper {
     halted: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarProgramStep {
     pub pc: u64,
     pub word: u32,
     pub next_pc: u64,
     pub instruction: ScalarInstructionStep,
     pub halted_after: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ScalarProgramRun {
-    pub start_pc: u64,
-    pub next_pc: u64,
-    pub steps: Vec<ScalarProgramStep>,
-    pub stop: ScalarProgramStop,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScalarProgramStop {
-    Halted,
-    StepBudgetReached,
 }
 
 #[derive(Debug, Error)]
@@ -46,18 +30,6 @@ pub enum ScalarStepperError<E: std::error::Error + 'static> {
     Fetch(#[from] DeviceKernelFetchError),
     #[error(transparent)]
     Execute(#[from] ScalarInstructionError<E>),
-}
-
-pub trait LoadedScalarMemoryBus: ScalarMemoryBus {
-    fn code_memory(&mut self) -> &mut HbmPvMemory;
-
-    fn sync_machine(&mut self, _machine: &ScalarMachine) {}
-}
-
-impl LoadedScalarMemoryBus for HbmPvMemory {
-    fn code_memory(&mut self) -> &mut HbmPvMemory {
-        self
-    }
 }
 
 impl ScalarStepper {
@@ -165,171 +137,16 @@ impl ScalarStepper {
             self.step_word(word, data_bus).map_err(Into::into)
         }
     }
-
-    pub fn step_loaded_unified(
-        &mut self,
-        kernel: &LoadedDeviceKernel,
-        memory: &mut HbmPvMemory,
-    ) -> Result<ScalarProgramStep, ScalarStepperError<HbmPvMemoryError>> {
-        self.step_loaded_mapped(kernel, memory)
-    }
-
-    pub fn step_loaded_mapped<B: LoadedScalarMemoryBus>(
-        &mut self,
-        kernel: &LoadedDeviceKernel,
-        memory: &mut B,
-    ) -> Result<ScalarProgramStep, ScalarStepperError<B::Error>> {
-        if self.machine.architecture() != kernel.placement().architecture {
-            return Err(ScalarStepperError::ArchitectureMismatch);
-        }
-        if self.halted {
-            return Err(ScalarStepperError::Execute(
-                ScalarInstructionError::ProgramEnded { pc: self.pc },
-            ));
-        }
-        memory.sync_machine(&self.machine);
-        let word = kernel.fetch_executable_word(memory.code_memory(), self.pc)?;
-        if C310VfQueueInstruction::is_prefix(self.machine.architecture(), word) {
-            let second_word =
-                kernel.fetch_executable_word(memory.code_memory(), self.pc.wrapping_add(4))?;
-            self.step_c310_vf_words(word, second_word, memory)
-                .map_err(Into::into)
-        } else {
-            self.step_word(word, memory).map_err(Into::into)
-        }
-    }
-
-    pub fn run_loaded<B: ScalarMemoryBus>(
-        &mut self,
-        kernel: &LoadedDeviceKernel,
-        code_memory: &mut HbmPvMemory,
-        data_bus: &mut B,
-        max_steps: usize,
-    ) -> Result<ScalarProgramRun, ScalarStepperError<B::Error>> {
-        let start_pc = self.pc;
-        let mut steps = Vec::new();
-        let stop = self.run_loaded_with(kernel, code_memory, data_bus, max_steps, |step| {
-            steps.push(step);
-        })?;
-        Ok(ScalarProgramRun {
-            start_pc,
-            next_pc: self.pc,
-            steps,
-            stop,
-        })
-    }
-
-    pub fn run_loaded_with<B: ScalarMemoryBus, F: FnMut(ScalarProgramStep)>(
-        &mut self,
-        kernel: &LoadedDeviceKernel,
-        code_memory: &mut HbmPvMemory,
-        data_bus: &mut B,
-        max_steps: usize,
-        on_step: F,
-    ) -> Result<ScalarProgramStop, ScalarStepperError<B::Error>> {
-        if self.machine.architecture() != kernel.placement().architecture {
-            return Err(ScalarStepperError::ArchitectureMismatch);
-        }
-        self.run_steps(max_steps, on_step, |stepper| {
-            stepper.step_loaded(kernel, code_memory, data_bus)
-        })
-    }
-
-    pub fn run_loaded_unified(
-        &mut self,
-        kernel: &LoadedDeviceKernel,
-        memory: &mut HbmPvMemory,
-        max_steps: usize,
-    ) -> Result<ScalarProgramRun, ScalarStepperError<HbmPvMemoryError>> {
-        let start_pc = self.pc;
-        let mut steps = Vec::new();
-        let stop = self.run_loaded_unified_with(kernel, memory, max_steps, |step| {
-            steps.push(step);
-        })?;
-        Ok(ScalarProgramRun {
-            start_pc,
-            next_pc: self.pc,
-            steps,
-            stop,
-        })
-    }
-
-    pub fn run_loaded_unified_with<F: FnMut(ScalarProgramStep)>(
-        &mut self,
-        kernel: &LoadedDeviceKernel,
-        memory: &mut HbmPvMemory,
-        max_steps: usize,
-        on_step: F,
-    ) -> Result<ScalarProgramStop, ScalarStepperError<HbmPvMemoryError>> {
-        self.run_loaded_mapped_with(kernel, memory, max_steps, on_step)
-    }
-
-    pub fn run_loaded_mapped<B: LoadedScalarMemoryBus>(
-        &mut self,
-        kernel: &LoadedDeviceKernel,
-        memory: &mut B,
-        max_steps: usize,
-    ) -> Result<ScalarProgramRun, ScalarStepperError<B::Error>> {
-        let start_pc = self.pc;
-        let mut steps = Vec::new();
-        let stop = self.run_loaded_mapped_with(kernel, memory, max_steps, |step| {
-            steps.push(step);
-        })?;
-        Ok(ScalarProgramRun {
-            start_pc,
-            next_pc: self.pc,
-            steps,
-            stop,
-        })
-    }
-
-    pub fn run_loaded_mapped_with<B: LoadedScalarMemoryBus, F: FnMut(ScalarProgramStep)>(
-        &mut self,
-        kernel: &LoadedDeviceKernel,
-        memory: &mut B,
-        max_steps: usize,
-        on_step: F,
-    ) -> Result<ScalarProgramStop, ScalarStepperError<B::Error>> {
-        if self.machine.architecture() != kernel.placement().architecture {
-            return Err(ScalarStepperError::ArchitectureMismatch);
-        }
-        self.run_steps(max_steps, on_step, |stepper| {
-            stepper.step_loaded_mapped(kernel, memory)
-        })
-    }
-
-    fn run_steps<E, F, Next>(
-        &mut self,
-        max_steps: usize,
-        mut on_step: F,
-        mut next: Next,
-    ) -> Result<ScalarProgramStop, E>
-    where
-        F: FnMut(ScalarProgramStep),
-        Next: FnMut(&mut Self) -> Result<ScalarProgramStep, E>,
-    {
-        let mut executed = 0;
-        while !self.halted && executed < max_steps {
-            let step = next(self)?;
-            on_step(step);
-            executed += 1;
-        }
-        Ok(if self.halted {
-            ScalarProgramStop::Halted
-        } else {
-            ScalarProgramStop::StepBudgetReached
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::device::architecture::Architecture;
-    use crate::execution::buffer_c310::C310BufferDisposition;
+    use crate::execution::c310::buffer::C310BufferDisposition;
+    use crate::execution::c310::predicate_buffer::{C310PushPbDisposition, C310PushPbStep};
+    use crate::execution::c310::vector_queue::{C310VfQueueDisposition, C310VfQueueStep};
     use crate::execution::machine::ScalarMachineError;
-    use crate::execution::predicate_buffer_c310::{C310PushPbDisposition, C310PushPbStep};
-    use crate::execution::vec_queue_c310::{C310VfQueueDisposition, C310VfQueueStep};
     use crate::instruction::flow::{BufferEncoding, BufferOperation, C310BufferStep};
     use std::io;
 

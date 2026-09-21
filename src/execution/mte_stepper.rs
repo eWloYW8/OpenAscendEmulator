@@ -1,34 +1,25 @@
-use serde::Serialize;
 use thiserror::Error;
 
 use crate::device::architecture::Architecture;
-use crate::execution::buffer_c310::C310BufferDisposition;
+use crate::execution::c220::transfer::{C220Mte2TransferPlan, C220Mte3TransferPlan};
 use crate::execution::machine::{ScalarInstructionError, ScalarInstructionStep, ScalarMemoryBus};
-use crate::execution::predicate_buffer_c310::{C310PushPbDisposition, C310PushPbStep};
+use crate::execution::scalar_bus::{UbScalarBus, UbScalarBusError};
 use crate::execution::stepper::{ScalarProgramStep, ScalarStepper};
-use crate::execution::vec_queue_c310::{C310VfQueueDisposition, C310VfQueueStep};
-use crate::instruction::flow::{
-    C310BufferStep, DcciStep, DsbStep, FlagInstruction, FlagOperation, PipelineBarrierScope,
-    PipelineBarrierStep,
-};
-use crate::instruction::mte_c220::{
+use crate::instruction::c220::mte::{
     C220DmaMovDescriptor, C220MovInstruction, C220MovOutToUbDescriptor, C220MovOutToUbError,
-    C220MovOutToUbSegment,
 };
-use crate::instruction::mte_c310::{
-    C310CapturedMovAlignDecode, C310CapturedMovAlignError, C310MovAlignRegisterSelectors,
+use crate::instruction::c220::vector::{
+    C220_VECTOR_TILE_BYTES, C220Fp32Addresses, C220Fp32Control, C220Fp32Issue, C220Fp32Step,
+    C220MovevInstruction, C220MovevStep, C220VecArithmeticHint, C220VecArithmeticOperation,
+    C220VectorError, C220VectorStore, decode_c220_fp32_control, decode_c220_fp32_unary_control,
+    decode_c220_movev_control, decode_c220_repeat_masks, execute_c220_fp32_to_ub,
+    execute_c220_movev_to_ub, plan_c220_fp32_issue,
 };
-use crate::instruction::vec_c220::{
-    C220_VECTOR_TILE_BYTES, C220Fp32Addresses, C220Fp32Step, C220MovevInstruction, C220MovevStep,
-    C220VecArithmeticHint, C220VecArithmeticOperation, C220VectorError, decode_c220_fp32_control,
-    decode_c220_fp32_mask, decode_c220_movev_control, decode_c220_tile_mask,
-    execute_c220_fp32_to_ub, execute_c220_movev_to_ub,
+use crate::instruction::c310::mte::{
+    C310MovAlignDecode, C310MovAlignError, C310MovAlignRegisterSelectors,
 };
-use crate::memory::c220_scalar_address_space::{
-    C220_UB_BYTES, C220ScalarRoute, classify_c220_scalar_address,
-};
-use crate::memory::c310_scalar_address_space::{
-    C310_UB_ROUTE_BYTES, C310ScalarRoute, classify_c310_scalar_address,
+use crate::instruction::flow::{
+    FlagInstruction, FlagOperation, PipelineBarrierScope, PipelineBarrierStep,
 };
 use crate::memory::mapped::MappedMemory;
 use crate::memory::sparse::MemoryByteState;
@@ -65,207 +56,11 @@ mod test_words {
 #[cfg(test)]
 pub use test_words::*;
 pub const MAX_PENDING_MTE2_TRANSFERS: usize = 64;
-pub const SCALAR_UB_ALIAS_BASE: u64 = 0x80000;
-pub const SCALAR_UB_ALIAS_BYTES: u64 = 0x80000;
-
-#[derive(Debug, Error)]
-pub enum UbScalarBusError<E: std::error::Error + 'static> {
-    #[error("scalar address range overflows u64")]
-    AddressOverflow,
-    #[error(
-        "scalar address range at {address:#x} with {bytes} bytes crosses the UB alias boundary"
-    )]
-    AliasBoundary { address: u64, bytes: usize },
-    #[error("scalar local-address roots are unavailable")]
-    MissingLocalRoots,
-    #[error("scalar local address {address:#x} is unsupported")]
-    UnsupportedLocal { address: u64 },
-    #[error(transparent)]
-    Ub(#[from] UbMemoryError),
-    #[error("scalar memory backend: {0}")]
-    Fallback(#[source] E),
-}
-
-struct UbScalarBus<'a, B> {
-    ub: &'a mut UbMemory,
-    fallback: &'a mut B,
-    architecture: Architecture,
-    local_roots: Option<(u64, u64)>,
-}
-
-enum ScalarBusRoute {
-    Fallback(u64),
-    Ub(u64),
-}
-
-impl<B: ScalarMemoryBus> UbScalarBus<'_, B> {
-    fn route(
-        &self,
-        address: u64,
-        bytes: usize,
-    ) -> Result<ScalarBusRoute, UbScalarBusError<B::Error>> {
-        if bytes == 0 {
-            return Ok(ScalarBusRoute::Fallback(address));
-        }
-        let length = u64::try_from(bytes).map_err(|_| UbScalarBusError::AddressOverflow)?;
-        let end = address
-            .checked_add(length)
-            .ok_or(UbScalarBusError::AddressOverflow)?;
-        let (spr67, spr68) = self
-            .local_roots
-            .ok_or(UbScalarBusError::MissingLocalRoots)?;
-        match self.architecture {
-            Architecture::Dav2201 => {
-                let start = classify_c220_scalar_address(address, spr67, spr68);
-                let last = classify_c220_scalar_address(end - 1, spr67, spr68);
-                match (start, last) {
-                    (C220ScalarRoute::Hbm, C220ScalarRoute::Hbm) => {
-                        Ok(ScalarBusRoute::Fallback(address))
-                    }
-                    (C220ScalarRoute::Ub(offset), C220ScalarRoute::Ub(_))
-                        if length <= C220_UB_BYTES.saturating_sub(offset) =>
-                    {
-                        Ok(ScalarBusRoute::Ub(offset))
-                    }
-                    (C220ScalarRoute::Unsupported, _) => {
-                        Err(UbScalarBusError::UnsupportedLocal { address })
-                    }
-                    _ => Err(UbScalarBusError::AliasBoundary { address, bytes }),
-                }
-            }
-            Architecture::Dav3510 => {
-                let start = classify_c310_scalar_address(address, spr67, spr68);
-                let last = classify_c310_scalar_address(end - 1, spr67, spr68);
-                match (start, last) {
-                    (C310ScalarRoute::Hbm(mapped), C310ScalarRoute::Hbm(last_mapped))
-                        if mapped.checked_add(length - 1) == Some(last_mapped) =>
-                    {
-                        Ok(ScalarBusRoute::Fallback(mapped))
-                    }
-                    (C310ScalarRoute::Ub(offset), C310ScalarRoute::Ub(_))
-                        if length <= C310_UB_ROUTE_BYTES.saturating_sub(offset) =>
-                    {
-                        Ok(ScalarBusRoute::Ub(offset))
-                    }
-                    (C310ScalarRoute::Unsupported, _) => {
-                        Err(UbScalarBusError::UnsupportedLocal { address })
-                    }
-                    _ => Err(UbScalarBusError::AliasBoundary { address, bytes }),
-                }
-            }
-        }
-    }
-}
-
-impl<B: ScalarMemoryBus> ScalarMemoryBus for UbScalarBus<'_, B> {
-    type Error = UbScalarBusError<B::Error>;
-
-    fn read(&mut self, address: u64, destination: &mut [u8]) -> Result<(), Self::Error> {
-        match self.route(address, destination.len())? {
-            ScalarBusRoute::Ub(offset) => {
-                destination.copy_from_slice(&self.ub.read_known(offset, destination.len())?);
-                Ok(())
-            }
-            ScalarBusRoute::Fallback(mapped) => self
-                .fallback
-                .read(mapped, destination)
-                .map_err(UbScalarBusError::Fallback),
-        }
-    }
-
-    fn write(&mut self, address: u64, source: &[u8]) -> Result<(), Self::Error> {
-        match self.route(address, source.len())? {
-            ScalarBusRoute::Ub(offset) => {
-                let states = source
-                    .iter()
-                    .copied()
-                    .map(MemoryByteState::Known)
-                    .collect::<Vec<_>>();
-                self.ub.write_states(offset, &states)?;
-                Ok(())
-            }
-            ScalarBusRoute::Fallback(mapped) => self
-                .fallback
-                .write(mapped, source)
-                .map_err(UbScalarBusError::Fallback),
-        }
-    }
-
-    fn maintain_data_cache(&mut self, step: DcciStep) -> Result<bool, Self::Error> {
-        self.fallback
-            .maintain_data_cache(step)
-            .map_err(UbScalarBusError::Fallback)
-    }
-
-    fn synchronize_pipeline(&mut self, step: DsbStep) -> Result<bool, Self::Error> {
-        self.fallback
-            .synchronize_pipeline(step)
-            .map_err(UbScalarBusError::Fallback)
-    }
-
-    fn synchronize_barrier(&mut self, step: PipelineBarrierStep) -> Result<bool, Self::Error> {
-        self.fallback
-            .synchronize_barrier(step)
-            .map_err(UbScalarBusError::Fallback)
-    }
-
-    fn execute_c310_buffer(
-        &mut self,
-        step: C310BufferStep,
-    ) -> Result<C310BufferDisposition, Self::Error> {
-        self.fallback
-            .execute_c310_buffer(step)
-            .map_err(UbScalarBusError::Fallback)
-    }
-
-    fn execute_c310_push_pb(
-        &mut self,
-        step: C310PushPbStep,
-    ) -> Result<C310PushPbDisposition, Self::Error> {
-        self.fallback
-            .execute_c310_push_pb(step)
-            .map_err(UbScalarBusError::Fallback)
-    }
-
-    fn enqueue_c310_vf(
-        &mut self,
-        step: C310VfQueueStep,
-    ) -> Result<C310VfQueueDisposition, Self::Error> {
-        self.fallback
-            .enqueue_c310_vf(step)
-            .map_err(UbScalarBusError::Fallback)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingMte2 {
     C220(C220Mte2TransferPlan),
-    C310(C310CapturedMovAlignDecode),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct C220Mte2TransferPlan {
-    pub descriptor: C220MovOutToUbDescriptor,
-    pub source_address: u64,
-    pub destination_address: u64,
-    pub bytes: usize,
-    pub dma_mode_word: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct C220Mte3TransferPlan {
-    pub descriptor: C220DmaMovDescriptor,
-    pub source_address: u64,
-    pub destination_address: u64,
-    pub bytes: usize,
-    pub dma_mode_word: u64,
-}
-
-impl C220Mte2TransferPlan {
-    pub fn descriptor_segments(self) -> Result<Vec<C220MovOutToUbSegment>, C220MovOutToUbError> {
-        self.descriptor
-            .segments(self.source_address, self.destination_address)
-    }
+    C310(C310MovAlignDecode),
 }
 
 impl PendingMte2 {
@@ -307,7 +102,14 @@ struct C220OutputToken {
     source_address: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ResolvedC220Fp32 {
+    pc: u64,
+    control: C220Fp32Control,
+    addresses: C220Fp32Addresses,
+    iteration_masks: Vec<[u64; 4]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220OutputAction {
     SetMte3Flag {
         flag_id: u8,
@@ -338,7 +140,7 @@ pub enum C220OutputAction {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220OutputStep {
     pub pc: u64,
     pub word: u32,
@@ -346,7 +148,7 @@ pub struct C220OutputStep {
     pub action: C220OutputAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MteAction {
     Issue {
         source_address: u64,
@@ -370,7 +172,7 @@ pub enum MteAction {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MteProgramStep {
     pub pc: u64,
     pub word: u32,
@@ -433,7 +235,7 @@ pub enum MteStepperError {
     #[error(transparent)]
     C220(#[from] C220MovOutToUbError),
     #[error(transparent)]
-    C310(#[from] C310CapturedMovAlignError),
+    C310(#[from] C310MovAlignError),
     #[error(transparent)]
     Ub(#[from] UbMemoryError),
     #[error(transparent)]
@@ -552,12 +354,12 @@ impl MteCoreStepper {
         fallback: &mut B,
     ) -> Result<ScalarProgramStep, ScalarInstructionError<UbScalarBusError<B::Error>>> {
         let machine = self.scalar.machine();
-        let mut bus = UbScalarBus {
-            ub: &mut self.ub,
+        let mut bus = UbScalarBus::new(
+            &mut self.ub,
             fallback,
-            architecture: machine.architecture(),
-            local_roots: machine.spr_value(67).zip(machine.spr_value(68)),
-        };
+            machine.architecture(),
+            machine.spr_value(67).zip(machine.spr_value(68)),
+        );
         self.scalar.step_word(word, &mut bus)
     }
 
@@ -568,12 +370,12 @@ impl MteCoreStepper {
         fallback: &mut B,
     ) -> Result<ScalarProgramStep, ScalarInstructionError<UbScalarBusError<B::Error>>> {
         let machine = self.scalar.machine();
-        let mut bus = UbScalarBus {
-            ub: &mut self.ub,
+        let mut bus = UbScalarBus::new(
+            &mut self.ub,
             fallback,
-            architecture: machine.architecture(),
-            local_roots: machine.spr_value(67).zip(machine.spr_value(68)),
-        };
+            machine.architecture(),
+            machine.spr_value(67).zip(machine.spr_value(68)),
+        );
         self.scalar
             .step_c310_vf_words(first_word, second_word, &mut bus)
     }
@@ -730,7 +532,13 @@ impl MteCoreStepper {
             .spr_value(101)
             .ok_or(C220VectorError::MissingMaskState)?;
         let lane_count = C220_VECTOR_TILE_BYTES / usize::from(element_bytes);
-        let active_mask = decode_c220_tile_mask(mask_control, mask0, mask1, lane_count)?;
+        let iteration_masks = decode_c220_repeat_masks(
+            mask_control,
+            mask0,
+            mask1,
+            lane_count,
+            control.encoded_repeat_count,
+        )?;
         let destination_address = xregs[usize::from(instruction.destination_register)];
         let scalar_word = xregs[usize::from(instruction.source_register)] as u32;
         let step = execute_c220_movev_to_ub(
@@ -739,11 +547,21 @@ impl MteCoreStepper {
             control,
             destination_address,
             scalar_word,
-            &active_mask,
+            &iteration_masks,
             &mut self.ub,
         )?;
         self.scalar.advance_sequential();
         Ok(step)
+    }
+
+    pub(crate) fn step_c220_movev_word_deferred(
+        &mut self,
+        word: u32,
+    ) -> Result<C220MovevStep, MteStepperError> {
+        let visible = self.ub.clone();
+        let step = self.step_c220_movev_word(word);
+        self.ub = visible;
+        step
     }
 
     pub(crate) fn resolve_c220_vector_flag_id(
@@ -785,8 +603,61 @@ impl MteCoreStepper {
         self.step_c220_fp32_word(word, Some(C220VecArithmeticOperation::Multiply))
     }
 
+    pub fn step_c220_vmax_word(&mut self, word: u32) -> Result<C220Fp32Step, MteStepperError> {
+        self.step_c220_fp32_word(word, Some(C220VecArithmeticOperation::Maximum))
+    }
+
+    pub fn step_c220_vmin_word(&mut self, word: u32) -> Result<C220Fp32Step, MteStepperError> {
+        self.step_c220_fp32_word(word, Some(C220VecArithmeticOperation::Minimum))
+    }
+
+    pub fn step_c220_vabs_word(&mut self, word: u32) -> Result<C220Fp32Step, MteStepperError> {
+        self.step_c220_fp32_word(word, Some(C220VecArithmeticOperation::Absolute))
+    }
+
     pub fn step_c220_vector_word(&mut self, word: u32) -> Result<C220Fp32Step, MteStepperError> {
         self.step_c220_fp32_word(word, None)
+    }
+
+    pub(crate) fn issue_c220_vector_word(
+        &mut self,
+        word: u32,
+    ) -> Result<C220Fp32Issue, MteStepperError> {
+        let resolved = self.resolve_c220_fp32(word, None)?;
+        let issue = plan_c220_fp32_issue(
+            resolved.pc,
+            word,
+            resolved.control,
+            resolved.addresses,
+            &resolved.iteration_masks,
+            &self.ub,
+        )?;
+        self.unsignaled_output = Some(C220OutputToken {
+            source_address: issue.addresses.destination,
+        });
+        self.scalar.advance_sequential();
+        Ok(issue)
+    }
+
+    pub(crate) fn commit_c220_vector_stores(
+        &mut self,
+        stores: &[C220VectorStore],
+    ) -> Result<(), MteStepperError> {
+        let segments = stores
+            .iter()
+            .map(|store| {
+                (
+                    store.address,
+                    store.data[..usize::from(store.width_bytes)]
+                        .iter()
+                        .copied()
+                        .map(MemoryByteState::Known)
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.ub.write_segments(&segments)?;
+        Ok(())
     }
 
     fn step_c220_fp32_word(
@@ -794,6 +665,27 @@ impl MteCoreStepper {
         word: u32,
         expected_operation: Option<C220VecArithmeticOperation>,
     ) -> Result<C220Fp32Step, MteStepperError> {
+        let resolved = self.resolve_c220_fp32(word, expected_operation)?;
+        let step = execute_c220_fp32_to_ub(
+            resolved.pc,
+            word,
+            resolved.control,
+            resolved.addresses,
+            &resolved.iteration_masks,
+            &mut self.ub,
+        )?;
+        self.unsignaled_output = Some(C220OutputToken {
+            source_address: step.destination_address,
+        });
+        self.scalar.advance_sequential();
+        Ok(step)
+    }
+
+    fn resolve_c220_fp32(
+        &self,
+        word: u32,
+        expected_operation: Option<C220VecArithmeticOperation>,
+    ) -> Result<ResolvedC220Fp32, MteStepperError> {
         let pc = self.scalar.pc();
         if self.scalar.is_halted() {
             return Err(MteStepperError::ProgramEnded { pc });
@@ -810,33 +702,34 @@ impl MteCoreStepper {
             .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
         let machine = self.scalar.machine();
         let xregs = machine.xregs();
-        let control = xregs[usize::from(hint.x_register_index_8)];
-        let control = decode_c220_fp32_control(control)?;
+        let control = xregs[usize::from(hint.control_register)];
+        let control = if hint.operation == C220VecArithmeticOperation::Absolute {
+            decode_c220_fp32_unary_control(control)
+        } else {
+            decode_c220_fp32_control(control)?
+        };
         let ctrl = machine.spr_value(3);
         let mask0 = machine.spr_value(100);
         let mask1 = machine.spr_value(101);
-        let active_mask = decode_c220_fp32_mask(
+        let iteration_masks = decode_c220_repeat_masks(
             ctrl.ok_or(C220VectorError::MissingMaskState)?,
             mask0.ok_or(C220VectorError::MissingMaskState)?,
             mask1.ok_or(C220VectorError::MissingMaskState)?,
+            C220_VECTOR_TILE_BYTES / 4,
+            control.encoded_repeat_count,
         )?;
-        let step = execute_c220_fp32_to_ub(
+        Ok(ResolvedC220Fp32 {
             pc,
-            word,
             control,
-            C220Fp32Addresses {
-                source_0: xregs[usize::from(hint.x_register_index_4)],
-                source_1: xregs[usize::from(hint.x_register_index_6)],
-                destination: xregs[usize::from(hint.x_register_index_0)],
+            addresses: C220Fp32Addresses {
+                source_0: xregs[usize::from(hint.source_0_register)],
+                source_1: hint
+                    .source_1_register
+                    .map_or(0, |register| xregs[usize::from(register)]),
+                destination: xregs[usize::from(hint.destination_register)],
             },
-            &active_mask,
-            &mut self.ub,
-        )?;
-        self.unsignaled_output = Some(C220OutputToken {
-            source_address: step.destination_address,
-        });
-        self.scalar.advance_sequential();
-        Ok(step)
+            iteration_masks,
+        })
     }
 
     pub fn step_c220_output_word(
@@ -1141,24 +1034,29 @@ impl MteCoreStepper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SCALAR_UB_ALIAS_BASE: u64 = 0x80000;
+    use crate::execution::c310::buffer::C310BufferDisposition;
+    use crate::execution::c310::scalar_address::C310_UB_ROUTE_BYTES;
     use crate::execution::machine::{
         ScalarInstructionStep, ScalarMachine, ScalarMemoryExecutionError,
     };
-    use crate::instruction::mte_c220::{
+    use crate::instruction::c220::mte::{
         CAPTURED_C220_MOV_OUT_TO_UB_X_WORD, CAPTURED_C220_MOV_OUT_TO_UB_Y_WORD,
         CAPTURED_C220_MOV_UB_TO_OUT_WORD, CAPTURED_C220_SUB_MOV_UB_TO_OUT_WORD,
         CAPTURED_C220_SUB_TILING_MOV_OUT_TO_UB_WORD, CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD,
     };
-    use crate::instruction::mte_c310::{
-        C310_ADD_MOV_ALIGN_X_WORD, C310_ADD_MOV_ALIGN_Y_WORD, C310_SUB_TILING_MOV_ALIGN_WORD,
-        C310_TILING_MOV_ALIGN_WORD,
-    };
-    use crate::instruction::rvec::{C310_CAPTURED_VLDI_V0_WORD, C310RvecValueMachine};
-    use crate::instruction::vec_c220::{
+    use crate::instruction::c220::vector::{
         C220_CAPTURED_MOVEV_CONTROL, C220_CAPTURED_MOVEV_WORD, C220_CAPTURED_VADD_CONTROL,
         C220_CAPTURED_VADD_WORD, C220_CAPTURED_VMUL_CONTROL, C220_CAPTURED_VMUL_WORD,
         C220_CAPTURED_VSUB_WORD,
     };
+    use crate::instruction::c310::mte::{
+        C310_ADD_MOV_ALIGN_X_WORD, C310_ADD_MOV_ALIGN_Y_WORD, C310_SUB_TILING_MOV_ALIGN_WORD,
+        C310_TILING_MOV_ALIGN_WORD,
+    };
+    use crate::instruction::c310::vector::{C310_CAPTURED_VLDI_V0_WORD, C310RvecValueMachine};
+    use crate::instruction::flow::C310BufferStep;
     use crate::memory::mapped::MappedMemory;
     use crate::memory::region::MemoryRegion;
     use crate::memory::sparse::{MemoryByteState, SparseMemory};
@@ -1477,19 +1375,20 @@ mod tests {
         assert_eq!(step.pc, 0x1000);
         assert_eq!(core.ub().read_known(0, 8).unwrap(), pointer.to_le_bytes());
         let mut alias_bytes = [0; 8];
-        let mut bus = UbScalarBus {
-            ub: &mut core.ub,
-            fallback: &mut NoMemoryBus,
-            architecture: Architecture::Dav2201,
-            local_roots: Some((0, 0)),
-        };
+        let mut fallback = NoMemoryBus;
+        let mut bus = UbScalarBus::new(
+            &mut core.ub,
+            &mut fallback,
+            Architecture::Dav2201,
+            Some((0, 0)),
+        );
         bus.read(SCALAR_UB_ALIAS_BASE, &mut alias_bytes).unwrap();
         assert_eq!(alias_bytes, pointer.to_le_bytes());
         assert!(matches!(
             bus.write(0x12_ffff, &[1, 2]),
             Err(UbScalarBusError::AliasBoundary { .. })
         ));
-        assert_eq!(bus.ub.read_known(0, 8).unwrap(), pointer.to_le_bytes());
+        assert_eq!(bus.ub().read_known(0, 8).unwrap(), pointer.to_le_bytes());
     }
 
     #[test]
@@ -1509,12 +1408,12 @@ mod tests {
         assert_eq!(step.pc, 0x1000);
         assert_eq!(core.ub().read_known(0x7f40, 2).unwrap(), [0x44, 0x33]);
         let mut fallback = NoMemoryBus;
-        let mut bus = UbScalarBus {
-            ub: &mut core.ub,
-            fallback: &mut fallback,
-            architecture: Architecture::Dav3510,
-            local_roots: Some((0, 0)),
-        };
+        let mut bus = UbScalarBus::new(
+            &mut core.ub,
+            &mut fallback,
+            Architecture::Dav3510,
+            Some((0, 0)),
+        );
         let mut actual = [0; 2];
         bus.read(0x87f40, &mut actual).unwrap();
         assert_eq!(actual, [0x44, 0x33]);
@@ -1563,12 +1462,7 @@ mod tests {
     fn scalar_ub_alias_writes_preserve_provenance_and_reject_crossings() {
         let mut ub = UbMemory::new(64, 64);
         let mut fallback = NoMemoryBus;
-        let mut bus = UbScalarBus {
-            ub: &mut ub,
-            fallback: &mut fallback,
-            architecture: Architecture::Dav3510,
-            local_roots: Some((0, 0)),
-        };
+        let mut bus = UbScalarBus::new(&mut ub, &mut fallback, Architecture::Dav3510, Some((0, 0)));
         assert!(matches!(
             bus.read(SCALAR_UB_ALIAS_BASE + 4, &mut [0; 4]),
             Err(UbScalarBusError::Ub(UbMemoryError::UnknownByte {
@@ -1579,7 +1473,7 @@ mod tests {
         let mut bytes = [0; 4];
         bus.read(SCALAR_UB_ALIAS_BASE + 4, &mut bytes).unwrap();
         assert_eq!(bytes, [1, 2, 3, 4]);
-        assert_eq!(bus.ub.read_known(4, 4).unwrap(), bytes);
+        assert_eq!(bus.ub().read_known(4, 4).unwrap(), bytes);
         assert!(matches!(
             bus.read(SCALAR_UB_ALIAS_BASE - 1, &mut [0; 2]),
             Err(UbScalarBusError::UnsupportedLocal { .. })
@@ -1588,7 +1482,7 @@ mod tests {
             bus.write(SCALAR_UB_ALIAS_BASE + C310_UB_ROUTE_BYTES - 1, &[5, 6]),
             Err(UbScalarBusError::AliasBoundary { .. })
         ));
-        assert_eq!(bus.ub.read_known(4, 4).unwrap(), bytes);
+        assert_eq!(bus.ub().read_known(4, 4).unwrap(), bytes);
     }
 
     #[test]
@@ -2032,7 +1926,7 @@ mod tests {
     }
 
     #[test]
-    fn c220_movev_rejects_unverified_control_mask_and_overflow_atomically() {
+    fn c220_movev_rejects_invalid_mask_and_capacity_atomically() {
         let mut core = stepper(Architecture::Dav2201, 0x3000);
         let machine = core.scalar_mut().machine_mut();
         machine.set_xreg(5, C220_CAPTURED_MOVEV_CONTROL).unwrap();
@@ -2042,29 +1936,29 @@ mod tests {
         machine.set_spr_value(100, 32).unwrap();
         machine.set_spr_value(101, 0).unwrap();
 
-        core.scalar_mut().machine_mut().set_xreg(5, 0).unwrap();
+        core.scalar_mut().machine_mut().set_spr_value(3, 1).unwrap();
         let before = core.clone();
         assert!(matches!(
             core.step_c220_movev_word(C220_CAPTURED_MOVEV_WORD),
             Err(MteStepperError::Vector(
-                C220VectorError::UnsupportedMovevControl { control: 0 }
+                C220VectorError::UnsupportedMaskControl { control: 1 }
             ))
         ));
         assert_eq!(core, before);
 
         core.scalar_mut()
             .machine_mut()
-            .set_xreg(5, C220_CAPTURED_MOVEV_CONTROL)
+            .set_spr_value(3, 1 << 56)
             .unwrap();
         core.scalar_mut()
             .machine_mut()
-            .set_spr_value(100, 65)
+            .set_spr_value(100, 4096 * 64 + 1)
             .unwrap();
         let before = core.clone();
         assert!(matches!(
             core.step_c220_movev_word(C220_CAPTURED_MOVEV_WORD),
             Err(MteStepperError::Vector(
-                C220VectorError::CountMaskExceedsTile { .. }
+                C220VectorError::RepeatLimitExceeded { .. }
             ))
         ));
         assert_eq!(core, before);
@@ -2356,18 +2250,18 @@ mod tests {
         machine.set_spr_value(3, 1 << 56).unwrap();
         machine.set_spr_value(100, 31).unwrap();
         machine.set_spr_value(101, 0).unwrap();
-        core.scalar_mut().machine_mut().set_xreg(6, 0).unwrap();
+        core.scalar_mut().machine_mut().set_spr_value(3, 1).unwrap();
         let before_control = core.clone();
         assert!(matches!(
             core.step_c220_vmul_word(C220_CAPTURED_VMUL_WORD),
             Err(MteStepperError::Vector(
-                C220VectorError::UnsupportedFp32Control { control: 0 }
+                C220VectorError::UnsupportedMaskControl { control: 1 }
             ))
         ));
         assert_eq!(core, before_control);
         core.scalar_mut()
             .machine_mut()
-            .set_xreg(6, C220_CAPTURED_VMUL_CONTROL)
+            .set_spr_value(3, 1 << 56)
             .unwrap();
         let mut partial = core.clone();
         let partial_step = partial
@@ -2632,10 +2526,10 @@ mod tests {
 
         let step = core.step_c220_vadd_word(word).unwrap();
         assert_eq!(step.hint.operation, C220VecArithmeticOperation::Add);
-        assert_eq!(step.hint.x_register_index_0, 3);
-        assert_eq!(step.hint.x_register_index_4, 9);
-        assert_eq!(step.hint.x_register_index_6, 10);
-        assert_eq!(step.hint.x_register_index_8, 7);
+        assert_eq!(step.hint.destination_register, 3);
+        assert_eq!(step.hint.source_0_register, 9);
+        assert_eq!(step.hint.source_1_register, Some(10));
+        assert_eq!(step.hint.control_register, 7);
         assert_eq!(step.stores.len(), 2);
         assert_eq!(step.stores[0].lane_index, 0);
         assert_eq!(step.stores[1].lane_index, 2);
@@ -2651,7 +2545,7 @@ mod tests {
     }
 
     #[test]
-    fn c220_vadd_rejects_unverified_control_and_unknown_input_atomically() {
+    fn c220_vadd_rejects_invalid_mask_and_unknown_input_atomically() {
         let mut core = stepper(Architecture::Dav2201, 0x3000);
         let machine = core.scalar_mut().machine_mut();
         machine.set_xreg(8, C220_CAPTURED_VADD_CONTROL).unwrap();
@@ -2662,20 +2556,17 @@ mod tests {
         machine.set_spr_value(100, 0x5555_5555).unwrap();
         machine.set_spr_value(101, 0).unwrap();
 
-        core.scalar_mut().machine_mut().set_xreg(8, 0).unwrap();
+        core.scalar_mut().machine_mut().set_spr_value(3, 1).unwrap();
         let before = core.clone();
         assert!(matches!(
             core.step_c220_vadd_word(C220_CAPTURED_VADD_WORD),
             Err(MteStepperError::Vector(
-                C220VectorError::UnsupportedFp32Control { control: 0 }
+                C220VectorError::UnsupportedMaskControl { control: 1 }
             ))
         ));
         assert_eq!(core, before);
 
-        core.scalar_mut()
-            .machine_mut()
-            .set_xreg(8, C220_CAPTURED_VADD_CONTROL)
-            .unwrap();
+        core.scalar_mut().machine_mut().set_spr_value(3, 0).unwrap();
         let before = core.clone();
         assert!(matches!(
             core.step_c220_vadd_word(C220_CAPTURED_VADD_WORD),

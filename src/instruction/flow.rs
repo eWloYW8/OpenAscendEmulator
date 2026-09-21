@@ -1,29 +1,28 @@
 use crate::device::architecture::Architecture;
 use crate::instruction::isa::AicClass;
-use serde::Serialize;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JumpOffsetSource {
     Immediate { encoded_words: u16 },
     Register { index: u8 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnconditionalJump {
     pub architecture: Architecture,
     pub word: u32,
     pub offset_source: JumpOffsetSource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConditionalJump {
     pub architecture: Architecture,
     pub word: u32,
     pub offset_source: JumpOffsetSource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JumpTarget {
     pub pc: u64,
     pub word: u32,
@@ -33,14 +32,14 @@ pub struct JumpTarget {
     pub target_pc: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlowNop {
     pub pc: u64,
     pub word: u32,
     pub target_pc: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlowEnd {
     pub pc: u64,
     pub word: u32,
@@ -61,7 +60,7 @@ impl FlowEnd {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DcciInstruction {
     pub architecture: Architecture,
     pub word: u32,
@@ -70,7 +69,7 @@ pub struct DcciInstruction {
     pub operation_field: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DcciStep {
     pub pc: u64,
     pub word: u32,
@@ -81,20 +80,20 @@ pub struct DcciStep {
     pub effective_address: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DsbStep {
     pub pc: u64,
     pub word: u32,
     pub scope_field: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineBarrierScope {
     Vector,
     All,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineBarrierStep {
     pub pc: u64,
     pub word: u32,
@@ -114,19 +113,19 @@ impl PipelineBarrierStep {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlagOperation {
     Set,
     Wait,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlagIdSource {
     Immediate(u8),
     Register(u8),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlagInstruction {
     pub architecture: Architecture,
     pub word: u32,
@@ -136,7 +135,7 @@ pub struct FlagInstruction {
     pub id_source: FlagIdSource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlagStep {
     pub pc: u64,
     pub instruction: FlagInstruction,
@@ -144,25 +143,25 @@ pub struct FlagStep {
     pub source_value: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferOperation {
     Get,
     Release,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferEncoding {
     FlowControl,
     PushQueue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferIdSource {
     Immediate(u8),
     Register(u8),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310BufferInstruction {
     pub word: u32,
     pub encoding: BufferEncoding,
@@ -172,7 +171,7 @@ pub struct C310BufferInstruction {
     pub mode_field: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310BufferStep {
     pub pc: u64,
     pub instruction: C310BufferInstruction,
@@ -351,7 +350,7 @@ impl FlowNop {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConditionalJumpTarget {
     pub pc: u64,
     pub word: u32,
@@ -362,19 +361,19 @@ pub struct ConditionalJumpTarget {
     pub target_pc: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JumpCompareOperand {
     Immediate { encoded: u8 },
     Register { index: u8 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JumpCompareOffset {
     Immediate { encoded_words: u16 },
     Register { index: u8 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JumpCompare {
     pub architecture: Architecture,
     pub word: u32,
@@ -385,7 +384,7 @@ pub struct JumpCompare {
     pub offset_source: JumpCompareOffset,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JumpCompareTarget {
     pub pc: u64,
     pub word: u32,

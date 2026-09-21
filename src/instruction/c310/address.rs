@@ -1,11 +1,10 @@
-use serde::Serialize;
 use thiserror::Error;
 
-use crate::instruction::rvec::C310RvecValueMachine;
+use crate::instruction::c310::vector::C310RvecValueMachine;
 
 pub const C310_CAPTURED_VAG_WORD: u32 = 0xc200_001d;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310CapturedVagDescriptor {
     pub pc: u64,
     pub word: u32,
@@ -13,7 +12,7 @@ pub struct C310CapturedVagDescriptor {
     pub source_s_registers: [u8; 4],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310CapturedA0Step {
     pub iteration_i1: u64,
     pub stride: u32,
@@ -30,7 +29,7 @@ pub enum C310RvecAddressError {
     MissingScalar { index: u8 },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct C310RvecAddressState {
     vag: Option<C310CapturedVagDescriptor>,
     iteration_i1: Option<u64>,
@@ -104,7 +103,7 @@ impl C310RvecAddressState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::predicate_buffer_c310::C310_PB_SLOT_BYTES;
+    use crate::instruction::c310::layout::C310_PB_SLOT_BYTES;
 
     fn scalar_bank(stride: u32) -> C310RvecValueMachine {
         let mut machine = C310RvecValueMachine::from_vector_words(vec![vec![0; 64]]).unwrap();

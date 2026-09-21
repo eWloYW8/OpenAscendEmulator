@@ -1,18 +1,16 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
 
-use serde::Serialize;
 use thiserror::Error;
 
 use crate::device::architecture::Architecture;
 use crate::execution::c220::dma_uop::{C220DmaUopError, C220DmaUopRequest, mte2_requests};
-use crate::execution::mte_stepper::{
-    C220Mte2TransferPlan, MteAction, MteCoreStepper, MteProgramStep, MteStepperError,
-};
+use crate::execution::c220::transfer::C220Mte2TransferPlan;
+use crate::execution::mte_stepper::{MteAction, MteCoreStepper, MteProgramStep, MteStepperError};
 use crate::instruction::flow::{FlagInstruction, FlagOperation};
 use crate::memory::mapped::MappedMemory;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220Mte2TimingRules {
     pub issue_interval: NonZeroU64,
     pub startup_ticks: u64,
@@ -20,7 +18,7 @@ pub struct C220Mte2TimingRules {
     pub retire_ticks: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220Mte2Ticket {
     pub issue_tick: u64,
     pub data_ready_tick: u64,
@@ -36,17 +34,17 @@ impl C220Mte2Ticket {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220StallCause {
     InstructionRate,
     Mte2IssueRate,
     Mte2Dependency,
     Mte3IssueRate,
     Mte3Dependency,
+    VectorDependency,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220Stall {
     pub tick: u64,
     pub pc: u64,
@@ -54,8 +52,7 @@ pub struct C220Stall {
     pub cause: C220StallCause,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220TimedMte2Step {
     Executed {
         tick: u64,
@@ -316,7 +313,7 @@ impl C220TimedMte2Core {
 }
 
 pub(super) fn is_mte2_transfer(word: u32) -> bool {
-    crate::instruction::mte_c220::C220MovOutToUbDescriptor::is_word(word)
+    crate::instruction::c220::mte::C220MovOutToUbDescriptor::is_word(word)
 }
 
 #[cfg(test)]
@@ -324,7 +321,7 @@ mod tests {
     use super::*;
     use crate::execution::machine::ScalarMachine;
     use crate::execution::stepper::ScalarStepper;
-    use crate::instruction::mte_c220::{
+    use crate::instruction::c220::mte::{
         C220MovOutToUbDescriptor, CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,
     };
     use crate::memory::ub::UbMemory;

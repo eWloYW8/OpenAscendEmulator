@@ -1,26 +1,23 @@
 use crate::device::architecture::Architecture;
-use serde::Serialize;
+use crate::instruction::c310::layout::{
+    C310_PB_DEFAULT_SLOTS, C310_PB_PUSH_BYTES, C310_PB_SLOT_BYTES,
+};
 use thiserror::Error;
 
-pub const C310_PB_DEFAULT_SLOTS: u16 = 32;
-pub const C310_PB_HALFWORDS_PER_SLOT: usize = 64;
-pub const C310_PB_SLOT_BYTES: usize = C310_PB_HALFWORDS_PER_SLOT * 2;
-pub const C310_PB_PUSH_BYTES: usize = 32;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C310PushPbDisposition {
     Accepted,
     Stalled,
     Unsupported,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310PushPbInstruction {
     pub word: u32,
     pub source_registers: [u8; 4],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310PushPbStep {
     pub pc: u64,
     pub instruction: C310PushPbInstruction,
@@ -79,14 +76,14 @@ pub enum C310PredicateBufferError {
     NoActiveSlot,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310PredicateBufferWrite {
     pub slot_id: u16,
     pub byte_offset: u8,
     pub bytes: [u8; C310_PB_PUSH_BYTES],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310PredicateBufferVfIssue {
     pub slot_id: u16,
     pub halfword_cursor_before: u8,

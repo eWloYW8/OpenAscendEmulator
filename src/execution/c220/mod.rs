@@ -1,5 +1,10 @@
 pub mod core;
 pub mod dma_uop;
 pub mod mte3_timing;
+pub(crate) mod scalar_address;
 pub mod timing;
+pub mod transfer;
+pub mod ub_arbiter;
+pub mod vector_pipeline;
+pub mod vector_read;
 pub mod vector_timing;

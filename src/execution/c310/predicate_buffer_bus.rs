@@ -1,12 +1,11 @@
-use crate::execution::buffer_c310::C310BufferDisposition;
-use crate::execution::machine::ScalarMemoryBus;
-use crate::execution::predicate_buffer_c310::{
+use crate::execution::c310::buffer::C310BufferDisposition;
+use crate::execution::c310::predicate_buffer::{
     C310PredicateBuffer, C310PredicateBufferError, C310PredicateBufferVfIssue,
     C310PredicateBufferWrite, C310PushPbDisposition, C310PushPbStep,
 };
-use crate::execution::vec_queue_c310::{C310VfQueueDisposition, C310VfQueueStep};
+use crate::execution::c310::vector_queue::{C310VfQueueDisposition, C310VfQueueStep};
+use crate::execution::machine::ScalarMemoryBus;
 use crate::instruction::flow::{C310BufferStep, DcciStep, DsbStep, PipelineBarrierStep};
-use serde::Serialize;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -19,13 +18,13 @@ pub enum C310PredicateBufferBusError<E: std::error::Error + 'static> {
     NoOutstandingVfIssue { slot_id: u16 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310PredicateBufferQueuedVfIssue {
     pub queue: C310VfQueueStep,
     pub predicate_buffer: C310PredicateBufferVfIssue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310PredicateBufferCompletedVfIssue {
     pub issue: C310PredicateBufferQueuedVfIssue,
 }
@@ -191,7 +190,7 @@ mod tests {
     use crate::device::architecture::Architecture;
     use crate::execution::machine::{ScalarInstructionError, ScalarInstructionStep, ScalarMachine};
     use crate::execution::stepper::ScalarStepper;
-    use crate::instruction::rvec_pb_c310::project_c310_pb_rvec_scalar_init;
+    use crate::instruction::c310::predicate::project_c310_pb_rvec_scalar_init;
     use std::convert::Infallible;
 
     struct UnusedMemory;
@@ -291,13 +290,13 @@ mod tests {
         let mut bus = C310PredicateBufferBus::new(inner, C310PredicateBuffer::new(3).unwrap());
         let push = C310PushPbStep {
             pc: 0x10d0_d6fc,
-            instruction: crate::execution::predicate_buffer_c310::C310PushPbInstruction::decode(
+            instruction: crate::execution::c310::predicate_buffer::C310PushPbInstruction::decode(
                 Architecture::Dav3510,
                 0x4319_7108,
             )
             .unwrap(),
             source_values: [1, 2, 3, 4],
-            bytes: [0x5a; crate::execution::predicate_buffer_c310::C310_PB_PUSH_BYTES],
+            bytes: [0x5a; crate::instruction::c310::layout::C310_PB_PUSH_BYTES],
         };
         assert_eq!(
             bus.execute_c310_push_pb(push).unwrap(),
@@ -305,7 +304,7 @@ mod tests {
         );
         let queue = C310VfQueueStep {
             pc: 0x10d0_d718,
-            instruction: crate::execution::vec_queue_c310::C310VfQueueInstruction::decode(
+            instruction: crate::execution::c310::vector_queue::C310VfQueueInstruction::decode(
                 Architecture::Dav3510,
                 0x1542_0000,
                 0x15e0_0125,
@@ -351,7 +350,7 @@ mod tests {
             };
             let mut buffer = C310PredicateBuffer::new(2).unwrap();
             let instruction =
-                crate::execution::predicate_buffer_c310::C310PushPbInstruction::decode(
+                crate::execution::c310::predicate_buffer::C310PushPbInstruction::decode(
                     Architecture::Dav3510,
                     0x4319_7108,
                 )
@@ -363,7 +362,7 @@ mod tests {
             let mut bus = C310PredicateBufferBus::new(inner, buffer);
             let queue = C310VfQueueStep {
                 pc: 0x1010,
-                instruction: crate::execution::vec_queue_c310::C310VfQueueInstruction::decode(
+                instruction: crate::execution::c310::vector_queue::C310VfQueueInstruction::decode(
                     Architecture::Dav3510,
                     0x1542_0000,
                     0x15e0_0125,
@@ -387,7 +386,7 @@ mod tests {
         let mut bus = C310PredicateBufferBus::new(inner, C310PredicateBuffer::new(2).unwrap());
         let queue = C310VfQueueStep {
             pc: 0x1010,
-            instruction: crate::execution::vec_queue_c310::C310VfQueueInstruction::decode(
+            instruction: crate::execution::c310::vector_queue::C310VfQueueInstruction::decode(
                 Architecture::Dav3510,
                 0x1542_0000,
                 0x15e0_0125,

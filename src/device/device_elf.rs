@@ -1,4 +1,3 @@
-use serde::Serialize;
 use thiserror::Error;
 
 const ELF_HEADER_SIZE: usize = 64;
@@ -8,16 +7,11 @@ const ASCEND_MACHINE: u16 = 0x1029;
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
-const SHT_NOTE: u32 = 7;
 const SHF_ALLOC: u64 = 2;
 const SHF_EXECINSTR: u64 = 4;
 const STT_FUNC: u8 = 2;
-const STT_OBJECT: u8 = 1;
-const STB_GLOBAL: u8 = 1;
-const STV_HIDDEN: u8 = 2;
-const DEVICE_CODE_ALIGNMENT: u64 = 4096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceElfHeader {
     pub file_type: u16,
     pub machine: u16,
@@ -25,7 +19,7 @@ pub struct DeviceElfHeader {
     pub section_count: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceKernelSummary {
     pub name: String,
     pub section: String,
@@ -38,15 +32,10 @@ pub struct DeviceKernelSummary {
 }
 
 impl DeviceKernelSummary {
-    pub fn function_device_address(&self, bin_align_base_addr: u64) -> Result<u64, DeviceElfError> {
-        if !bin_align_base_addr.is_multiple_of(DEVICE_CODE_ALIGNMENT) {
-            return Err(DeviceElfError::UnalignedCodeBase(bin_align_base_addr));
-        }
-        let offset = u32::try_from(self.virtual_address)
-            .map_err(|_| DeviceElfError::UnsupportedRuntimeKernelOffset(self.virtual_address))?;
-        bin_align_base_addr
-            .checked_add(u64::from(offset))
-            .ok_or(DeviceElfError::RuntimeAddressOverflow)
+    pub fn device_address(&self, image_base: u64) -> Result<u64, DeviceElfError> {
+        image_base
+            .checked_add(self.virtual_address)
+            .ok_or(DeviceElfError::DeviceAddressOverflow)
     }
 }
 
@@ -56,150 +45,10 @@ pub struct DeviceKernel<'a> {
     pub bytes: &'a [u8],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DeviceLoadImageSummary {
-    pub file_offset: u64,
-    pub byte_count: u64,
-    pub first_alloc_section: String,
-    pub last_alloc_section: String,
-    pub alloc_section_count: usize,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceLoadImage<'a> {
-    pub summary: DeviceLoadImageSummary,
-    pub bytes: &'a [u8],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeviceGlobalSymbol {
-    SimdPrintFifoSpace,
-    FftsAddress,
-    L2CacheHintConfig,
-    SimtPrintFifoSpace,
-}
-
-impl DeviceGlobalSymbol {
-    const ALL: [Self; 4] = [
-        Self::SimdPrintFifoSpace,
-        Self::FftsAddress,
-        Self::L2CacheHintConfig,
-        Self::SimtPrintFifoSpace,
-    ];
-
-    pub const fn meta_flag(self) -> u32 {
-        match self {
-            Self::SimdPrintFifoSpace => 1,
-            Self::FftsAddress => 2,
-            Self::L2CacheHintConfig => 4,
-            Self::SimtPrintFifoSpace => 8,
-        }
-    }
-
-    pub const fn elf_name(self) -> &'static str {
-        match self {
-            Self::SimdPrintFifoSpace => "g_sysPrintFifoSpace",
-            Self::FftsAddress => "g_sysFftsAddr",
-            Self::L2CacheHintConfig => "g_opL2CacheHintCfg",
-            Self::SimtPrintFifoSpace => "g_sysSimtPrintFifoSpace",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DeviceGlobalAddresses {
-    pub simd_print_fifo_space: Option<u64>,
-    pub ffts_address: Option<u64>,
-    pub l2_cache_hint_config: Option<u64>,
-    pub simt_print_fifo_space: Option<u64>,
-}
-
-impl DeviceGlobalAddresses {
-    const fn get(self, symbol: DeviceGlobalSymbol) -> Option<u64> {
-        match symbol {
-            DeviceGlobalSymbol::SimdPrintFifoSpace => self.simd_print_fifo_space,
-            DeviceGlobalSymbol::FftsAddress => self.ffts_address,
-            DeviceGlobalSymbol::L2CacheHintConfig => self.l2_cache_hint_config,
-            DeviceGlobalSymbol::SimtPrintFifoSpace => self.simt_print_fifo_space,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DeviceGlobalPatchSite {
-    pub symbol: DeviceGlobalSymbol,
     pub file_offset: u64,
-    pub image_offset: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedDeviceLoadImage {
-    pub summary: DeviceLoadImageSummary,
-    pub address_meta_flags: u32,
-    pub bytes: Vec<u8>,
-    pub patches: Vec<DeviceGlobalPatchSite>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectedDeviceKernel<'a> {
-    pub summary: DeviceKernelSummary,
-    pub entry_address: u64,
-    pub executable_start_address: u64,
-    bytes: &'a [u8],
-    executable_bytes: &'a [u8],
-}
-
-impl ProjectedDeviceKernel<'_> {
-    pub fn fetch_word(&self, device_pc: u64) -> Result<u32, DeviceElfError> {
-        let offset = device_pc
-            .checked_sub(self.entry_address)
-            .ok_or(DeviceElfError::InstructionOutsideKernel(device_pc))?;
-        if !device_pc.is_multiple_of(4) {
-            return Err(DeviceElfError::UnalignedInstructionAddress(device_pc));
-        }
-        let bytes = checked_slice(self.bytes, offset, 4)
-            .map_err(|_| DeviceElfError::InstructionOutsideKernel(device_pc))?;
-        Ok(u32::from_le_bytes(
-            bytes.try_into().expect("four-byte instruction"),
-        ))
-    }
-
-    pub fn fetch_executable_word(&self, device_pc: u64) -> Result<u32, DeviceElfError> {
-        let offset = device_pc.checked_sub(self.executable_start_address).ok_or(
-            DeviceElfError::InstructionOutsideExecutableSection(device_pc),
-        )?;
-        if !device_pc.is_multiple_of(4) {
-            return Err(DeviceElfError::UnalignedInstructionAddress(device_pc));
-        }
-        let bytes = checked_slice(self.executable_bytes, offset, 4)
-            .map_err(|_| DeviceElfError::InstructionOutsideExecutableSection(device_pc))?;
-        Ok(u32::from_le_bytes(
-            bytes.try_into().expect("four-byte instruction"),
-        ))
-    }
-}
-
-#[cfg(test)]
-impl<'a> ProjectedDeviceKernel<'a> {
-    pub(crate) fn from_test_code(bytes: &'a [u8], entry_address: u64) -> Self {
-        Self {
-            summary: DeviceKernelSummary {
-                name: String::from("Kernel"),
-                section: String::from(".text"),
-                section_virtual_address: 0,
-                section_file_offset: 0,
-                section_byte_count: bytes.len() as u64,
-                virtual_address: 0,
-                file_offset: 0,
-                byte_count: bytes.len() as u64,
-            },
-            entry_address,
-            executable_start_address: entry_address,
-            bytes,
-            executable_bytes: bytes,
-        }
-    }
+    pub bytes: &'a [u8],
 }
 
 impl DeviceKernel<'_> {
@@ -321,193 +170,36 @@ impl<'a> DeviceElf<'a> {
     }
 
     pub fn load_image(&self) -> Result<DeviceLoadImage<'a>, DeviceElfError> {
-        let mut first: Option<(usize, u64)> = None;
-        let mut last: Option<(usize, u64, u64)> = None;
-        let mut count = 0;
-        for (index, section) in self.sections.iter().enumerate() {
+        let mut first: Option<u64> = None;
+        let mut last: Option<(u64, u64)> = None;
+        for section in &self.sections {
             if section.flags & SHF_ALLOC == 0 || section.byte_count == 0 {
                 continue;
             }
-            if first.is_some_and(|(_, offset)| offset == 0) {
+            if first == Some(0) {
                 return Err(DeviceElfError::AmbiguousZeroOffsetLoadImage);
             }
             let end = section
                 .file_offset
                 .checked_add(section.byte_count)
                 .ok_or(DeviceElfError::RangeOverflow)?;
-            if let Some((_, previous_offset, previous_end)) = last
+            if let Some((previous_offset, previous_end)) = last
                 && (section.file_offset < previous_offset || end < previous_end)
             {
                 return Err(DeviceElfError::UnorderedLoadImageSections);
             }
             if first.is_none() {
-                first = Some((index, section.file_offset));
+                first = Some(section.file_offset);
             }
-            last = Some((index, section.file_offset, end));
-            count += 1;
+            last = Some((section.file_offset, end));
         }
-        let (first_index, file_offset) = first.ok_or(DeviceElfError::NoLoadImage)?;
-        let (last_index, _, end) = last.expect("first section implies last section");
+        let file_offset = first.ok_or(DeviceElfError::NoLoadImage)?;
+        let (_, end) = last.expect("first section implies last section");
         let byte_count = end
             .checked_sub(file_offset)
             .ok_or(DeviceElfError::UnorderedLoadImageSections)?;
         let bytes = checked_slice(self.bytes, file_offset, byte_count)?;
-        Ok(DeviceLoadImage {
-            summary: DeviceLoadImageSummary {
-                file_offset,
-                byte_count,
-                first_alloc_section: self.section_names[first_index].clone(),
-                last_alloc_section: self.section_names[last_index].clone(),
-                alloc_section_count: count,
-            },
-            bytes,
-        })
-    }
-
-    pub fn address_meta_flags(&self) -> Result<u32, DeviceElfError> {
-        let mut flags = 0;
-        for (section, name) in self.sections.iter().zip(&self.section_names) {
-            if name != ".ascend.meta"
-                || (section.section_type != SHT_PROGBITS && section.section_type != SHT_NOTE)
-            {
-                continue;
-            }
-            let bytes = checked_slice(self.bytes, section.file_offset, section.byte_count)?;
-            let mut offset = 0usize;
-            while bytes.len() - offset > 4 {
-                let kind = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
-                let length = usize::from(u16::from_le_bytes(
-                    bytes[offset + 2..offset + 4].try_into().unwrap(),
-                ));
-                let end = offset
-                    .checked_add(4)
-                    .and_then(|value| value.checked_add(length))
-                    .ok_or(DeviceElfError::RangeOverflow)?;
-                if end > bytes.len() {
-                    return Err(DeviceElfError::InvalidAddressMeta);
-                }
-                if kind == 4 {
-                    if length < 4 {
-                        return Err(DeviceElfError::InvalidAddressMeta);
-                    }
-                    let value =
-                        u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
-                    if (1..=4).contains(&value) {
-                        flags |= 1 << (value - 1);
-                    }
-                }
-                offset = end;
-            }
-        }
-        Ok(flags)
-    }
-
-    pub fn global_patch_sites(&self) -> Result<Vec<DeviceGlobalPatchSite>, DeviceElfError> {
-        let flags = self.address_meta_flags()?;
-        if flags == 0 {
-            return Ok(Vec::new());
-        }
-        let image = self.load_image()?;
-        let mut sites = Vec::new();
-        for table in &self.sections {
-            if table.section_type != SHT_SYMTAB {
-                continue;
-            }
-            if table.entry_size != SYMBOL_SIZE as u64 || table.byte_count % SYMBOL_SIZE as u64 != 0
-            {
-                return Err(DeviceElfError::InvalidSymbolTable);
-            }
-            let strings = self
-                .sections
-                .get(table.link as usize)
-                .ok_or(DeviceElfError::InvalidSymbolTable)?;
-            if strings.section_type != SHT_STRTAB {
-                return Err(DeviceElfError::InvalidSymbolTable);
-            }
-            let string_bytes = checked_slice(self.bytes, strings.file_offset, strings.byte_count)?;
-            let symbols = checked_slice(self.bytes, table.file_offset, table.byte_count)?;
-            for symbol in symbols.chunks_exact(SYMBOL_SIZE) {
-                if symbol[4] & 0xf != STT_OBJECT {
-                    continue;
-                }
-                let index = usize::from(read_u16(symbol, 6)?);
-                let section = self
-                    .sections
-                    .get(index)
-                    .ok_or(DeviceElfError::InvalidSymbolTable)?;
-                let name = read_c_string(string_bytes, read_u32(symbol, 0)?)?;
-                let Some(kind) = DeviceGlobalSymbol::ALL.into_iter().find(|kind| {
-                    kind.meta_flag() & flags != 0 && name == kind.elf_name().as_bytes()
-                }) else {
-                    continue;
-                };
-                if sites
-                    .iter()
-                    .any(|site: &DeviceGlobalPatchSite| site.symbol == kind)
-                {
-                    return Err(DeviceElfError::DuplicateGlobalSymbol(kind.elf_name()));
-                }
-                if section.flags & SHF_ALLOC == 0 || read_u64(symbol, 16)? < 8 {
-                    return Err(DeviceElfError::InvalidGlobalSymbolRange(kind.elf_name()));
-                }
-                let relative = read_u64(symbol, 8)?
-                    .checked_sub(section.address)
-                    .ok_or(DeviceElfError::InvalidGlobalSymbolRange(kind.elf_name()))?;
-                if relative
-                    .checked_add(8)
-                    .ok_or(DeviceElfError::RangeOverflow)?
-                    > section.byte_count
-                {
-                    return Err(DeviceElfError::InvalidGlobalSymbolRange(kind.elf_name()));
-                }
-                let file_offset = section
-                    .file_offset
-                    .checked_add(relative)
-                    .ok_or(DeviceElfError::RangeOverflow)?;
-                checked_slice(self.bytes, file_offset, 8)?;
-                let image_offset = file_offset
-                    .checked_sub(image.summary.file_offset)
-                    .ok_or(DeviceElfError::InvalidGlobalSymbolRange(kind.elf_name()))?;
-                checked_slice(image.bytes, image_offset, 8)
-                    .map_err(|_| DeviceElfError::InvalidGlobalSymbolRange(kind.elf_name()))?;
-                if sites.iter().any(|site: &DeviceGlobalPatchSite| {
-                    site.image_offset < image_offset + 8 && image_offset < site.image_offset + 8
-                }) {
-                    return Err(DeviceElfError::OverlappingGlobalPatches);
-                }
-                sites.push(DeviceGlobalPatchSite {
-                    symbol: kind,
-                    file_offset,
-                    image_offset,
-                });
-            }
-            break;
-        }
-        Ok(sites)
-    }
-
-    pub fn prepare_load_image(
-        &self,
-        addresses: DeviceGlobalAddresses,
-    ) -> Result<PreparedDeviceLoadImage, DeviceElfError> {
-        let image = self.load_image()?;
-        let flags = self.address_meta_flags()?;
-        let patches = self.global_patch_sites()?;
-        let mut bytes = image.bytes.to_vec();
-        for site in &patches {
-            let value = addresses
-                .get(site.symbol)
-                .ok_or(DeviceElfError::MissingGlobalAddress(site.symbol.elf_name()))?;
-            let start =
-                usize::try_from(site.image_offset).map_err(|_| DeviceElfError::RangeOverflow)?;
-            bytes[start..start + 8].copy_from_slice(&value.to_le_bytes());
-        }
-        Ok(PreparedDeviceLoadImage {
-            summary: image.summary,
-            address_meta_flags: flags,
-            bytes,
-            patches,
-        })
+        Ok(DeviceLoadImage { file_offset, bytes })
     }
 
     pub fn kernels(&self) -> Result<Vec<DeviceKernelSummary>, DeviceElfError> {
@@ -535,11 +227,7 @@ impl<'a> DeviceElf<'a> {
             )?;
             let symbol_bytes = checked_slice(self.bytes, section.file_offset, section.byte_count)?;
             for symbol in symbol_bytes.chunks_exact(SYMBOL_SIZE) {
-                if symbol[4] & 0xf != STT_FUNC
-                    || symbol[4] >> 4 != STB_GLOBAL
-                    || symbol[5] & 3 == STV_HIDDEN
-                    || read_u32(symbol, 0)? == 0
-                {
+                if symbol[4] & 0xf != STT_FUNC || read_u32(symbol, 0)? == 0 {
                     continue;
                 }
                 let section_index = usize::from(read_u16(symbol, 6)?);
@@ -604,26 +292,18 @@ impl<'a> DeviceElf<'a> {
         Ok(DeviceKernel { summary, bytes })
     }
 
-    pub fn project_kernel(
-        &self,
-        name: &str,
-        bin_align_base_addr: u64,
-    ) -> Result<ProjectedDeviceKernel<'a>, DeviceElfError> {
+    pub fn loadable_kernel(&self, name: &str) -> Result<DeviceKernelSummary, DeviceElfError> {
         let image = self.load_image()?;
         let kernel = self.kernel(name)?;
-        let entry_address = kernel
-            .summary
-            .function_device_address(bin_align_base_addr)?;
-        if !entry_address.is_multiple_of(4) {
-            return Err(DeviceElfError::UnalignedInstructionAddress(entry_address));
+        if !kernel.summary.virtual_address.is_multiple_of(4) {
+            return Err(DeviceElfError::UnalignedInstructionAddress(
+                kernel.summary.virtual_address,
+            ));
         }
-        entry_address
-            .checked_add(kernel.summary.byte_count)
-            .ok_or(DeviceElfError::RuntimeAddressOverflow)?;
         let image_relative_file_offset = kernel
             .summary
             .file_offset
-            .checked_sub(image.summary.file_offset)
+            .checked_sub(image.file_offset)
             .ok_or(DeviceElfError::NonlinearKernelCopyMapping)?;
         if image_relative_file_offset != kernel.summary.virtual_address {
             return Err(DeviceElfError::NonlinearKernelCopyMapping);
@@ -631,36 +311,24 @@ impl<'a> DeviceElf<'a> {
         let section_relative_file_offset = kernel
             .summary
             .section_file_offset
-            .checked_sub(image.summary.file_offset)
+            .checked_sub(image.file_offset)
             .ok_or(DeviceElfError::NonlinearKernelCopyMapping)?;
         if section_relative_file_offset != kernel.summary.section_virtual_address {
             return Err(DeviceElfError::NonlinearKernelCopyMapping);
         }
-        let executable_bytes = checked_slice(
+        checked_slice(
             image.bytes,
             section_relative_file_offset,
             kernel.summary.section_byte_count,
         )
         .map_err(|_| DeviceElfError::KernelOutsideLoadImage)?;
-        let executable_start_address = bin_align_base_addr
-            .checked_add(kernel.summary.section_virtual_address)
-            .ok_or(DeviceElfError::RuntimeAddressOverflow)?;
-        executable_start_address
-            .checked_add(kernel.summary.section_byte_count)
-            .ok_or(DeviceElfError::RuntimeAddressOverflow)?;
-        let bytes = checked_slice(
+        checked_slice(
             image.bytes,
             image_relative_file_offset,
             kernel.summary.byte_count,
         )
         .map_err(|_| DeviceElfError::KernelOutsideLoadImage)?;
-        Ok(ProjectedDeviceKernel {
-            summary: kernel.summary,
-            entry_address,
-            executable_start_address,
-            bytes,
-            executable_bytes,
-        })
+        Ok(kernel.summary)
     }
 }
 
@@ -684,34 +352,16 @@ pub enum DeviceElfError {
     InvalidStringTable,
     #[error("ELF symbol table is malformed")]
     InvalidSymbolTable,
-    #[error("ELF .ascend.meta address TLV is malformed")]
-    InvalidAddressMeta,
-    #[error("global symbol {0} cannot be safely mapped into the copied image")]
-    InvalidGlobalSymbolRange(&'static str),
-    #[error("global symbol {0} occurs more than once in the selected symbol table")]
-    DuplicateGlobalSymbol(&'static str),
-    #[error("global-address patch sites overlap in the copied image")]
-    OverlappingGlobalPatches,
-    #[error("device address for global symbol {0} was not supplied")]
-    MissingGlobalAddress(&'static str),
     #[error("ELF function symbol is outside its executable section")]
     InvalidKernelRange,
-    #[error("aligned device code base {0:#x} is not 4 KiB aligned")]
-    UnalignedCodeBase(u64),
-    #[error("ELF function offset {0:#x} does not fit the runtime's 32-bit kernel field")]
-    UnsupportedRuntimeKernelOffset(u64),
     #[error("device function address overflows 64 bits")]
-    RuntimeAddressOverflow,
+    DeviceAddressOverflow,
     #[error("kernel symbol does not map linearly into the copied device image")]
     NonlinearKernelCopyMapping,
     #[error("kernel symbol bytes fall outside the copied device image")]
     KernelOutsideLoadImage,
     #[error("device instruction address {0:#x} is not four-byte aligned")]
     UnalignedInstructionAddress(u64),
-    #[error("device instruction address {0:#x} is outside the selected kernel")]
-    InstructionOutsideKernel(u64),
-    #[error("device instruction address {0:#x} is outside the executable section")]
-    InstructionOutsideExecutableSection(u64),
     #[error("device ELF has no nonempty SHF_ALLOC section to load")]
     NoLoadImage,
     #[error("SHF_ALLOC sections are not ordered by increasing file span")]
@@ -859,153 +509,6 @@ mod tests {
         bytes
     }
 
-    fn address_meta_fixture() -> Vec<u8> {
-        let mut bytes = fixture();
-        bytes.resize(0x500, 0);
-        put_u16(&mut bytes, 60, 7);
-        put_u64(
-            &mut bytes,
-            0x200 + SECTION_HEADER_SIZE + 8,
-            SHF_ALLOC | SHF_EXECINSTR,
-        );
-        let names = b"\0.text\0.symtab\0.shstrtab\0.strtab\0.ascend.meta\0";
-        bytes[0x110..0x110 + names.len()].copy_from_slice(names);
-        section(&mut bytes, 3, 15, SHT_STRTAB, 0x110, names.len() as u64);
-        section(&mut bytes, 5, 0, SHT_PROGBITS, 0x140, 8);
-        put_u64(&mut bytes, 0x200 + 5 * SECTION_HEADER_SIZE + 8, SHF_ALLOC);
-        put_u64(&mut bytes, 0x200 + 5 * SECTION_HEADER_SIZE + 16, 0x40);
-        let meta_name = names
-            .windows(b".ascend.meta".len())
-            .position(|window| window == b".ascend.meta")
-            .unwrap();
-        section(&mut bytes, 6, meta_name as u32, SHT_NOTE, 0x150, 8);
-        put_u16(&mut bytes, 0x150, 4);
-        put_u16(&mut bytes, 0x152, 4);
-        put_u32(&mut bytes, 0x154, 2);
-        section(&mut bytes, 2, 7, SHT_SYMTAB, 0x180, 3 * SYMBOL_SIZE as u64);
-        put_u32(&mut bytes, 0x200 + 2 * SECTION_HEADER_SIZE + 40, 4);
-        put_u64(
-            &mut bytes,
-            0x200 + 2 * SECTION_HEADER_SIZE + 56,
-            SYMBOL_SIZE as u64,
-        );
-        let strings = b"\0Kernel\0g_sysFftsAddr\0";
-        bytes[0x1d0..0x1d0 + strings.len()].copy_from_slice(strings);
-        section(&mut bytes, 4, 25, SHT_STRTAB, 0x1d0, strings.len() as u64);
-        let object = 0x180 + 2 * SYMBOL_SIZE;
-        put_u32(&mut bytes, object, 8);
-        bytes[object + 4] = 0x11;
-        put_u16(&mut bytes, object + 6, 5);
-        put_u64(&mut bytes, object + 8, 0x40);
-        put_u64(&mut bytes, object + 16, 8);
-        bytes
-    }
-
-    #[test]
-    fn prepares_flagged_object_symbol_from_exact_binary_meta_tlv() {
-        let bytes = address_meta_fixture();
-        let elf = DeviceElf::parse(&bytes).unwrap();
-        assert_eq!(elf.address_meta_flags(), Ok(2));
-        assert_eq!(
-            elf.global_patch_sites(),
-            Ok(vec![DeviceGlobalPatchSite {
-                symbol: DeviceGlobalSymbol::FftsAddress,
-                file_offset: 0x140,
-                image_offset: 0x40,
-            }])
-        );
-        let prepared = elf
-            .prepare_load_image(DeviceGlobalAddresses {
-                ffts_address: Some(0x1122_3344_5566_7788),
-                ..DeviceGlobalAddresses::default()
-            })
-            .unwrap();
-        assert_eq!(prepared.summary.file_offset, 0x100);
-        assert_eq!(prepared.summary.byte_count, 0x48);
-        assert_eq!(prepared.address_meta_flags, 2);
-        assert_eq!(
-            &prepared.bytes[0x40..0x48],
-            &0x1122_3344_5566_7788u64.to_le_bytes()
-        );
-        assert_eq!(&bytes[0x140..0x148], &[0; 8]);
-    }
-
-    #[test]
-    fn address_refresh_requires_values_only_for_flagged_present_symbols() {
-        let mut bytes = address_meta_fixture();
-        let elf = DeviceElf::parse(&bytes).unwrap();
-        assert_eq!(
-            elf.prepare_load_image(DeviceGlobalAddresses::default()),
-            Err(DeviceElfError::MissingGlobalAddress("g_sysFftsAddr"))
-        );
-
-        put_u32(&mut bytes, 0x200 + 6 * SECTION_HEADER_SIZE, 0);
-        let elf = DeviceElf::parse(&bytes).unwrap();
-        assert_eq!(elf.address_meta_flags(), Ok(0));
-        assert_eq!(elf.global_patch_sites(), Ok(vec![]));
-        assert_eq!(
-            elf.prepare_load_image(DeviceGlobalAddresses::default())
-                .unwrap()
-                .bytes,
-            elf.load_image().unwrap().bytes
-        );
-    }
-
-    #[test]
-    fn all_four_binary_address_tlv_values_enable_distinct_bits() {
-        let mut bytes = address_meta_fixture();
-        put_u64(&mut bytes, 0x200 + 6 * SECTION_HEADER_SIZE + 32, 32);
-        for (index, value) in [1, 2, 3, 4].into_iter().enumerate() {
-            let offset = 0x150 + index * 8;
-            put_u16(&mut bytes, offset, 4);
-            put_u16(&mut bytes, offset + 2, 4);
-            put_u32(&mut bytes, offset + 4, value);
-        }
-        let elf = DeviceElf::parse(&bytes).unwrap();
-        assert_eq!(elf.address_meta_flags(), Ok(0xf));
-        assert_eq!(elf.global_patch_sites().unwrap().len(), 1);
-
-        let object = 0x180 + 2 * SYMBOL_SIZE;
-        bytes[object + 4] = 0x12;
-        assert_eq!(
-            DeviceElf::parse(&bytes).unwrap().global_patch_sites(),
-            Ok(vec![])
-        );
-    }
-
-    #[test]
-    fn address_refresh_rejects_malformed_tlv_symbol_target_and_duplicates() {
-        let mut bytes = address_meta_fixture();
-        put_u16(&mut bytes, 0x152, 9);
-        assert_eq!(
-            DeviceElf::parse(&bytes).unwrap().address_meta_flags(),
-            Err(DeviceElfError::InvalidAddressMeta)
-        );
-        put_u16(&mut bytes, 0x152, 4);
-        let object = 0x180 + 2 * SYMBOL_SIZE;
-        put_u16(&mut bytes, object + 6, 4);
-        assert_eq!(
-            DeviceElf::parse(&bytes).unwrap().global_patch_sites(),
-            Err(DeviceElfError::InvalidGlobalSymbolRange("g_sysFftsAddr"))
-        );
-        put_u16(&mut bytes, object + 6, 5);
-        let first = 0x180 + SYMBOL_SIZE;
-        bytes[first + 4] = 0x11;
-        put_u16(&mut bytes, first + 6, u16::MAX);
-        assert_eq!(
-            DeviceElf::parse(&bytes).unwrap().global_patch_sites(),
-            Err(DeviceElfError::InvalidSymbolTable)
-        );
-        put_u32(&mut bytes, first, 8);
-        put_u16(&mut bytes, first + 6, 5);
-        put_u64(&mut bytes, first + 8, 0x40);
-        put_u64(&mut bytes, first + 16, 8);
-        assert_eq!(
-            DeviceElf::parse(&bytes).unwrap().global_patch_sites(),
-            Err(DeviceElfError::DuplicateGlobalSymbol("g_sysFftsAddr"))
-        );
-    }
-
     #[test]
     fn extracts_function_bytes_and_little_endian_words() {
         let bytes = fixture();
@@ -1016,10 +519,7 @@ mod tests {
         assert_eq!(kernel.summary.section, ".text");
         assert_eq!(kernel.summary.file_offset, 0x100);
         assert_eq!(kernel.bytes, &[1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(
-            kernel.summary.function_device_address(0x1000).unwrap(),
-            0x1000
-        );
+        assert_eq!(kernel.summary.device_address(0x1000).unwrap(), 0x1000);
         assert_eq!(
             kernel.words().collect::<Vec<_>>(),
             vec![(0, 0x04030201), (4, 0x08070605)]
@@ -1027,33 +527,24 @@ mod tests {
     }
 
     #[test]
-    fn matches_runtime_global_non_hidden_function_filter() {
+    fn accepts_named_function_symbols_regardless_of_binding_or_visibility() {
         let mut bytes = fixture();
         let symbol = 0x180 + SYMBOL_SIZE;
         bytes[symbol + 4] = 0x02;
-        assert!(
-            DeviceElf::parse(&bytes)
-                .unwrap()
-                .kernels()
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            DeviceElf::parse(&bytes).unwrap().kernels().unwrap().len(),
+            1
         );
         bytes[symbol + 4] = 0x22;
-        assert!(
-            DeviceElf::parse(&bytes)
-                .unwrap()
-                .kernels()
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            DeviceElf::parse(&bytes).unwrap().kernels().unwrap().len(),
+            1
         );
         bytes[symbol + 4] = 0x12;
-        bytes[symbol + 5] = STV_HIDDEN;
-        assert!(
-            DeviceElf::parse(&bytes)
-                .unwrap()
-                .kernels()
-                .unwrap()
-                .is_empty()
+        bytes[symbol + 5] = 2;
+        assert_eq!(
+            DeviceElf::parse(&bytes).unwrap().kernels().unwrap().len(),
+            1
         );
         bytes[symbol + 5] = 3;
         assert_eq!(
@@ -1071,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn computes_only_bounded_runtime_function_addresses() {
+    fn computes_bounded_device_addresses_without_runtime_field_limits() {
         let bytes = fixture();
         let mut kernel = DeviceElf::parse(&bytes)
             .unwrap()
@@ -1079,59 +570,13 @@ mod tests {
             .unwrap()
             .remove(0);
         kernel.virtual_address = 0x1234;
-        assert_eq!(kernel.function_device_address(0x2000).unwrap(), 0x3234);
-        assert_eq!(
-            kernel.function_device_address(0x2001),
-            Err(DeviceElfError::UnalignedCodeBase(0x2001))
-        );
+        assert_eq!(kernel.device_address(0x2000).unwrap(), 0x3234);
         kernel.virtual_address = u64::from(u32::MAX) + 1;
-        assert_eq!(
-            kernel.function_device_address(0x2000),
-            Err(DeviceElfError::UnsupportedRuntimeKernelOffset(
-                0x1_0000_0000
-            ))
-        );
+        assert_eq!(kernel.device_address(0x2000), Ok(0x1_0000_2000));
         kernel.virtual_address = 0x1000;
         assert_eq!(
-            kernel.function_device_address(u64::MAX - 4095),
-            Err(DeviceElfError::RuntimeAddressOverflow)
-        );
-    }
-
-    #[test]
-    fn projected_copy_bytes_feed_the_existing_scalar_execution_island() {
-        let mut bytes = fixture();
-        put_u64(
-            &mut bytes,
-            0x200 + SECTION_HEADER_SIZE + 8,
-            SHF_ALLOC | SHF_EXECINSTR,
-        );
-        put_u32(&mut bytes, 0x100, 0x073a_7f80);
-        put_u32(&mut bytes, 0x104, 0x077b_0010);
-        let elf = DeviceElf::parse(&bytes).unwrap();
-        let projected = elf.project_kernel("Kernel", 0x1000).unwrap();
-        assert_eq!(projected.entry_address, 0x1000);
-        assert_eq!(projected.fetch_word(0x1000), Ok(0x073a_7f80));
-        assert_eq!(projected.fetch_word(0x1004), Ok(0x077b_0010));
-
-        let mut machine = ScalarMachine::new(Architecture::Dav2201, [0; 32], 0);
-        for pc in [0x1000, 0x1004] {
-            machine
-                .execute_word(pc, projected.fetch_word(pc).unwrap())
-                .unwrap();
-        }
-        assert_eq!(machine.xregs()[29], 0x10_7f80);
-        assert_eq!(
-            projected.fetch_word(0x0ffc),
-            Err(DeviceElfError::InstructionOutsideKernel(0x0ffc))
-        );
-        assert_eq!(
-            projected.fetch_word(0x1001),
-            Err(DeviceElfError::UnalignedInstructionAddress(0x1001))
-        );
-        assert_eq!(
-            projected.fetch_word(0x1008),
-            Err(DeviceElfError::InstructionOutsideKernel(0x1008))
+            kernel.device_address(u64::MAX - 4095),
+            Err(DeviceElfError::DeviceAddressOverflow)
         );
     }
 
@@ -1148,64 +593,39 @@ mod tests {
             put_u32(&mut bytes, 0x100, 0x073a_7f80);
             put_u32(&mut bytes, 0x104, 0x077b_0010);
             put_u32(&mut bytes, 0x108, 0xc200_001d);
-            put_u32(&mut bytes, 0x110, 0xaabb_ccdd);
             let elf = DeviceElf::parse(&bytes).unwrap();
-            let projected = elf.project_kernel("Kernel", 0x1000).unwrap();
-            assert_eq!(projected.fetch_executable_word(0x1008), Ok(0xc200_001d));
-            assert_eq!(
-                projected.fetch_word(0x1008),
-                Err(DeviceElfError::InstructionOutsideKernel(0x1008))
-            );
             let mut memory = HbmPvMemory::new(architecture, 0, 3);
-            let loaded = load_named_kernel(
-                &mut memory,
-                &elf,
-                "Kernel",
-                DeviceGlobalAddresses::default(),
-            )
-            .unwrap();
+            let loaded = load_named_kernel(&mut memory, &elf, "Kernel").unwrap();
             let pc = loaded.entry_address();
             assert_eq!(loaded.kernel().name, "Kernel");
             assert_eq!(loaded.placement().aligned_code_address, pc);
-            assert_eq!(loaded.fetch_word(&mut memory, pc), Ok(0x073a_7f80));
-            assert_eq!(loaded.fetch_word(&mut memory, pc + 4), Ok(0x077b_0010));
+            assert_eq!(
+                loaded.fetch_executable_word(&mut memory, pc),
+                Ok(0x073a_7f80)
+            );
+            assert_eq!(
+                loaded.fetch_executable_word(&mut memory, pc + 4),
+                Ok(0x077b_0010)
+            );
             assert_eq!(loaded.executable_start_address(), pc);
             assert_eq!(
                 loaded.fetch_executable_word(&mut memory, pc + 8),
                 Ok(0xc200_001d)
             );
             assert_eq!(
-                loaded.fetch_word(&mut memory, pc + 1),
+                loaded.fetch_executable_word(&mut memory, pc + 1),
                 Err(DeviceKernelFetchError::UnalignedPc(pc + 1))
-            );
-            assert_eq!(
-                loaded.fetch_word(&mut memory, pc + 8),
-                Err(DeviceKernelFetchError::OutsideKernel(pc + 8))
             );
             assert_eq!(
                 loaded.fetch_executable_word(&mut memory, pc + 20),
                 Err(DeviceKernelFetchError::OutsideExecutableSection(pc + 20))
             );
-            let window = loaded.fetch_window(&mut memory, pc + 16).unwrap();
-            assert_eq!(window.pc, pc + 16);
-            assert_eq!(window.requested_bytes, 16);
-            assert_eq!(window.copied_image_bytes, 4);
-            assert_eq!(&window.bytes[..4], &0xaabb_ccdd_u32.to_le_bytes());
-            assert_eq!(&window.bytes[4..], &[0; 12]);
-            memory.host_to_device(pc + 20, &[0x5a]).unwrap();
-            let window = loaded.fetch_window(&mut memory, pc + 16).unwrap();
-            assert_eq!(window.copied_image_bytes, 4);
-            assert_eq!(window.bytes[4], 0x5a);
-            let window = loaded.fetch_window(&mut memory, pc + 4).unwrap();
-            assert_eq!(window.requested_bytes, 12);
-            assert_eq!(window.copied_image_bytes, 12);
-            assert_eq!(&window.bytes[..4], &0x077b_0010_u32.to_le_bytes());
             memory
                 .host_to_device(pc, &0x0200_4880_u32.to_le_bytes())
                 .unwrap();
             let mut scalar = ScalarMachine::new(architecture, [0; 32], 0);
             scalar.set_spr_value(4, 0x1022_be00).unwrap();
-            let word = loaded.fetch_word(&mut memory, pc).unwrap();
+            let word = loaded.fetch_executable_word(&mut memory, pc).unwrap();
             let step = scalar.execute_spr_read_word(pc, word).unwrap();
             assert_eq!(step.value, 0x1022_be00);
             assert_eq!(scalar.xregs()[0], 0x1022_be00);
@@ -1233,7 +653,10 @@ mod tests {
             memory
                 .host_to_device(pc + 4, &0x0102_0304_u32.to_le_bytes())
                 .unwrap();
-            assert_eq!(loaded.fetch_word(&mut memory, pc + 4), Ok(0x0102_0304));
+            assert_eq!(
+                loaded.fetch_executable_word(&mut memory, pc + 4),
+                Ok(0x0102_0304)
+            );
 
             let other_architecture = match architecture {
                 Architecture::Dav2201 => Architecture::Dav3510,
@@ -1241,7 +664,7 @@ mod tests {
             };
             let mut wrong_memory = HbmPvMemory::new(other_architecture, 0, 1);
             assert_eq!(
-                loaded.fetch_word(&mut wrong_memory, pc),
+                loaded.fetch_executable_word(&mut wrong_memory, pc),
                 Err(DeviceKernelFetchError::ArchitectureMismatch)
             );
         }
@@ -1259,12 +682,7 @@ mod tests {
         let architecture = Architecture::Dav2201;
         let mut memory = HbmPvMemory::new(architecture, 0, 1);
         assert!(matches!(
-            load_named_kernel(
-                &mut memory,
-                &elf,
-                "Missing",
-                DeviceGlobalAddresses::default(),
-            ),
+            load_named_kernel(&mut memory, &elf, "Missing"),
             Err(DeviceKernelLoadError::Elf(DeviceElfError::KernelNotFound(
                 _
             )))
@@ -1274,12 +692,10 @@ mod tests {
     }
 
     #[test]
-    fn projection_rejects_a_symbol_that_does_not_match_the_copied_layout() {
+    fn loadable_kernel_rejects_a_symbol_that_does_not_match_the_image() {
         let mut bytes = fixture();
         assert_eq!(
-            DeviceElf::parse(&bytes)
-                .unwrap()
-                .project_kernel("Kernel", 0x1000),
+            DeviceElf::parse(&bytes).unwrap().loadable_kernel("Kernel"),
             Err(DeviceElfError::NoLoadImage)
         );
 
@@ -1291,9 +707,7 @@ mod tests {
         put_u64(&mut bytes, 0x200 + SECTION_HEADER_SIZE + 16, 0x100);
         put_u64(&mut bytes, 0x180 + SYMBOL_SIZE + 8, 0x100);
         assert_eq!(
-            DeviceElf::parse(&bytes)
-                .unwrap()
-                .project_kernel("Kernel", 0x1000),
+            DeviceElf::parse(&bytes).unwrap().loadable_kernel("Kernel"),
             Err(DeviceElfError::NonlinearKernelCopyMapping)
         );
 
@@ -1301,10 +715,8 @@ mod tests {
         put_u64(&mut bytes, 0x180 + SYMBOL_SIZE + 8, 1);
         put_u64(&mut bytes, 0x180 + SYMBOL_SIZE + 16, 4);
         assert_eq!(
-            DeviceElf::parse(&bytes)
-                .unwrap()
-                .project_kernel("Kernel", 0x1000),
-            Err(DeviceElfError::UnalignedInstructionAddress(0x1001))
+            DeviceElf::parse(&bytes).unwrap().loadable_kernel("Kernel"),
+            Err(DeviceElfError::UnalignedInstructionAddress(1))
         );
     }
 
@@ -1323,11 +735,8 @@ mod tests {
 
         let elf = DeviceElf::parse(&bytes).unwrap();
         let image = elf.load_image().unwrap();
-        assert_eq!(image.summary.file_offset, 0x100);
-        assert_eq!(image.summary.byte_count, 0x44);
-        assert_eq!(image.summary.first_alloc_section, ".text");
-        assert_eq!(image.summary.last_alloc_section, "");
-        assert_eq!(image.summary.alloc_section_count, 2);
+        assert_eq!(image.file_offset, 0x100);
+        assert_eq!(image.bytes.len(), 0x44);
         assert_eq!(&image.bytes[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(&image.bytes[0x40..], &[9, 10, 11, 12]);
     }

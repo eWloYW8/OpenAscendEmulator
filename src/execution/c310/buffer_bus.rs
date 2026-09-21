@@ -1,21 +1,20 @@
-use crate::execution::buffer_c310::{
+use crate::execution::c310::buffer::{
     C310BufferAdmissionState, C310BufferCounterError, C310BufferDisposition, C310GetBufAdmission,
     C310GetBufDispatch, C310ReleaseAdmission,
 };
+use crate::execution::c310::predicate_buffer::{C310PushPbDisposition, C310PushPbStep};
+use crate::execution::c310::vector_queue::{C310VfQueueDisposition, C310VfQueueStep};
 use crate::execution::machine::ScalarMemoryBus;
-use crate::execution::predicate_buffer_c310::{C310PushPbDisposition, C310PushPbStep};
-use crate::execution::vec_queue_c310::{C310VfQueueDisposition, C310VfQueueStep};
 use crate::instruction::flow::{
     BufferOperation, C310BufferStep, DcciStep, DsbStep, PipelineBarrierStep,
 };
-use serde::Serialize;
 use thiserror::Error;
 
 pub trait C310BufferPipeSink {
     fn try_enqueue(&mut self, pipe_code: u8, step: C310BufferStep) -> bool;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C310BufferAdmissionRoute {
     DirectGet(C310GetBufDispatch),
     QueuedGet(C310GetBufDispatch),
@@ -23,7 +22,7 @@ pub enum C310BufferAdmissionRoute {
     NoPipeRelease,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C310BufferAdmissionRecord {
     pub step: C310BufferStep,
     pub route: C310BufferAdmissionRoute,

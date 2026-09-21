@@ -1,7 +1,6 @@
 use thiserror::Error;
 
 use crate::device::architecture::Architecture;
-use crate::execution::machine::ScalarMemoryBus;
 use crate::memory::hbm::{HbmAllocationError, HbmAllocator, HbmResolveError};
 use crate::memory::pv_memory::{PvMemory, PvMemoryError};
 
@@ -13,24 +12,6 @@ pub enum HbmPvMemoryError {
     Resolve(#[from] HbmResolveError),
     #[error(transparent)]
     Store(#[from] PvMemoryError),
-}
-
-impl ScalarMemoryBus for HbmPvMemory {
-    type Error = HbmPvMemoryError;
-
-    fn read(&mut self, address: u64, destination: &mut [u8]) -> Result<(), Self::Error> {
-        if destination.is_empty() {
-            return Ok(());
-        }
-        self.device_to_host(address, destination)
-    }
-
-    fn write(&mut self, address: u64, source: &[u8]) -> Result<(), Self::Error> {
-        if source.is_empty() {
-            return Ok(());
-        }
-        self.host_to_device(address, source)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,28 +84,12 @@ impl HbmPvMemory {
         self.store.read_into(device_address, destination)?;
         Ok(())
     }
-
-    pub fn device_to_device(
-        &mut self,
-        destination_address: u64,
-        source_address: u64,
-        length: usize,
-    ) -> Result<(), HbmPvMemoryError> {
-        if length == 0 {
-            return Ok(());
-        }
-        self.allocator.resolve_live(source_address, length as u64)?;
-        self.allocator
-            .resolve_live(destination_address, length as u64)?;
-        self.store
-            .copy(destination_address, source_address, length)?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::machine::ScalarMemoryBus;
 
     #[test]
     fn scalar_bus_uses_one_live_hbm_allocation() {
@@ -158,8 +123,6 @@ mod tests {
             let mut result = [0; 5];
             memory.device_to_host(pointer + 2, &mut result).unwrap();
             assert_eq!(result, [0xa5, 1, 2, 3, 0xa5]);
-            assert_eq!(memory.store().dirty_byte(pointer + 2), Some(0));
-            assert_eq!(memory.store().dirty_byte(pointer + 3), Some(1));
         }
     }
 
@@ -176,33 +139,26 @@ mod tests {
     }
 
     #[test]
-    fn host_copies_require_live_allocations() {
+    fn host_transfers_require_live_allocations() {
         for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
             let mut memory = HbmPvMemory::new(architecture, 0, 1);
             let first = memory.allocate(64).unwrap();
-            let second = memory.allocate(64).unwrap();
-            assert_eq!(second, first + 64);
             let pattern: [u8; 16] = [
                 0x01, 0x80, 0x00, 0xff, 0x5a, 0xa5, 0x12, 0x34, 0xde, 0xad, 0xbe, 0xef, 0x7f, 0x20,
                 0x09, 0xc3,
             ];
             memory.host_to_device(first + 3, &pattern).unwrap();
-            memory.device_to_device(second + 5, first + 3, 16).unwrap();
             let mut result = [0; 16];
-            memory.device_to_host(second + 5, &mut result).unwrap();
+            memory.device_to_host(first + 3, &mut result).unwrap();
             assert_eq!(result, pattern);
 
-            memory.free(second).unwrap();
+            memory.free(first).unwrap();
             assert!(matches!(
-                memory.device_to_host(second + 5, &mut result),
+                memory.device_to_host(first + 3, &mut result),
                 Err(HbmPvMemoryError::Resolve(HbmResolveError::Unmapped { .. }))
             ));
             assert!(matches!(
-                memory.host_to_device(second + 5, &pattern),
-                Err(HbmPvMemoryError::Resolve(HbmResolveError::Unmapped { .. }))
-            ));
-            assert!(matches!(
-                memory.device_to_device(second + 5, first + 3, 16),
+                memory.host_to_device(first + 3, &pattern),
                 Err(HbmPvMemoryError::Resolve(HbmResolveError::Unmapped { .. }))
             ));
         }
