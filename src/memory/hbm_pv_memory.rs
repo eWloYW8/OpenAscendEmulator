@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::device::architecture::Architecture;
+use crate::architecture::Architecture;
 use crate::memory::hbm::{HbmAllocationError, HbmAllocator, HbmResolveError};
 use crate::memory::pv_memory::{PvMemory, PvMemoryError};
 
@@ -89,7 +89,7 @@ impl HbmPvMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::machine::ScalarMemoryBus;
+    use crate::sim::machine::ScalarMemoryBus;
 
     #[test]
     fn scalar_bus_uses_one_live_hbm_allocation() {

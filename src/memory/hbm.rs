@@ -1,4 +1,4 @@
-use crate::device::architecture::Architecture;
+use crate::architecture::Architecture;
 use thiserror::Error;
 
 pub const DEFAULT_HBM_BASE: u64 = 0x1000_0000;

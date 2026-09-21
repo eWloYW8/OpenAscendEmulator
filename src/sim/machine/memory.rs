@@ -1,0 +1,313 @@
+use super::*;
+
+impl ScalarMachine {
+    pub fn execute_memory_word<B: ScalarMemoryBus>(
+        &mut self,
+        pc: u64,
+        word: u32,
+        bus: &mut B,
+    ) -> Result<ScalarMemoryStep, ScalarMemoryExecutionError<B::Error>> {
+        let Some(
+            hint @ AicDecoderHint::ScalarLoadStoreImmediate {
+                operation,
+                width_bytes,
+                data_register,
+                base_register,
+                post_index,
+                sign_extend,
+                ..
+            },
+        ) = AicDecoderHint::from_word(self.architecture, word)
+        else {
+            return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
+        };
+        if post_index
+            && matches!(operation, ScalarLoadStoreOperation::Load)
+            && data_register == base_register
+        {
+            return Err(ScalarMemoryExecutionError::AliasedPostIndex {
+                pc,
+                word,
+                register: data_register,
+            });
+        }
+        let prior_base_value = self.xregs[usize::from(base_register)];
+        let prior_data_value = self.xregs[usize::from(data_register)];
+        let effect = hint
+            .scalar_address_effect(prior_base_value)
+            .expect("the load/store hint has an address effect");
+        let width = usize::from(width_bytes);
+        let mut bytes = [0_u8; 8];
+        let sign_extension_requested = sign_extend == Some(true) && width_bytes < 8;
+        let data_value = match operation {
+            ScalarLoadStoreOperation::Load => {
+                bus.read(effect.effective_address, &mut bytes[..width])
+                    .map_err(ScalarMemoryExecutionError::Backend)?;
+                let raw = u64::from_le_bytes(bytes);
+                if sign_extension_requested {
+                    let bits = u32::from(width_bytes) * 8;
+                    (((raw << (64 - bits)) as i64) >> (64 - bits)) as u64
+                } else {
+                    raw
+                }
+            }
+            ScalarLoadStoreOperation::Store => {
+                bytes[..width].copy_from_slice(&prior_data_value.to_le_bytes()[..width]);
+                bus.write(effect.effective_address, &bytes[..width])
+                    .map_err(ScalarMemoryExecutionError::Backend)?;
+                prior_data_value
+            }
+        };
+        if matches!(operation, ScalarLoadStoreOperation::Load) {
+            self.xregs[usize::from(data_register)] = data_value;
+        }
+        if let Some(updated_base) = effect.updated_base {
+            self.xregs[usize::from(base_register)] = updated_base;
+        }
+        Ok(ScalarMemoryStep {
+            pc,
+            word,
+            operation,
+            effective_address: effect.effective_address,
+            width_bytes,
+            data_register,
+            prior_data_value,
+            data_value,
+            base_register,
+            prior_base_value,
+            updated_base: effect.updated_base,
+            bytes,
+            sign_extension_requested,
+        })
+    }
+
+    pub fn execute_indexed_load_word<B: ScalarMemoryBus>(
+        &mut self,
+        pc: u64,
+        word: u32,
+        bus: &mut B,
+    ) -> Result<ScalarIndexedLoadStep, ScalarMemoryExecutionError<B::Error>> {
+        let Some(AicDecoderHint::ScalarIndexedLoad {
+            width_bytes,
+            destination_register,
+            base_register,
+            offset_register,
+        }) = AicDecoderHint::from_word(self.architecture, word)
+        else {
+            return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
+        };
+        let base_value = self.xregs[usize::from(base_register)];
+        let offset_value = self.xregs[usize::from(offset_register)];
+        let effective_address = base_value.wrapping_add(offset_value * u64::from(width_bytes));
+        let mut bytes = [0_u8; 8];
+        bus.read(effective_address, &mut bytes[..usize::from(width_bytes)])
+            .map_err(ScalarMemoryExecutionError::Backend)?;
+        let value = u64::from_le_bytes(bytes);
+        let prior_destination_value = self.xregs[usize::from(destination_register)];
+        self.xregs[usize::from(destination_register)] = value;
+        Ok(ScalarIndexedLoadStep {
+            pc,
+            word,
+            effective_address,
+            width_bytes,
+            destination_register,
+            prior_destination_value,
+            value,
+            base_register,
+            base_value,
+            offset_register,
+            offset_value,
+            bytes,
+        })
+    }
+
+    pub fn execute_indexed_immediate_store_word<B: ScalarMemoryBus>(
+        &mut self,
+        pc: u64,
+        word: u32,
+        bus: &mut B,
+    ) -> Result<ScalarIndexedImmediateStoreStep, ScalarMemoryExecutionError<B::Error>> {
+        let Some(AicDecoderHint::ScalarIndexedImmediateStore {
+            width_bytes,
+            base_register,
+            offset_register,
+            value,
+        }) = AicDecoderHint::from_word(self.architecture, word)
+        else {
+            return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
+        };
+        let base_value = self.xregs[usize::from(base_register)];
+        let offset_value = self.xregs[usize::from(offset_register)];
+        let effective_address = base_value.wrapping_add(offset_value * u64::from(width_bytes));
+        let mut bytes = [0_u8; 8];
+        match value {
+            ScalarStoreImmediateValue::Zero => {}
+            ScalarStoreImmediateValue::One => bytes[0] = 1,
+            ScalarStoreImmediateValue::Ones => bytes.fill(0xff),
+        }
+        bus.write(effective_address, &bytes[..usize::from(width_bytes)])
+            .map_err(ScalarMemoryExecutionError::Backend)?;
+        Ok(ScalarIndexedImmediateStoreStep {
+            pc,
+            word,
+            effective_address,
+            width_bytes,
+            base_register,
+            base_value,
+            offset_register,
+            offset_value,
+            value,
+            bytes,
+        })
+    }
+
+    pub fn execute_immediate_store_word<B: ScalarMemoryBus>(
+        &mut self,
+        pc: u64,
+        word: u32,
+        bus: &mut B,
+    ) -> Result<ScalarImmediateStoreStep, ScalarMemoryExecutionError<B::Error>> {
+        let Some(AicDecoderHint::ScalarStoreImmediate {
+            width_bytes,
+            base_register,
+            signed_offset,
+            post_index: false,
+            value,
+            ..
+        }) = AicDecoderHint::from_word(self.architecture, word)
+        else {
+            return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
+        };
+        let prior_base_value = self.xregs[usize::from(base_register)];
+        let effective_address = prior_base_value.wrapping_add(signed_offset as i64 as u64);
+        let mut bytes = [0_u8; 8];
+        match value {
+            ScalarStoreImmediateValue::Zero => {}
+            ScalarStoreImmediateValue::One => bytes[0] = 1,
+            ScalarStoreImmediateValue::Ones => bytes.fill(0xff),
+        }
+        bus.write(effective_address, &bytes[..usize::from(width_bytes)])
+            .map_err(ScalarMemoryExecutionError::Backend)?;
+        Ok(ScalarImmediateStoreStep {
+            pc,
+            word,
+            effective_address,
+            width_bytes,
+            base_register,
+            prior_base_value,
+            value,
+            bytes,
+        })
+    }
+
+    pub fn execute_pair_load_word<B: ScalarMemoryBus>(
+        &mut self,
+        pc: u64,
+        word: u32,
+        bus: &mut B,
+    ) -> Result<ScalarPairLoadStep, ScalarMemoryExecutionError<B::Error>> {
+        let Some(AicDecoderHint::ScalarPairLoad {
+            width_bytes,
+            first_destination_register,
+            second_destination_register,
+            base_register,
+            signed_offset,
+            sign_extend,
+            ..
+        }) = AicDecoderHint::from_word(self.architecture, word)
+        else {
+            return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
+        };
+        let base_value = self.xregs[usize::from(base_register)];
+        let first_address = base_value.wrapping_add(signed_offset as i64 as u64);
+        let second_address = first_address.wrapping_add(u64::from(width_bytes));
+        let width = usize::from(width_bytes);
+        let mut first_bytes = [0_u8; 8];
+        let mut second_bytes = [0_u8; 8];
+        bus.read(first_address, &mut first_bytes[..width])
+            .map_err(ScalarMemoryExecutionError::Backend)?;
+        bus.read(second_address, &mut second_bytes[..width])
+            .map_err(ScalarMemoryExecutionError::Backend)?;
+        let decode = |bytes: [u8; 8]| {
+            let raw = u64::from_le_bytes(bytes);
+            if sign_extend && width_bytes < 8 {
+                let bits = u32::from(width_bytes) * 8;
+                (((raw << (64 - bits)) as i64) >> (64 - bits)) as u64
+            } else {
+                raw
+            }
+        };
+        let first_value = decode(first_bytes);
+        let second_value = decode(second_bytes);
+        let first_prior_value = self.xregs[usize::from(first_destination_register)];
+        let second_prior_value = self.xregs[usize::from(second_destination_register)];
+        self.xregs[usize::from(first_destination_register)] = first_value;
+        self.xregs[usize::from(second_destination_register)] = second_value;
+        Ok(ScalarPairLoadStep {
+            pc,
+            word,
+            first_address,
+            second_address,
+            width_bytes,
+            base_register,
+            base_value,
+            first_destination_register,
+            first_prior_value,
+            first_value,
+            first_bytes,
+            second_destination_register,
+            second_prior_value,
+            second_value,
+            second_bytes,
+            sign_extension_requested: sign_extend && width_bytes < 8,
+        })
+    }
+
+    pub fn execute_pair_store_word<B: ScalarMemoryBus>(
+        &mut self,
+        pc: u64,
+        word: u32,
+        bus: &mut B,
+    ) -> Result<ScalarPairStoreStep, ScalarMemoryExecutionError<B::Error>> {
+        let Some(AicDecoderHint::ScalarPairStore {
+            width_bytes,
+            first_source_register,
+            second_source_register,
+            base_register,
+            signed_offset,
+            ..
+        }) = AicDecoderHint::from_word(self.architecture, word)
+        else {
+            return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
+        };
+        let base_value = self.xregs[usize::from(base_register)];
+        let first_address = base_value.wrapping_add(signed_offset as i64 as u64);
+        let second_address = first_address.wrapping_add(u64::from(width_bytes));
+        let first_value = self.xregs[usize::from(first_source_register)];
+        let second_value = self.xregs[usize::from(second_source_register)];
+        let width = usize::from(width_bytes);
+        let mut first_bytes = [0_u8; 8];
+        let mut second_bytes = [0_u8; 8];
+        first_bytes[..width].copy_from_slice(&first_value.to_le_bytes()[..width]);
+        second_bytes[..width].copy_from_slice(&second_value.to_le_bytes()[..width]);
+        bus.write(first_address, &first_bytes[..width])
+            .map_err(ScalarMemoryExecutionError::Backend)?;
+        bus.write(second_address, &second_bytes[..width])
+            .map_err(ScalarMemoryExecutionError::Backend)?;
+        Ok(ScalarPairStoreStep {
+            pc,
+            word,
+            first_address,
+            second_address,
+            width_bytes,
+            base_register,
+            base_value,
+            first_source_register,
+            first_value,
+            first_bytes,
+            second_source_register,
+            second_value,
+            second_bytes,
+        })
+    }
+}

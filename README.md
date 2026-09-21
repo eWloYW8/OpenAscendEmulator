@@ -7,11 +7,11 @@ The current focus is the `dav_2201` core. Its loaded-program execution path
 connects scalar, selected vector, and memory-transfer instructions with an
 explicit MTE2 timeline. The 16- and 32-bit MOVEV paths decode register
 operands and respect active lanes; vector stores also report their UB bank
-placement. MOVEV and FP32 add/subtract/multiply/maximum/minimum use
+placement. MOVEV and FP32 add/subtract/multiply/divide/maximum/minimum use
 independently encoded per-block and per-repeat UB strides; count masks can
-cover multiple repeats with a final partial tile. FP32 VABS uses the unary
-stride layout and one UB read source. Its modeled vector execution stage takes
-five ticks.
+cover multiple repeats with a final partial tile. FP32 VABS and VRELU use the
+unary stride layout and one UB read source. Their modeled vector execution
+stages take 15 and 6 ticks, respectively.
 Vector execution exposes per-block UB write demand, bank-group writeback
 latency, and per-uop read/execute delays. The full-block writeback estimate
 splits writes at 32-byte UB boundaries and arbitrates bank and bank-group

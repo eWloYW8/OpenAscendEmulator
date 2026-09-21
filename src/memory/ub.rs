@@ -2,10 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
-use crate::instruction::c220::mte::{
-    C220DmaMovDescriptor, C220DmaMovError, C220MovOutToUbDescriptor, C220MovOutToUbError,
-};
-use crate::instruction::c310::mte::{C310MovAlignCoordinateError, C310MovAlignDecode};
 use crate::memory::mapped::{MappedMemory, MappedMemoryError};
 use crate::memory::sparse::MemoryByteState;
 
@@ -21,25 +17,10 @@ pub enum UbMemoryError {
     HostAllocationFailed { requested: usize },
     #[error("UB byte at {address:#x} is unknown")]
     UnknownByte { address: u64 },
-    #[error("UB transfer length is zero")]
-    ZeroTransferLength,
     #[error("UB transfer result size overflows usize")]
     ResultSizeOverflow,
-    #[error("MOV_ALIGN_V2 route {source_class}->{destination_class} is not HBM-to-UB")]
-    UnsupportedRoute {
-        source_class: u8,
-        destination_class: u8,
-    },
-    #[error(transparent)]
-    C220Descriptor(#[from] C220MovOutToUbError),
-    #[error(transparent)]
-    C220OutputDescriptor(#[from] C220DmaMovError),
-    #[error(transparent)]
-    C310Coordinates(#[from] C310MovAlignCoordinateError),
     #[error(transparent)]
     Source(MappedMemoryError),
-    #[error(transparent)]
-    Destination(#[from] MappedMemoryError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,11 +29,6 @@ pub struct UbTransferResult {
     pub bytes: usize,
     pub known_bytes: usize,
     pub unknown_bytes: usize,
-}
-
-pub struct C220PreparedOutput {
-    pub(crate) writes: Vec<(u64, Vec<MemoryByteState>)>,
-    pub result: UbTransferResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,104 +159,7 @@ impl UbMemory {
         self.write_states(destination_address, &states)
     }
 
-    pub fn copy_c220_mov_out_to_ub(
-        &mut self,
-        source: &MappedMemory,
-        descriptor: C220MovOutToUbDescriptor,
-        source_address: u64,
-        destination_address: u64,
-    ) -> Result<UbTransferResult, UbMemoryError> {
-        let segments = descriptor.segments(source_address, destination_address)?;
-        self.copy_segments(
-            source,
-            segments.into_iter().map(|segment| {
-                (
-                    segment.source_hbm,
-                    segment.destination_local,
-                    segment.bytes as usize,
-                )
-            }),
-        )
-    }
-
-    pub fn copy_c310_mov_align_hbm_to_ub(
-        &mut self,
-        source: &MappedMemory,
-        decoded: C310MovAlignDecode,
-    ) -> Result<UbTransferResult, UbMemoryError> {
-        if decoded.source_memory_class != 10 || decoded.destination_memory_class != 9 {
-            return Err(UbMemoryError::UnsupportedRoute {
-                source_class: decoded.source_memory_class,
-                destination_class: decoded.destination_memory_class,
-            });
-        }
-        if decoded.burst_bytes == 0 {
-            return Err(UbMemoryError::ZeroTransferLength);
-        }
-        let coordinates = decoded.parameters.coordinates()?;
-        self.copy_segments(
-            source,
-            coordinates.into_iter().map(|coordinate| {
-                (
-                    coordinate.source_address,
-                    coordinate.destination_address,
-                    decoded.burst_bytes as usize,
-                )
-            }),
-        )
-    }
-
-    pub fn copy_c220_mov_ub_to_hbm(
-        &self,
-        destination: &mut MappedMemory,
-        descriptor: C220DmaMovDescriptor,
-        source_address: u64,
-        destination_address: u64,
-    ) -> Result<UbTransferResult, UbMemoryError> {
-        let prepared =
-            self.prepare_c220_mov_ub_to_hbm(descriptor, source_address, destination_address)?;
-        destination.write_segments_at(&prepared.writes)?;
-        Ok(prepared.result)
-    }
-
-    pub fn prepare_c220_mov_ub_to_hbm(
-        &self,
-        descriptor: C220DmaMovDescriptor,
-        source_address: u64,
-        destination_address: u64,
-    ) -> Result<C220PreparedOutput, UbMemoryError> {
-        let segments = descriptor.segments(source_address, destination_address)?;
-        let bytes = segments
-            .len()
-            .checked_mul(32)
-            .ok_or(UbMemoryError::ResultSizeOverflow)?;
-        let mut writes = Vec::new();
-        writes.try_reserve_exact(segments.len()).map_err(|_| {
-            UbMemoryError::HostAllocationFailed {
-                requested: segments.len(),
-            }
-        })?;
-        let mut known_bytes = 0;
-        for segment in &segments {
-            let states = self.read_states(segment.source_local, segment.bytes as usize)?;
-            known_bytes += states
-                .iter()
-                .filter(|state| matches!(state, MemoryByteState::Known(_)))
-                .count();
-            writes.push((segment.destination_hbm, states));
-        }
-        Ok(C220PreparedOutput {
-            writes,
-            result: UbTransferResult {
-                segment_count: segments.len(),
-                bytes,
-                known_bytes,
-                unknown_bytes: bytes - known_bytes,
-            },
-        })
-    }
-
-    fn copy_segments(
+    pub(crate) fn copy_segments(
         &mut self,
         source: &MappedMemory,
         segments: impl Iterator<Item = (u64, u64, usize)>,
@@ -338,19 +217,23 @@ impl UbMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::architecture::Architecture;
-    use crate::instruction::c220::mte::{
+    use crate::architecture::Architecture;
+    use crate::isa::c220::mte::{
         C220DmaMovDescriptor, C220MovOutToUbDescriptor, CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,
         CAPTURED_C220_MOV_UB_TO_OUT_WORD, CAPTURED_C220_SUB_MOV_UB_TO_OUT_WORD,
         CAPTURED_C220_TILING_MOV_OUT_TO_UB_WORD,
     };
-    use crate::instruction::c310::mte::{
+    use crate::isa::c310::mte::{
         C310_TILING_MOV_ALIGN_WORD, C310MovAlignDecode, C310MovAlignRegisters,
     };
     use crate::memory::mapped::MappedMemory;
     use crate::memory::pv_memory::PvMemory;
     use crate::memory::region::MemoryRegion;
     use crate::memory::sparse::SparseMemory;
+    use crate::sim::c220::mte::transfer::{
+        C220TransferError, copy_c220_mov_out_to_ub, copy_c220_mov_ub_to_hbm,
+    };
+    use crate::sim::c310::transfer::{C310TransferError, copy_c310_mov_align_hbm_to_ub};
 
     fn tiling_space(tiling_pointer: u64) -> MappedMemory {
         let pointers = [0x2000_u64, tiling_pointer];
@@ -409,11 +292,10 @@ mod tests {
                     0x10010,
                 )
                 .unwrap();
-                ub.copy_c220_mov_out_to_ub(&hbm, descriptor, tiling_pointer, 0)
-                    .unwrap()
+                copy_c220_mov_out_to_ub(&mut ub, &hbm, descriptor, tiling_pointer, 0).unwrap()
             } else {
                 let decoded = c310_tiling_decode(tiling_pointer);
-                ub.copy_c310_mov_align_hbm_to_ub(&hbm, decoded).unwrap()
+                copy_c310_mov_align_hbm_to_ub(&mut ub, &hbm, decoded).unwrap()
             };
             assert_eq!(
                 result,
@@ -473,7 +355,7 @@ mod tests {
     fn multi_segment_copy_is_atomic_when_later_source_is_unmapped() {
         let hbm = input_space(0x3000, &[0x5a; 32]);
         let descriptor = C220MovOutToUbDescriptor::decode(
-            crate::instruction::c220::mte::CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,
+            crate::isa::c220::mte::CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,
             0x40010,
         )
         .unwrap();
@@ -481,8 +363,8 @@ mod tests {
         ub.write_states(0, &[MemoryByteState::Known(0xa5)]).unwrap();
         let before = ub.clone();
         assert!(matches!(
-            ub.copy_c220_mov_out_to_ub(&hbm, descriptor, 0x3000, 0),
-            Err(UbMemoryError::Source(_))
+            copy_c220_mov_out_to_ub(&mut ub, &hbm, descriptor, 0x3000, 0),
+            Err(C220TransferError::Ub(UbMemoryError::Source(_)))
         ));
         assert_eq!(ub, before);
 
@@ -490,8 +372,8 @@ mod tests {
         c310.parameters.burst_count = 2;
         c310.parameters.source_burst_stride = 32;
         assert!(matches!(
-            ub.copy_c310_mov_align_hbm_to_ub(&hbm, c310),
-            Err(UbMemoryError::Source(_))
+            copy_c310_mov_align_hbm_to_ub(&mut ub, &hbm, c310),
+            Err(C310TransferError::Ub(UbMemoryError::Source(_)))
         ));
         assert_eq!(ub, before);
     }
@@ -503,9 +385,7 @@ mod tests {
         let mut ub = UbMemory::new(512, 128);
         let c220 =
             C220MovOutToUbDescriptor::decode(CAPTURED_C220_MOV_OUT_TO_UB_X_WORD, 0x40010).unwrap();
-        let result = ub
-            .copy_c220_mov_out_to_ub(&hbm, c220, 0x3000, 0x80)
-            .unwrap();
+        let result = copy_c220_mov_out_to_ub(&mut ub, &hbm, c220, 0x3000, 0x80).unwrap();
         assert_eq!(
             result,
             UbTransferResult {
@@ -529,7 +409,7 @@ mod tests {
         .decode_hbm_to_ub(0x74ad_8bae)
         .unwrap();
         assert_eq!(
-            ub.copy_c310_mov_align_hbm_to_ub(&hbm, c310).unwrap(),
+            copy_c310_mov_align_hbm_to_ub(&mut ub, &hbm, c310).unwrap(),
             UbTransferResult {
                 segment_count: 1,
                 bytes: 128,
@@ -548,8 +428,8 @@ mod tests {
         decoded.destination_memory_class = 10;
         let mut ub = UbMemory::new(64, 32);
         assert_eq!(
-            ub.copy_c310_mov_align_hbm_to_ub(&hbm, decoded),
-            Err(UbMemoryError::UnsupportedRoute {
+            copy_c310_mov_align_hbm_to_ub(&mut ub, &hbm, decoded),
+            Err(C310TransferError::UnsupportedRoute {
                 source_class: 10,
                 destination_class: 10,
             })
@@ -558,8 +438,8 @@ mod tests {
         decoded.destination_memory_class = 9;
         decoded.burst_bytes = 0;
         assert_eq!(
-            ub.copy_c310_mov_align_hbm_to_ub(&hbm, decoded),
-            Err(UbMemoryError::ZeroTransferLength)
+            copy_c310_mov_align_hbm_to_ub(&mut ub, &hbm, decoded),
+            Err(C310TransferError::ZeroTransferLength)
         );
         assert_eq!(ub.tracked_bytes(), 0);
     }
@@ -586,8 +466,7 @@ mod tests {
             let descriptor = C220DmaMovDescriptor::decode(word, 0x40010).unwrap();
             let mut destination = output_regions();
             assert_eq!(
-                ub.copy_c220_mov_ub_to_hbm(&mut destination, descriptor, 0x100, 0x3000)
-                    .unwrap(),
+                copy_c220_mov_ub_to_hbm(&ub, &mut destination, descriptor, 0x100, 0x3000).unwrap(),
                 UbTransferResult {
                     segment_count: 4,
                     bytes: 128,
@@ -601,16 +480,16 @@ mod tests {
             malformed.burst_count = 2;
             let before = destination.read_states_at(0x3000, 128).unwrap();
             assert!(matches!(
-                ub.copy_c220_mov_ub_to_hbm(&mut destination, malformed, 0x100, 0x3000),
-                Err(UbMemoryError::C220OutputDescriptor(_))
+                copy_c220_mov_ub_to_hbm(&ub, &mut destination, malformed, 0x100, 0x3000),
+                Err(C220TransferError::OutputDescriptor(_))
             ));
             assert_eq!(destination.read_states_at(0x3000, 128).unwrap(), before);
 
             let mut outside = output_regions();
             let before = outside.read_states_at(0x3000, 128).unwrap();
             assert!(matches!(
-                ub.copy_c220_mov_ub_to_hbm(&mut outside, descriptor, 0x100, 0x3001),
-                Err(UbMemoryError::Destination(_))
+                copy_c220_mov_ub_to_hbm(&ub, &mut outside, descriptor, 0x100, 0x3001),
+                Err(C220TransferError::Destination(_))
             ));
             assert_eq!(outside.read_states_at(0x3000, 128).unwrap(), before);
         }
@@ -619,9 +498,8 @@ mod tests {
         let descriptor =
             C220DmaMovDescriptor::decode(CAPTURED_C220_MOV_UB_TO_OUT_WORD, 0x40010).unwrap();
         let mut destination = output_regions();
-        let result = ub
-            .copy_c220_mov_ub_to_hbm(&mut destination, descriptor, 0x100, 0x3000)
-            .unwrap();
+        let result =
+            copy_c220_mov_ub_to_hbm(&ub, &mut destination, descriptor, 0x100, 0x3000).unwrap();
         assert_eq!(result.known_bytes, 127);
         assert_eq!(result.unknown_bytes, 1);
         assert_eq!(
@@ -638,8 +516,7 @@ mod tests {
         let input =
             C220MovOutToUbDescriptor::decode(CAPTURED_C220_MOV_OUT_TO_UB_X_WORD, xm).unwrap();
         let mut ub = UbMemory::new(512, 32);
-        ub.copy_c220_mov_out_to_ub(&source, input, 0x4000, 0x80)
-            .unwrap();
+        copy_c220_mov_out_to_ub(&mut ub, &source, input, 0x4000, 0x80).unwrap();
         assert_eq!(ub.read_known(0x80, 32).unwrap(), data[..32]);
         assert_eq!(ub.read_known(0xc0, 32).unwrap(), data[64..96]);
         assert_eq!(
@@ -649,8 +526,7 @@ mod tests {
 
         let output = C220DmaMovDescriptor::decode(CAPTURED_C220_MOV_UB_TO_OUT_WORD, xm).unwrap();
         let mut destination = output_regions();
-        ub.copy_c220_mov_ub_to_hbm(&mut destination, output, 0x80, 0x3000)
-            .unwrap();
+        copy_c220_mov_ub_to_hbm(&ub, &mut destination, output, 0x80, 0x3000).unwrap();
         assert_eq!(destination.read_known_at(0x3000, 32).unwrap(), data[..32]);
         assert_eq!(destination.read_known_at(0x3040, 32).unwrap(), data[64..96]);
         assert_eq!(
@@ -660,8 +536,8 @@ mod tests {
 
         let mut rejected = output_regions();
         assert!(matches!(
-            ub.copy_c220_mov_ub_to_hbm(&mut rejected, output, 0x80, 0x3040),
-            Err(UbMemoryError::Destination(_))
+            copy_c220_mov_ub_to_hbm(&ub, &mut rejected, output, 0x80, 0x3040),
+            Err(C220TransferError::Destination(_))
         ));
         assert_eq!(
             rejected.read_states_at(0x3040, 32).unwrap(),

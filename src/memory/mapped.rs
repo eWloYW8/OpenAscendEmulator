@@ -192,9 +192,9 @@ impl MappedMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::architecture::Architecture;
-    use crate::execution::machine::ScalarMachine;
+    use crate::architecture::Architecture;
     use crate::memory::region::MemoryRegion;
+    use crate::sim::machine::ScalarMachine;
 
     fn sub_memory() -> SparseMemory {
         let regions = vec![
