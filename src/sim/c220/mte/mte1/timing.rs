@@ -154,6 +154,14 @@ impl C220TimedMte1Lane {
             .max()
     }
 
+    pub fn pending_visibility_tick(&self, destination: C220Load2dDestination) -> Option<u64> {
+        self.pending_retirements
+            .iter()
+            .filter(|ticket| ticket.transfer.instruction.destination == destination)
+            .map(|ticket| ticket.retire_tick)
+            .max()
+    }
+
     pub fn pending_retirement_count(&self) -> usize {
         self.pending_retirements.len()
     }
@@ -163,20 +171,30 @@ impl C220TimedMte1Lane {
     }
 
     pub fn advance_to(&mut self, tick: u64) -> &[C220Mte1Ticket] {
-        self.last_retirements.clear();
-        let mut index = 0;
-        while index < self.pending_retirements.len() {
-            if self.pending_retirements[index].retire_tick <= tick {
-                self.last_retirements.push(
-                    self.pending_retirements
-                        .remove(index)
-                        .expect("indexed MTE1 retirement exists"),
-                );
-            } else {
-                index += 1;
-            }
-        }
+        self.begin_retirements();
+        while self.retire_ready_front(tick) {}
         &self.last_retirements
+    }
+
+    pub(super) fn begin_retirements(&mut self) {
+        self.last_retirements.clear();
+    }
+
+    pub(super) fn retire_ready_front(&mut self, tick: u64) -> bool {
+        if self
+            .pending_retirements
+            .front()
+            .is_some_and(|ticket| ticket.retire_tick <= tick)
+        {
+            self.last_retirements.push(
+                self.pending_retirements
+                    .pop_front()
+                    .expect("ready MTE1 retirement exists"),
+            );
+            true
+        } else {
+            false
+        }
     }
 
     pub fn preview_issue(
@@ -250,9 +268,17 @@ impl C220TimedMte1Lane {
                 .ok_or(C220Mte1TimingError::TimeOverflow)?;
         }
         let data_ready_tick = uops.last().map_or(tick, |uop| uop.data_ready_tick);
-        let retire_tick = data_ready_tick
+        let mut retire_tick = data_ready_tick
             .checked_add(C220_MTE1_RETIRE_TICKS)
             .ok_or(C220Mte1TimingError::TimeOverflow)?;
+        if let Some(previous) = self.pending_retirements.back() {
+            retire_tick = retire_tick.max(
+                previous
+                    .retire_tick
+                    .checked_add(1)
+                    .ok_or(C220Mte1TimingError::TimeOverflow)?,
+            );
+        }
         tick.checked_add(rules.issue_interval.get())
             .ok_or(C220Mte1TimingError::TimeOverflow)?;
         Ok(C220Mte1Ticket {

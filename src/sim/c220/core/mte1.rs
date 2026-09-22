@@ -1,7 +1,7 @@
 use crate::architecture::Architecture;
 use crate::isa::c220::mte::load2d::C220Load2dInstruction;
 use crate::isa::flow::{FlagInstruction, FlagOperation};
-use crate::sim::c220::mte::mte1::load2d::{C220Load2dTransferError, prepare_c220_load2d};
+use crate::sim::c220::mte::mte1::load2d::C220Load2dTransferError;
 use crate::sim::c220::mte::mte1::{C220Mte1TimingError, C220Mte1TimingRules};
 
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
@@ -39,13 +39,17 @@ impl C220Core {
                 .capture(self.state.scalar().machine().xregs())
                 .map_err(C220Load2dTransferError::from)?;
             let ticket = self.mte1.timing.preview_issue(tick, transfer)?;
-            let prepared = prepare_c220_load2d(&self.local_memory, transfer)?;
-            let result = prepared.result;
-            self.mte1.issue(&ticket, prepared)?;
+            self.mte1.issue(
+                self.next_instruction_id,
+                pc,
+                &ticket,
+                &mut self.hardware_flags,
+            )?;
             self.state.commit_c220_sequential_issue();
             C220CoreInstruction::Mte1Load2d {
+                instruction_id: self.next_instruction_id,
+                pc,
                 transfer,
-                result,
                 ticket: Box::new(ticket),
             }
         } else {

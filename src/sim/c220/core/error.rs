@@ -36,6 +36,8 @@ pub enum C220CoreError {
     #[error(transparent)]
     Mte1Timing(#[from] C220Mte1TimingError),
     #[error(transparent)]
+    Mte1Runtime(#[from] crate::sim::c220::mte::mte1::C220Mte1RuntimeError),
+    #[error(transparent)]
     HardwareFlagDecode(#[from] C220HardwareFlagError),
     #[error(transparent)]
     HardwareFlagTiming(#[from] C220HardwareFlagTimingError),

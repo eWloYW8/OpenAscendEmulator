@@ -6,7 +6,7 @@ A work-in-progress Rust instruction and timing emulator for `dav_2201` and
 ## Organization
 
 - `isa/`: instruction decoding and encoded operands, separated by architecture.
-  C220 Vector families live in `isa/c220/vector/`; DMA, LOAD2D and BT
+  C220 Vector families live in `isa/c220/vector/`; DMA, LOAD2D, SET_2D and BT
   encodings live in `isa/c220/mte/`.
 - `sim/c220/core/`: instruction dispatch, execution-unit coordination, and program execution.
 - `sim/c220/state/`: register/UB state, Vector-to-MTE3 handoff, and execution errors.
@@ -54,6 +54,25 @@ The shared interface owns bounded input queues, unique request IDs, in-flight
 response tracking and output scheduling. L1 bank arbitration and transport stay
 external so other memory clients can participate.
 
+`mte/set2d/` implements captured 16/32-bit pattern fills to L0A, L0B and L1,
+with independent repeat, burst and destination-gap fields. Functional writes
+use linear addresses; overflowing bursts are skipped and counted explicitly.
+Its lazy micro-operation plan uses separately supplied destination bandwidths,
+routes L0 fills to write port 1 and L1 fills to write port 2, and exposes
+repeat boundaries and the final instruction fragment. SET_2D command generation
+and integrated core dispatch are not implemented yet.
+
+`C220MteL1WriteInterface` provides the shared four-port MTE write path to L1.
+It owns bounded, latency-bearing input queues, round-robin selection, unique
+transport IDs, outstanding responses and a one-tick acknowledgment queue.
+Selection rotates even when transport credit is unavailable. Only a returned
+instruction-tail acknowledgment signals retirement; sending a write does not.
+Connect its requests to `C220L1Transport` on `C220L1Port::MteWrite` so writes
+participate in shared bank arbitration with FIXP and reads. Send, response and
+retirement callbacks are separate and run at most once per tick, leaving their
+relative phases under the owner's control. Queue heads, in-flight requests,
+acknowledgments and arbitration decisions remain inspectable.
+
 The shared MTE L1 read arbiter exposes per-port eligibility and round-robin
 selection, including output-fragment backpressure. LOAD2D has a lazy physical
 read planner under `mte/mte1/load2d/`. Completing reads expand into L0 output
@@ -76,6 +95,24 @@ drain. Cross-engine callback order remains explicit at the composition boundary;
 complete callback-order equivalence is not established.
 The integrated core still uses the aggregate timing lane; the L1 read and
 L0 write components are not yet coordinated in core dispatch.
+LOAD2D captures register operands on issue but reads L1 and commits L0 at
+ordered command retirement. Issue events contain the plan, not a premature
+transfer result. `core.last_mte1_outcomes()` reports the transfers completed
+during the latest advance, including instruction identity, retirement tick,
+and known/unknown byte counts. Non-triggered MTE1 HSETs are queued per memory
+and attached to the next matching transfer, with duplicate event IDs suppressed
+while queued. Attached flags become visible after command retirement, not at
+transport readiness. Flag admission checks visible counters, independently of
+pending sets; delivery saturates at the counter limit. Counter snapshots expose
+visible and pending tokens, and discarded deliveries have a cumulative count.
+Triggered flag operations stall when a token or counter capacity is unavailable.
+Attached HSET capacity stalls currently return an explicit error; automatic
+retirement backpressure recovery and response-driven command retirement remain
+to be integrated. Triggered flags do not yet gate on generation-engine idleness.
+Each attached HSET is attempted independently. A blocked or failed command keeps
+its timing slot and produces no retirement outcome; successful transfers release
+their slot only after committing memory. `core.pending_mte1_commands()` exposes
+instruction identity, earliest retirement attempt, remaining sets and flag stalls.
 
 Vector has explicit boundaries between instruction preparation, operations,
 operand reads, and scheduling:

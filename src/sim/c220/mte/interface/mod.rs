@@ -2,6 +2,7 @@ mod l0_write;
 mod l1;
 mod l1_output;
 mod l1_read;
+mod l1_write;
 mod output;
 
 pub use l0_write::{
@@ -18,5 +19,10 @@ pub use l1_output::{
 pub use l1_read::{
     C220MteL1ReadArbiter, C220MteL1ReadDecision, C220MteL1ReadDestination, C220MteL1ReadHead,
     C220MteL1ReadPort,
+};
+pub use l1_write::{
+    C220MteL1WriteAcknowledgment, C220MteL1WriteEntry, C220MteL1WriteError,
+    C220MteL1WriteInterface, C220MteL1WritePort, C220MteL1WriteQueues, C220MteL1WriteRequest,
+    C220MteL1WriteSend,
 };
 pub use output::{C220MteOutputFragment, C220MteOutputPlan};

@@ -147,6 +147,25 @@ impl C220LocalBuffer {
         self.write_states(address, &states)
     }
 
+    /// Write linear addresses without applying the physical capacity mask.
+    /// Capacity-bounded and wrapping clients use the other write methods.
+    pub fn write_known_linear(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), C220LocalBufferError> {
+        if !bytes.is_empty() {
+            address
+                .checked_add((bytes.len() - 1) as u64)
+                .ok_or(C220LocalBufferError::RangeOverflow)?;
+        }
+        for (offset, &byte) in bytes.iter().enumerate() {
+            self.bytes
+                .insert(address + offset as u64, MemoryByteState::Known(byte));
+        }
+        Ok(())
+    }
+
     pub fn write_known_wrapped(
         &mut self,
         address: u64,

@@ -53,17 +53,21 @@ impl C220Core {
 
     pub(super) fn advance_matrix_to(&mut self, tick: u64) -> Result<(), C220CoreError> {
         self.cube.begin_advance();
+        self.mte1.begin_advance();
         loop {
             let event_tick = self
                 .cube
                 .pipeline
                 .next_event_tick()
                 .into_iter()
-                .chain(self.mte1.next_data_ready_tick())
+                .chain(self.mte1.next_retire_tick())
                 .min()
                 .map_or(tick, |next| next.min(tick));
-            self.mte1
-                .commit_ready_at(event_tick, &mut self.local_memory)?;
+            self.mte1.commit_ready_at(
+                event_tick,
+                &mut self.local_memory,
+                &mut self.hardware_flags,
+            )?;
             self.cube.advance_event(
                 event_tick,
                 &mut self.local_memory,
@@ -156,8 +160,8 @@ mod tests {
         let flag = (2 << 29) | (15 << 21) | (1 << 15) | (3 << 10) | (2 << 7);
         for (tick, word) in [
             (0, cube),
-            (1, load | (7 << 12)),
-            (2, flag),
+            (1, flag),
+            (2, load | (7 << 12)),
             (3, flag | (1 << 5)),
             (4, cube | (4 << 17)),
             (5, load | (9 << 12)),
@@ -177,11 +181,15 @@ mod tests {
         let mut releases = Vec::new();
         let mut retired = Vec::new();
         let mut outcomes = Vec::new();
+        let mut mte1_outcomes = Vec::new();
+        let mut mte1_retirements = Vec::new();
         for tick in 6..=64 {
             incremental.advance_to(tick).unwrap();
             releases.extend_from_slice(incremental.cube.pipeline.last_uop_releases());
             retired.extend_from_slice(incremental.cube.pipeline.last_retirements());
             outcomes.extend_from_slice(incremental.last_cube_outcomes());
+            mte1_outcomes.extend_from_slice(incremental.last_mte1_outcomes());
+            mte1_retirements.extend_from_slice(incremental.mte1_timing().last_retirements());
         }
         bulk.advance_to(64).unwrap();
         assert!(bulk.local_memory == incremental.local_memory);
@@ -189,6 +197,9 @@ mod tests {
         assert_eq!(bulk.cube.pipeline.last_uop_releases(), releases);
         assert_eq!(bulk.cube.pipeline.last_retirements(), retired);
         assert_eq!(bulk.last_cube_outcomes(), outcomes);
+        assert_eq!(bulk.last_mte1_outcomes(), mte1_outcomes);
+        assert_eq!(bulk.mte1_timing().last_retirements(), mte1_retirements);
+        assert_eq!(mte1_outcomes.len(), 2);
         for (address, expected) in [(0, 16.0_f32), (1024, 32.0)] {
             assert_eq!(
                 bulk.local_memory
@@ -207,5 +218,38 @@ mod tests {
                 ..
             }
         ));
+
+        let flag = (2 << 29) | (15 << 21) | (1 << 19) | (1 << 15) | (3 << 10) | (2 << 7) | 1;
+        let wait = flag | (1 << 5);
+        let pc = bulk.state.scalar().pc();
+        assert!(matches!(
+            bulk.step_word_at(66, wait).unwrap(),
+            C220CoreStep::Stalled(crate::sim::c220::schedule::C220Stall {
+                resume_tick: 67,
+                ..
+            })
+        ));
+        assert_eq!(bulk.state.scalar().pc(), pc);
+        let set = crate::isa::c220::hflag::C220HardwareFlagInstruction::decode(flag)
+            .unwrap()
+            .resolve(pc, bulk.state.scalar().machine().xregs())
+            .unwrap();
+        bulk.hardware_flags.schedule_set(set, 66).unwrap();
+        assert!(matches!(
+            bulk.step_word_at(67, wait).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        assert_eq!(bulk.state.scalar().pc(), pc + 4);
+        for _ in 0..crate::sim::c220::sync::C220_HARDWARE_FLAG_ALMOST_FULL {
+            bulk.hardware_flags.schedule_set(set, 67).unwrap();
+        }
+        assert!(matches!(
+            bulk.step_word_at(68, flag).unwrap(),
+            C220CoreStep::Stalled(crate::sim::c220::schedule::C220Stall {
+                resume_tick: 69,
+                ..
+            })
+        ));
+        assert_eq!(bulk.state.scalar().pc(), pc + 4);
     }
 }

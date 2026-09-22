@@ -1,6 +1,7 @@
 pub mod bias;
 mod burst;
 pub mod load2d;
+pub mod set2d;
 
 use burst::{BurstLayout, BurstSizeError};
 

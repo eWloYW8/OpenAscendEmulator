@@ -3,7 +3,6 @@ use crate::isa::c220::mte::load2d::C220Load2dTransfer;
 use crate::isa::flow::FlagStep;
 use crate::sim::c220::cube::C220CubeIssue;
 use crate::sim::c220::mte::mte1::C220Mte1Ticket;
-use crate::sim::c220::mte::mte1::load2d::C220Load2dTransferResult;
 use crate::sim::c220::mte::mte2::C220Mte2Step;
 use crate::sim::c220::mte::mte3::C220Mte3Ticket;
 use crate::sim::c220::mte::mte3::C220OutputStep;
@@ -20,8 +19,9 @@ pub enum C220CoreInstruction {
     },
     Barrier(ScalarProgramStep),
     Mte1Load2d {
+        instruction_id: u64,
+        pc: u64,
         transfer: C220Load2dTransfer,
-        result: C220Load2dTransferResult,
         ticket: Box<C220Mte1Ticket>,
     },
     Mte1Flag(FlagStep),

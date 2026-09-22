@@ -5,7 +5,7 @@ use crate::memory::mapped::MappedMemory;
 use crate::sim::c220::cube::{C220CubeExecutionOutcome, C220CubePipeline};
 use crate::sim::c220::device::C220Device;
 use crate::sim::c220::memory::{C220LocalMemory, C220LocalMemoryConfig};
-use crate::sim::c220::mte::mte1::C220TimedMte1Lane;
+use crate::sim::c220::mte::mte1::{C220Mte1CommandState, C220Mte1Load2dOutcome, C220TimedMte1Lane};
 use crate::sim::c220::mte::mte2::C220Mte2Pipeline;
 use crate::sim::c220::scalar::timing::C220ScalarTimingLane;
 use crate::sim::c220::schedule::{C220IssueClock, C220Stall, C220StallCause};
@@ -170,6 +170,10 @@ impl C220Core {
         &self.mte1.timing
     }
 
+    pub fn pending_mte1_commands(&self) -> impl Iterator<Item = C220Mte1CommandState> + '_ {
+        self.mte1.pending_commands()
+    }
+
     pub const fn hardware_flags(&self) -> &C220HardwareFlagState {
         &self.hardware_flags
     }
@@ -210,6 +214,10 @@ impl C220Core {
         &self.cube.outcomes
     }
 
+    pub fn last_mte1_outcomes(&self) -> &[C220Mte1Load2dOutcome] {
+        &self.mte1.outcomes
+    }
+
     pub fn memory_mut(&mut self) -> &mut MappedMemory {
         &mut self.memory
     }
@@ -225,7 +233,6 @@ impl C220Core {
     pub fn advance_to(&mut self, tick: u64) -> Result<Option<C220Stall>, C220CoreError> {
         let gate = self.clock.observe(tick, self.state.scalar().pc())?;
         self.scalar_timing.advance_to(tick);
-        self.mte1.timing.advance_to(tick);
         self.advance_matrix_to(tick)?;
         self.hardware_flags.advance_to(tick)?;
         self.local_memory
