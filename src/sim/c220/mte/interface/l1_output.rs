@@ -49,12 +49,19 @@ pub struct C220MteL1OutputCycle<T> {
     pub queues: C220MteL1OutputQueues,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct C220MteL1OutputSend<T> {
+    pub tick: u64,
+    pub sent: Option<C220MteL1OutputTransfer<T>>,
+    pub blocked: Option<C220MteL1OutputDestination>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220MteL1OutputError {
     #[error("L1 output time reversed from {previous} to {requested}")]
     TimeReversed { previous: u64, requested: u64 },
-    #[error("L1 output expected cycle {expected}, got {requested}")]
-    InvalidCycle { expected: u64, requested: u64 },
+    #[error("L1 output {phase} callback already ran at tick {tick}")]
+    RepeatedCallback { phase: &'static str, tick: u64 },
     #[error("L1 output time overflowed")]
     TimeOverflow,
 }
@@ -84,7 +91,8 @@ pub struct C220MteL1Output<T> {
     acknowledged: VecDeque<Acknowledgment<T>>,
     retiring: VecDeque<Retirement<T>>,
     observed_tick: Option<u64>,
-    next_tick: Option<u64>,
+    send_tick: Option<u64>,
+    retire_tick: Option<u64>,
 }
 
 impl<T> Default for C220MteL1Output<T> {
@@ -93,7 +101,8 @@ impl<T> Default for C220MteL1Output<T> {
             acknowledged: VecDeque::new(),
             retiring: VecDeque::new(),
             observed_tick: None,
-            next_tick: None,
+            send_tick: None,
+            retire_tick: None,
         }
     }
 }
@@ -128,9 +137,6 @@ impl<T: Copy> C220MteL1Output<T> {
         payload: T,
     ) -> Result<(), C220MteL1OutputError> {
         self.validate_receive(tick)?;
-        if self.is_idle() {
-            self.next_tick = Some(self.next_tick.unwrap_or(tick).max(tick));
-        }
         self.acknowledged.push_back(Acknowledgment {
             ready_tick: tick + 1,
             destination,
@@ -158,17 +164,23 @@ impl<T: Copy> C220MteL1Output<T> {
         tick: u64,
         credits: C220MteL1OutputCredits,
     ) -> Result<(), C220MteL1OutputError> {
-        self.check_time(tick)?;
-        if let Some(expected) = self.next_tick
-            && tick < expected
-        {
-            return Err(C220MteL1OutputError::InvalidCycle {
-                expected,
-                requested: tick,
-            });
-        }
-        tick.checked_add(1)
-            .ok_or(C220MteL1OutputError::TimeOverflow)?;
+        self.validate_retire(tick)?;
+        self.validate_send(tick, credits)
+    }
+
+    pub(in crate::sim::c220::mte) fn validate_retire(
+        &self,
+        tick: u64,
+    ) -> Result<(), C220MteL1OutputError> {
+        self.check_callback(tick, self.retire_tick, "retire")
+    }
+
+    pub(in crate::sim::c220::mte) fn validate_send(
+        &self,
+        tick: u64,
+        credits: C220MteL1OutputCredits,
+    ) -> Result<(), C220MteL1OutputError> {
+        self.check_callback(tick, self.send_tick, "send")?;
         if let Some(head) = self.ready_head(tick)
             && head.destination == C220MteL1OutputDestination::Bt
             && credits.permits(head.destination)
@@ -192,10 +204,45 @@ impl<T: Copy> C220MteL1Output<T> {
         credits: C220MteL1OutputCredits,
     ) -> Result<C220MteL1OutputCycle<T>, C220MteL1OutputError> {
         self.validate_step(tick, credits)?;
+        let retired = self.retire(tick)?;
+        let sent = self.send(tick, credits)?;
+        Ok(C220MteL1OutputCycle {
+            tick,
+            sent: sent.sent,
+            blocked: sent.blocked,
+            retired,
+            queues: self.queue_state(),
+        })
+    }
+
+    pub fn acknowledgment_ready_tick(&self) -> Option<u64> {
+        self.acknowledged.front().map(|entry| entry.ready_tick)
+    }
+
+    pub fn retirement_ready_tick(&self) -> Option<u64> {
+        self.retiring.front().map(|entry| entry.ready_tick)
+    }
+
+    pub fn retire(
+        &mut self,
+        tick: u64,
+    ) -> Result<Option<C220MteL1OutputTransfer<T>>, C220MteL1OutputError> {
+        self.validate_retire(tick)?;
         let retired = self
             .retiring
             .pop_front_if(|entry| entry.ready_tick <= tick)
             .map(|entry| entry.transfer);
+        self.observed_tick = Some(tick);
+        self.retire_tick = Some(tick);
+        Ok(retired)
+    }
+
+    pub fn send(
+        &mut self,
+        tick: u64,
+        credits: C220MteL1OutputCredits,
+    ) -> Result<C220MteL1OutputSend<T>, C220MteL1OutputError> {
+        self.validate_send(tick, credits)?;
         let mut sent = None;
         let mut blocked = None;
         if let Some(head) = self
@@ -228,13 +275,11 @@ impl<T: Copy> C220MteL1Output<T> {
             }
         }
         self.observed_tick = Some(tick);
-        self.next_tick = Some(tick + 1);
-        Ok(C220MteL1OutputCycle {
+        self.send_tick = Some(tick);
+        Ok(C220MteL1OutputSend {
             tick,
             sent,
             blocked,
-            retired,
-            queues: self.queue_state(),
         })
     }
 
@@ -253,14 +298,18 @@ impl<T: Copy> C220MteL1Output<T> {
                 requested: tick,
             });
         }
-        if !self.is_idle()
-            && let Some(expected) = self.next_tick
-            && tick > expected
-        {
-            return Err(C220MteL1OutputError::InvalidCycle {
-                expected,
-                requested: tick,
-            });
+        Ok(())
+    }
+
+    fn check_callback(
+        &self,
+        tick: u64,
+        previous: Option<u64>,
+        phase: &'static str,
+    ) -> Result<(), C220MteL1OutputError> {
+        self.check_time(tick)?;
+        if previous == Some(tick) {
+            return Err(C220MteL1OutputError::RepeatedCallback { phase, tick });
         }
         Ok(())
     }

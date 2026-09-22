@@ -1,6 +1,9 @@
 use super::C220MteOutputFragment;
 use std::collections::VecDeque;
 
+mod events;
+pub use events::{C220L0WriteCallback, C220L0WriteEventOutcome, C220L0WriteEvents};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum C220L0WritePort {
@@ -40,12 +43,35 @@ pub struct C220L0WriteCycle {
     pub pending_acknowledgments: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220L0WriteSend {
+    pub tick: u64,
+    pub selected_port: Option<C220L0WritePort>,
+    pub sent: Option<C220MteOutputFragment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220L0WriteAcknowledgment {
+    pub tick: u64,
+    pub fragment: C220MteOutputFragment,
+}
+
+impl C220L0WriteAcknowledgment {
+    pub const fn retired_instruction(self) -> Option<u64> {
+        if self.fragment.last_in_instruction {
+            Some(self.fragment.instruction_id)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220L0WriteError {
     #[error("L0 write time reversed from {previous} to {requested}")]
     TimeReversed { previous: u64, requested: u64 },
-    #[error("L0 write pipeline expected cycle {expected}, got {requested}")]
-    InvalidCycle { expected: u64, requested: u64 },
+    #[error("L0 write {phase} callback already ran at tick {tick}")]
+    RepeatedCallback { phase: &'static str, tick: u64 },
     #[error("L0 write time overflowed")]
     TimeOverflow,
 }
@@ -53,14 +79,16 @@ pub enum C220L0WriteError {
 /// One L0A or L0B write interface. Instantiate separately for the two targets.
 /// Ports 0 and 1 share round-robin priority; port 2 runs only when neither is
 /// ready. Sending confirms locally after one tick, without a memory response.
-/// Enqueue before or after stepping to control the producer's callback phase.
+/// Sending and retirement are independent callbacks, each once per tick.
+/// The event owner decides their order relative to producers and consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220L0WritePipeline {
     inputs: [VecDeque<C220L0WriteEntry>; 3],
     acknowledgments: VecDeque<C220L0WriteEntry>,
     last_primary: C220L0WritePort,
     observed_tick: Option<u64>,
-    next_tick: Option<u64>,
+    send_tick: Option<u64>,
+    retire_tick: Option<u64>,
 }
 
 impl Default for C220L0WritePipeline {
@@ -70,7 +98,8 @@ impl Default for C220L0WritePipeline {
             acknowledgments: VecDeque::new(),
             last_primary: C220L0WritePort::Port1,
             observed_tick: None,
-            next_tick: None,
+            send_tick: None,
+            retire_tick: None,
         }
     }
 }
@@ -107,9 +136,6 @@ impl C220L0WritePipeline {
         let ready_tick = tick
             .checked_add(port.input_ticks())
             .ok_or(C220L0WriteError::TimeOverflow)?;
-        if self.is_idle() {
-            self.next_tick = Some(self.next_tick.unwrap_or(tick).max(tick));
-        }
         self.inputs[port as usize].push_back(C220L0WriteEntry {
             ready_tick,
             fragment,
@@ -132,22 +158,14 @@ impl C220L0WritePipeline {
         })
     }
 
-    pub fn step(&mut self, tick: u64) -> Result<C220L0WriteCycle, C220L0WriteError> {
-        self.check_time(tick)?;
-        if let Some(expected) = self.next_tick
-            && tick < expected
-        {
-            return Err(C220L0WriteError::InvalidCycle {
-                expected,
-                requested: tick,
-            });
-        }
-        let next_tick = tick.checked_add(1).ok_or(C220L0WriteError::TimeOverflow)?;
+    pub fn send(&mut self, tick: u64) -> Result<C220L0WriteSend, C220L0WriteError> {
+        self.check_callback(tick, self.send_tick, "send")?;
         let selected_port = self.selected_port(tick);
-        let acknowledged = self
-            .acknowledgments
-            .pop_front_if(|head| head.ready_tick <= tick)
-            .map(|head| head.fragment);
+        let ready_tick = if selected_port.is_some() {
+            tick.checked_add(1).ok_or(C220L0WriteError::TimeOverflow)?
+        } else {
+            tick
+        };
         let sent = selected_port.map(|port| {
             if port != C220L0WritePort::Port2 {
                 self.last_primary = port;
@@ -157,21 +175,53 @@ impl C220L0WritePipeline {
                 .expect("selected queue head")
                 .fragment;
             self.acknowledgments.push_back(C220L0WriteEntry {
-                ready_tick: next_tick,
+                ready_tick,
                 fragment,
             });
             fragment
         });
-        self.next_tick = Some(next_tick);
+        self.send_tick = Some(tick);
         self.observed_tick = Some(tick);
-        Ok(C220L0WriteCycle {
+        Ok(C220L0WriteSend {
             tick,
             selected_port,
             sent,
-            acknowledged,
-            retired_instruction: acknowledged
-                .filter(|f| f.last_in_instruction)
-                .map(|f| f.instruction_id),
+        })
+    }
+
+    pub fn retire(
+        &mut self,
+        tick: u64,
+    ) -> Result<Option<C220L0WriteAcknowledgment>, C220L0WriteError> {
+        self.check_callback(tick, self.retire_tick, "retire")?;
+        let acknowledgment = self
+            .acknowledgments
+            .pop_front_if(|head| head.ready_tick <= tick)
+            .map(|head| C220L0WriteAcknowledgment {
+                tick,
+                fragment: head.fragment,
+            });
+        self.retire_tick = Some(tick);
+        self.observed_tick = Some(tick);
+        Ok(acknowledgment)
+    }
+
+    /// Convenience for owners that explicitly choose retire-before-send.
+    /// Event-driven owners call the two phases separately when notified.
+    pub fn step(&mut self, tick: u64) -> Result<C220L0WriteCycle, C220L0WriteError> {
+        self.check_callback(tick, self.send_tick, "send")?;
+        self.check_callback(tick, self.retire_tick, "retire")?;
+        if self.selected_port(tick).is_some() && tick == u64::MAX {
+            return Err(C220L0WriteError::TimeOverflow);
+        }
+        let acknowledgment = self.retire(tick)?;
+        let send = self.send(tick)?;
+        Ok(C220L0WriteCycle {
+            tick,
+            selected_port: send.selected_port,
+            sent: send.sent,
+            acknowledged: acknowledgment.map(|ack| ack.fragment),
+            retired_instruction: acknowledgment.and_then(|ack| ack.retired_instruction()),
             queue_lengths: std::array::from_fn(|index| self.inputs[index].len()),
             pending_acknowledgments: self.acknowledgments.len(),
         })
@@ -186,14 +236,18 @@ impl C220L0WritePipeline {
                 requested: tick,
             });
         }
-        if !self.is_idle()
-            && let Some(expected) = self.next_tick
-            && tick > expected
-        {
-            return Err(C220L0WriteError::InvalidCycle {
-                expected,
-                requested: tick,
-            });
+        Ok(())
+    }
+
+    fn check_callback(
+        &self,
+        tick: u64,
+        last: Option<u64>,
+        phase: &'static str,
+    ) -> Result<(), C220L0WriteError> {
+        self.check_time(tick)?;
+        if last == Some(tick) {
+            return Err(C220L0WriteError::RepeatedCallback { phase, tick });
         }
         Ok(())
     }

@@ -53,8 +53,8 @@ fn blocked_load2d_holds_bt_until_output_tail_and_l0_confirms_separately() {
         if tick == 2 {
             let before = output.clone();
             assert!(matches!(
-                output.step(4, C220MteL1OutputCredits::default()),
-                Err(C220MteL1OutputError::InvalidCycle { .. })
+                output.step(1, C220MteL1OutputCredits::default()),
+                Err(C220MteL1OutputError::RepeatedCallback { .. })
             ));
             assert_eq!(output, before);
         }

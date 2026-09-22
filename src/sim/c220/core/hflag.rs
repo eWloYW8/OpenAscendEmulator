@@ -2,7 +2,7 @@ use crate::isa::c220::hflag::{
     C220HardwareFlagInstruction, C220HardwareFlagOperation, C220HardwareFlagSourcePipe,
     C220MatrixMemory,
 };
-use crate::sim::c220::sync::C220HardwareFlagTimingError;
+use crate::sim::c220::sync::{C220HardwareFlagEvent, C220HardwareFlagTimingError};
 
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 
@@ -24,8 +24,11 @@ impl C220Core {
                             C220HardwareFlagSourcePipe::Mte1,
                             C220MatrixMemory::L0a | C220MatrixMemory::L0b,
                         ) => {
-                            self.hardware_flags
-                                .enqueue_mte_set(self.next_instruction_id, step)?;
+                            self.hardware_flags.enqueue_mte_set(
+                                self.next_instruction_id,
+                                step,
+                                tick,
+                            )?;
                         }
                         (source_pipe, memory) => {
                             return Err(C220CoreError::UnsupportedHardwareFlagCheckpoint {
@@ -36,7 +39,10 @@ impl C220Core {
                     }
                     None
                 } else {
-                    match self.hardware_flags.schedule_set(step, tick) {
+                    match self
+                        .hardware_flags
+                        .schedule_event(C220HardwareFlagEvent::capture_mte(step, tick), tick)
+                    {
                         Ok(ready_tick) => Some(ready_tick),
                         Err(C220HardwareFlagTimingError::AlmostFull { .. }) => {
                             return Ok(C220CoreStep::Stalled(C220Stall {

@@ -1,4 +1,11 @@
+mod events;
+mod frontend;
 mod uop;
+pub use events::{C220Set2dEventOutcome, C220Set2dEvents};
+pub use frontend::{
+    C220Set2dFrontend, C220Set2dFrontendError, C220Set2dGates, C220Set2dGenerated, C220Set2dIssue,
+    C220Set2dOutputs, C220Set2dQueues, C220Set2dSend, C220Set2dStall,
+};
 pub use uop::{C220Set2dBandwidths, C220Set2dOutputRoute, C220Set2dUop, C220Set2dUops};
 
 use crate::isa::c220::mte::set2d::{C220Set2dDestination, C220Set2dFill};

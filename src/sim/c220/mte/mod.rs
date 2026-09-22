@@ -1,4 +1,6 @@
 mod error;
+mod generator;
+pub use generator::C220MteGeneratorCallback;
 pub mod interface;
 pub mod mte1;
 pub mod mte2;

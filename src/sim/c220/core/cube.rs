@@ -251,5 +251,20 @@ mod tests {
             })
         ));
         assert_eq!(bulk.state.scalar().pc(), pc + 4);
+        let bias_set = (flag & !(7 << 15)) | (5 << 15);
+        assert!(matches!(
+            bulk.step_word_at(69, bias_set).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::HardwareFlag {
+                    token_ready_tick: Some(70),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            bulk.step_word_at(70, bias_set | (1 << 5)).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
     }
 }

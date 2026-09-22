@@ -1,11 +1,13 @@
 use super::{C220Mte1Ticket, C220Mte1TimingError, C220TimedMte1Lane};
-use crate::isa::c220::hflag::{C220HardwareFlagStep, C220MatrixMemory};
+use crate::isa::c220::hflag::C220MatrixMemory;
 use crate::isa::c220::mte::load2d::{C220Load2dDestination, C220Load2dTransfer};
 use crate::sim::c220::memory::C220LocalMemory;
 use crate::sim::c220::mte::mte1::load2d::{
     C220Load2dTransferError, C220Load2dTransferResult, prepare_c220_load2d,
 };
-use crate::sim::c220::sync::{C220HardwareFlagState, C220HardwareFlagTimingError};
+use crate::sim::c220::sync::{
+    C220HardwareFlagEvent, C220HardwareFlagState, C220HardwareFlagTimingError,
+};
 use std::collections::VecDeque;
 
 #[derive(Debug, thiserror::Error)]
@@ -47,7 +49,7 @@ struct PendingLoad2d {
     pc: u64,
     retire_tick: u64,
     transfer: C220Load2dTransfer,
-    sets: VecDeque<C220HardwareFlagStep>,
+    sets: VecDeque<C220HardwareFlagEvent>,
     hardware_flag_stall: Option<C220HardwareFlagTimingError>,
 }
 
@@ -111,8 +113,8 @@ impl Mte1Engine {
             }
             pending.hardware_flag_stall = None;
             let mut index = 0;
-            while let Some(&step) = pending.sets.get(index) {
-                match flags.schedule_set(step, tick) {
+            while let Some(&event) = pending.sets.get(index) {
+                match flags.schedule_event(event, tick) {
                     Ok(_) => {
                         pending.sets.remove(index);
                     }
@@ -174,9 +176,9 @@ mod tests {
             .unwrap()
             .resolve(0x1008, &registers)
             .unwrap();
-        flags.enqueue_mte_set(11, set_b).unwrap();
-        flags.enqueue_mte_set(12, set_b).unwrap();
-        flags.enqueue_mte_set(13, set_a).unwrap();
+        flags.enqueue_mte_set(11, set_b, 1).unwrap();
+        flags.enqueue_mte_set(12, set_b, 1).unwrap();
+        flags.enqueue_mte_set(13, set_a, 1).unwrap();
         assert_eq!(flags.pending_mte_set_count(), 2);
         registers[3] = (1 << 16) | (1 << 24);
         let fast = C220Load2dInstruction::decode(0x6000_2180)
@@ -267,8 +269,8 @@ mod tests {
         for _ in 0..crate::sim::c220::sync::C220_HARDWARE_FLAG_ALMOST_FULL {
             flags.schedule_set(set0, 0).unwrap();
         }
-        flags.enqueue_mte_set(2, set0).unwrap();
-        flags.enqueue_mte_set(3, set1).unwrap();
+        flags.enqueue_mte_set(2, set0, 1).unwrap();
+        flags.enqueue_mte_set(3, set1, 1).unwrap();
         registers[0] = 512;
         let second = engine
             .timing

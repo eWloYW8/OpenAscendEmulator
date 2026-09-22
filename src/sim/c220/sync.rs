@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use thiserror::Error;
 
@@ -12,6 +12,33 @@ pub struct C220HardwareFlagCounterSnapshot {
     pub visible: u8,
     pub pending: usize,
     pub almost_full: bool,
+}
+
+/// A captured synchronization event. Zero requests a fresh visibility delay;
+/// a nonzero timestamp is retained until a delivery callback observes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220HardwareFlagEvent {
+    pub step: C220HardwareFlagStep,
+    pub timestamp: u64,
+}
+
+impl C220HardwareFlagEvent {
+    /// MTE instruction capture uses the low 32 bits of the issue clock.
+    pub const fn capture_mte(step: C220HardwareFlagStep, tick: u64) -> Self {
+        Self {
+            step,
+            timestamp: tick as u32 as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220HardwareFlagDelivery {
+    pub admitted_tick: u64,
+    pub timestamp: u64,
+    pub destination_pipe_code: u8,
+    pub memory: C220MatrixMemory,
+    pub event_id: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -33,7 +60,8 @@ impl C220HardwareFlagKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct C220PendingHardwareFlag {
-    ready_tick: u64,
+    admitted_tick: u64,
+    event: C220HardwareFlagEvent,
     key: C220HardwareFlagKey,
 }
 
@@ -46,7 +74,7 @@ struct C220QueuedHardwareWait {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct C220QueuedMteSet {
     instruction_id: u64,
-    step: C220HardwareFlagStep,
+    event: C220HardwareFlagEvent,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,6 +82,8 @@ pub struct C220HardwareFlagState {
     now: u64,
     counters: BTreeMap<C220HardwareFlagKey, u8>,
     pending_sets: Vec<C220PendingHardwareFlag>,
+    // The delivery process runs at most once per tick, across all notifications.
+    notifications: BTreeSet<u64>,
     cube_waits: VecDeque<C220QueuedHardwareWait>,
     mte_sets: Vec<C220QueuedMteSet>,
     saturated_sets: u64,
@@ -64,20 +94,21 @@ impl C220HardwareFlagState {
         &mut self,
         instruction_id: u64,
         step: C220HardwareFlagStep,
+        tick: u64,
     ) -> Result<(), C220HardwareFlagTimingError> {
         if step.instruction.operation != C220HardwareFlagOperation::Set || step.instruction.trigger
         {
             return Err(C220HardwareFlagTimingError::OperationMismatch);
         }
         if self.mte_sets.iter().any(|pending| {
-            pending.step.instruction.memory == step.instruction.memory
-                && pending.step.event_id == step.event_id
+            pending.event.step.instruction.memory == step.instruction.memory
+                && pending.event.step.event_id == step.event_id
         }) {
             return Ok(());
         }
         self.mte_sets.push(C220QueuedMteSet {
             instruction_id,
-            step,
+            event: C220HardwareFlagEvent::capture_mte(step, tick),
         });
         Ok(())
     }
@@ -90,12 +121,13 @@ impl C220HardwareFlagState {
         &mut self,
         instruction_id: u64,
         memory: C220MatrixMemory,
-    ) -> VecDeque<C220HardwareFlagStep> {
+    ) -> VecDeque<C220HardwareFlagEvent> {
         let mut attached = VecDeque::new();
         self.mte_sets.retain(|pending| {
-            if pending.instruction_id < instruction_id && pending.step.instruction.memory == memory
+            if pending.instruction_id < instruction_id
+                && pending.event.step.instruction.memory == memory
             {
-                attached.push_back(pending.step);
+                attached.push_back(pending.event);
                 false
             } else {
                 true
@@ -111,10 +143,21 @@ impl C220HardwareFlagState {
                 previous: self.now,
             });
         }
+        while let Some(&notification) = self.notifications.first()
+            && notification <= tick
+        {
+            self.notifications.pop_first();
+            self.deliver_at(notification);
+        }
         self.now = tick;
+        Ok(())
+    }
+
+    fn deliver_at(&mut self, tick: u64) {
         let mut index = 0;
         while index < self.pending_sets.len() {
-            if self.pending_sets[index].ready_tick <= tick {
+            let pending = self.pending_sets[index];
+            if pending.admitted_tick <= tick && pending.event.timestamp <= tick {
                 let pending = self.pending_sets.remove(index);
                 let counter = self.counters.entry(pending.key).or_default();
                 if *counter >= C220_HARDWARE_FLAG_CAPACITY {
@@ -126,16 +169,37 @@ impl C220HardwareFlagState {
                 index += 1;
             }
         }
-        Ok(())
     }
 
+    /// Schedule a new, untimestamped completion signal.
     pub fn schedule_set(
         &mut self,
         step: C220HardwareFlagStep,
         checkpoint_tick: u64,
     ) -> Result<u64, C220HardwareFlagTimingError> {
+        self.schedule_event(
+            C220HardwareFlagEvent { step, timestamp: 0 },
+            checkpoint_tick,
+        )
+    }
+
+    /// Return the notification tick, not a guaranteed token visibility tick.
+    /// Every notification scans all admitted events; an earlier notification
+    /// can deliver this event, while a future timestamp can outlive this wake.
+    pub fn schedule_event(
+        &mut self,
+        mut event: C220HardwareFlagEvent,
+        checkpoint_tick: u64,
+    ) -> Result<u64, C220HardwareFlagTimingError> {
+        let step = event.step;
         if step.instruction.operation != C220HardwareFlagOperation::Set {
             return Err(C220HardwareFlagTimingError::OperationMismatch);
+        }
+        if checkpoint_tick < self.now {
+            return Err(C220HardwareFlagTimingError::TimeReversed {
+                requested: checkpoint_tick,
+                previous: self.now,
+            });
         }
         let key = C220HardwareFlagKey::from_step(step);
         let count = self.counters.get(&key).copied().unwrap_or(0);
@@ -145,12 +209,53 @@ impl C220HardwareFlagState {
                 count,
             });
         }
-        let ready_tick = checkpoint_tick
-            .checked_add(visibility_ticks(step.instruction.memory))
+        let delay = if event.timestamp == 0 {
+            visibility_ticks(step.instruction.memory)
+        } else {
+            1
+        };
+        let notification_tick = checkpoint_tick
+            .checked_add(delay)
             .ok_or(C220HardwareFlagTimingError::TimeOverflow)?;
+        if event.timestamp == 0 {
+            event.timestamp = notification_tick;
+        }
+        self.notifications.insert(notification_tick);
+        self.pending_sets.push(C220PendingHardwareFlag {
+            admitted_tick: checkpoint_tick,
+            event,
+            key,
+        });
+        Ok(notification_tick)
+    }
+
+    pub fn next_notification_tick(&self) -> Option<u64> {
+        self.notifications.first().copied()
+    }
+
+    pub fn pending_deliveries(&self) -> impl Iterator<Item = C220HardwareFlagDelivery> + '_ {
         self.pending_sets
-            .push(C220PendingHardwareFlag { ready_tick, key });
-        Ok(ready_tick)
+            .iter()
+            .map(|pending| C220HardwareFlagDelivery {
+                admitted_tick: pending.admitted_tick,
+                timestamp: pending.event.timestamp,
+                destination_pipe_code: pending.key.destination_pipe_code,
+                memory: pending.event.step.instruction.memory,
+                event_id: pending.key.event_id,
+            })
+    }
+
+    fn next_delivery_tick(&self, key: C220HardwareFlagKey) -> Option<u64> {
+        self.pending_sets
+            .iter()
+            .filter(|pending| pending.key == key)
+            .filter_map(|pending| {
+                self.notifications
+                    .range(pending.admitted_tick.max(pending.event.timestamp)..)
+                    .next()
+                    .copied()
+            })
+            .min()
     }
 
     pub fn enqueue_cube_wait(
@@ -199,11 +304,7 @@ impl C220HardwareFlagState {
                 == 0
             {
                 let resume_tick = self
-                    .pending_sets
-                    .iter()
-                    .filter(|pending| pending.key == C220HardwareFlagKey::from_step(step))
-                    .map(|pending| pending.ready_tick)
-                    .min()
+                    .next_delivery_tick(C220HardwareFlagKey::from_step(step))
                     .map_or_else(
                         || {
                             tick.checked_add(1)
@@ -234,12 +335,7 @@ impl C220HardwareFlagState {
         if self.counters.get(&key).copied().unwrap_or(0) != 0 {
             return Ok(Some(self.now));
         }
-        Ok(self
-            .pending_sets
-            .iter()
-            .filter(|pending| pending.key == key)
-            .map(|pending| pending.ready_tick)
-            .min())
+        Ok(self.next_delivery_tick(key))
     }
 
     pub fn consume_wait(
@@ -409,5 +505,77 @@ mod tests {
         assert_eq!(flags.schedule_set(set, 1), Ok(2));
         flags.advance_to(2).unwrap();
         assert_eq!(flags.count(2, C220MatrixMemory::L0a, 0), 32);
+    }
+
+    #[test]
+    fn timestamped_sets_share_notifications_without_automatic_rearming() {
+        let set = step(C220HardwareFlagOperation::Set);
+        let wait = step(C220HardwareFlagOperation::Wait);
+        let mut flags = C220HardwareFlagState::default();
+        // This timestamp remains pending after its initial notification.
+        assert_eq!(
+            flags.schedule_event(
+                C220HardwareFlagEvent {
+                    step: set,
+                    timestamp: 10,
+                },
+                0
+            ),
+            Ok(1)
+        );
+        flags.advance_to(9).unwrap();
+        assert_eq!(flags.wait_ready_tick(wait), Ok(None));
+        assert_eq!(flags.next_notification_tick(), None);
+        assert_eq!(flags.pending_deliveries().next().unwrap().timestamp, 10);
+
+        // A different counter's notification wakes the whole table.
+        let mut other = set;
+        other.event_id = 1;
+        assert_eq!(flags.schedule_set(other, 9), Ok(10));
+        assert_eq!(flags.wait_ready_tick(wait), Ok(Some(10)));
+        // Even a set whose own notification is later participates in that scan.
+        assert_eq!(
+            flags.schedule_event(
+                C220HardwareFlagEvent {
+                    step: set,
+                    timestamp: 3,
+                },
+                10
+            ),
+            Ok(11)
+        );
+        flags.advance_to(10).unwrap();
+        assert_eq!(flags.count(2, C220MatrixMemory::L0a, 0), 2);
+        assert_eq!(flags.count(2, C220MatrixMemory::L0a, 1), 1);
+        assert_eq!(flags.pending_deliveries().count(), 0);
+        flags.advance_to(11).unwrap();
+        assert_eq!(flags.count(2, C220MatrixMemory::L0a, 0), 2);
+    }
+
+    #[test]
+    fn mte_capture_preserves_timestamp_through_attachment() {
+        let mut set = step(C220HardwareFlagOperation::Set);
+        set.instruction.memory = C220MatrixMemory::BiasTable;
+        let mut flags = C220HardwareFlagState::default();
+        flags.enqueue_mte_set(1, set, 5).unwrap();
+        flags.enqueue_mte_set(2, set, 6).unwrap();
+        let event = flags
+            .take_mte_sets(3, C220MatrixMemory::BiasTable)
+            .pop_front()
+            .unwrap();
+        assert_eq!(event.timestamp, 5);
+        flags.advance_to(20).unwrap();
+        assert_eq!(flags.schedule_event(event, 20), Ok(21));
+        flags.advance_to(21).unwrap();
+        assert_eq!(flags.count(2, C220MatrixMemory::BiasTable, 0), 1);
+
+        // A wrapped issue timestamp of zero requests the full memory delay.
+        let wrapped = C220HardwareFlagEvent::capture_mte(set, 1_u64 << 32);
+        assert_eq!(wrapped.timestamp, 0);
+        assert_eq!(flags.schedule_event(wrapped, 21), Ok(23));
+        flags.advance_to(22).unwrap();
+        assert_eq!(flags.count(2, C220MatrixMemory::BiasTable, 0), 1);
+        flags.advance_to(23).unwrap();
+        assert_eq!(flags.count(2, C220MatrixMemory::BiasTable, 0), 2);
     }
 }

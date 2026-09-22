@@ -2,10 +2,12 @@ use super::*;
 use crate::isa::c220::mte::bias::C220MovL1ToBtInstruction;
 use crate::isa::c220::mte::load2d::C220Load2dInstruction;
 use crate::sim::c220::memory::l1::{C220L1Geometry, C220L1Port, C220L1Request, C220L1Transport};
+use crate::sim::c220::mte::C220MteGeneratorCallback;
 use crate::sim::c220::mte::interface::{
     C220L0WritePipeline, C220MteL1CycleInputs, C220MteL1OutputCredits,
 };
 use crate::sim::c220::mte::mte1::bias::c220_bt_uops;
+use crate::sim::common::event::EventDispatcher;
 use std::collections::{BTreeMap, BTreeSet};
 
 fn nz(value: u32) -> NonZeroU32 {
@@ -99,13 +101,7 @@ fn bt_frontend_preserves_physical_requests_backpressure_and_retirement() {
         let issue = frontend
             .issue(0, 7, C220Mte1ReadTransfer::Bt(transfer))
             .unwrap();
-        assert!(!issue.retired && issue.request_count == 8);
-        let before = frontend.clone();
-        assert!(matches!(
-            frontend.step(2, false, &mut interface),
-            Err(C220Mte1ReadFrontendError::InvalidCycle { .. })
-        ));
-        assert_eq!(frontend, before);
+        assert!(!issue.completion_ready && issue.request_count == 8);
         let interface_before = interface.clone();
         assert!(matches!(
             interface.step(
@@ -149,6 +145,14 @@ fn bt_frontend_preserves_physical_requests_backpressure_and_retirement() {
                 )
                 .unwrap();
             let generated = frontend.step(tick, tick < 13, &mut interface).unwrap();
+            if tick == 0 {
+                let before = frontend.clone();
+                assert!(matches!(
+                    frontend.step(tick, false, &mut interface),
+                    Err(C220Mte1ReadFrontendError::RepeatedCallback { .. })
+                ));
+                assert_eq!(frontend, before);
+            }
             assert!(generated.queues.generated <= 4);
             assert!(interface.queue_state().inputs[0] <= 5);
             generated_full |= generated.queues.generated == 4;
@@ -239,7 +243,7 @@ fn bt_frontend_preserves_physical_requests_backpressure_and_retirement() {
         let issue = frontend
             .issue(200, 8, C220Mte1ReadTransfer::Bt(empty))
             .unwrap();
-        assert!(issue.retired && issue.request_count == 0 && frontend.is_idle());
+        assert!(issue.completion_ready && issue.request_count == 0 && frontend.is_idle());
         let before = frontend.clone();
         assert_eq!(
             frontend.issue(u64::MAX, 9, C220Mte1ReadTransfer::Bt(transfer)),
@@ -278,15 +282,35 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
         let mut l1 = C220L1Transport::new(C220L1Geometry::new(32, 4, 1, 0).unwrap());
         let mut l0a = C220L0WritePipeline::default();
         let mut l0b = C220L0WritePipeline::default();
-        load.issue(0, 1, C220Mte1ReadTransfer::Load2d(transfer))
+        let mut events = EventDispatcher::new(0);
+        let clock = events.add_event();
+        let load_events = C220Mte1ReadEvents::register(&mut events, clock, |phase| {
+            (C220Mte1ReadKind::Load2d, phase)
+        });
+        let bt_events =
+            C220Mte1ReadEvents::register(&mut events, clock, |phase| (C220Mte1ReadKind::Bt, phase));
+        load_events
+            .issue(
+                &mut events,
+                &mut load,
+                1,
+                C220Mte1ReadTransfer::Load2d(transfer),
+            )
             .unwrap();
-        bt.issue(0, 2, C220Mte1ReadTransfer::Bt(bt_transfer(true)))
+        bt_events
+            .issue(
+                &mut events,
+                &mut bt,
+                2,
+                C220Mte1ReadTransfer::Bt(bt_transfer(true)),
+            )
             .unwrap();
         let mut ids = BTreeSet::new();
         let mut reads = Vec::new();
         let mut retired = BTreeSet::new();
         let mut output_bytes = [0_u32; 2];
         let mut shared_full = false;
+        let mut idle_before_retirement = false;
         for tick in 0..300 {
             for cycle in [l0a.step(tick).unwrap(), l0b.step(tick).unwrap()] {
                 if let Some(id) = cycle.retired_instruction {
@@ -310,9 +334,39 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
                     },
                 )
                 .unwrap();
-            // An explicit callback order, not an assertion of global engine order.
-            load.step(tick, false, &mut interface).unwrap();
-            bt.step(tick, false, &mut interface).unwrap();
+            events.advance_to(tick).unwrap();
+            events.notify_at(clock, tick);
+            events.notify_at(clock, tick);
+            let mut phases = [Vec::new(), Vec::new()];
+            while let Some(invocation) = events.next_callback() {
+                let (kind, phase) = invocation.callback;
+                let (binding, frontend, index) = match kind {
+                    C220Mte1ReadKind::Load2d => (&load_events, &mut load, 0),
+                    C220Mte1ReadKind::Bt => (&bt_events, &mut bt, 1),
+                };
+                if matches!(
+                    phase,
+                    C220MteGeneratorCallback::Send | C220MteGeneratorCallback::Generate
+                ) {
+                    phases[index].push(phase);
+                }
+                binding
+                    .handle(phase, &mut events, frontend, false, &mut interface)
+                    .unwrap();
+            }
+            for phases in phases {
+                assert!(phases.len() <= 2);
+                if phases.len() == 2 {
+                    assert_eq!(
+                        phases,
+                        [
+                            C220MteGeneratorCallback::Send,
+                            C220MteGeneratorCallback::Generate
+                        ]
+                    );
+                }
+            }
+            idle_before_retirement |= load.is_idle() && bt.is_idle() && retired.len() < 2;
             let inputs = interface.queue_state().inputs;
             assert!(inputs[0] <= 5 && inputs[1] == 0 && inputs[2] == 0);
             shared_full |= inputs[0] == 5;
@@ -353,7 +407,7 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
                 break;
             }
         }
-        assert!(shared_full);
+        assert!(shared_full && idle_before_retirement);
         assert_eq!(reads, expected);
         assert_eq!(ids.len(), expected.len() + 4);
         assert_eq!(output_bytes, [1024, 512]);

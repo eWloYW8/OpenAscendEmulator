@@ -3,8 +3,9 @@ use std::num::NonZeroU32;
 
 use super::{
     C220MteL1Output, C220MteL1OutputCredits, C220MteL1OutputCycle, C220MteL1OutputDestination,
-    C220MteL1OutputError, C220MteL1OutputQueues, C220MteL1ReadArbiter, C220MteL1ReadDecision,
-    C220MteL1ReadDestination, C220MteL1ReadHead, C220MteL1ReadPort, C220MteOutputPlan,
+    C220MteL1OutputError, C220MteL1OutputQueues, C220MteL1OutputSend, C220MteL1OutputTransfer,
+    C220MteL1ReadArbiter, C220MteL1ReadDecision, C220MteL1ReadDestination, C220MteL1ReadHead,
+    C220MteL1ReadPort, C220MteOutputPlan,
 };
 use crate::sim::c220::memory::l1::{C220L1Access, C220L1Request};
 
@@ -63,12 +64,19 @@ pub struct C220MteL1Cycle<T> {
     pub queues: C220MteL1Queues,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct C220MteL1ReadSend<T> {
+    pub tick: u64,
+    pub decision: C220MteL1ReadDecision,
+    pub sent: Option<C220MteL1ReadRequest<T>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220MteL1Error {
     #[error("L1 interface time reversed from {previous} to {requested}")]
     TimeReversed { previous: u64, requested: u64 },
-    #[error("L1 interface expected cycle {expected}, got {requested}")]
-    InvalidCycle { expected: u64, requested: u64 },
+    #[error("L1 interface {phase} callback already ran at tick {tick}")]
+    RepeatedCallback { phase: &'static str, tick: u64 },
     #[error("L1 interface time or request ID overflowed")]
     Overflow,
     #[error("L1 response {0} does not identify an outstanding request")]
@@ -94,7 +102,8 @@ pub struct C220MteL1Interface<T> {
     output: C220MteL1Output<C220MteL1ReadRequest<T>>,
     next_request_id: u64,
     observed_tick: Option<u64>,
-    next_tick: Option<u64>,
+    send_tick: Option<u64>,
+    receive_tick: Option<u64>,
 }
 
 impl<T> Default for C220MteL1Interface<T> {
@@ -106,7 +115,8 @@ impl<T> Default for C220MteL1Interface<T> {
             output: C220MteL1Output::default(),
             next_request_id: 0,
             observed_tick: None,
-            next_tick: None,
+            send_tick: None,
+            receive_tick: None,
         }
     }
 }
@@ -170,9 +180,6 @@ impl<T: Copy> C220MteL1Interface<T> {
         if !self.can_push(port) {
             return Ok(None);
         }
-        if self.is_idle() {
-            self.next_tick = Some(self.next_tick.unwrap_or(tick).max(tick));
-        }
         let request = C220MteL1ReadRequest {
             id: self.next_request_id,
             operation,
@@ -191,18 +198,58 @@ impl<T: Copy> C220MteL1Interface<T> {
         tick: u64,
         inputs: C220MteL1CycleInputs,
     ) -> Result<C220MteL1Cycle<T>, C220MteL1Error> {
-        self.check_time(tick)?;
-        if let Some(expected) = self.next_tick
-            && tick < expected
-        {
-            return Err(C220MteL1Error::InvalidCycle {
-                expected,
-                requested: tick,
-            });
-        }
-        let next_tick = tick.checked_add(1).ok_or(C220MteL1Error::Overflow)?;
-        let received = inputs
-            .response
+        self.check_callback(tick, self.send_tick, "send request")?;
+        self.validate_response(tick, inputs.response)?;
+        self.output.validate_step(tick, inputs.output_credits)?;
+        // Read eligibility uses occupancy at callback entry, before output drains.
+        let request = self.send_request(tick, inputs.request_ready)?;
+        let output = self.output.step(tick, inputs.output_credits)?;
+        let received = self.receive_response(tick, inputs.response)?;
+        Ok(C220MteL1Cycle {
+            tick,
+            decision: request.decision,
+            sent: request.sent,
+            received,
+            output,
+            queues: self.queue_state(),
+        })
+    }
+
+    pub fn send_request(
+        &mut self,
+        tick: u64,
+        request_ready: bool,
+    ) -> Result<C220MteL1ReadSend<T>, C220MteL1Error> {
+        self.check_callback(tick, self.send_tick, "send request")?;
+        let decision = self.arbiter.arbitrate(
+            tick,
+            self.heads(),
+            self.output.queue_state().output_fragments,
+        );
+        let sent = decision.selected.filter(|_| request_ready).map(|port| {
+            let request = self.inputs[port as usize]
+                .pop_front()
+                .expect("selected input")
+                .request;
+            self.in_flight.insert(request.id, request);
+            request
+        });
+        self.observed_tick = Some(tick);
+        self.send_tick = Some(tick);
+        Ok(C220MteL1ReadSend {
+            tick,
+            decision,
+            sent,
+        })
+    }
+
+    fn validate_response(
+        &self,
+        tick: u64,
+        response: Option<u64>,
+    ) -> Result<Option<C220MteL1ReadRequest<T>>, C220MteL1Error> {
+        self.check_callback(tick, self.receive_tick, "receive response")?;
+        let received = response
             .map(|id| {
                 self.in_flight
                     .get(&id)
@@ -210,18 +257,18 @@ impl<T: Copy> C220MteL1Interface<T> {
                     .ok_or(C220MteL1Error::UnknownResponse(id))
             })
             .transpose()?;
-        self.output.validate_step(tick, inputs.output_credits)?;
         if received.is_some_and(|request| request.operation.completes_logical_uop) {
             self.output.validate_receive(tick)?;
         }
+        Ok(received)
+    }
 
-        // Read eligibility uses occupancy at callback entry, before output drains.
-        let decision = self.arbiter.arbitrate(
-            tick,
-            self.heads(),
-            self.output.queue_state().output_fragments,
-        );
-        let output = self.output.step(tick, inputs.output_credits)?;
+    pub fn receive_response(
+        &mut self,
+        tick: u64,
+        response: Option<u64>,
+    ) -> Result<Option<C220MteL1ReadRequest<T>>, C220MteL1Error> {
+        let received = self.validate_response(tick, response)?;
         if let Some(request) = received {
             self.in_flight.remove(&request.id);
             let operation = request.operation;
@@ -241,27 +288,44 @@ impl<T: Copy> C220MteL1Interface<T> {
                 )?;
             }
         }
-        let sent = decision
-            .selected
-            .filter(|_| inputs.request_ready)
-            .map(|port| {
-                let request = self.inputs[port as usize]
-                    .pop_front()
-                    .expect("selected input")
-                    .request;
-                self.in_flight.insert(request.id, request);
-                request
-            });
         self.observed_tick = Some(tick);
-        self.next_tick = Some(next_tick);
-        Ok(C220MteL1Cycle {
-            tick,
-            decision,
-            sent,
-            received,
-            output,
-            queues: self.queue_state(),
-        })
+        self.receive_tick = Some(tick);
+        Ok(received)
+    }
+
+    pub fn send_output(
+        &mut self,
+        tick: u64,
+        credits: C220MteL1OutputCredits,
+    ) -> Result<C220MteL1OutputSend<C220MteL1ReadRequest<T>>, C220MteL1Error> {
+        self.check_time(tick)?;
+        let output = self.output.send(tick, credits)?;
+        self.observed_tick = Some(tick);
+        Ok(output)
+    }
+
+    pub fn retire(
+        &mut self,
+        tick: u64,
+    ) -> Result<Option<C220MteL1OutputTransfer<C220MteL1ReadRequest<T>>>, C220MteL1Error> {
+        self.check_time(tick)?;
+        let retired = self.output.retire(tick)?;
+        self.observed_tick = Some(tick);
+        Ok(retired)
+    }
+
+    pub fn input_ready_tick(&self, port: C220MteL1ReadPort) -> Option<u64> {
+        self.inputs[port as usize]
+            .front()
+            .map(|head| head.ready_tick)
+    }
+
+    pub fn acknowledgment_ready_tick(&self) -> Option<u64> {
+        self.output.acknowledgment_ready_tick()
+    }
+
+    pub fn retirement_ready_tick(&self) -> Option<u64> {
+        self.output.retirement_ready_tick()
     }
 
     fn heads(&self) -> [Option<C220MteL1ReadHead>; 3] {
@@ -286,14 +350,18 @@ impl<T: Copy> C220MteL1Interface<T> {
                 requested: tick,
             });
         }
-        if !self.is_idle()
-            && let Some(expected) = self.next_tick
-            && tick > expected
-        {
-            return Err(C220MteL1Error::InvalidCycle {
-                expected,
-                requested: tick,
-            });
+        Ok(())
+    }
+
+    fn check_callback(
+        &self,
+        tick: u64,
+        previous: Option<u64>,
+        phase: &'static str,
+    ) -> Result<(), C220MteL1Error> {
+        self.check_time(tick)?;
+        if previous == Some(tick) {
+            return Err(C220MteL1Error::RepeatedCallback { phase, tick });
         }
         Ok(())
     }

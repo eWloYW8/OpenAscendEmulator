@@ -1,6 +1,7 @@
 use super::*;
 use crate::isa::c220::mte::load2d::C220Load2dInstruction;
 use crate::sim::c220::mte::mte1::load2d::C220Load2dRequestPlan;
+use crate::sim::common::event::EventDispatcher;
 use std::num::NonZeroU32;
 
 fn fragment(id: u64) -> C220MteOutputFragment {
@@ -35,7 +36,7 @@ fn bounded_queues_prioritize_primary_ports_and_acknowledge_locally() {
         assert!(pipeline.step(tick).unwrap().sent.is_none());
     }
     let before = pipeline.clone();
-    assert!(pipeline.step(11).is_err());
+    assert!(pipeline.step(9).is_err());
     assert_eq!(pipeline, before);
     let mut previous = None;
     for (tick, expected) in (10..).zip([0, 10, 1, 11, 2, 12, 13, 14, 20]) {
@@ -60,6 +61,65 @@ fn bounded_queues_prioritize_primary_ports_and_acknowledge_locally() {
         Err(C220L0WriteError::TimeOverflow)
     );
     assert_eq!(pipeline, before);
+}
+
+#[test]
+fn shared_events_arbitrate_once_and_keep_send_separate_from_retirement() {
+    use C220L0WritePort::{Port0, Port1, Port2};
+    let mut events = EventDispatcher::new(0);
+    let clock = events.add_event();
+    let binding = C220L0WriteEvents::register(&mut events, clock, |callback| callback);
+    let mut pipeline = C220L0WritePipeline::default();
+    for (port, id) in [(Port0, 0), (Port1, 1), (Port2, 2)] {
+        pipeline.push(0, port, fragment(id)).unwrap();
+    }
+    let mut sent = Vec::new();
+    let mut retired = Vec::new();
+    for tick in 0..12 {
+        events.advance_to(tick).unwrap();
+        events.notify_at(clock, tick);
+        events.notify_at(clock, tick);
+        let mut phases = Vec::new();
+        while let Some(call) = events.next_callback() {
+            match binding
+                .handle(call.callback, &mut events, &mut pipeline)
+                .unwrap()
+            {
+                C220L0WriteEventOutcome::Sent(send) => {
+                    phases.push("send");
+                    sent.push((tick, send.sent.unwrap().instruction_id));
+                }
+                C220L0WriteEventOutcome::Acknowledged(Some(ack)) => {
+                    phases.push("retire");
+                    retired.push((tick, ack.retired_instruction().unwrap()));
+                }
+                _ => {}
+            }
+        }
+        assert!(phases.iter().filter(|&&phase| phase == "send").count() <= 1);
+        if tick == 2 {
+            // Enqueue another ready primary contender for the port-1 wakeup.
+            pipeline.push(tick, Port0, fragment(3)).unwrap();
+        }
+        if tick == 5 {
+            assert_eq!(phases, ["send", "retire"]);
+        }
+    }
+    assert_eq!(sent, [(2, 0), (4, 1), (5, 3), (10, 2)]);
+    assert_eq!(retired, [(3, 0), (5, 1), (6, 3), (11, 2)]);
+    assert!(pipeline.is_idle());
+
+    // With explicit callbacks, idle clock intervals need no dummy steps.
+    pipeline.push(100, Port0, fragment(9)).unwrap();
+    assert_eq!(pipeline.send(102).unwrap().sent, Some(fragment(9)));
+    assert!(pipeline.retire(102).unwrap().is_none());
+    let before = pipeline.clone();
+    assert!(pipeline.step(102).is_err());
+    assert_eq!(pipeline, before);
+    assert_eq!(
+        pipeline.retire(103).unwrap().unwrap().retired_instruction(),
+        Some(9)
+    );
 }
 
 #[test]

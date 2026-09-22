@@ -15,6 +15,9 @@ const COMMAND_TICKS: u64 = 1;
 const GENERATED_TICKS: u64 = 3;
 const GENERATED_CAPACITY: usize = 4;
 
+mod events;
+pub use events::{C220Mte1ReadEventOutcome, C220Mte1ReadEvents};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1ReadKind {
     Load2d,
@@ -146,9 +149,9 @@ struct Generation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Generated {
-    ready_tick: u64,
-    operation: C220MteL1ReadOperation<C220Mte1ReadUop>,
+pub struct C220Mte1ReadGenerated {
+    pub ready_tick: u64,
+    pub operation: C220MteL1ReadOperation<C220Mte1ReadUop>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +159,23 @@ pub struct C220Mte1ReadIssue {
     pub tick: u64,
     pub instruction_id: u64,
     pub request_count: u64,
-    pub retired: bool,
+    /// No output acknowledgment is needed; the command owner may retire it.
+    pub completion_ready: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220Mte1ReadStall {
+    NotReady,
+    HardwareFlag,
+    OutputFull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220Mte1ReadSend {
+    pub tick: u64,
+    pub offered: Option<C220Mte1ReadGenerated>,
+    pub stall: Option<C220Mte1ReadStall>,
+    pub queued: Option<C220MteL1ReadRequest<C220Mte1ReadUop>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,8 +201,10 @@ pub enum C220Mte1ReadFrontendError {
         expected: C220Mte1ReadKind,
         requested: C220Mte1ReadKind,
     },
-    #[error("MTE1 read generator expected cycle {expected}, got {requested}")]
-    InvalidCycle { expected: u64, requested: u64 },
+    #[error("MTE1 read generator time reversed from {previous} to {requested}")]
+    TimeReversed { previous: u64, requested: u64 },
+    #[error("MTE1 read generator {phase} callback already ran at tick {tick}")]
+    RepeatedCallback { phase: &'static str, tick: u64 },
     #[error("MTE1 read generator time overflowed")]
     TimeOverflow,
     #[error(transparent)]
@@ -202,8 +223,10 @@ pub struct C220Mte1ReadFrontend {
     access_width: NonZeroU32,
     bandwidths: C220Mte1ReadBandwidths,
     generation: Option<Generation>,
-    generated: VecDeque<Generated>,
-    next_tick: Option<u64>,
+    generated: VecDeque<C220Mte1ReadGenerated>,
+    observed_tick: Option<u64>,
+    generation_tick: Option<u64>,
+    send_tick: Option<u64>,
 }
 
 impl C220Mte1ReadFrontend {
@@ -218,7 +241,9 @@ impl C220Mte1ReadFrontend {
             bandwidths,
             generation: None,
             generated: VecDeque::new(),
-            next_tick: None,
+            observed_tick: None,
+            generation_tick: None,
+            send_tick: None,
         }
     }
 
@@ -241,13 +266,23 @@ impl C220Mte1ReadFrontend {
         }
     }
 
+    pub fn generated(&self) -> &VecDeque<C220Mte1ReadGenerated> {
+        &self.generated
+    }
+
+    pub(super) fn instruction_ready_tick(&self) -> Option<u64> {
+        self.generation
+            .as_ref()
+            .map(|generation| generation.ready_tick)
+    }
+
     pub fn issue(
         &mut self,
         tick: u64,
         instruction_id: u64,
         transfer: C220Mte1ReadTransfer,
     ) -> Result<C220Mte1ReadIssue, C220Mte1ReadFrontendError> {
-        self.check_tick(tick)?;
+        self.check_time(tick)?;
         if transfer.kind() != self.kind {
             return Err(C220Mte1ReadFrontendError::WrongGenerator {
                 expected: self.kind,
@@ -278,25 +313,96 @@ impl C220Mte1ReadFrontend {
                 plan,
             });
         }
-        self.next_tick = Some(tick);
+        self.observed_tick = Some(tick);
         Ok(C220Mte1ReadIssue {
             tick,
             instruction_id,
             request_count,
-            retired: request_count == 0,
+            completion_ready: request_count == 0,
         })
     }
 
+    pub fn generate(
+        &mut self,
+        tick: u64,
+    ) -> Result<Option<C220Mte1ReadGenerated>, C220Mte1ReadFrontendError> {
+        self.check_callback(tick, self.generation_tick, "generation")?;
+        let eligible = self
+            .instruction_ready_tick()
+            .is_some_and(|ready| ready <= tick)
+            && self.generated.len() < GENERATED_CAPACITY;
+        let generated = if eligible {
+            let ready_tick = tick
+                .checked_add(GENERATED_TICKS)
+                .ok_or(C220Mte1ReadFrontendError::TimeOverflow)?;
+            let generation = self.generation.as_mut().expect("eligible instruction");
+            let operation = generation
+                .plan
+                .next()
+                .expect("nonempty request plan")
+                .operation(generation.instruction_id, self.bandwidths);
+            let entry = C220Mte1ReadGenerated {
+                ready_tick,
+                operation,
+            };
+            self.generated.push_back(entry);
+            if generation.plan.remaining() == 0 {
+                self.generation = None;
+            }
+            Some(entry)
+        } else {
+            None
+        };
+        self.generation_tick = Some(tick);
+        self.observed_tick = Some(tick);
+        Ok(generated)
+    }
+
+    pub fn send(
+        &mut self,
+        tick: u64,
+        hardware_sync_blocked: bool,
+        interface: &mut C220MteL1Interface<C220Mte1ReadUop>,
+    ) -> Result<C220Mte1ReadSend, C220Mte1ReadFrontendError> {
+        self.check_callback(tick, self.send_tick, "send")?;
+        let offered = self.generated.front().copied();
+        let mut stall = None;
+        let mut queued = None;
+        if let Some(head) = offered {
+            stall = if head.ready_tick > tick {
+                Some(C220Mte1ReadStall::NotReady)
+            } else if hardware_sync_blocked {
+                Some(C220Mte1ReadStall::HardwareFlag)
+            } else {
+                queued = interface.push(tick, C220MteL1ReadPort::Port0, head.operation)?;
+                if queued.is_some() {
+                    self.generated.pop_front();
+                    None
+                } else {
+                    Some(C220Mte1ReadStall::OutputFull)
+                }
+            };
+        }
+        self.send_tick = Some(tick);
+        self.observed_tick = Some(tick);
+        Ok(C220Mte1ReadSend {
+            tick,
+            offered,
+            stall,
+            queued,
+        })
+    }
+
+    /// Explicit send-before-generate convenience; shared event owners invoke
+    /// the two callbacks separately. Errors are checked before either mutates.
     pub fn step(
         &mut self,
         tick: u64,
         hardware_sync_blocked: bool,
         interface: &mut C220MteL1Interface<C220Mte1ReadUop>,
     ) -> Result<C220Mte1ReadFrontendCycle, C220Mte1ReadFrontendError> {
-        self.check_tick(tick)?;
-        let next_tick = tick
-            .checked_add(1)
-            .ok_or(C220Mte1ReadFrontendError::TimeOverflow)?;
+        self.check_callback(tick, self.send_tick, "send")?;
+        self.check_callback(tick, self.generation_tick, "generation")?;
         let port = C220MteL1ReadPort::Port0;
         let dispatch = !hardware_sync_blocked
             && self
@@ -312,47 +418,12 @@ impl C220Mte1ReadFrontend {
             .as_ref()
             .is_some_and(|g| g.ready_tick <= tick)
             && self.generated.len() - usize::from(dispatch) < GENERATED_CAPACITY;
-        let ready_tick = if generate {
-            Some(
-                tick.checked_add(GENERATED_TICKS)
-                    .ok_or(C220Mte1ReadFrontendError::TimeOverflow)?,
-            )
-        } else {
-            None
-        };
-
-        let queued = if dispatch {
-            let operation = self
-                .generated
-                .front()
-                .expect("eligible generated uop")
-                .operation;
-            let request = interface
-                .push(tick, port, operation)?
-                .expect("validated input credit");
-            self.generated.pop_front();
-            Some(request)
-        } else {
-            None
-        };
-        let generated = ready_tick.map(|ready_tick| {
-            let generation = self.generation.as_mut().expect("eligible instruction");
-            let operation = generation
-                .plan
-                .next()
-                .expect("nonempty request plan")
-                .operation(generation.instruction_id, self.bandwidths);
-            let done = generation.plan.remaining() == 0;
-            self.generated.push_back(Generated {
-                ready_tick,
-                operation,
-            });
-            if done {
-                self.generation = None;
-            }
-            operation
-        });
-        self.next_tick = Some(next_tick);
+        if generate {
+            tick.checked_add(GENERATED_TICKS)
+                .ok_or(C220Mte1ReadFrontendError::TimeOverflow)?;
+        }
+        let queued = self.send(tick, hardware_sync_blocked, interface)?.queued;
+        let generated = self.generate(tick)?.map(|entry| entry.operation);
         Ok(C220Mte1ReadFrontendCycle {
             tick,
             generated,
@@ -361,14 +432,27 @@ impl C220Mte1ReadFrontend {
         })
     }
 
-    fn check_tick(&self, tick: u64) -> Result<(), C220Mte1ReadFrontendError> {
-        if let Some(expected) = self.next_tick
-            && (tick < expected || (!self.is_idle() && tick != expected))
+    fn check_time(&self, tick: u64) -> Result<(), C220Mte1ReadFrontendError> {
+        if let Some(previous) = self.observed_tick
+            && tick < previous
         {
-            return Err(C220Mte1ReadFrontendError::InvalidCycle {
-                expected,
+            return Err(C220Mte1ReadFrontendError::TimeReversed {
+                previous,
                 requested: tick,
             });
+        }
+        Ok(())
+    }
+
+    fn check_callback(
+        &self,
+        tick: u64,
+        previous: Option<u64>,
+        phase: &'static str,
+    ) -> Result<(), C220Mte1ReadFrontendError> {
+        self.check_time(tick)?;
+        if previous == Some(tick) {
+            return Err(C220Mte1ReadFrontendError::RepeatedCallback { phase, tick });
         }
         Ok(())
     }

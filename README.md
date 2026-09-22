@@ -59,8 +59,17 @@ with independent repeat, burst and destination-gap fields. Functional writes
 use linear addresses; overflowing bursts are skipped and counted explicitly.
 Its lazy micro-operation plan uses separately supplied destination bandwidths,
 routes L0 fills to write port 1 and L1 fills to write port 2, and exposes
-repeat boundaries and the final instruction fragment. SET_2D command generation
-and integrated core dispatch are not implemented yet.
+repeat boundaries and the final instruction fragment. `C220Set2dFrontend`
+owns lazy command expansion and the bounded generated-uop queue. Its independent
+generation and send callbacks feed shared L0A, L0B and L1 write interfaces;
+there are no private destination queues duplicating those resources. L0 sends
+honor hardware-flag backpressure, while L1 sends honor the command's prefetch
+gate. The owner supplies these per-head decisions through `C220Set2dGates`.
+Generated entries retain instruction identity, uop index, eligibility tick and
+route; send results distinguish readiness, synchronization and output-credit
+stalls. Empty commands signal completion without output traffic. Generation
+completion permits command admission but does not imply output retirement.
+SET_2D integrated core dispatch and automatic gate resolution remain incomplete.
 
 `C220MteL1WriteInterface` provides the shared four-port MTE write path to L1.
 It owns bounded, latency-bearing input queues, round-robin selection, unique
