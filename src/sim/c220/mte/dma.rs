@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use super::generator::{C220MteGeneratorCallback, GeneratorEvents};
-use super::uop::{C220DmaUopMode, C220DmaUopRequest, C220DmaUops};
+use super::uop::{C220DmaDestinationLayout, C220DmaUopMode, C220DmaUopRequest, C220DmaUops};
 use crate::sim::common::event::{EventDispatcher, EventId};
 
 const COMMAND_TICKS: u64 = 1;
@@ -14,6 +14,7 @@ pub struct C220DmaGenerated {
     pub uop_index: u64,
     pub ready_tick: u64,
     pub request: C220DmaUopRequest,
+    pub destination: C220DmaDestinationLayout,
     pub mode: C220DmaUopMode,
     pub out_of_order: bool,
     pub last_in_instruction: bool,
@@ -142,6 +143,7 @@ impl C220DmaFrontend {
                 uop_index: generation.next_index,
                 ready_tick,
                 request,
+                destination: generation.requests.destination(),
                 mode: generation.requests.mode(),
                 out_of_order: generation.requests.out_of_order(),
                 last_in_instruction,

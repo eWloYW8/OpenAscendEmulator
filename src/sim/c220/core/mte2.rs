@@ -3,7 +3,7 @@ use crate::architecture::Architecture;
 use crate::isa::c220::mte::set2d::C220Set2dInstruction;
 use crate::isa::flow::{FlagInstruction, FlagOperation};
 use crate::sim::c220::mte::dma::C220DmaGenerated;
-use crate::sim::c220::mte::interface::biu_read::returns::{C220BiuReadBeat, C220BiuReadOutput};
+use crate::sim::c220::mte::interface::biu_read::returns::C220BiuReadBeat;
 use crate::sim::c220::mte::interface::biu_read::{
     C220BiuReadConfig, C220BiuReadRequest, C220BiuSubcore,
 };
@@ -52,17 +52,6 @@ impl C220Core {
             .receive_biu_read(heads)?)
     }
 
-    pub fn take_mte2_biu_output(
-        &mut self,
-        subcore: C220BiuSubcore,
-    ) -> Result<Option<C220BiuReadOutput>, C220CoreError> {
-        Ok(self
-            .mte_pipeline
-            .as_mut()
-            .ok_or(C220CoreError::MteUnconfigured)?
-            .take_biu_read_output(subcore)?)
-    }
-
     /// Selects explicit DMA generation and destination completion instead of
     /// aggregate timing. A transport consumer must drain requests and return
     /// completion only after the destination has accepted the entire command.
@@ -103,7 +92,7 @@ impl C220Core {
     ) -> Result<(), C220CoreError> {
         self.advance_to(tick)?;
         if let Some(pipeline) = &self.mte_pipeline {
-            pipeline.check_dma_completion(instruction_id)?;
+            pipeline.check_external_dma_completion()?;
         }
         self.mte2.complete_dma(instruction_id)?;
         Ok(())

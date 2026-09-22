@@ -85,6 +85,13 @@ fn biu_tags_backpressure_dma_without_retiring_on_request_delivery() {
             outstanding: NonZeroU32::new(2).unwrap(),
             weights: [1; 3],
             group_vector_returns: true,
+            write_bandwidths:
+                crate::sim::c220::mte::interface::biu_read::write::C220BiuWriteBandwidths {
+                    l1: NonZeroU32::new(128).unwrap(),
+                    l0a: NonZeroU32::new(128).unwrap(),
+                    l0b: NonZeroU32::new(128).unwrap(),
+                    ub: NonZeroU32::new(128).unwrap(),
+                },
         },
         C220BiuSubcore::Vector0,
     )
@@ -154,25 +161,41 @@ fn biu_tags_backpressure_dma_without_retiring_on_request_delivery() {
         if core.receive_mte2_biu_at(tick, heads).unwrap()[0] {
             beats.pop_front();
         }
-        if tick > 50 {
-            assert!(
-                core.complete_mte2_dma_at(tick, issue.instruction_id)
-                    .is_err()
-            );
-            while let Some(output) = core.take_mte2_biu_output(C220BiuSubcore::Vector0).unwrap() {
-                outputs.push(output);
+        for event in core.mte_pipeline().unwrap().last_events() {
+            use crate::sim::c220::mte::C220MtePipelineEvent;
+            match event {
+                C220MtePipelineEvent::UbRequest(C220BiuSubcore::Vector0, request) => {
+                    assert_eq!(request.ready_tick, request.sent_tick + 1);
+                    assert!(request.ready_tick <= tick);
+                    outputs.push(request.fragment);
+                }
+                C220MtePipelineEvent::UbResponse(C220BiuSubcore::Vector0, request)
+                    if request.fragment.last_in_instruction =>
+                {
+                    completed_at = Some(tick);
+                }
+                _ => {}
             }
-            if outputs.len() == 8 {
-                assert!(beats.is_empty());
-                assert!(core.state.ub().read_known(0, 32).is_err());
-                core.complete_mte2_dma_at(tick, issue.instruction_id)
-                    .unwrap();
-                completed_at = Some(tick);
-                break;
-            }
+        }
+        if completed_at.is_some() {
+            assert!(beats.is_empty());
+            assert_eq!(outputs.len(), 32);
+            assert!(core.state.ub().read_known(0, 32).is_err());
+            break;
         }
     }
     assert_eq!(requests.len(), 8);
+    assert_eq!(
+        outputs
+            .iter()
+            .map(|output| u64::from(output.logical_bytes))
+            .sum::<u64>(),
+        4096
+    );
+    for (index, fragment) in outputs.iter().enumerate() {
+        assert_eq!(fragment.destination_address, index as u64 * 128);
+        assert_eq!(fragment.bytes, 128);
+    }
     assert_eq!(
         outputs
             .iter()
@@ -192,6 +215,11 @@ fn biu_tags_backpressure_dma_without_retiring_on_request_delivery() {
         assert_eq!(request.byte_offset, 0);
     }
     core.advance_to(completed_at.unwrap() + 1).unwrap();
+    assert!(core.state.ub().read_known(0, 32).is_err());
+    assert!(core.mte2.is_busy());
+    // Reentering the same tick must not apply the acknowledgment twice.
+    core.advance_to(completed_at.unwrap() + 1).unwrap();
+    core.advance_to(completed_at.unwrap() + 2).unwrap();
     assert_eq!(core.state.ub().read_known(0, 4096).unwrap(), vec![7; 4096]);
     assert!(!core.mte2.is_busy());
     assert!(core.mte_pipeline().unwrap().is_idle());

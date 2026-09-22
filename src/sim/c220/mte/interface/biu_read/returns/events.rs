@@ -1,5 +1,6 @@
 use super::{C220BiuReadOutput, C220BiuReadReturns, C220BiuReturnError, C220BiuRobBeat, Tag};
 use crate::sim::c220::mte::interface::biu_read::C220BiuSubcore;
+use crate::sim::c220::mte::interface::biu_read::write::C220BiuWriteSend;
 use crate::sim::common::event::{EventDispatcher, EventError, EventId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +10,7 @@ pub enum C220BiuReturnCallback {
     Select,
     Read,
     Egress(C220BiuSubcore),
+    Send(C220BiuSubcore),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +20,7 @@ pub enum C220BiuReturnEvent {
     Selected([Option<Tag>; 3]),
     Read(Vec<C220BiuRobBeat>),
     Egress(Option<C220BiuReadOutput>),
+    Send(C220BiuWriteSend),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +29,7 @@ pub struct C220BiuReturnEvents {
     selection: EventId,
     read: EventId,
     egress: [EventId; 3],
+    send: [EventId; 3],
 }
 
 impl C220BiuReturnEvents {
@@ -54,11 +58,18 @@ impl C220BiuReturnEvents {
             events.subscribe(event, process);
             event
         });
+        let send = C220BiuSubcore::ALL.map(|core| {
+            let event = events.add_event();
+            let process = events.add_process(tag(C220BiuReturnCallback::Send(core)), false);
+            events.subscribe(event, process);
+            event
+        });
         Self {
             ingress,
             selection,
             read,
             egress,
+            send,
         }
     }
 
@@ -67,6 +78,7 @@ impl C220BiuReturnEvents {
         callback: C220BiuReturnCallback,
         events: &mut EventDispatcher<T>,
         returns: &mut C220BiuReadReturns,
+        destination_ready: [bool; 3],
     ) -> Result<C220BiuReturnEvent, C220BiuReturnError> {
         let tick = events.tick();
         match callback {
@@ -87,6 +99,11 @@ impl C220BiuReturnEvents {
                 for (core, queue) in returns.egress.iter().enumerate() {
                     if queue.front().is_some_and(|head| head.ready_tick <= tick) {
                         events.notify_at(self.egress[core], tick);
+                    }
+                }
+                for (core, queue) in returns.adapters.iter().enumerate() {
+                    if queue.front().is_some_and(|head| head.ready_tick <= tick) {
+                        events.notify_at(self.send[core], tick);
                     }
                 }
                 Ok(C220BiuReturnEvent::Readiness)
@@ -112,6 +129,9 @@ impl C220BiuReturnEvents {
             C220BiuReturnCallback::Egress(core) => {
                 returns.egress(tick, core).map(C220BiuReturnEvent::Egress)
             }
+            C220BiuReturnCallback::Send(core) => returns
+                .send_output(tick, core, destination_ready[core as usize])
+                .map(C220BiuReturnEvent::Send),
         }
     }
 

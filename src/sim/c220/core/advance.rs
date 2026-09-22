@@ -36,6 +36,9 @@ impl C220Core {
                     .observe_completions(event_tick, pipeline.mte1_completions());
                 self.mte2
                     .observe_l1_completions(event_tick, pipeline.l1_fill_completions());
+                for id in pipeline.take_dma_completions() {
+                    self.mte2.complete_dma(id)?;
+                }
             }
             self.cube.advance_event(
                 event_tick,
@@ -44,6 +47,9 @@ impl C220Core {
                 self.state.scalar_mut().machine_mut(),
             )?;
             self.vector.advance_event(event_tick, &mut self.state)?;
+            if let Some(pipeline) = &mut self.mte_pipeline {
+                pipeline.advance_ub_service(self.vector.ub_cycles_at(event_tick))?;
+            }
             self.mte3.commit_ready_at(event_tick, &mut self.memory)?;
             if event_tick == tick {
                 break;

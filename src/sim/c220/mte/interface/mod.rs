@@ -5,6 +5,7 @@ mod l1_output;
 mod l1_read;
 mod l1_write;
 mod output;
+pub mod ub_write;
 
 pub use l0_write::{
     C220L0WriteAcknowledgment, C220L0WriteCallback, C220L0WriteCycle, C220L0WriteEntry,

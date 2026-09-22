@@ -232,17 +232,19 @@ impl C220VectorPipeline {
                 let mut eligible = read_ready
                     .saturating_add(u64::from(entry.uop.stages.execute_ticks))
                     .saturating_add(entry.uop.writeback_ticks as u64);
-                if entry
-                    .write
-                    .as_ref()
-                    .is_some_and(|write| !write.is_complete())
-                {
+                if let Some(write) = &entry.write {
                     let earliest_grant = self
                         .observed_tick
                         .map_or(0, |observed| observed.saturating_add(1))
-                        .max(entry.execute_ready_tick.unwrap_or(0));
-                    eligible = eligible.max(earliest_grant.saturating_add(1));
+                        .max(entry.execute_ready_tick.unwrap_or_else(|| {
+                            read_ready.saturating_add(u64::from(entry.uop.stages.execute_ticks))
+                        }));
+                    let completion = write
+                        .projected_write_completion(earliest_grant)
+                        .unwrap_or(u64::MAX);
+                    eligible = eligible.max(completion.saturating_add(1));
                 }
+                eligible = eligible.max(entry.eligible_tick.unwrap_or(0));
                 eligible.max(previous_release.map_or(0, |tick| tick.saturating_add(1)))
             });
             if entry.execute_ready_tick.is_some() {

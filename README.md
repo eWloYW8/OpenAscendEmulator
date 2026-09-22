@@ -169,9 +169,18 @@ two ROB ports, transaction-ID ordering, ingress delay, in-order/out-of-order tag
 arbitration, Cube/Vector read scheduling and bounded write-adapter queues. Tags
 are recycled internally only after successful egress. The final-completion marker
 follows the last completing request, including when the issued tail returns early.
-Inspect `biu_read_returns()` and consume `take_mte2_biu_output()` for destination
-service. Whole-command destination completion remains separate and is rejected
-while BIU requests or adapter outputs remain pending. Native HBM service latency,
+Destination sends run once per subcore per tick. Each destination has independent
+alignment state: out-of-order returns split by bandwidth, while ordered returns
+coalesce across requests and flush at burst boundaries. Collapsed DMA bursts
+restore destination strides. Packets distinguish logical bytes from rounded
+interface bytes, and retain adapter credit until the final packet is accepted.
+Inspect `biu_read_returns()` for buffered bytes and pending packets; consume
+`take_mte2_biu_output()` for destination service. Its one-slot handoff is an
+explicit consumer boundary, not a native destination queue. The current core DMA
+generator targets UB and requires a vector subcore; the return component also
+provides independently configured L1/L0A/L0B packet paths.
+Whole-command destination completion remains separate and is rejected
+while BIU requests, alignment state or output packets remain pending. Native HBM service latency,
 destination write service, prefetch task switching and automatic synchronization
 gates are still missing; this is not an end-to-end calibrated DMA model.
 Ordinary DMA descriptors cover the full encoded burst range without an artificial

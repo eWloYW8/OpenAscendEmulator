@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use super::C220UbBlockProgress;
+
 const BANK_BYTES: u64 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,12 +35,35 @@ pub struct C220UbBlock {
 pub struct C220UbRequest {
     blocks: Vec<C220UbBlock>,
     grants: Vec<Option<u64>>,
+    progress: Vec<C220UbBlockProgress>,
+    partial_writes: Vec<bool>,
 }
 
 impl C220UbRequest {
     pub fn from_accesses(accesses: &[(u64, usize)]) -> Result<Self, C220UbRequestError> {
+        Self::build(
+            accesses
+                .iter()
+                .map(|&(address, bytes)| (address, bytes, false, false)),
+        )
+    }
+
+    /// Each access carries whether its entire element mask is enabled. A
+    /// masked access is still split across its full physical address span.
+    pub fn from_writes(accesses: &[(u64, usize, bool)]) -> Result<Self, C220UbRequestError> {
+        Self::build(
+            accesses
+                .iter()
+                .map(|&(address, bytes, full_mask)| (address, bytes, true, full_mask)),
+        )
+    }
+
+    fn build(
+        accesses: impl IntoIterator<Item = (u64, usize, bool, bool)>,
+    ) -> Result<Self, C220UbRequestError> {
         let mut blocks = Vec::new();
-        for &(address, bytes) in accesses {
+        let mut partial_writes = Vec::new();
+        for (address, bytes, write, full_mask) in accesses {
             let end = address
                 .checked_add(bytes as u64)
                 .ok_or(C220UbRequestError::AddressOverflow { address, bytes })?;
@@ -51,11 +76,15 @@ impl C220UbRequest {
                     bytes: (next - at) as u8,
                     bank: C220UbBank::from_address(at),
                 });
+                partial_writes
+                    .push(write && (!full_mask || at % BANK_BYTES != 0 || next - at != BANK_BYTES));
                 at = next;
             }
         }
         Ok(Self {
             grants: vec![None; blocks.len()],
+            progress: vec![C220UbBlockProgress::Waiting; blocks.len()],
+            partial_writes,
             blocks,
         })
     }
@@ -68,12 +97,31 @@ impl C220UbRequest {
         &self.grants
     }
 
+    pub fn progress(&self) -> &[C220UbBlockProgress] {
+        &self.progress
+    }
+
     pub fn is_complete(&self) -> bool {
         self.grants.iter().all(Option::is_some)
     }
 
     pub fn completion_tick(&self) -> Option<u64> {
         self.grants.iter().copied().flatten().max()
+    }
+
+    /// Projects this request in isolation, preserving completed grants and
+    /// partial-write delay state. Other UB masters can delay the result.
+    pub fn projected_write_completion(&self, start_tick: u64) -> Option<u64> {
+        let mut request = self.clone();
+        let mut tick = start_tick;
+        while !request.is_complete() {
+            C220UbCycle::arbitrate(tick, Some(&mut request), None, None);
+            if request.is_complete() {
+                break;
+            }
+            tick = tick.checked_add(1)?;
+        }
+        request.completion_tick()
     }
 }
 
@@ -91,6 +139,7 @@ pub struct C220UbDecision {
     pub block_index: usize,
     pub block: C220UbBlock,
     pub granted: bool,
+    pub second_grant: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,20 +197,16 @@ impl C220UbCycle {
             | C220UbPort::VectorRead1
             | C220UbPort::VectorReadDestination => &mut self.read_group_mask,
         };
-        for (index, (&block, grant)) in request
-            .blocks
-            .iter()
-            .zip(request.grants.iter_mut())
-            .enumerate()
-        {
-            if grant.is_some() {
+        for (index, &block) in request.blocks.iter().enumerate() {
+            let Some(second_grant) = request.progress[index].pending_grant() else {
                 continue;
-            }
+            };
             let bank_bit = 1_u64 << block.bank.id;
             let group_bit = 1_u16 << block.bank.group;
             let granted = self.bank_mask & bank_bit == 0 && *group_mask & group_bit == 0;
             if granted {
-                *grant = Some(self.tick);
+                request.progress[index].grant(self.tick, request.partial_writes[index]);
+                request.grants[index] = request.progress[index].completion_tick();
                 self.bank_mask |= bank_bit;
                 *group_mask |= group_bit;
             }
@@ -170,7 +215,11 @@ impl C220UbCycle {
                 block_index: index,
                 block,
                 granted,
+                second_grant,
             });
+        }
+        for progress in &mut request.progress {
+            progress.finish_tick(self.tick);
         }
     }
 }
@@ -222,6 +271,31 @@ mod tests {
                 bytes: 2,
             })
         );
+    }
+
+    #[test]
+    fn unaligned_full_mask_writes_require_two_grants_per_split() {
+        let mut write = C220UbRequest::from_writes(&[(31, 32, true)]).unwrap();
+        assert_eq!(write.projected_write_completion(0), Some(7));
+        let first = C220UbCycle::arbitrate(0, Some(&mut write), None, None);
+        assert_eq!(first.bank_mask, 3);
+        assert_eq!(write.grants(), [None, None]);
+        for tick in 1..=6 {
+            assert!(
+                C220UbCycle::arbitrate(tick, Some(&mut write), None, None)
+                    .decisions
+                    .is_empty()
+            );
+        }
+        let second = C220UbCycle::arbitrate(7, Some(&mut write), None, None);
+        assert!(
+            second
+                .decisions
+                .iter()
+                .all(|decision| decision.granted && decision.second_grant)
+        );
+        assert_eq!(write.grants(), [Some(7), Some(7)]);
+        assert_eq!(write.projected_write_completion(8), Some(7));
     }
 
     #[test]

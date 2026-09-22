@@ -189,9 +189,9 @@ impl C220VectorPipeline {
                 let accesses = plan
                     .blocks
                     .iter()
-                    .map(|block| (block.base_address, C220_VECTOR_BLOCK_BYTES))
+                    .map(|block| (block.base_address, C220_VECTOR_BLOCK_BYTES, block.full()))
                     .collect::<Vec<_>>();
-                Some(C220UbRequest::from_accesses(&accesses)?)
+                Some(C220UbRequest::from_writes(&accesses)?)
             };
             entries.push(PendingVectorUop {
                 uop,

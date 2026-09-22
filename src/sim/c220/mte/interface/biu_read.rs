@@ -7,6 +7,7 @@ mod events;
 pub mod returns;
 #[cfg(test)]
 mod tests;
+pub mod write;
 pub use events::{C220BiuReadCallback, C220BiuReadEvent, C220BiuReadEvents};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,11 +27,13 @@ pub struct C220BiuReadConfig {
     pub outstanding: NonZeroU32,
     pub weights: [u32; 3],
     pub group_vector_returns: bool,
+    pub write_bandwidths: write::C220BiuWriteBandwidths,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220BiuReadInput {
     pub subcore: C220BiuSubcore,
+    pub destination: write::C220BiuWriteDestination,
     pub prefetch: bool,
     pub generated: C220DmaGenerated,
 }
@@ -55,7 +58,12 @@ pub struct C220BiuReadSend {
     pub tick: u64,
     pub offered: Option<C220BiuReadRequest>,
     pub stall: Option<C220BiuReadStall>,
-    pub sent: Option<C220BiuReadRequest>,
+}
+
+impl C220BiuReadSend {
+    pub fn sent(&self) -> Option<C220BiuReadRequest> {
+        self.offered.filter(|_| self.stall.is_none())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +76,8 @@ pub struct C220BiuReadArbitration {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220BiuReadError {
+    #[error("BIU write destination does not belong to the request subcore")]
+    WrongDestination,
     #[error("BIU time reversed from {previous} to {requested}")]
     TimeReversed { previous: u64, requested: u64 },
     #[error("BIU {phase} callback already ran at tick {tick}")]
@@ -204,6 +214,9 @@ impl C220BiuReadFrontend {
 
     pub fn push(&mut self, tick: u64, input: C220BiuReadInput) -> Result<bool, C220BiuReadError> {
         self.check_time(tick)?;
+        if input.destination.subcore() != input.subcore {
+            return Err(C220BiuReadError::WrongDestination);
+        }
         if input.generated.request.bytes == 0 {
             return Err(C220BiuReadError::EmptyInput);
         }
@@ -282,7 +295,6 @@ impl C220BiuReadFrontend {
             tick,
             offered: None,
             stall: None,
-            sent: None,
         };
         if let Some(head) = self.current.front().copied() {
             if tick < head.ready_tick {
@@ -323,7 +335,6 @@ impl C220BiuReadFrontend {
                         if input.prefetch {
                             self.prefetch_outstanding[input.subcore as usize] += 1;
                         }
-                        result.sent = Some(request);
                     } else {
                         result.stall = Some(C220BiuReadStall::TransportFull);
                     }

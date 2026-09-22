@@ -332,7 +332,7 @@ impl VectorEngine {
                 instruction
             }
             _ if C220MergeInstruction::decode(word).is_some() => {
-                if let Some(resume_tick) = self.pipeline.pending_drain_tick()
+                if let Some(resume_tick) = self.pending_drain_tick()
                     && tick < resume_tick
                 {
                     return Ok(VectorStep::Stalled(C220Stall {

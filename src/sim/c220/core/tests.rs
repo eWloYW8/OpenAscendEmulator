@@ -2150,6 +2150,29 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     let visibility = core.vmsu_pipeline().pending_visibility_tick().unwrap();
     let retirement = core.vmsu_pipeline().pending_drain_tick().unwrap();
     assert!(retirement > visibility);
+    let initial_trace = &core.vmsu_pipeline().trace().unwrap().repeats[0];
+    assert_eq!(initial_trace.completion_tick, None);
+    assert!(initial_trace.ub_cycles.is_empty());
+    assert!(initial_trace.comparisons.is_empty());
+    assert!(matches!(
+        core.step_word_at(1, word).unwrap(),
+        C220CoreStep::Stalled(C220Stall {
+            resume_tick,
+            cause: C220StallCause::VectorDependency,
+            ..
+        }) if resume_tick == retirement
+    ));
+    let mut standalone = core.vmsu_pipeline().clone();
+    let mut standalone_state = core.state().clone();
+    standalone
+        .advance_to(retirement, &mut standalone_state)
+        .unwrap();
+    core.advance_to(3).unwrap();
+    let partial_trace = &core.vmsu_pipeline().trace().unwrap().repeats[0];
+    assert_eq!(partial_trace.completion_tick, None);
+    assert!(!partial_trace.ub_cycles.is_empty());
+    assert!(partial_trace.ub_cycles.iter().all(|cycle| cycle.tick <= 3));
+    assert!(partial_trace.write_groups.is_empty());
     core.advance_to(visibility).unwrap();
     let output = core.state().ub().read_known(0x100, 64).unwrap();
     let payloads = output
@@ -2166,5 +2189,7 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     ));
     core.advance_to(retirement).unwrap();
     assert!(!core.vmsu_pipeline().is_active());
+    assert_eq!(core.vmsu_pipeline().trace(), standalone.trace());
+    assert_eq!(core.state().ub(), standalone_state.ub());
     assert_eq!(core.state().scalar().machine().spr_value(17), Some(0));
 }

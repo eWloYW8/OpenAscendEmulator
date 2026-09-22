@@ -20,6 +20,25 @@ pub(in crate::sim::c220) struct VectorEngine {
 }
 
 impl VectorEngine {
+    pub(in crate::sim::c220) fn ub_cycles_at(
+        &self,
+        tick: u64,
+    ) -> impl Iterator<Item = &crate::sim::c220::memory::C220UbCycle> {
+        self.pipeline
+            .last_ub_cycles()
+            .iter()
+            .rev()
+            .take_while(move |cycle| cycle.tick == tick)
+            .chain(
+                self.vmsu
+                    .trace()
+                    .into_iter()
+                    .flat_map(|trace| trace.repeats.iter().rev())
+                    .flat_map(|repeat| repeat.ub_cycles.iter().rev())
+                    .take_while(move |cycle| cycle.tick == tick),
+            )
+    }
+
     pub(in crate::sim::c220) fn new(rules: C220VectorTimingRules, mask: C220CompareMask) -> Self {
         let mut pipeline = C220VectorPipeline::new(rules);
         pipeline.set_compare_mask(mask);

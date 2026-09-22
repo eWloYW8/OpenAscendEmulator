@@ -63,6 +63,13 @@ pub struct C220DmaUopRequest {
     pub last_in_burst: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220DmaDestinationLayout {
+    pub base: u64,
+    pub burst_bytes: u32,
+    pub burst_stride: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum C220DmaUopError {
     #[error(transparent)]
@@ -96,6 +103,18 @@ pub fn mte2_requests(
 }
 
 pub fn mte2_uops(transfer: C220Mte2TransferPlan) -> Result<C220DmaUops, C220DmaUopError> {
+    let mut requests = mte2_request_stream(transfer)?;
+    requests.destination = C220DmaDestinationLayout {
+        base: transfer.destination_address,
+        burst_bytes: u32::from(transfer.descriptor.burst_length) * 32,
+        burst_stride: (u64::from(transfer.descriptor.burst_length)
+            + u64::from(transfer.descriptor.destination_gap))
+            * 32,
+    };
+    Ok(requests)
+}
+
+fn mte2_request_stream(transfer: C220Mte2TransferPlan) -> Result<C220DmaUops, C220DmaUopError> {
     let descriptor = checked_descriptor(transfer)?;
     let route = if descriptor.source_gap == 0 && descriptor.destination_gap == 0 {
         Some(C220DmaUopRoute::ContiguousBatch)
@@ -262,6 +281,11 @@ fn split_requests(
         return Err(C220DmaUopError::SizeOverflow);
     }
     Ok(C220DmaUops {
+        destination: C220DmaDestinationLayout {
+            base: geometry.destination_base,
+            burst_bytes: geometry.burst_bytes as u32,
+            burst_stride: geometry.destination_stride,
+        },
         geometry,
         route,
         mode,
@@ -274,6 +298,7 @@ fn split_requests(
 /// destination offsets and both base addresses remain 64-bit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220DmaUops {
+    destination: C220DmaDestinationLayout,
     geometry: DmaRequestGeometry,
     route: C220DmaUopRoute,
     mode: C220DmaUopMode,
@@ -282,6 +307,10 @@ pub struct C220DmaUops {
 }
 
 impl C220DmaUops {
+    pub(super) fn destination(&self) -> C220DmaDestinationLayout {
+        self.destination
+    }
+
     pub(super) fn out_of_order(&self) -> bool {
         self.geometry.split_enabled
     }

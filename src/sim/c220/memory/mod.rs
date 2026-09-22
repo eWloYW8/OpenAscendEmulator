@@ -2,6 +2,8 @@ mod buffer;
 mod l0c;
 pub mod l1;
 mod ub_arbiter;
+mod ub_block;
+pub mod ub_service;
 
 use crate::memory::pv_memory::PvMemory;
 use crate::sim::c220::device::C220Device;
@@ -15,6 +17,7 @@ pub use ub_arbiter::{
     C220UbBank, C220UbBlock, C220UbCycle, C220UbDecision, C220UbPort, C220UbRequest,
     C220UbRequestError,
 };
+pub use ub_block::C220UbBlockProgress;
 
 pub const C220_L0C_UNIT_FLAG_READ_LATENCY: u32 = 12;
 

@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU32;
 
+use super::write::{
+    C220BiuWriteBandwidths, C220BiuWriteDestination, C220BiuWriteError, C220BiuWriteFragment,
+    C220BiuWriteProgress, C220BiuWriteSend, C220BiuWriteStall, WriteAligner, WritePlan,
+};
 use super::{C220BiuReadRequest, C220BiuSubcore};
 
 mod events;
@@ -41,6 +45,8 @@ pub struct C220BiuReadProgress {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220BiuReturnError {
+    #[error(transparent)]
+    Write(#[from] C220BiuWriteError),
     #[error("BIU return time reversed from {previous} to {requested}")]
     TimeReversed { previous: u64, requested: u64 },
     #[error("BIU return {phase} callback already ran at tick {tick}")]
@@ -104,8 +110,8 @@ impl<const N: usize> RoundRobin<N> {
 }
 
 /// Ordinary two-port BIU read returns. Receive, ingress, tag selection, ROB
-/// reads and egress are independent callbacks. The write adapter is the output
-/// boundary; destination service and HBM response latency belong to their owners.
+/// reads, egress and destination sends are independent callbacks. Destination
+/// service and HBM response latency belong to their owners.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220BiuReadReturns {
     capacity: u32,
@@ -119,6 +125,8 @@ pub struct C220BiuReadReturns {
     active_ready_tick: Option<u64>,
     egress: [VecDeque<C220BiuReadOutput>; 3],
     adapters: [VecDeque<C220BiuReadOutput>; 3],
+    aligners: [WriteAligner; 5],
+    write_plans: [Option<WritePlan>; 3],
     receive_arbiter: RoundRobin<2>,
     core_arbiter: RoundRobin<3>,
     order_arbiters: [RoundRobin<2>; 3],
@@ -129,10 +137,15 @@ pub struct C220BiuReadReturns {
     select_tick: Option<u64>,
     read_tick: Option<u64>,
     egress_ticks: [Option<u64>; 3],
+    send_ticks: [Option<u64>; 3],
 }
 
 impl C220BiuReadReturns {
-    pub fn new(outstanding: NonZeroU32, group_vectors: bool) -> Result<Self, C220BiuReturnError> {
+    pub fn new(
+        outstanding: NonZeroU32,
+        group_vectors: bool,
+        bandwidths: C220BiuWriteBandwidths,
+    ) -> Result<Self, C220BiuReturnError> {
         let capacity = (outstanding.get().wrapping_shl(9) / 2) >> 7;
         if capacity == 0 {
             return Err(C220BiuReturnError::ZeroCapacity);
@@ -149,6 +162,8 @@ impl C220BiuReadReturns {
             active_ready_tick: None,
             egress: std::array::from_fn(|_| VecDeque::new()),
             adapters: std::array::from_fn(|_| VecDeque::new()),
+            aligners: bandwidths.widths().map(WriteAligner::new),
+            write_plans: std::array::from_fn(|_| None),
             receive_arbiter: RoundRobin::default(),
             core_arbiter: RoundRobin::default(),
             order_arbiters: [RoundRobin::default(); 3],
@@ -159,11 +174,17 @@ impl C220BiuReadReturns {
             select_tick: None,
             read_tick: None,
             egress_ticks: [None; 3],
+            send_ticks: [None; 3],
         })
     }
 
     pub fn is_idle(&self) -> bool {
-        self.records.is_empty() && self.adapters.iter().all(VecDeque::is_empty)
+        self.records.is_empty()
+            && self.adapters.iter().all(VecDeque::is_empty)
+            && self
+                .aligners
+                .iter()
+                .all(|aligner| aligner.progress.instruction_id.is_none())
     }
 
     pub fn contains_instruction(&self, id: u64) -> bool {
@@ -175,6 +196,10 @@ impl C220BiuReadReturns {
                 .iter()
                 .flatten()
                 .any(|output| output.request.input.generated.instruction_id == id)
+            || self
+                .aligners
+                .iter()
+                .any(|aligner| aligner.progress.instruction_id == Some(id))
     }
 
     pub fn occupancy(&self) -> [u32; 2] {
@@ -214,6 +239,16 @@ impl C220BiuReadReturns {
         &self.adapters[core as usize]
     }
 
+    pub fn write_fragment(&self, core: C220BiuSubcore) -> Option<C220BiuWriteFragment> {
+        self.write_plans[core as usize]
+            .as_ref()
+            .and_then(WritePlan::front)
+    }
+
+    pub fn write_progress(&self, destination: C220BiuWriteDestination) -> C220BiuWriteProgress {
+        self.aligners[destination as usize].progress
+    }
+
     pub fn track(
         &mut self,
         tick: u64,
@@ -225,6 +260,9 @@ impl C220BiuReadReturns {
         }
         if request.input.prefetch {
             return Err(C220BiuReturnError::PrefetchUnsupported);
+        }
+        if request.input.destination.subcore() != request.input.subcore {
+            return Err(C220BiuWriteError::WrongSubcore.into());
         }
         if self.records.contains_key(&request.tag) {
             return Err(C220BiuReturnError::DuplicateTag(request.tag));
@@ -508,20 +546,48 @@ impl C220BiuReadReturns {
         Ok(sent)
     }
 
-    pub fn take_output(
+    pub fn send_output(
         &mut self,
         tick: u64,
         core: C220BiuSubcore,
-    ) -> Result<Option<C220BiuReadOutput>, C220BiuReturnError> {
-        self.check_time(tick)?;
-        let queue = &mut self.adapters[core as usize];
-        let output = if queue.front().is_some_and(|head| head.ready_tick <= tick) {
-            queue.pop_front()
-        } else {
-            None
+        destination_ready: bool,
+    ) -> Result<C220BiuWriteSend, C220BiuReturnError> {
+        let index = core as usize;
+        self.check_callback(tick, self.send_ticks[index], "destination send")?;
+        let mut result = C220BiuWriteSend {
+            tick,
+            core,
+            offered: None,
+            stall: None,
+            consumed: None,
         };
+        if let Some(output) = self.adapters[index].front().copied() {
+            if output.ready_tick > tick {
+                result.stall = Some(C220BiuWriteStall::NotReady);
+            } else {
+                if self.write_plans[index].is_none() {
+                    self.write_plans[index] = Some(
+                        self.aligners[output.request.input.destination as usize].plan(output)?,
+                    );
+                }
+                let plan = self.write_plans[index].as_mut().expect("prepared output");
+                result.offered = plan.front();
+                if result.offered.is_some() {
+                    if destination_ready {
+                        plan.advance();
+                    } else {
+                        result.stall = Some(C220BiuWriteStall::DestinationFull);
+                    }
+                }
+                if plan.front().is_none() {
+                    result.consumed = self.adapters[index].pop_front();
+                    self.write_plans[index] = None;
+                }
+            }
+        }
+        self.send_ticks[index] = Some(tick);
         self.observed_tick = Some(tick);
-        Ok(output)
+        Ok(result)
     }
 
     fn pop_beat(&mut self, tag: Tag) -> C220BiuRobBeat {

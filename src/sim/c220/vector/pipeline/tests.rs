@@ -12,6 +12,89 @@ use crate::sim::common::scalar::ScalarMachine;
 use crate::sim::common::scalar::ScalarStepper;
 
 #[test]
+fn masked_write_reacquires_bank_and_delays_mte_until_second_grant() {
+    use crate::sim::c220::memory::ub_service::{
+        C220UbMtePort, C220UbMteService, C220UbServiceRequest,
+    };
+    use crate::sim::c220::vector::timing::{C220VectorUopKind, C220VectorUopStages};
+
+    let machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+    let mut core = C220State::new(ScalarStepper::new(machine, 0), UbMemory::new(256, 256));
+    let mut pipeline = C220VectorPipeline::new(C220VectorTimingRules {
+        dispatch_ticks: 0,
+        uop_issue_interval: NonZeroU64::new(1).unwrap(),
+        ub_response_ticks: 2,
+    });
+    let store = C220VectorStore {
+        repeat_index: 0,
+        lane_index: 0,
+        address: 0,
+        bank: C220UbBank::from_address(0),
+        width_bytes: 4,
+        data: [7; 8],
+    };
+    pipeline
+        .issue_at(
+            0,
+            &[C220VectorUop {
+                pc: 0,
+                repeat_index: 0,
+                lane_group: Some(0),
+                kind: C220VectorUopKind::Ordinary,
+                stages: C220VectorUopStages {
+                    read_ticks: 0,
+                    execute_ticks: 0,
+                },
+                writeback_ticks: 7,
+                writes_ub: true,
+            }],
+            &[store],
+            None,
+        )
+        .unwrap();
+    assert_eq!(pipeline.pending_visibility_tick(), Some(10));
+    let mut memory = C220UbMteService::default();
+    for tick in 0..=10 {
+        pipeline.advance_to(tick, &mut core).unwrap();
+        let cycles = pipeline.last_ub_cycles();
+        let banks = cycles.iter().fold(0, |mask, cycle| mask | cycle.bank_mask);
+        if tick == 7 {
+            memory
+                .receive(
+                    tick,
+                    C220UbMtePort::Write0,
+                    C220UbServiceRequest {
+                        id: 1,
+                        address: 0,
+                        bytes: 32,
+                    },
+                )
+                .unwrap();
+        }
+        let mte = memory.arbitrate(tick, banks, !cycles.is_empty()).unwrap();
+        if tick == 0 || tick == 7 {
+            let decision = cycles[0].decisions[0];
+            assert!(decision.granted);
+            assert_eq!(decision.second_grant, tick == 7);
+        } else if tick < 7 {
+            assert!(cycles.iter().all(|cycle| cycle.decisions.is_empty()));
+        }
+        if tick == 7 {
+            assert!(!mte.decisions[0].granted);
+            assert!(mte.completed.is_empty());
+        }
+        if tick == 8 {
+            assert_eq!(mte.completed.len(), 1);
+        }
+        if tick < 10 {
+            assert!(core.ub().read_known(0, 4).is_err());
+        }
+    }
+    assert_eq!(core.ub().read_known(0, 4).unwrap(), [7; 4]);
+    assert!(core.ub().read_known(4, 1).is_err());
+}
+
+#[test]
 fn conflicting_read_ports_delay_visibility_and_keep_granted_bytes() {
     let mut ub = UbMemory::new(4096, 256);
     for (address, value) in [(0, 1.0_f32), (0x10000, 2.0_f32)] {

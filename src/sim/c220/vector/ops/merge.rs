@@ -69,8 +69,6 @@ pub struct C220MergeRecord {
 pub struct C220MergeRepeatData {
     pub repeat_index: usize,
     pub lists: [Vec<C220MergeRecord>; 4],
-    pub output: Vec<C220MergeRecord>,
-    pub consumed: [u16; 4],
 }
 
 pub fn plan_c220_merge_issue(
@@ -224,59 +222,10 @@ pub fn load_c220_merge_repeat(
             });
         }
     }
-    let (output, consumed) = merge_loaded_lists(issue, &lists)?;
     Ok(C220MergeRepeatData {
         repeat_index,
         lists,
-        output,
-        consumed,
     })
-}
-
-fn merge_loaded_lists(
-    issue: &C220MergeIssue,
-    lists: &[Vec<C220MergeRecord>; 4],
-) -> Result<(Vec<C220MergeRecord>, [u16; 4]), C220VectorError> {
-    let maximum = issue.maximum_output_records();
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(maximum)
-        .map_err(|_| C220VectorError::HostAllocationFailed { lanes: maximum })?;
-    let mut consumed = [0_u16; 4];
-    while output.len() < maximum {
-        let mut selected = None;
-        for list in 0..4 {
-            if !issue.list_is_active(list) {
-                continue;
-            }
-            let index = usize::from(consumed[list]);
-            let Some(candidate) = lists[list].get(index) else {
-                continue;
-            };
-            if selected.is_none_or(|current: usize| {
-                merge_record_precedes(
-                    issue.instruction.width,
-                    candidate,
-                    &lists[current][usize::from(consumed[current])],
-                )
-            }) {
-                selected = Some(list);
-            }
-        }
-        let Some(list) = selected else {
-            break;
-        };
-        let mut record = lists[list][usize::from(consumed[list])];
-        if issue.instruction.width == C220MergeWidth::F16 {
-            record.bytes[2..4].fill(0);
-        }
-        output.push(record);
-        consumed[list] += 1;
-        if issue.control.exhausted_suspension && consumed[list] == issue.list_lengths[list] {
-            break;
-        }
-    }
-    Ok((output, consumed))
 }
 
 pub(crate) fn merge_record_precedes(

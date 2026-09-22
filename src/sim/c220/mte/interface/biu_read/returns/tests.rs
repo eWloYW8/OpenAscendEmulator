@@ -9,6 +9,11 @@ fn request(tag: u32, id: u64, core: C220BiuSubcore, bytes: u32) -> C220BiuReadRe
         byte_offset: 0,
         input: C220BiuReadInput {
             subcore: core,
+            destination: match core {
+                C220BiuSubcore::Cube => C220BiuWriteDestination::L1,
+                C220BiuSubcore::Vector0 => C220BiuWriteDestination::Ub0,
+                C220BiuSubcore::Vector1 => C220BiuWriteDestination::Ub1,
+            },
             prefetch: false,
             generated: C220DmaGenerated {
                 instruction_id: id,
@@ -16,6 +21,11 @@ fn request(tag: u32, id: u64, core: C220BiuSubcore, bytes: u32) -> C220BiuReadRe
                 ready_tick: 0,
                 mode: C220DmaUopMode::Wide512,
                 out_of_order: false,
+                destination: crate::sim::c220::mte::uop::C220DmaDestinationLayout {
+                    base: 0,
+                    burst_bytes: bytes,
+                    burst_stride: u64::from(bytes),
+                },
                 last_in_instruction: true,
                 request: C220DmaUopRequest {
                     route: C220DmaUopRoute::Ordinary,
@@ -30,6 +40,16 @@ fn request(tag: u32, id: u64, core: C220BiuSubcore, bytes: u32) -> C220BiuReadRe
     }
 }
 
+fn bandwidths(bytes: u32) -> C220BiuWriteBandwidths {
+    let width = NonZeroU32::new(bytes).unwrap();
+    C220BiuWriteBandwidths {
+        l1: width,
+        l0a: width,
+        l0b: width,
+        ub: width,
+    }
+}
+
 fn beat(request: C220BiuReadRequest, id: u32) -> Option<C220BiuReadBeat> {
     Some(C220BiuReadBeat {
         tag: request.tag,
@@ -39,7 +59,8 @@ fn beat(request: C220BiuReadRequest, id: u32) -> Option<C220BiuReadBeat> {
 
 #[test]
 fn out_of_order_tail_waits_for_last_completing_request() {
-    let mut returns = C220BiuReadReturns::new(NonZeroU32::new(2).unwrap(), true).unwrap();
+    let mut returns =
+        C220BiuReadReturns::new(NonZeroU32::new(2).unwrap(), true, bandwidths(128)).unwrap();
     let mut first = request(1, 7, C220BiuSubcore::Vector0, 128);
     first.input.generated.last_in_instruction = false;
     first.input.generated.out_of_order = true;
@@ -66,13 +87,15 @@ fn out_of_order_tail_waits_for_last_completing_request() {
     );
     assert!(
         returns
-            .take_output(6, C220BiuSubcore::Vector0)
+            .send_output(6, C220BiuSubcore::Vector0, true)
             .unwrap()
+            .sent()
             .is_none()
     );
     returns
-        .take_output(7, C220BiuSubcore::Vector0)
+        .send_output(7, C220BiuSubcore::Vector0, true)
         .unwrap()
+        .sent()
         .unwrap();
     returns.receive(8, [beat(first, 0), None]).unwrap();
     returns.ingress(10, 0).unwrap();
@@ -86,8 +109,9 @@ fn out_of_order_tail_waits_for_last_completing_request() {
     assert!(output.last_in_instruction);
     assert!(returns.contains_instruction(7));
     returns
-        .take_output(14, C220BiuSubcore::Vector0)
+        .send_output(14, C220BiuSubcore::Vector0, true)
         .unwrap()
+        .sent()
         .unwrap();
     assert!(returns.is_idle());
     assert_eq!(returns.occupancy(), [0; 2]);
@@ -95,7 +119,8 @@ fn out_of_order_tail_waits_for_last_completing_request() {
 
 #[test]
 fn cube_drains_distinct_ports_together_but_vector_port_conflicts_serialize() {
-    let mut returns = C220BiuReadReturns::new(NonZeroU32::new(4).unwrap(), true).unwrap();
+    let mut returns =
+        C220BiuReadReturns::new(NonZeroU32::new(4).unwrap(), true, bandwidths(128)).unwrap();
     let cube = request(1, 1, C220BiuSubcore::Cube, 256);
     let v0 = request(2, 2, C220BiuSubcore::Vector0, 128);
     let v1 = request(3, 3, C220BiuSubcore::Vector1, 128);
@@ -130,4 +155,117 @@ fn cube_drains_distinct_ports_together_but_vector_port_conflicts_serialize() {
     assert_eq!(returns.read(8).unwrap()[0].beat.tag, v1.tag);
     assert!(!returns.has_active_tags());
     assert_eq!(returns.occupancy(), [0; 2]);
+}
+
+#[test]
+fn destination_send_holds_adapter_credit_and_rounds_only_interface_bytes() {
+    let core = C220BiuSubcore::Vector0;
+    let mut returns =
+        C220BiuReadReturns::new(NonZeroU32::new(2).unwrap(), true, bandwidths(64)).unwrap();
+    let mut request = request(1, 1, core, 65);
+    request.input.generated.out_of_order = true;
+    request.input.generated.request.destination_address = 17;
+    let output = C220BiuReadOutput {
+        ready_tick: 4,
+        request,
+        last_in_instruction: true,
+    };
+    returns.adapters[1].push_back(output);
+    assert_eq!(
+        returns.send_output(3, core, true).unwrap().stall,
+        Some(C220BiuWriteStall::NotReady)
+    );
+    let blocked = returns.send_output(4, core, false).unwrap();
+    assert_eq!(blocked.stall, Some(C220BiuWriteStall::DestinationFull));
+    assert_eq!(returns.adapter(core).len(), 1);
+    let first = returns.send_output(5, core, true).unwrap();
+    assert_eq!(first.sent(), blocked.offered);
+    let first = first.sent().unwrap();
+    assert_eq!(
+        (first.destination_address, first.bytes, first.logical_bytes),
+        (17, 64, 64)
+    );
+    assert!(!first.last_in_instruction);
+    assert_eq!(returns.adapter(core).len(), 1);
+    assert!(returns.send_output(5, core, true).is_err());
+    assert!(
+        returns
+            .send_output(6, core, false)
+            .unwrap()
+            .consumed
+            .is_none()
+    );
+    let tail = returns.send_output(7, core, true).unwrap();
+    let fragment = tail.sent().unwrap();
+    assert_eq!(
+        (
+            fragment.destination_address,
+            fragment.bytes,
+            fragment.logical_bytes
+        ),
+        (81, 32, 1)
+    );
+    assert!(fragment.last_in_instruction);
+    assert_eq!(tail.consumed, Some(output));
+    assert!(returns.is_idle());
+}
+
+#[test]
+fn ordered_destination_coalesces_across_requests_and_restores_collapsed_gaps() {
+    let core = C220BiuSubcore::Vector0;
+    let mut returns =
+        C220BiuReadReturns::new(NonZeroU32::new(2).unwrap(), true, bandwidths(64)).unwrap();
+    let mut tick = 0;
+    let mut send = |bytes, last_in_burst, last_in_instruction, collapsed| {
+        let mut request = request(1, 1, core, bytes);
+        request.input.generated.destination =
+            crate::sim::c220::mte::uop::C220DmaDestinationLayout {
+                base: 0x1000,
+                burst_bytes: 32,
+                burst_stride: 160,
+            };
+        request.input.generated.request.last_in_burst = last_in_burst;
+        if collapsed {
+            request.input.generated.request.route = C220DmaUopRoute::DestinationGapCollapse;
+        }
+        returns.adapters[1].push_back(C220BiuReadOutput {
+            ready_tick: tick,
+            request,
+            last_in_instruction,
+        });
+        let mut fragments = Vec::new();
+        while !returns.adapter(core).is_empty() {
+            let sent = returns.send_output(tick, core, true).unwrap();
+            fragments.extend(sent.sent());
+            tick += 1;
+        }
+        fragments
+    };
+    assert!(send(31, false, false, false).is_empty());
+    let first = send(33, false, false, false);
+    assert_eq!((first[0].destination_address, first[0].bytes), (0x1000, 64));
+    assert!(!first[0].last_in_instruction);
+    let burst_tail = send(1, true, false, false);
+    assert_eq!(
+        (burst_tail[0].destination_address, burst_tail[0].bytes),
+        (0x1040, 32)
+    );
+    let tail = send(32, true, true, false);
+    assert_eq!((tail[0].destination_address, tail[0].bytes), (0x10a0, 32));
+    assert!(tail[0].last_in_instruction);
+    let full = send(127, false, false, true);
+    assert_eq!(
+        full.iter()
+            .map(|f| f.destination_address)
+            .collect::<Vec<_>>(),
+        [0x1000, 0x10a0, 0x1140]
+    );
+    let tail = send(1, true, true, true);
+    assert_eq!((tail[0].destination_address, tail[0].bytes), (0x11e0, 32));
+    assert!(tail[0].last_in_instruction);
+    assert_eq!(
+        returns.write_progress(C220BiuWriteDestination::Ub0),
+        C220BiuWriteProgress::default()
+    );
+    assert!(returns.is_idle());
 }
