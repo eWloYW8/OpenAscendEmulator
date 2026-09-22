@@ -2,66 +2,6 @@ use super::{C220VectorAdvanceError, C220VectorPipeline};
 use crate::sim::c220::state::C220State;
 use crate::sim::c220::vector::read::PendingVectorRead;
 impl C220VectorPipeline {
-    pub(super) fn apply_compare_updates(
-        &mut self,
-        tick: u64,
-        core: &mut C220State,
-    ) -> Result<(), C220VectorAdvanceError> {
-        for index in 0..self.pending.len() {
-            if self.pending[index].compare_update_applied
-                || self.pending[index]
-                    .execute_ready_tick
-                    .is_none_or(|ready| ready > tick)
-            {
-                continue;
-            }
-            let earlier_state_access_pending = self.pending.iter().take(index).any(|entry| {
-                let Some(read) = entry.read.as_ref() else {
-                    return false;
-                };
-                (read.uses_compare_mask() && !read.is_sampled())
-                    || (read.writes_compare_mask() && !entry.compare_update_applied)
-            });
-            if earlier_state_access_pending {
-                continue;
-            }
-            if let Some(update) = self.pending[index].compare_update {
-                self.compare_mask.apply(update);
-                let [low, high] = self.compare_mask.bits();
-                core.scalar_mut().machine_mut().set_spr_value(104, low)?;
-                core.scalar_mut().machine_mut().set_spr_value(105, high)?;
-                self.pending[index].compare_update_applied = true;
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn apply_selection_updates(&mut self, tick: u64) {
-        for index in 0..self.pending.len() {
-            if self.pending[index].selection_update_applied
-                || self.pending[index]
-                    .execute_ready_tick
-                    .is_none_or(|ready| ready > tick)
-            {
-                continue;
-            }
-            let earlier_state_access_pending = self.pending.iter().take(index).any(|entry| {
-                let Some(read) = entry.read.as_ref() else {
-                    return false;
-                };
-                (read.uses_selection_mask() && !read.is_sampled())
-                    || (read.writes_selection_mask() && !entry.selection_update_applied)
-            });
-            if earlier_state_access_pending {
-                continue;
-            }
-            if let Some(update) = self.pending[index].selection_update.clone() {
-                self.selection_mask = Some(update);
-                self.pending[index].selection_update_applied = true;
-            }
-        }
-    }
-
     pub(super) fn apply_reduction_updates(
         &mut self,
         tick: u64,

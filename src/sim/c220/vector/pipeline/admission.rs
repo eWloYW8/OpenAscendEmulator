@@ -1,5 +1,5 @@
 use super::functional::FunctionalInstruction;
-use super::hazards::{C220VectorIssueVariant, C220VectorQueueClass};
+use super::hazards::{C220VectorIssueVariant, C220VectorQueueClass, RepeatOpcode};
 use super::{
     C220VectorPipeline, C220VectorPipelineError, PendingReductionUpdate, PendingVectorUop,
 };
@@ -9,7 +9,7 @@ use crate::sim::c220::vector::ops::reduce::{
     C220ReductionState, C220ReductionStateUpdate, C220ReductionValue,
 };
 use crate::sim::c220::vector::read::{C220VectorReadIssue, PendingVectorRead};
-use crate::sim::c220::vector::repeat::{AccumulatorSchedule, OrdinaryReadSchedule};
+use crate::sim::c220::vector::repeat::{AccumulatorSchedule, OrdinaryRepeatSchedule};
 use crate::sim::c220::vector::timing::{
     C220VectorTimelineError, C220VectorUop, C220VectorUopKind, C220VectorWritePlan,
 };
@@ -61,7 +61,7 @@ impl C220VectorPipeline {
             .into());
         }
         let accumulator = compute.and_then(AccumulatorSchedule::from_issue);
-        let ordinary_reads = compute.and_then(OrdinaryReadSchedule::from_issue);
+        let ordinary_reads = compute.and_then(OrdinaryRepeatSchedule::from_issue);
         let functional = compute.and_then(FunctionalInstruction::from_issue);
         let mut grouped = vec![Vec::new(); uops.len()];
         for &store in stores {
@@ -96,7 +96,7 @@ impl C220VectorPipeline {
             let index = uops
                 .iter()
                 .position(|uop| {
-                    (uop.writes_ub || accumulator.is_some())
+                    (uop.writes_ub || accumulator.is_some() || ordinary_reads.is_some())
                         && uop.repeat_index == store.repeat_index
                         && if matches!(
                             uop.kind,
@@ -114,7 +114,7 @@ impl C220VectorPipeline {
             grouped[index].push(store);
         }
         if uops.iter().enumerate().any(|(index, uop)| {
-            if accumulator.is_some() {
+            if accumulator.is_some() || ordinary_reads.is_some() {
                 uop.lane_group.is_some() == grouped[index].is_empty()
             } else {
                 uop.writes_ub == grouped[index].is_empty()
@@ -128,8 +128,7 @@ impl C220VectorPipeline {
             .ok_or(C220VectorPipelineError::TimeOverflow)?;
         let mut next_admission_tick = self.next_admission_tick;
         let issue_variant = C220VectorIssueVariant::from_compute(compute);
-        let mut previous_variant = self.last_issue_variant;
-        let mut previous_admission_tick = self.last_uop_admission_tick;
+        let repeat_opcode = compute.and_then(RepeatOpcode::from_compute);
         let mut entries = Vec::with_capacity(uops.len());
         let instruction_group = self.next_instruction_group;
         if !uops.is_empty() {
@@ -165,30 +164,30 @@ impl C220VectorPipeline {
                 Some(C220VectorReadIssue::Nchw(_)) => uop.repeat_index % 2 == 1,
                 _ => false,
             };
-            let conflict_tick = previous_variant.zip(previous_admission_tick).map_or(
-                0,
-                |(previous, previous_tick)| {
-                    previous_tick.saturating_add(issue_variant.minimum_gap_from(previous))
-                },
-            );
-            let admission_tick = first_admission.max(next_admission_tick).max(conflict_tick);
+            let admission_tick = first_admission.max(next_admission_tick);
             let issue_gap = accumulator
                 .zip(uop.kind.lane_slice())
                 .map_or(1, |(schedule, (first, lanes))| {
                     schedule.issue_gap(uop.repeat_index, first, lanes)
                 })
-                .max(self.rules.uop_issue_interval.get());
+                .max(ordinary_reads.map_or(1, |schedule| {
+                    schedule.issue_gap(uop.repeat_index, uop.stages.execute_ticks)
+                }));
             next_admission_tick = admission_tick
-                .checked_add(issue_gap)
+                .checked_add(self.rules.uop_issue_interval.get())
                 .ok_or(C220VectorPipelineError::TimeOverflow)?;
-            previous_variant = Some(issue_variant);
-            previous_admission_tick = Some(admission_tick);
             let synthetic_zero_reduction =
                 reduction_group.is_some_and(|(_, update)| update.is_some());
+            let synthetic_functional = functional.is_some()
+                && match compute {
+                    Some(C220VectorReadIssue::Select(select)) => select.iteration_masks.is_empty(),
+                    Some(C220VectorReadIssue::MoveMask(_)) => false,
+                    _ => uop.lane_group.is_none(),
+                };
             let mut read = if let Some(issue) = compute
                 && !shared_read_from_previous
                 && !synthetic_zero_reduction
-                && !(functional.is_some() && uop.lane_group.is_none())
+                && !synthetic_functional
             {
                 Some(PendingVectorRead::new(
                     issue,
@@ -224,21 +223,22 @@ impl C220VectorPipeline {
                 admission_tick,
                 admitted: false,
                 issue_gap,
+                issue_variant,
+                repeat_opcode,
+                conflict_check_tick: None,
                 deferred_compute: functional.is_some(),
                 stores,
                 read,
                 shared_read_from_previous,
                 write,
+                write_completion_tick: None,
                 execute_ready_tick: None,
                 eligible_tick: None,
                 release_tick: None,
                 retirement_tick: None,
                 visible_tick: None,
                 committed: false,
-                compare_update: None,
                 compare_update_applied: false,
-                selection_update: None,
-                selection_update_applied: false,
                 reduction_update: reduction_group.map(|(group, update)| PendingReductionUpdate {
                     group,
                     update,
@@ -255,10 +255,6 @@ impl C220VectorPipeline {
         {
             self.functional_instructions
                 .insert(instruction_group, functional);
-        }
-        if !uops.is_empty() {
-            self.last_issue_variant = previous_variant;
-            self.last_uop_admission_tick = previous_admission_tick;
         }
         self.pending.extend(entries);
         Ok(self.pending_visibility_tick())

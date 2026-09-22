@@ -127,6 +127,7 @@ pub struct C220CompareMaskIssue {
     pub control: C220VectorControl,
     pub addresses: C220VectorAddresses,
     pub iteration_masks: Vec<[u64; 4]>,
+    pub initial_compare_mask: C220CompareMask,
 }
 
 impl C220CompareMaskIssue {
@@ -167,6 +168,7 @@ pub fn plan_c220_compare_mask_issue(
     word: u32,
     control_value: u64,
     mask: C220VectorMaskState,
+    initial_compare_mask: C220CompareMask,
     registers: &[u64; 32],
     ub: &UbMemory,
 ) -> Result<C220CompareMaskIssue, C220VectorError> {
@@ -193,6 +195,7 @@ pub fn plan_c220_compare_mask_issue(
         control,
         addresses,
         iteration_masks,
+        initial_compare_mask,
     };
     for uop_index in 0..issue.uop_count() {
         for access in issue.read_accesses_for_uop(uop_index)? {
@@ -514,6 +517,99 @@ mod tests {
     use crate::sim::c220::vector::read::C220VectorReadIssue;
     use crate::sim::common::scalar::ScalarMachine;
     use crate::sim::common::scalar::ScalarStepper;
+
+    #[test]
+    fn compare_tail_preserves_issue_snapshot_not_previous_repeat() {
+        for opcode in [0x9940_0000, 0x99c0_0000] {
+            for zero_count in [false, true] {
+                let word = opcode | (1 << 12) | (2 << 7) | (3 << 2);
+                let width = C220CompareMaskInstruction::decode(word).unwrap().width;
+                let mut ub = UbMemory::new(4096, 256);
+                for address in [0x400, 0x500, 0x800, 0x900] {
+                    ub.write_states(address, &[MemoryByteState::Known(0); 256])
+                        .unwrap();
+                }
+                let mut registers = [0; 32];
+                registers[1] = 0x400;
+                registers[2] = 0x800;
+                let seed = [0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555];
+                let issue = plan_c220_compare_mask_issue(
+                    0,
+                    word,
+                    (8 << 40) | (8 << 32) | (1 << 16) | (1 << 8),
+                    C220VectorMaskState {
+                        control: 1 << 56,
+                        low: if zero_count {
+                            0
+                        } else {
+                            width.lane_count() as u64 + 1
+                        },
+                        high: 0,
+                    },
+                    C220CompareMask::from_bits(seed),
+                    &registers,
+                    &ub,
+                )
+                .unwrap();
+                let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+                machine.set_spr_value(104, 0x1234).unwrap();
+                machine.set_spr_value(105, 0x5678).unwrap();
+                let mut core = C220State::new(ScalarStepper::new(machine, 0), ub);
+                let mut pipeline = C220VectorPipeline::new(C220VectorTimingRules {
+                    dispatch_ticks: 0,
+                    uop_issue_interval: NonZeroU64::new(1).unwrap(),
+                    ub_response_ticks: 2,
+                });
+                let uops = C220VectorInstruction::CompareMask(issue.clone())
+                    .uops()
+                    .unwrap();
+                pipeline
+                    .issue_at(
+                        0,
+                        &uops,
+                        &[],
+                        Some(C220VectorReadIssue::CompareMask(&issue)),
+                    )
+                    .unwrap();
+                pipeline.advance_to(1000, &mut core).unwrap();
+                let expected = if zero_count {
+                    [0x1234, 0x5678]
+                } else {
+                    [
+                        seed[0] | 1,
+                        if width == C220CompareWidth::F16 {
+                            seed[1]
+                        } else {
+                            0x5678
+                        },
+                    ]
+                };
+                assert_eq!(core.scalar().machine().spr_value(104), Some(expected[0]));
+                assert_eq!(core.scalar().machine().spr_value(105), Some(expected[1]));
+                assert!(!pipeline.has_pending_compare_mask_write());
+                assert_eq!(
+                    pipeline.last_functional_samples().len(),
+                    if zero_count { 0 } else { 2 }
+                );
+                if !zero_count {
+                    assert_eq!(
+                        pipeline.last_functional_samples()[0]
+                            .compare_update
+                            .unwrap()
+                            .values[0],
+                        u64::MAX
+                    );
+                    assert_eq!(
+                        pipeline.last_functional_samples()[1]
+                            .compare_update
+                            .unwrap()
+                            .values[0],
+                        seed[0] | 1
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn packed_compare_writes_dense_results_for_supported_operands() {

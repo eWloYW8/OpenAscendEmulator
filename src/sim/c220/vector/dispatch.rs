@@ -24,7 +24,8 @@ use crate::isa::c220::vector::{
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 use crate::sim::c220::vector::C220VectorInstruction;
 use crate::sim::c220::vector::ops::compare::{
-    plan_c220_compare_mask_issue, plan_c220_move_mask_issue, plan_c220_packed_compare_issue,
+    C220CompareMask, plan_c220_compare_mask_issue, plan_c220_move_mask_issue,
+    plan_c220_packed_compare_issue,
 };
 use crate::sim::c220::vector::ops::nchw::plan_c220_nchw_issue;
 use crate::sim::c220::vector::ops::select::{C220SelectMode, plan_c220_select_issue};
@@ -249,6 +250,14 @@ impl VectorEngine {
                             .spr_value(101)
                             .ok_or(C220VectorError::MissingMaskState)?,
                     },
+                    C220CompareMask::from_bits([
+                        machine
+                            .spr_value(104)
+                            .ok_or(C220VectorError::MissingMaskState)?,
+                        machine
+                            .spr_value(105)
+                            .ok_or(C220VectorError::MissingMaskState)?,
+                    ]),
                     registers,
                     state.ub(),
                 )?;

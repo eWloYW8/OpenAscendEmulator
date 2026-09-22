@@ -3,9 +3,17 @@ use crate::isa::c220::vector::conversion::C220ConversionKind;
 use crate::sim::c220::state::C220State;
 use crate::sim::c220::vector::C220_VECTOR_TILE_BYTES;
 use crate::sim::c220::vector::ops::{
-    arithmetic::C220VectorArithmeticIssue, axpy::C220AxpyIssue, conversion::C220ConversionIssue,
-    copy::C220CopyIssue, fused::C220FusedIssue, scalar::C220VectorScalarIssue,
-    shift::C220ShiftIssue, special::C220SpecialUnaryIssue, ternary::C220TernaryIssue,
+    arithmetic::C220VectorArithmeticIssue,
+    axpy::C220AxpyIssue,
+    compare::{C220CompareMask, C220CompareMaskIssue, C220MoveMaskIssue},
+    conversion::C220ConversionIssue,
+    copy::C220CopyIssue,
+    fused::C220FusedIssue,
+    scalar::C220VectorScalarIssue,
+    select::{C220SelectIssue, C220SelectMode},
+    shift::C220ShiftIssue,
+    special::C220SpecialUnaryIssue,
+    ternary::C220TernaryIssue,
 };
 use crate::sim::c220::vector::read::{C220VectorReadIssue, PendingVectorRead};
 use crate::sim::c220::vector::timing::C220VectorUopKind;
@@ -21,6 +29,9 @@ pub(super) enum FunctionalInstruction {
     Axpy(Box<C220AxpyIssue>),
     Conversion(Box<C220ConversionIssue>),
     Fused(Box<C220FusedIssue>),
+    MoveMask(C220MoveMaskIssue),
+    Select(Box<C220SelectIssue>),
+    Compare(Box<C220CompareMaskIssue>),
 }
 
 impl FunctionalInstruction {
@@ -41,6 +52,9 @@ impl FunctionalInstruction {
                 Some(Self::Conversion(Box::new(issue.clone())))
             }
             C220VectorReadIssue::Fused(issue) => Some(Self::Fused(Box::new(issue.clone()))),
+            C220VectorReadIssue::MoveMask(issue) => Some(Self::MoveMask(issue.clone())),
+            C220VectorReadIssue::Select(issue) => Some(Self::Select(Box::new(issue.clone()))),
+            C220VectorReadIssue::CompareMask(issue) => Some(Self::Compare(Box::new(issue.clone()))),
             _ => None,
         }
     }
@@ -56,10 +70,18 @@ impl FunctionalInstruction {
             Self::Axpy(issue) => C220VectorReadIssue::Axpy(issue),
             Self::Conversion(issue) => C220VectorReadIssue::Conversion(issue),
             Self::Fused(issue) => C220VectorReadIssue::Fused(issue),
+            Self::MoveMask(issue) => C220VectorReadIssue::MoveMask(issue),
+            Self::Select(issue) => C220VectorReadIssue::Select(issue),
+            Self::Compare(issue) => C220VectorReadIssue::CompareMask(issue),
         }
     }
 
     fn prepare_repeat(&mut self, core: &C220State) {
+        if let Self::Select(issue) = self
+            && issue.mode == C220SelectMode::TensorTensor
+        {
+            issue.selection_mask_base = Some(core.scalar().machine().spr_value(104).unwrap_or(0));
+        }
         if let Self::Conversion(issue) = self {
             match issue.instruction.kind {
                 C220ConversionKind::VectorDeqS16ToS8 { .. } => {
@@ -102,6 +124,15 @@ impl FunctionalInstruction {
             Self::Fused(issue) => {
                 return (issue.iteration_masks.len(), issue.instruction.lane_count());
             }
+            Self::MoveMask(_) => return (1, 0),
+            Self::Compare(issue) => (
+                issue.iteration_masks.len(),
+                issue.instruction.width.element_bytes(),
+            ),
+            Self::Select(issue) => (
+                issue.iteration_masks.len(),
+                issue.instruction.width.element_bytes(),
+            ),
         };
         (repeats, C220_VECTOR_TILE_BYTES / usize::from(element_bytes))
     }
@@ -118,19 +149,45 @@ impl C220VectorPipeline {
         for repeat in 0..repeats {
             let instruction = self.functional_instructions.get_mut(&group).unwrap();
             instruction.prepare_repeat(core);
-            let mut read = PendingVectorRead::new(
+            let (lane_group, kind) = if matches!(instruction, FunctionalInstruction::MoveMask(_)) {
+                (None, C220VectorUopKind::Ordinary)
+            } else {
+                (
+                    Some(0),
+                    C220VectorUopKind::LaneSlice {
+                        first_lane: 0,
+                        lane_count: lanes as u16,
+                    },
+                )
+            };
+            let mut read = PendingVectorRead::new_functional(
                 instruction.read_issue(),
                 repeat,
-                Some(0),
-                C220VectorUopKind::LaneSlice {
-                    first_lane: 0,
-                    lane_count: lanes as u16,
-                },
+                lane_group,
+                kind,
             )?;
             read.capture_functional_inputs(core.ub())?;
             read.set_ready_tick(tick);
-            let (sample, stores) = read.sample(core.ub(), self.compare_mask, None)?;
+            let mask = C220CompareMask::from_bits([
+                core.scalar().machine().spr_value(104).unwrap_or(0),
+                core.scalar().machine().spr_value(105).unwrap_or(0),
+            ]);
+            let (sample, stores) = read.sample(core.ub(), mask)?;
             core.commit_c220_vector_stores(&stores)?;
+            if let Some(update) = sample.compare_update {
+                self.compare_mask = mask;
+                self.compare_mask.apply(update);
+                let [low, high] = self.compare_mask.bits();
+                core.scalar_mut().machine_mut().set_spr_value(104, low)?;
+                core.scalar_mut().machine_mut().set_spr_value(105, high)?;
+                for entry in self
+                    .pending
+                    .iter_mut()
+                    .filter(|entry| entry.instruction_group == group)
+                {
+                    entry.compare_update_applied = true;
+                }
+            }
             self.last_functional_samples.push(sample);
         }
         self.functional_instructions.remove(&group);

@@ -418,9 +418,21 @@ pub struct C220VectorUopRelease {
     pub lane_group: Option<u8>,
     pub kind: C220VectorUopKind,
     pub admission_tick: u64,
+    pub conflict_check_tick: u64,
     pub eligible_tick: u64,
     pub release_tick: u64,
     pub ub_write_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct C220VectorWriteCompletion {
+    pub pc: u64,
+    pub repeat_index: usize,
+    pub lane_group: Option<u8>,
+    pub kind: C220VectorUopKind,
+    pub submitted_tick: u64,
+    pub completion_tick: u64,
+    pub block_grants: Vec<Option<u64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

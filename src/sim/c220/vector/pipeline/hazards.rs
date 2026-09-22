@@ -9,6 +9,34 @@ use crate::isa::c220::vector::sort::C220SortWidth;
 use crate::isa::c220::vector::special::C220SpecialUnaryOperation;
 use crate::isa::c220::vector::ternary::C220TernaryOperation;
 use crate::sim::c220::vector::read::C220VectorReadIssue;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RepeatOpcode {
+    Arithmetic(C220VecArithmeticOperation, u8),
+    Ternary(
+        C220TernaryOperation,
+        crate::isa::c220::vector::ternary::C220TernaryWidth,
+    ),
+    Axpy(crate::isa::c220::vector::axpy::C220AxpyWidth),
+}
+
+impl RepeatOpcode {
+    pub(super) fn from_compute(compute: C220VectorReadIssue<'_>) -> Option<Self> {
+        match compute {
+            C220VectorReadIssue::Arithmetic(issue) => Some(Self::Arithmetic(
+                issue.hint.operation,
+                issue.hint.dtype_selector,
+            )),
+            C220VectorReadIssue::Ternary(issue) => Some(Self::Ternary(
+                issue.instruction.operation,
+                issue.instruction.width,
+            )),
+            C220VectorReadIssue::Axpy(issue) => Some(Self::Axpy(issue.instruction.width)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum C220VectorIssueVariant {
     Other,

@@ -1,23 +1,24 @@
 mod admission;
+mod conflict;
 mod functional;
 mod hazards;
 mod updates;
+mod writeback;
 use functional::FunctionalInstruction;
-use hazards::C220VectorIssueVariant;
 pub(crate) use hazards::C220VectorQueueClass;
+use hazards::{C220VectorIssueVariant, RepeatOpcode};
 
 use crate::memory::ub::UbMemory;
 use crate::sim::c220::memory::{C220UbCycle, C220UbPort, C220UbRequest, C220UbRequestError};
 use crate::sim::c220::state::{C220ExecutionError, C220State};
-use crate::sim::c220::vector::ops::compare::{C220CompareMask, C220CompareMaskUpdate};
+use crate::sim::c220::vector::ops::compare::C220CompareMask;
 use crate::sim::c220::vector::ops::reduce::{C220ReductionState, C220ReductionStateUpdate};
-use crate::sim::c220::vector::ops::select::C220SelectionMaskBlock;
 use crate::sim::c220::vector::read::{
     C220VectorReadError, C220VectorReadSample, PendingVectorRead,
 };
 use crate::sim::c220::vector::timing::{
     C220VectorTimelineError, C220VectorUop, C220VectorUopKind, C220VectorUopRelease,
-    C220VectorWritePlanError,
+    C220VectorWriteCompletion, C220VectorWritePlanError,
 };
 use crate::sim::c220::vector::va::C220VaUpdate;
 use crate::sim::c220::vector::{C220VectorError, C220VectorStore};
@@ -64,21 +65,22 @@ struct PendingVectorUop {
     admission_tick: u64,
     admitted: bool,
     issue_gap: u64,
+    issue_variant: C220VectorIssueVariant,
+    repeat_opcode: Option<RepeatOpcode>,
+    conflict_check_tick: Option<u64>,
     deferred_compute: bool,
     stores: Vec<C220VectorStore>,
     read: Option<PendingVectorRead>,
     shared_read_from_previous: bool,
     write: Option<C220UbRequest>,
+    write_completion_tick: Option<u64>,
     execute_ready_tick: Option<u64>,
     eligible_tick: Option<u64>,
     release_tick: Option<u64>,
     retirement_tick: Option<u64>,
     visible_tick: Option<u64>,
     committed: bool,
-    compare_update: Option<C220CompareMaskUpdate>,
     compare_update_applied: bool,
-    selection_update: Option<C220SelectionMaskBlock>,
-    selection_update_applied: bool,
     reduction_update: Option<PendingReductionUpdate>,
     va_update: Option<C220VaUpdate>,
     va_update_applied: bool,
@@ -92,6 +94,13 @@ struct PendingReductionUpdate {
     applied: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ProjectedVectorTiming {
+    visible: Option<u64>,
+    retirement: u64,
+    write_completion: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct C220VectorPipeline {
     rules: C220VectorTimingRules,
@@ -100,16 +109,15 @@ pub struct C220VectorPipeline {
     next_service_tick: u64,
     observed_tick: Option<u64>,
     last_release_tick: Option<u64>,
-    last_issue_variant: Option<C220VectorIssueVariant>,
-    last_uop_admission_tick: Option<u64>,
+    last_conflict_check_tick: Option<u64>,
     pending: VecDeque<PendingVectorUop>,
     last_read_samples: Vec<C220VectorReadSample>,
     last_functional_samples: Vec<C220VectorReadSample>,
     functional_instructions: BTreeMap<u64, FunctionalInstruction>,
     last_ub_cycles: Vec<C220UbCycle>,
+    last_write_completions: Vec<C220VectorWriteCompletion>,
     last_va_updates: Vec<C220VaUpdate>,
     compare_mask: C220CompareMask,
-    selection_mask: Option<C220SelectionMaskBlock>,
     next_reduction_group: u64,
     next_instruction_group: u64,
     reduction_states: BTreeMap<u64, C220ReductionState>,
@@ -124,16 +132,15 @@ impl C220VectorPipeline {
             next_service_tick: 0,
             observed_tick: None,
             last_release_tick: None,
-            last_issue_variant: None,
-            last_uop_admission_tick: None,
+            last_conflict_check_tick: None,
             pending: VecDeque::new(),
             last_read_samples: Vec::new(),
             last_functional_samples: Vec::new(),
             functional_instructions: BTreeMap::new(),
             last_ub_cycles: Vec::new(),
+            last_write_completions: Vec::new(),
             last_va_updates: Vec::new(),
             compare_mask: C220CompareMask::default(),
-            selection_mask: None,
             next_reduction_group: 0,
             next_instruction_group: 0,
             reduction_states: BTreeMap::new(),
@@ -169,10 +176,11 @@ impl C220VectorPipeline {
         )
     }
 
+    /// Planned or submitted UB writes whose bank service has not completed.
     pub fn pending_ub_responses(&self) -> usize {
         self.pending
             .iter()
-            .filter(|entry| !entry.stores.is_empty() && !entry.committed)
+            .filter(|entry| entry.write.is_some() && entry.write_completion_tick.is_none())
             .count()
     }
 
@@ -187,6 +195,10 @@ impl C220VectorPipeline {
 
     pub fn last_ub_cycles(&self) -> &[C220UbCycle] {
         &self.last_ub_cycles
+    }
+
+    pub fn last_write_completions(&self) -> &[C220VectorWriteCompletion] {
+        &self.last_write_completions
     }
 
     pub fn last_va_updates(&self) -> &[C220VaUpdate] {
@@ -211,12 +223,13 @@ impl C220VectorPipeline {
         })
     }
 
-    fn predicted_ticks(&self) -> Vec<(u64, Option<u64>, u64)> {
+    fn predicted_ticks(&self) -> Vec<ProjectedVectorTiming> {
         let mut previous_release = self.last_release_tick;
         let mut previous_read_ready = None;
+        let mut previous_write_completion = None;
         let mut release_and_visibility = Vec::with_capacity(self.pending.len());
         let mut group_retirements = BTreeMap::new();
-        for entry in &self.pending {
+        for (index, entry) in self.pending.iter().enumerate() {
             let release = entry.release_tick.unwrap_or_else(|| {
                 let read_ready = if entry.shared_read_from_previous {
                     entry
@@ -236,7 +249,8 @@ impl C220VectorPipeline {
                             self.observed_tick.map_or(entry.admission_tick, |observed| {
                                 entry.admission_tick.max(observed.saturating_add(1))
                             });
-                        earliest_grant.saturating_add(u64::from(entry.uop.stages.read_ticks))
+                        self.conflict_ready_tick(index, earliest_grant)
+                            .saturating_add(u64::from(entry.uop.stages.read_ticks))
                     })
                 } else {
                     entry
@@ -247,18 +261,6 @@ impl C220VectorPipeline {
                 let mut eligible = read_ready
                     .saturating_add(u64::from(entry.uop.stages.execute_ticks))
                     .saturating_add(entry.uop.writeback_ticks as u64);
-                if let Some(write) = &entry.write {
-                    let earliest_grant = self
-                        .observed_tick
-                        .map_or(0, |observed| observed.saturating_add(1))
-                        .max(entry.execute_ready_tick.unwrap_or_else(|| {
-                            read_ready.saturating_add(u64::from(entry.uop.stages.execute_ticks))
-                        }));
-                    let completion = write
-                        .projected_write_completion(earliest_grant)
-                        .unwrap_or(u64::MAX);
-                    eligible = eligible.max(completion.saturating_add(1));
-                }
                 eligible = eligible.max(entry.eligible_tick.unwrap_or(0));
                 eligible.max(previous_release.map_or(0, |tick| tick.saturating_add(1)))
             });
@@ -268,6 +270,11 @@ impl C220VectorPipeline {
                     .map(|ready| ready.saturating_sub(u64::from(entry.uop.stages.execute_ticks)));
             }
             previous_release = Some(release);
+            let write_completion =
+                self.projected_write_completion(entry, release, previous_write_completion);
+            if write_completion.is_some() {
+                previous_write_completion = write_completion;
+            }
             let visible = if entry.deferred_compute {
                 entry.instruction_last.then(|| {
                     entry
@@ -277,13 +284,13 @@ impl C220VectorPipeline {
             } else if entry.stores.is_empty() {
                 None
             } else {
-                Some(
-                    entry
-                        .visible_tick
-                        .unwrap_or_else(|| release.saturating_add(self.rules.ub_response_ticks)),
-                )
+                Some(entry.visible_tick.unwrap_or_else(|| {
+                    write_completion
+                        .unwrap_or(release)
+                        .saturating_add(self.rules.ub_response_ticks)
+                }))
             };
-            release_and_visibility.push((release, visible));
+            release_and_visibility.push((visible, write_completion));
             if entry.instruction_last {
                 group_retirements.insert(
                     entry.instruction_group,
@@ -296,13 +303,17 @@ impl C220VectorPipeline {
         self.pending
             .iter()
             .zip(release_and_visibility)
-            .map(|(entry, (release, visible))| {
+            .map(|(entry, (visible, write_completion))| {
                 let retirement = entry.retirement_tick.unwrap_or_else(|| {
                     *group_retirements
                         .get(&entry.instruction_group)
                         .expect("pending vector instruction has a final uop")
                 });
-                (release, visible, retirement)
+                ProjectedVectorTiming {
+                    visible,
+                    retirement,
+                    write_completion,
+                }
             })
             .collect()
     }
@@ -312,17 +323,28 @@ impl C220VectorPipeline {
             .iter()
             .zip(self.predicted_ticks())
             .filter(|(entry, _)| !entry.committed)
-            .filter_map(|(_, (_, visible, _))| visible)
+            .filter_map(|(_, timing)| timing.visible)
             .max()
     }
 
     pub fn pending_drain_tick(&self) -> Option<u64> {
-        self.pending
-            .iter()
-            .zip(self.predicted_ticks())
-            .map(|(_, (_, visible, retirement))| {
-                visible.map_or(retirement, |tick| tick.max(retirement))
+        self.predicted_ticks()
+            .into_iter()
+            .map(|timing| {
+                timing
+                    .visible
+                    .map_or(timing.retirement, |tick| tick.max(timing.retirement))
+                    .max(timing.write_completion.unwrap_or(0))
             })
+            .max()
+    }
+
+    /// Projected instruction retirement, independent of outstanding UB writes.
+    pub fn pending_retirement_tick(&self) -> Option<u64> {
+        self.predicted_ticks()
+            .into_iter()
+            .map(|timing| timing.retirement)
+            .filter(|&retirement| self.observed_tick.is_none_or(|tick| retirement > tick))
             .max()
     }
 
@@ -340,7 +362,8 @@ impl C220VectorPipeline {
             .iter()
             .zip(self.predicted_ticks())
             .filter(|(entry, _)| incoming.is_blocked_by(entry.queue_class))
-            .map(|(_, (_, _, retirement))| retirement)
+            .map(|(_, timing)| timing.retirement)
+            .filter(|&retirement| self.observed_tick.is_none_or(|tick| retirement > tick))
             .max()
     }
 
@@ -354,7 +377,7 @@ impl C220VectorPipeline {
                     .as_ref()
                     .is_some_and(PendingVectorRead::is_load_va)
             })
-            .map(|(_, (_, _, retirement))| retirement)
+            .map(|(_, timing)| timing.retirement)
             .max()
     }
 
@@ -371,6 +394,7 @@ impl C220VectorPipeline {
         self.last_read_samples.clear();
         self.last_functional_samples.clear();
         self.last_ub_cycles.clear();
+        self.last_write_completions.clear();
         self.last_va_updates.clear();
     }
 
@@ -415,17 +439,18 @@ impl C220VectorPipeline {
             }
             self.commit_ready(cycle_tick, core)?;
             self.admit_ready(cycle_tick)?;
-            self.apply_compare_updates(cycle_tick, core)?;
-            self.apply_selection_updates(cycle_tick);
             self.apply_reduction_updates(cycle_tick, core)?;
             self.apply_va_updates(cycle_tick);
+            self.check_conflicts(cycle_tick)?;
+            self.prepare_writeback()?;
+            self.release_ready(cycle_tick, &mut releases)?;
             self.arbitrate_ub(cycle_tick, core.ub())?;
+            self.check_conflicts(cycle_tick)?;
             self.finish_reads(cycle_tick, core.ub())?;
-            self.apply_compare_updates(cycle_tick, core)?;
-            self.apply_selection_updates(cycle_tick);
             self.apply_reduction_updates(cycle_tick, core)?;
             self.apply_va_updates(cycle_tick);
             self.finish_writes()?;
+            self.prepare_writeback()?;
             self.release_ready(cycle_tick, &mut releases)?;
             self.commit_ready(cycle_tick, core)?;
             while self.pending.front().is_some_and(|entry| {
@@ -433,6 +458,7 @@ impl C220VectorPipeline {
                     .retirement_tick
                     .is_some_and(|retirement| retirement <= cycle_tick)
                     && entry.committed
+                    && (entry.write.is_none() || entry.write_completion_tick.is_some())
             }) {
                 self.pending.pop_front();
             }
@@ -454,13 +480,7 @@ impl C220VectorPipeline {
         let occupied = self
             .pending
             .iter()
-            .filter(|entry| {
-                entry.admitted
-                    && entry
-                        .read
-                        .as_ref()
-                        .is_some_and(|read| read.ready_tick().is_none())
-            })
+            .filter(|entry| entry.admitted && entry.conflict_check_tick.is_none())
             .count();
         if occupied >= C220_VECTOR_READ_QUEUE_CAPACITY {
             return Ok(());
@@ -476,28 +496,14 @@ impl C220VectorPipeline {
         entry.admitted = true;
         entry.admission_tick = tick;
         self.next_actual_admission_tick = tick
-            .checked_add(entry.issue_gap)
+            .checked_add(self.rules.uop_issue_interval.get())
             .ok_or(C220VectorAdvanceError::TimeOverflow)?;
-        if entry.read.is_none() && !entry.shared_read_from_previous {
-            let execute_ready_tick = tick
-                .checked_add(u64::from(entry.uop.stages.read_ticks))
-                .and_then(|value| value.checked_add(u64::from(entry.uop.stages.execute_ticks)))
-                .ok_or(C220VectorAdvanceError::TimeOverflow)?;
-            entry.execute_ready_tick = Some(execute_ready_tick);
-            if entry.write.is_none() {
-                entry.eligible_tick = Some(
-                    execute_ready_tick
-                        .checked_add(entry.uop.writeback_ticks as u64)
-                        .ok_or(C220VectorAdvanceError::TimeOverflow)?,
-                );
-            }
-        }
         Ok(())
     }
 
     fn arbitrate_ub(&mut self, tick: u64, ub: &UbMemory) -> Result<(), C220VectorAdvanceError> {
         let write_index = self.pending.iter().position(|entry| {
-            entry.execute_ready_tick.is_some_and(|ready| ready <= tick)
+            entry.release_tick.is_some_and(|released| released <= tick)
                 && entry
                     .write
                     .as_ref()
@@ -610,52 +616,13 @@ impl C220VectorPipeline {
 
     fn finish_reads(&mut self, tick: u64, ub: &UbMemory) -> Result<(), C220VectorAdvanceError> {
         for index in 0..self.pending.len() {
-            if !self.pending[index].admitted {
+            if self.pending[index].conflict_check_tick.is_none() {
                 continue;
             }
-            let waits_for_compare_mask = self.pending[index]
-                .read
-                .as_ref()
-                .is_some_and(PendingVectorRead::uses_compare_mask)
-                && self.pending.iter().take(index).any(|entry| {
-                    entry
-                        .read
-                        .as_ref()
-                        .is_some_and(PendingVectorRead::writes_compare_mask)
-                        && !entry.compare_update_applied
-                });
-            if waits_for_compare_mask {
-                continue;
-            }
-            let waits_for_selection_mask = self.pending[index]
-                .read
-                .as_ref()
-                .is_some_and(PendingVectorRead::uses_selection_mask)
-                && self.pending.iter().take(index).any(|entry| {
-                    entry
-                        .read
-                        .as_ref()
-                        .is_some_and(PendingVectorRead::writes_selection_mask)
-                        && !entry.selection_update_applied
-                });
-            if waits_for_selection_mask {
-                continue;
-            }
-            let admission_tick = self.pending[index].admission_tick;
-            let read_ticks = self.pending[index].uop.stages.read_ticks;
             let deferred_compute = self.pending[index].deferred_compute;
             let Some(read) = self.pending[index].read.as_mut() else {
                 continue;
             };
-            if read.ready_tick().is_none()
-                && let Some(grant_tick) = read.grant_tick(admission_tick)
-            {
-                read.set_ready_tick(
-                    grant_tick
-                        .checked_add(u64::from(read_ticks))
-                        .ok_or(C220VectorAdvanceError::TimeOverflow)?,
-                );
-            }
             let Some(ready_tick) = read.ready_tick() else {
                 continue;
             };
@@ -670,19 +637,9 @@ impl C220VectorPipeline {
                     .checked_add(u64::from(entry.uop.stages.execute_ticks))
                     .ok_or(C220VectorAdvanceError::TimeOverflow)?;
                 entry.execute_ready_tick = Some(execute_ready_tick);
-                if entry.write.is_none() {
-                    entry.eligible_tick = Some(
-                        execute_ready_tick
-                            .checked_add(entry.uop.writeback_ticks as u64)
-                            .ok_or(C220VectorAdvanceError::TimeOverflow)?,
-                    );
-                }
                 continue;
             }
-            let (sample, stores) =
-                read.sample(ub, self.compare_mask, self.selection_mask.as_ref())?;
-            let compare_update = sample.compare_update;
-            let selection_update = sample.selection_update.clone();
+            let (sample, stores) = read.sample(ub, self.compare_mask)?;
             let reduction_update = sample.reduction_update;
             let va_update = sample.va_update;
             let shares_read = read.shares_read_with_next();
@@ -709,8 +666,6 @@ impl C220VectorPipeline {
                 .expect("read remains pending")
                 .mark_sampled();
             self.pending[index].stores = first_stores.to_vec();
-            self.pending[index].compare_update = compare_update;
-            self.pending[index].selection_update = selection_update;
             if let Some(update) = self.pending[index].reduction_update.as_mut() {
                 update.update = reduction_update;
             }
@@ -719,45 +674,10 @@ impl C220VectorPipeline {
                 .checked_add(u64::from(self.pending[index].uop.stages.execute_ticks))
                 .ok_or(C220VectorAdvanceError::TimeOverflow)?;
             self.pending[index].execute_ready_tick = Some(execute_ready_tick);
-            if self.pending[index].write.is_none() {
-                self.pending[index].eligible_tick = Some(
-                    execute_ready_tick
-                        .checked_add(self.pending[index].uop.writeback_ticks as u64)
-                        .ok_or(C220VectorAdvanceError::TimeOverflow)?,
-                );
-            }
             if shares_read {
                 self.pending[index + 1].stores = second_stores.to_vec();
-                self.pending[index + 1].execute_ready_tick = Some(
-                    ready_tick
-                        .checked_add(u64::from(self.pending[index + 1].uop.stages.execute_ticks))
-                        .ok_or(C220VectorAdvanceError::TimeOverflow)?,
-                );
             }
             self.last_read_samples.push(sample);
-        }
-        Ok(())
-    }
-
-    fn finish_writes(&mut self) -> Result<(), C220VectorAdvanceError> {
-        for entry in &mut self.pending {
-            if entry.eligible_tick.is_some() {
-                continue;
-            }
-            let (Some(ready_tick), Some(write)) = (entry.execute_ready_tick, &entry.write) else {
-                continue;
-            };
-            if !write.is_complete() {
-                continue;
-            }
-            let baseline = ready_tick
-                .checked_add(entry.uop.writeback_ticks as u64)
-                .ok_or(C220VectorAdvanceError::TimeOverflow)?;
-            let last_grant = write.completion_tick().unwrap_or(ready_tick);
-            let granted = last_grant
-                .checked_add(1)
-                .ok_or(C220VectorAdvanceError::TimeOverflow)?;
-            entry.eligible_tick = Some(baseline.max(granted));
         }
         Ok(())
     }
@@ -804,7 +724,7 @@ impl C220VectorPipeline {
                 }
             } else if entry.stores.is_empty() {
                 entry.committed = true;
-            } else {
+            } else if entry.write.is_none() {
                 entry.visible_tick = Some(
                     release_tick
                         .checked_add(self.rules.ub_response_ticks)
@@ -817,6 +737,9 @@ impl C220VectorPipeline {
                 lane_group: entry.uop.lane_group,
                 kind: entry.uop.kind,
                 admission_tick: entry.admission_tick,
+                conflict_check_tick: entry
+                    .conflict_check_tick
+                    .expect("released uop passed conflicts"),
                 eligible_tick,
                 release_tick,
                 ub_write_requested: entry.uop.writes_ub,

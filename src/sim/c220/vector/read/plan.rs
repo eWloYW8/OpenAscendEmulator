@@ -69,6 +69,25 @@ impl PendingVectorRead {
         lane_group: Option<u8>,
         kind: C220VectorUopKind,
     ) -> Result<Self, C220VectorReadError> {
+        Self::plan(issue, repeat_index, lane_group, kind, false)
+    }
+
+    pub(in crate::sim::c220::vector) fn new_functional(
+        issue: C220VectorReadIssue<'_>,
+        repeat_index: usize,
+        lane_group: Option<u8>,
+        kind: C220VectorUopKind,
+    ) -> Result<Self, C220VectorReadError> {
+        Self::plan(issue, repeat_index, lane_group, kind, true)
+    }
+
+    fn plan(
+        issue: C220VectorReadIssue<'_>,
+        repeat_index: usize,
+        lane_group: Option<u8>,
+        kind: C220VectorUopKind,
+        functional: bool,
+    ) -> Result<Self, C220VectorReadError> {
         let select_mask_load = matches!(
             issue,
             C220VectorReadIssue::Select(select)
@@ -281,7 +300,19 @@ impl PendingVectorRead {
                     issue.control,
                     issue.addresses,
                     mask,
-                    issue.read_accesses_for_uop(repeat_index)?,
+                    if functional {
+                        crate::sim::c220::vector::plan_c220_vector_read_accesses(
+                            issue.control,
+                            issue.addresses,
+                            repeat_index,
+                            &[u64::MAX; 4],
+                            2,
+                            issue.instruction.width.element_bytes(),
+                            None,
+                        )?
+                    } else {
+                        issue.read_accesses_for_uop(repeat_index)?
+                    },
                     C220VectorReadOperation::CompareMask {
                         issue: Box::new(issue.clone()),
                     },
@@ -317,9 +348,7 @@ impl PendingVectorRead {
                 issue.addresses,
                 [u64::MAX; 4],
                 issue.mask_block_accesses(repeat_index, 0)?,
-                C220VectorReadOperation::SelectMaskLoad {
-                    issue: Box::new(issue.clone()),
-                },
+                C220VectorReadOperation::SelectMaskLoad,
             ),
             C220VectorReadIssue::Select(issue) => (
                 issue.pc,
@@ -327,7 +356,11 @@ impl PendingVectorRead {
                 issue.control,
                 issue.addresses,
                 issue.iteration_masks[repeat_index],
-                issue.read_accesses_for_repeat(repeat_index, ordinary_group)?,
+                if functional {
+                    issue.functional_read_accesses(repeat_index)?
+                } else {
+                    issue.read_accesses_for_repeat(repeat_index, ordinary_group)?
+                },
                 C220VectorReadOperation::Select {
                     issue: Box::new(issue.clone()),
                 },

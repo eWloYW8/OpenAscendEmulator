@@ -23,9 +23,7 @@ use crate::sim::c220::vector::ops::gather::C220GatherIssue;
 use crate::sim::c220::vector::ops::nchw::{C220NchwIssue, C220NchwRows};
 use crate::sim::c220::vector::ops::reduce::{C220ReductionIssue, C220ReductionStateUpdate};
 use crate::sim::c220::vector::ops::scalar::{C220VectorScalarIssue, C220VectorScalarOperand};
-use crate::sim::c220::vector::ops::select::{
-    C220SelectIssue, C220SelectMode, C220SelectionMaskBlock,
-};
+use crate::sim::c220::vector::ops::select::C220SelectIssue;
 use crate::sim::c220::vector::ops::shift::C220ShiftIssue;
 use crate::sim::c220::vector::ops::sort::{C220SortIssue, C220SortLaneOutcome};
 use crate::sim::c220::vector::ops::special::C220SpecialUnaryIssue;
@@ -106,9 +104,7 @@ enum C220VectorReadOperation {
     Select {
         issue: Box<C220SelectIssue>,
     },
-    SelectMaskLoad {
-        issue: Box<C220SelectIssue>,
-    },
+    SelectMaskLoad,
     PackedCompare {
         instruction: C220PackedCompareInstruction,
         scalar_bits: Option<u32>,
@@ -281,7 +277,7 @@ impl PendingVectorRead {
 
     pub(super) fn configure_ordinary_timing(
         &mut self,
-        schedule: super::repeat::OrdinaryReadSchedule,
+        schedule: super::repeat::OrdinaryRepeatSchedule,
     ) -> Result<(), C220VectorReadError> {
         self.accesses
             .retain(|access| schedule.reads_source(self.repeat_index, access.source_index));
@@ -303,14 +299,21 @@ impl PendingVectorRead {
         ub: &UbMemory,
     ) -> Result<(), C220VectorError> {
         for access in &self.accesses {
-            let bytes = ub.read_known(access.address, usize::from(access.bytes))?;
+            let offset = usize::from(access.buffer_offset);
+            let length = if matches!(self.operation, C220VectorReadOperation::MoveMask { .. }) {
+                16_usize
+                    .saturating_sub(offset)
+                    .min(usize::from(access.bytes))
+            } else {
+                usize::from(access.bytes)
+            };
+            let bytes = ub.read_known(access.address, length)?;
             let destination = match access.source_index {
                 0 => &mut self.source_0_bytes,
                 1 => &mut self.source_1_bytes,
                 2 => &mut self.destination_bytes,
                 _ => unreachable!("unknown vector read destination"),
             };
-            let offset = usize::from(access.buffer_offset);
             destination[offset..offset + bytes.len()].copy_from_slice(&bytes);
         }
         Ok(())
@@ -334,7 +337,6 @@ impl PendingVectorRead {
             fused_lanes: None,
             sort_lanes: None,
             compare_update: None,
-            selection_update: None,
             reduction_update: None,
             va_update: None,
         }
@@ -396,43 +398,6 @@ impl PendingVectorRead {
                 C220VectorReadOperation::MoveMask { issue }
                     if matches!(issue.instruction.direction, C220MoveMaskDirection::FromMemory)
             )
-    }
-
-    pub(super) fn uses_compare_mask(&self) -> bool {
-        matches!(
-            &self.operation,
-            C220VectorReadOperation::Select { issue }
-                if !matches!(issue.mode, C220SelectMode::TensorTensor)
-        ) || matches!(
-            &self.operation,
-            C220VectorReadOperation::SelectMaskLoad { issue }
-                if matches!(issue.mode, C220SelectMode::TensorTensor)
-        ) || matches!(
-            &self.operation,
-            C220VectorReadOperation::MoveMask { issue }
-                if matches!(issue.instruction.direction, C220MoveMaskDirection::ToMemory)
-        )
-    }
-
-    pub(super) fn writes_selection_mask(&self) -> bool {
-        matches!(
-            &self.operation,
-            C220VectorReadOperation::SelectMaskLoad { .. }
-        ) || matches!(
-            &self.operation,
-            C220VectorReadOperation::Select { issue }
-                if issue.loads_selection_mask(
-                    self.repeat_index,
-                    self.lane_group.unwrap_or_default()
-                )
-        )
-    }
-
-    pub(super) fn uses_selection_mask(&self) -> bool {
-        matches!(
-            &self.operation,
-            C220VectorReadOperation::Select { issue } if issue.mode.uses_tensor_mask()
-        )
     }
 
     pub(super) fn mark_sampled(&mut self) {
@@ -545,7 +510,6 @@ pub struct C220VectorReadSample {
     pub fused_lanes: Option<Vec<C220FusedLaneOutcome>>,
     pub sort_lanes: Option<Vec<C220SortLaneOutcome>>,
     pub(crate) compare_update: Option<C220CompareMaskUpdate>,
-    pub(crate) selection_update: Option<C220SelectionMaskBlock>,
     pub(crate) reduction_update: Option<C220ReductionStateUpdate>,
     pub(crate) va_update: Option<C220VaUpdate>,
 }

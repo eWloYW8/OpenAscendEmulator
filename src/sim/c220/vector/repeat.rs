@@ -3,13 +3,24 @@ use super::read::C220VectorReadIssue;
 use crate::isa::c220::vector::C220VecArithmeticOperation;
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct OrdinaryReadSchedule {
+pub(super) struct OrdinaryRepeatSchedule {
     reuse_input: bool,
     reads_second_source: bool,
+    feedback: bool,
+    repeat_count: usize,
 }
 
-impl OrdinaryReadSchedule {
+impl OrdinaryRepeatSchedule {
     pub(super) fn from_issue(issue: C220VectorReadIssue<'_>) -> Option<Self> {
+        let repeat_count = match issue {
+            C220VectorReadIssue::Arithmetic(issue) => issue.iteration_masks.len(),
+            C220VectorReadIssue::Fused(issue) => issue.iteration_masks.len(),
+            C220VectorReadIssue::VectorScalar(issue) => issue.iteration_masks.len(),
+            C220VectorReadIssue::Shift(issue) => issue.iteration_masks.len(),
+            C220VectorReadIssue::SpecialUnary(issue) => issue.iteration_masks.len(),
+            C220VectorReadIssue::Conversion(issue) => issue.iteration_masks.len(),
+            _ => return None,
+        };
         let (control, second_source, same_sources, feedback) = match issue {
             C220VectorReadIssue::Arithmetic(issue) => {
                 let control = issue.control;
@@ -47,7 +58,21 @@ impl OrdinaryReadSchedule {
         Some(Self {
             reuse_input: control.source_0_repeat_stride == 0 && !feedback,
             reads_second_source: second_source && !same_sources,
+            feedback,
+            repeat_count,
         })
+    }
+
+    pub(super) fn writes_destination(self, repeat: usize) -> bool {
+        !self.feedback || (repeat > 0 && repeat + 1 == self.repeat_count)
+    }
+
+    pub(super) fn issue_gap(self, repeat: usize, execute_ticks: u8) -> u64 {
+        if self.feedback && repeat > 0 {
+            u64::from(execute_ticks.saturating_sub(3)).max(1)
+        } else {
+            1
+        }
     }
 
     pub(super) fn reads_source(self, repeat: usize, source: u8) -> bool {

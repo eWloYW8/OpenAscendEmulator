@@ -30,7 +30,7 @@ use crate::sim::c220::vector::ops::reduce::evaluate_c220_reduction_repeat;
 use crate::sim::c220::vector::ops::scalar::{
     C220VectorScalarValueInputs, evaluate_c220_vector_scalar_repeat,
 };
-use crate::sim::c220::vector::ops::select::{C220SelectionMaskBlock, evaluate_c220_select_uop};
+use crate::sim::c220::vector::ops::select::{C220SelectMode, evaluate_c220_select_uop};
 use crate::sim::c220::vector::ops::shift::{C220ShiftValueInputs, evaluate_c220_shift_repeat};
 use crate::sim::c220::vector::ops::sort::evaluate_c220_sort_repeat;
 use crate::sim::c220::vector::ops::special::evaluate_c220_special_unary_repeat;
@@ -40,7 +40,7 @@ use crate::sim::c220::vector::ops::ternary::{
 use crate::sim::c220::vector::ops::transpose::evaluate_c220_transpose;
 use crate::sim::c220::vector::va::evaluate_c220_load_va;
 use crate::sim::c220::vector::{
-    C220_VECTOR_TILE_BYTES, C220VectorError, C220VectorStore, evaluate_c220_fp32_repeat_from_bytes,
+    C220VectorError, C220VectorStore, evaluate_c220_fp32_repeat_from_bytes,
 };
 
 impl PendingVectorRead {
@@ -48,7 +48,6 @@ impl PendingVectorRead {
         &self,
         ub: &UbMemory,
         compare_mask: C220CompareMask,
-        selection_mask: Option<&C220SelectionMaskBlock>,
     ) -> Result<(C220VectorReadSample, Vec<C220VectorStore>), C220VectorError> {
         let lane_group = self.lane_group.unwrap_or_default();
         let lane_active = |index: usize| {
@@ -129,30 +128,41 @@ impl PendingVectorRead {
                 )
             }
             C220VectorReadOperation::MoveMask { issue } => (Vec::new(), issue.stores(compare_mask)),
-            C220VectorReadOperation::SelectMaskLoad { .. } => (Vec::new(), Vec::new()),
+            C220VectorReadOperation::SelectMaskLoad => (Vec::new(), Vec::new()),
             C220VectorReadOperation::Select { issue } => {
-                let loaded_selection_mask = issue
-                    .loads_selection_mask(self.repeat_index, lane_group)
-                    .then(|| C220SelectionMaskBlock {
-                        first_repeat: self.repeat_index,
-                        bytes: self.source_1_bytes[..C220_VECTOR_TILE_BYTES]
-                            .try_into()
-                            .expect("selection-mask block"),
-                    });
-                let (values, stores) = evaluate_c220_select_uop(
-                    &issue,
-                    self.repeat_index,
-                    lane_group,
-                    compare_mask,
-                    loaded_selection_mask.as_ref().or(selection_mask),
-                    &self.source_0_bytes,
-                    &self.source_1_bytes,
-                )?;
+                let mask_bytes = if issue.mode == C220SelectMode::TensorScalar {
+                    &self.source_1_bytes
+                } else {
+                    &self.destination_bytes
+                };
+                let selection_mask = C220CompareMask::from_bits([
+                    u64::from_le_bytes(mask_bytes[..8].try_into().expect("low selection mask")),
+                    u64::from_le_bytes(mask_bytes[8..16].try_into().expect("high selection mask")),
+                ]);
+                let (first, count) = self
+                    .lane_slice
+                    .unwrap_or((usize::from(lane_group) * 64, 64));
+                let mut values = Vec::with_capacity(count);
+                let mut stores = Vec::with_capacity(count);
+                for group in first / 64..(first + count).div_ceil(64) {
+                    let (group_values, group_stores) = evaluate_c220_select_uop(
+                        &issue,
+                        self.repeat_index,
+                        group as u8,
+                        compare_mask,
+                        selection_mask,
+                        &self.source_0_bytes,
+                        &self.source_1_bytes,
+                    )?;
+                    values.extend(group_values);
+                    stores.extend(group_stores);
+                }
                 (
                     values
                         .into_iter()
-                        .map(|bits| C220VectorLaneOutcome {
-                            active: true,
+                        .enumerate()
+                        .map(|(index, bits)| C220VectorLaneOutcome {
+                            active: lane_active(first + index),
                             bits,
                             fp16_status: None,
                             fp32_status: None,
@@ -627,7 +637,7 @@ impl PendingVectorRead {
             }
         };
         let compare_update = match &self.operation {
-            C220VectorReadOperation::CompareMask { .. } => Some({
+            C220VectorReadOperation::CompareMask { issue } => Some({
                 let mut write_mask = [0_u64; 2];
                 let mut values = [0_u64; 2];
                 let first_lane = self.lane_slice.map_or_else(
@@ -643,6 +653,10 @@ impl PendingVectorRead {
                     if lane.bits != 0 {
                         values[bit / 64] |= 1_u64 << (bit % 64);
                     }
+                }
+                for word in 0..issue.instruction.width.lane_count() / 64 {
+                    values[word] |= issue.initial_compare_mask.bits()[word] & !write_mask[word];
+                    write_mask[word] = u64::MAX;
                 }
                 C220CompareMaskUpdate { write_mask, values }
             }),
@@ -668,28 +682,6 @@ impl PendingVectorRead {
             }
             _ => None,
         };
-        let selection_update = match &self.operation {
-            C220VectorReadOperation::SelectMaskLoad { .. } => Some(C220SelectionMaskBlock {
-                first_repeat: self.repeat_index,
-                bytes: self.source_0_bytes[..C220_VECTOR_TILE_BYTES]
-                    .try_into()
-                    .expect("selection-mask block"),
-            }),
-            C220VectorReadOperation::Select { issue }
-                if issue.loads_selection_mask(
-                    self.repeat_index,
-                    self.lane_group.unwrap_or_default(),
-                ) =>
-            {
-                Some(C220SelectionMaskBlock {
-                    first_repeat: self.repeat_index,
-                    bytes: self.source_1_bytes[..C220_VECTOR_TILE_BYTES]
-                        .try_into()
-                        .expect("selection-mask block"),
-                })
-            }
-            _ => None,
-        };
         Ok((
             C220VectorReadSample {
                 pc: self.pc,
@@ -708,7 +700,6 @@ impl PendingVectorRead {
                 fused_lanes,
                 sort_lanes,
                 compare_update,
-                selection_update,
                 reduction_update,
                 va_update,
             },

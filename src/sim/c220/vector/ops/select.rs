@@ -32,12 +32,6 @@ impl C220SelectMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct C220SelectionMaskBlock {
-    pub first_repeat: usize,
-    pub bytes: [u8; C220_VECTOR_TILE_BYTES],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220SelectIssue {
     pub pc: u64,
     pub word: u32,
@@ -51,6 +45,60 @@ pub struct C220SelectIssue {
 }
 
 impl C220SelectIssue {
+    pub(crate) fn functional_read_accesses(
+        &self,
+        repeat_index: usize,
+    ) -> Result<Vec<C220VectorReadAccess>, C220VectorError> {
+        if repeat_index >= self.iteration_masks.len() {
+            return Err(C220VectorError::InvalidRepeatIndex(repeat_index));
+        }
+        let mut accesses = plan_c220_vector_read_accesses(
+            self.control,
+            self.addresses,
+            repeat_index,
+            &[u64::MAX; 4],
+            if self.mode == C220SelectMode::TensorScalar {
+                1
+            } else {
+                2
+            },
+            self.instruction.width.element_bytes(),
+            None,
+        )?;
+        if self.mode.uses_tensor_mask() {
+            let base = self
+                .selection_mask_base
+                .ok_or(C220VectorError::MissingSelectionMask)?;
+            let offset = repeat_index * self.mask_bytes_per_repeat();
+            let address = if self.mode == C220SelectMode::TensorTensor {
+                u64::from((base as u32).wrapping_add(offset as u32))
+            } else {
+                base.checked_add(offset as u64)
+                    .ok_or(C220VectorError::AddressOverflow {
+                        base,
+                        lane: repeat_index,
+                    })?
+            };
+            accesses.push(C220VectorReadAccess {
+                source_index: if self.mode == C220SelectMode::TensorScalar {
+                    1
+                } else {
+                    2
+                },
+                block_index: 0,
+                buffer_offset: 0,
+                bytes: if self.mode == C220SelectMode::TensorScalar {
+                    32
+                } else {
+                    self.mask_bytes_per_repeat() as u16
+                },
+                address,
+                active_lane_mask: u16::MAX,
+            });
+        }
+        Ok(accesses)
+    }
+
     pub fn uop_count(&self) -> usize {
         self.iteration_masks.len() * self.instruction.width.groups_per_repeat()
     }
@@ -218,7 +266,7 @@ pub(crate) fn evaluate_c220_select_uop(
     repeat_index: usize,
     lane_group: u8,
     compare_mask: C220CompareMask,
-    selection_mask: Option<&C220SelectionMaskBlock>,
+    selection_mask: C220CompareMask,
     source_0_bytes: &[u8],
     source_1_bytes: &[u8],
 ) -> Result<(Vec<u32>, Vec<C220VectorStore>), C220VectorError> {
@@ -246,19 +294,12 @@ pub(crate) fn evaluate_c220_select_uop(
         let selected = match issue.mode {
             C220SelectMode::CompareMask => compare_mask.test(lane),
             C220SelectMode::TensorScalar | C220SelectMode::TensorTensor => {
-                let selection_mask = selection_mask.ok_or(C220VectorError::MissingSelectionMask)?;
-                let repeats_per_block = issue.mask_repeats_per_block();
-                let expected_first_repeat = repeat_index / repeats_per_block * repeats_per_block;
-                if selection_mask.first_repeat != expected_first_repeat {
-                    return Err(C220VectorError::MissingSelectionMask);
-                }
-                let bit =
-                    (repeat_index - expected_first_repeat) * issue.mask_bytes_per_repeat() * 8
-                        + lane;
-                selection_mask.bytes[bit / 8] & (1 << (bit % 8)) != 0
+                selection_mask.test(lane)
             }
         };
-        let bits = if !selected && matches!(issue.mode, C220SelectMode::TensorScalar) {
+        let bits = if !active {
+            0
+        } else if !selected && matches!(issue.mode, C220SelectMode::TensorScalar) {
             match element_bytes {
                 2 => compare_mask.bits()[0] as u16 as u32,
                 4 => compare_mask.bits()[0] as u32,
@@ -320,6 +361,99 @@ mod tests {
     use crate::sim::common::scalar::ScalarStepper;
 
     #[test]
+    fn select_repeats_read_current_inputs_and_masks() {
+        for opcode in [0x9d40_0000, 0x9dc0_0000] {
+            for mode in 0..3_u64 {
+                for repeats in [0, 2_u64] {
+                    let mut ub = UbMemory::new(4096, 4096);
+                    ub.write_states(0, &[MemoryByteState::Known(0); 4096])
+                        .unwrap();
+                    let mut registers = [0; 32];
+                    registers[0] = if mode == 0 { 0x500 } else { 0x800 };
+                    registers[1] = 0x400;
+                    registers[2] = if mode == 1 { 0x800 } else { 0xa00 };
+                    if mode == 0 {
+                        ub.write_states(0x400, &[MemoryByteState::Known(0x11); 256])
+                            .unwrap();
+                    }
+                    ub.write_states(0x800, &[MemoryByteState::Known(0xff); 256])
+                        .unwrap();
+                    ub.write_states(0xa00, &[MemoryByteState::Known(0x22); 512])
+                        .unwrap();
+                    let control = (repeats << 56)
+                        | (mode << 48)
+                        | (8 << 40)
+                        | (8 << 32)
+                        | (8 << 24)
+                        | (1 << 16)
+                        | (1 << 8)
+                        | 1;
+                    let issue = plan_c220_select_issue(
+                        0,
+                        opcode | (1 << 12) | (2 << 7) | (3 << 2),
+                        control,
+                        C220VectorMaskState {
+                            control: 0,
+                            low: u64::MAX,
+                            high: u64::MAX,
+                        },
+                        C220CompareMask::from_bits([0xc00, 0]),
+                        &registers,
+                        &ub,
+                    )
+                    .unwrap();
+                    let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+                    let low = match mode {
+                        0 => u64::MAX,
+                        1 => 0x3333_3333,
+                        _ => (1 << 32) | 0x800,
+                    };
+                    machine.set_spr_value(104, low).unwrap();
+                    machine.set_spr_value(105, u64::MAX).unwrap();
+                    let mut core = C220State::new(ScalarStepper::new(machine, 0), ub);
+                    let mut pipeline = C220VectorPipeline::new(C220VectorTimingRules {
+                        dispatch_ticks: 0,
+                        uop_issue_interval: NonZeroU64::new(1).unwrap(),
+                        ub_response_ticks: 2,
+                    });
+                    let uops = C220VectorInstruction::Select(issue.clone()).uops().unwrap();
+                    pipeline
+                        .issue_at(
+                            0,
+                            &uops,
+                            &issue.write_targets,
+                            Some(C220VectorReadIssue::Select(&issue)),
+                        )
+                        .unwrap();
+                    pipeline.advance_to(1000, &mut core).unwrap();
+                    assert_eq!(pipeline.last_functional_samples().len(), repeats as usize);
+                    assert!(
+                        pipeline
+                            .last_read_samples()
+                            .iter()
+                            .all(|sample| sample.lanes.is_empty())
+                    );
+                    if repeats != 0 {
+                        let expected = match mode {
+                            0 => 0x11,
+                            1 => 0x33,
+                            _ => 0x22,
+                        };
+                        assert_eq!(
+                            core.ub().read_known(registers[0] + 256, 256).unwrap(),
+                            vec![expected; 256]
+                        );
+                        assert_eq!(
+                            pipeline.last_functional_samples()[1].lanes.len(),
+                            issue.instruction.width.lane_count()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn compare_mask_becomes_visible_to_dependent_select() {
         let mut registers = [0_u64; 32];
         registers[..6].copy_from_slice(&[
@@ -362,6 +496,7 @@ mod tests {
                 low: u64::MAX,
                 high: u64::MAX,
             },
+            C220CompareMask::default(),
             &registers,
             &ub,
         )
@@ -440,6 +575,7 @@ mod tests {
                 low: u64::MAX,
                 high: u64::MAX,
             },
+            pipeline.compare_mask(),
             &registers,
             core.ub(),
         )
@@ -461,6 +597,9 @@ mod tests {
 
         let restore =
             plan_c220_move_mask_issue(0x2010, 0x9e0c_0003, &registers, core.ub()).unwrap();
+        core.ub_mut()
+            .write_states(0xc00, &[MemoryByteState::Known(0); 16])
+            .unwrap();
         pipeline
             .issue_at(
                 501,
@@ -473,6 +612,26 @@ mod tests {
                 Some(C220VectorReadIssue::MoveMask(&restore)),
             )
             .unwrap();
+        let mut released = false;
+        for tick in 502..600 {
+            let releases = pipeline.advance_to(tick, &mut core).unwrap();
+            if releases.iter().any(|release| release.pc == 0x2010) {
+                assert_eq!(pipeline.compare_mask().bits(), [0; 2]);
+                assert!(
+                    pipeline.has_pending_compare_mask_write(),
+                    "tick={tick} releases={releases:?}"
+                );
+                core.ub_mut()
+                    .write_states(0xc00, &[MemoryByteState::Known(0xff); 16])
+                    .unwrap();
+                pipeline.advance_to(tick + 1, &mut core).unwrap();
+                assert_eq!(pipeline.compare_mask().bits(), [u64::MAX; 2]);
+                assert!(!pipeline.has_pending_compare_mask_write());
+                released = true;
+                break;
+            }
+        }
+        assert!(released);
         pipeline.advance_to(600, &mut core).unwrap();
         assert_eq!(pipeline.compare_mask().bits(), [u64::MAX; 2]);
 

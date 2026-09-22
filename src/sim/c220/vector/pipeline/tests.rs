@@ -255,7 +255,7 @@ fn accumulator_repeats_separate_bypass_traffic_from_numerical_feedback() {
                 if bypass {
                     for pair in releases.windows(2) {
                         if pair[0].repeat_index != pair[1].repeat_index {
-                            assert!(pair[1].admission_tick >= pair[0].admission_tick + 8);
+                            assert!(pair[1].conflict_check_tick >= pair[0].conflict_check_tick + 8);
                         }
                     }
                 }
@@ -394,11 +394,14 @@ fn ordinary_repeat_bypass_preserves_live_alias_feedback() {
         C220VectorScalarOperand, plan_c220_vector_scalar_issue,
     };
 
-    for word in [0x85c0_0000, 0x89c0_0000, 0x97c0_0001] {
+    for (word, repeat_count) in [0x85c0_0000, 0x89c0_0000, 0x97c0_0001]
+        .into_iter()
+        .flat_map(|word| [1, 3].map(|repeats| (word, repeats)))
+    {
         for (source_1, destination) in [(512, 0), (512, 512), (0, 1024), (0, 0)] {
             let scalar = word == 0x97c0_0001;
             let control = C220VectorControl {
-                encoded_repeat_count: 3,
+                encoded_repeat_count: repeat_count,
                 destination_block_stride: 1,
                 source_0_block_stride: 1,
                 source_1_block_stride: 1,
@@ -422,7 +425,7 @@ fn ordinary_repeat_bypass_preserves_live_alias_feedback() {
                 source_1,
                 destination,
             };
-            let masks = [[u64::MAX, 0, 0, 0]; 3];
+            let masks = vec![[u64::MAX, 0, 0, 0]; usize::from(repeat_count)];
             let instruction = if scalar {
                 C220VectorInstruction::Scalar(
                     plan_c220_vector_scalar_issue(
@@ -454,7 +457,7 @@ fn ordinary_repeat_bypass_preserves_live_alias_feedback() {
                     .unwrap(),
                 )
             };
-            for _ in 0..3 {
+            for _ in 0..repeat_count {
                 let inputs = values.clone();
                 for lane in 0..64 {
                     let first = inputs[lane];
@@ -485,7 +488,20 @@ fn ordinary_repeat_bypass_preserves_live_alias_feedback() {
                     instruction.read_issue(),
                 )
                 .unwrap();
-            pipeline.advance_to(256, &mut core).unwrap();
+            let releases = pipeline.advance_to(256, &mut core).unwrap();
+            let feedback = !scalar && source_1 == destination;
+            for release in &releases {
+                assert_eq!(
+                    release.ub_write_requested,
+                    !feedback
+                        || (release.repeat_index > 0
+                            && release.repeat_index + 1 == usize::from(repeat_count))
+                );
+            }
+            if feedback && repeat_count == 3 {
+                assert!(releases[2].conflict_check_tick >= releases[1].conflict_check_tick + 4);
+                assert!(releases[2].admission_tick < releases[1].conflict_check_tick + 4);
+            }
             assert_eq!(
                 core.ub().read_known(0, 4096).unwrap(),
                 values
@@ -494,7 +510,7 @@ fn ordinary_repeat_bypass_preserves_live_alias_feedback() {
                     .collect::<Vec<_>>()
             );
             let timing = pipeline.last_read_samples();
-            assert_eq!(timing.len(), 3);
+            assert_eq!(timing.len(), usize::from(repeat_count));
             for sample in timing {
                 let first_read = sample.repeat_index == 0 || (!scalar && source_1 == destination);
                 assert_eq!(
@@ -513,7 +529,10 @@ fn ordinary_repeat_bypass_preserves_live_alias_feedback() {
                 );
                 assert!(sample.lanes.is_empty());
             }
-            assert_eq!(pipeline.last_functional_samples().len(), 3);
+            assert_eq!(
+                pipeline.last_functional_samples().len(),
+                usize::from(repeat_count)
+            );
             assert!(pipeline.pending_drain_tick().is_none());
         }
     }
@@ -799,13 +818,56 @@ fn masked_write_reacquires_bank_and_delays_mte_until_second_grant() {
             None,
         )
         .unwrap();
-    assert_eq!(pipeline.pending_visibility_tick(), Some(10));
+    assert_eq!(pipeline.pending_visibility_tick(), Some(16));
+    let full_stores = (0..8)
+        .map(|lane| C220VectorStore {
+            lane_index: lane,
+            address: 32 + lane as u64 * 4,
+            bank: C220UbBank::from_address(32 + lane as u64 * 4),
+            data: [9; 8],
+            ..store
+        })
+        .collect::<Vec<_>>();
+    pipeline
+        .issue_at(
+            0,
+            &[C220VectorUop {
+                pc: 4,
+                repeat_index: 0,
+                lane_group: Some(0),
+                kind: C220VectorUopKind::Ordinary,
+                stages: C220VectorUopStages {
+                    read_ticks: 0,
+                    execute_ticks: 0,
+                },
+                writeback_ticks: 1,
+                writes_ub: true,
+            }],
+            &full_stores,
+            None,
+        )
+        .unwrap();
+    assert_eq!(pipeline.pending_visibility_tick(), Some(17));
+    assert_eq!(pipeline.pending_drain_tick(), Some(17));
     let mut memory = C220UbMteService::default();
-    for tick in 0..=10 {
-        pipeline.advance_to(tick, &mut core).unwrap();
+    for tick in 0..=17 {
+        let releases = pipeline.advance_to(tick, &mut core).unwrap();
+        if tick == 7 || tick == 8 {
+            assert_eq!(releases.len(), 1);
+            assert_eq!(releases[0].release_tick, tick);
+            assert_eq!(pipeline.pending_uops(), usize::from(tick == 7));
+            assert_eq!(pipeline.pending_retirement_tick(), Some(10));
+        } else {
+            assert!(releases.is_empty());
+        }
+        if tick == 10 {
+            assert_eq!(pipeline.pending_retirement_tick(), None);
+            assert_eq!(pipeline.pending_ub_responses(), 2);
+            assert_eq!(pipeline.pending_drain_tick(), Some(17));
+        }
         let cycles = pipeline.last_ub_cycles();
         let banks = cycles.iter().fold(0, |mask, cycle| mask | cycle.bank_mask);
-        if tick == 7 {
+        if tick == 14 {
             memory
                 .receive(
                     tick,
@@ -819,26 +881,38 @@ fn masked_write_reacquires_bank_and_delays_mte_until_second_grant() {
                 .unwrap();
         }
         let mte = memory.arbitrate(tick, banks, !cycles.is_empty()).unwrap();
-        if tick == 0 || tick == 7 {
+        if tick == 7 || tick == 14 {
             let decision = cycles[0].decisions[0];
             assert!(decision.granted);
-            assert_eq!(decision.second_grant, tick == 7);
-        } else if tick < 7 {
+            assert_eq!(decision.second_grant, tick == 14);
+        } else if tick < 14 {
             assert!(cycles.iter().all(|cycle| cycle.decisions.is_empty()));
         }
-        if tick == 7 {
+        if tick == 14 {
             assert!(!mte.decisions[0].granted);
             assert!(mte.completed.is_empty());
+            let completion = &pipeline.last_write_completions()[0];
+            assert_eq!(completion.submitted_tick, 7);
+            assert_eq!(completion.completion_tick, 14);
+            assert_eq!(completion.block_grants, [Some(14)]);
+            assert_eq!(pipeline.pending_ub_responses(), 1);
         }
-        if tick == 8 {
+        if tick == 15 {
             assert_eq!(mte.completed.len(), 1);
+            let completion = &pipeline.last_write_completions()[0];
+            assert_eq!(completion.pc, 4);
+            assert_eq!(completion.submitted_tick, 8);
+            assert_eq!(completion.completion_tick, 15);
+            assert_eq!(pipeline.pending_ub_responses(), 0);
         }
-        if tick < 10 {
+        if tick < 16 {
             assert!(core.ub().read_known(0, 4).is_err());
         }
     }
     assert_eq!(core.ub().read_known(0, 4).unwrap(), [7; 4]);
     assert!(core.ub().read_known(4, 1).is_err());
+    assert_eq!(core.ub().read_known(32, 32).unwrap(), [9; 32]);
+    assert_eq!(pipeline.pending_drain_tick(), None);
 }
 
 #[test]
@@ -901,7 +975,7 @@ fn conflicting_read_ports_delay_timing_but_functional_reads_observe_completed_wr
                 lane_group: Some(0),
                 kind: crate::sim::c220::vector::timing::C220VectorUopKind::Ordinary,
                 stages: crate::sim::c220::vector::timing::C220VectorUopStages {
-                    read_ticks: 1,
+                    read_ticks: 0,
                     execute_ticks: 0,
                 },
                 writeback_ticks: 1,

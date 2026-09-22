@@ -9,7 +9,7 @@ use crate::sim::c220::vector::{C220_VECTOR_BLOCK_BYTES, C220_VECTOR_BLOCK_COUNT,
 
 use super::C220VectorUopError;
 use super::instruction::C220VectorInstruction;
-use super::repeat::AccumulatorSchedule;
+use super::repeat::{AccumulatorSchedule, OrdinaryRepeatSchedule};
 
 struct VectorUopInputs {
     pc: u64,
@@ -176,6 +176,22 @@ impl C220VectorInstruction {
 
     /// Describes admitted vector work in 64-lane groups or a complete tile.
     pub fn uops(&self) -> Result<Vec<C220VectorUop>, C220VectorUopError> {
+        let mut uops = self.generate_uops()?;
+        if let Some(schedule) = self
+            .read_issue()
+            .and_then(OrdinaryRepeatSchedule::from_issue)
+        {
+            for uop in &mut uops {
+                if !schedule.writes_destination(uop.repeat_index) {
+                    uop.writes_ub = false;
+                    uop.writeback_ticks = 1;
+                }
+            }
+        }
+        Ok(uops)
+    }
+
+    fn generate_uops(&self) -> Result<Vec<C220VectorUop>, C220VectorUopError> {
         if let Self::Control { pc, .. } = self {
             return Ok(vec![C220VectorUop {
                 pc: *pc,
