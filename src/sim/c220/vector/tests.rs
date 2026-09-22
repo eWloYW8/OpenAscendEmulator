@@ -351,7 +351,7 @@ fn captured_movev_add_and_sub_share_live_ub_state() {
     )
     .unwrap();
     assert_eq!(fill.stores.len(), 64);
-    assert_eq!(fill.stores[0].data, scalar_word.to_le_bytes());
+    assert_eq!(&fill.stores[0].data[..4], &scalar_word.to_le_bytes());
     let add = execute_c220_fp32_to_ub(
         0x1131_2660,
         C220_CAPTURED_VADD_WORD,

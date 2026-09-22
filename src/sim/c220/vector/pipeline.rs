@@ -3,7 +3,14 @@ use std::num::NonZeroU64;
 
 use thiserror::Error;
 
+use crate::isa::c220::conversion::C220ConversionKind;
+use crate::isa::c220::fused::{C220FusedFormat, C220FusedOperation};
 use crate::isa::c220::gather::C220GatherKind;
+use crate::isa::c220::reduce::{C220ReductionKind, C220ReductionWidth};
+use crate::isa::c220::sort::C220SortWidth;
+use crate::isa::c220::special::C220SpecialUnaryOperation;
+use crate::isa::c220::ternary::C220TernaryOperation;
+use crate::isa::c220::vector::C220VecArithmeticOperation;
 use crate::memory::ub::UbMemory;
 use crate::sim::c220::ub_arbiter::{C220UbCycle, C220UbPort, C220UbRequest, C220UbRequestError};
 use crate::sim::c220::vector::compare::{C220CompareMask, C220CompareMaskUpdate};
@@ -77,6 +84,147 @@ struct PendingReductionUpdate {
     applied: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum C220VectorIssueVariant {
+    Other,
+    Fma,
+    AddReduction {
+        grouped: bool,
+        width: C220ReductionWidth,
+    },
+    ReluConversion(C220FusedFormat),
+    Conversion(u16),
+    MulConversion,
+    Log,
+    Exp,
+    SlowDivide,
+    Sort(C220SortWidth),
+}
+
+impl C220VectorIssueVariant {
+    fn minimum_gap_from(self, previous: Self) -> u64 {
+        let mut gap = 1;
+        if self.is_fma() && (previous.is_add_reduction() || previous.is_relu_conversion()) {
+            gap = gap.max(5);
+        }
+        if self.is_fma() && previous.is_special_conversion() {
+            gap = gap.max(3);
+        }
+        if self == Self::Log && previous.is_fma() {
+            gap = gap.max(6);
+        }
+        if self == Self::Exp && previous.is_long_special() {
+            gap = gap.max(2);
+        }
+        if self == Self::Exp && previous.is_special_conversion() {
+            gap = gap.max(5);
+        }
+        if self == Self::Exp && (previous.is_fma() || previous == Self::MulConversion) {
+            gap = gap.max(6);
+        }
+        if self == Self::SlowDivide && previous.is_special_conversion() {
+            gap = gap.max(5);
+        }
+        if self == Self::SlowDivide && (previous.is_fma() || previous == Self::MulConversion) {
+            gap = gap.max(6);
+        }
+        if self.is_vcadd(C220ReductionWidth::F32) && previous.is_vcadd(C220ReductionWidth::F16) {
+            gap = gap.max(4);
+        }
+        if self.is_vcgadd(C220ReductionWidth::F16) {
+            if previous.is_vcadd(C220ReductionWidth::F32) {
+                gap = gap.max(4);
+            }
+            if previous.is_relu_conversion() {
+                gap = gap.max(10);
+            }
+        }
+        if self.is_vcgadd(C220ReductionWidth::F32) {
+            if previous.is_vcadd(C220ReductionWidth::F16)
+                || previous.is_vcgadd(C220ReductionWidth::F16)
+            {
+                gap = gap.max(4);
+            }
+            if previous.is_relu_conversion() {
+                gap = gap.max(7);
+            }
+        }
+        if self.is_special_conversion() && previous.is_fma() {
+            gap = gap.max(2);
+        }
+        if self.is_scalar_s32_dequant()
+            && (previous.is_special_conversion()
+                || previous.is_fma()
+                || previous == Self::MulConversion)
+        {
+            gap = gap.max(2);
+        }
+        if self.is_narrow_relu_conversion()
+            && (previous.is_special_conversion() || previous.is_scalar_s32_dequant())
+        {
+            gap = gap.max(6);
+        }
+        if self == Self::MulConversion
+            && (previous.is_special_conversion() || previous.is_scalar_s32_dequant())
+        {
+            gap = gap.max(6);
+        }
+        match (self, previous) {
+            (Self::Sort(current), Self::Sort(prior)) if current == prior => gap.max(17),
+            (Self::Sort(_), Self::Sort(_)) => gap.max(16),
+            _ => gap,
+        }
+    }
+
+    const fn is_fma(self) -> bool {
+        matches!(self, Self::Fma)
+    }
+
+    const fn is_add_reduction(self) -> bool {
+        matches!(self, Self::AddReduction { .. })
+    }
+
+    const fn is_vcadd(self, expected: C220ReductionWidth) -> bool {
+        matches!(
+            self,
+            Self::AddReduction {
+                grouped: false,
+                width,
+            } if width as u8 == expected as u8
+        )
+    }
+
+    const fn is_vcgadd(self, expected: C220ReductionWidth) -> bool {
+        matches!(
+            self,
+            Self::AddReduction {
+                grouped: true,
+                width,
+            } if width as u8 == expected as u8
+        )
+    }
+
+    const fn is_relu_conversion(self) -> bool {
+        matches!(self, Self::ReluConversion(_))
+    }
+
+    const fn is_narrow_relu_conversion(self) -> bool {
+        matches!(self, Self::ReluConversion(C220FusedFormat::F16ToS8))
+    }
+
+    const fn is_special_conversion(self) -> bool {
+        matches!(self, Self::Conversion(1019..=1022))
+    }
+
+    const fn is_scalar_s32_dequant(self) -> bool {
+        matches!(self, Self::Conversion(1023))
+    }
+
+    const fn is_long_special(self) -> bool {
+        matches!(self, Self::Log | Self::SlowDivide)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct C220VectorPipeline {
     rules: C220VectorTimingRules,
@@ -84,6 +232,8 @@ pub struct C220VectorPipeline {
     next_service_tick: u64,
     observed_tick: Option<u64>,
     last_release_tick: Option<u64>,
+    last_issue_variant: Option<C220VectorIssueVariant>,
+    last_uop_admission_tick: Option<u64>,
     pending: VecDeque<PendingVectorUop>,
     last_read_samples: Vec<C220VectorReadSample>,
     last_ub_cycles: Vec<C220UbCycle>,
@@ -101,6 +251,8 @@ impl C220VectorPipeline {
             next_service_tick: 0,
             observed_tick: None,
             last_release_tick: None,
+            last_issue_variant: None,
+            last_uop_admission_tick: None,
             pending: VecDeque::new(),
             last_read_samples: Vec::new(),
             last_ub_cycles: Vec::new(),
@@ -282,7 +434,7 @@ impl C220VectorPipeline {
             }
         }
         for &store in stores {
-            if !matches!(store.width_bytes, 1 | 2 | 4) {
+            if !matches!(store.width_bytes, 1 | 2 | 4 | 8) {
                 return Err(C220VectorPipelineError::UnsupportedStoreWidth(
                     store.width_bytes,
                 ));
@@ -291,6 +443,15 @@ impl C220VectorPipeline {
                 .address
                 .checked_add(u64::from(store.width_bytes))
                 .ok_or(C220VectorPipelineError::StoreAddressOverflow)?;
+            let logical_lane = match compute {
+                Some(C220VectorReadIssue::Conversion(issue)) => issue
+                    .logical_lane_for_store(&store)
+                    .ok_or(C220VectorPipelineError::StoreUopMismatch)?,
+                Some(C220VectorReadIssue::Fused(issue)) => issue
+                    .logical_lane_for_store(&store)
+                    .ok_or(C220VectorPipelineError::StoreUopMismatch)?,
+                _ => store.lane_index,
+            };
             let lanes_per_group = match compute {
                 Some(C220VectorReadIssue::Gather(issue)) => match issue.instruction.kind {
                     C220GatherKind::Elements(_) => 16,
@@ -298,7 +459,7 @@ impl C220VectorPipeline {
                 },
                 _ => 64,
             };
-            let lane_group = u8::try_from(store.lane_index / lanes_per_group)
+            let lane_group = u8::try_from(logical_lane / lanes_per_group)
                 .map_err(|_| C220VectorPipelineError::StoreUopMismatch)?;
             let index = indices
                 .get(&(store.repeat_index, Some(lane_group)))
@@ -318,6 +479,75 @@ impl C220VectorPipeline {
             .checked_add(self.rules.dispatch_ticks)
             .ok_or(C220VectorPipelineError::TimeOverflow)?;
         let mut next_admission_tick = self.next_admission_tick;
+        let issue_variant = match compute {
+            Some(C220VectorReadIssue::Arithmetic(issue))
+                if issue.hint.operation == C220VecArithmeticOperation::Divide =>
+            {
+                C220VectorIssueVariant::SlowDivide
+            }
+            Some(C220VectorReadIssue::Reduction(issue)) => match issue.instruction.kind {
+                C220ReductionKind::WholeAdd { .. } => C220VectorIssueVariant::AddReduction {
+                    grouped: false,
+                    width: issue.instruction.width,
+                },
+                C220ReductionKind::GroupAdd => C220VectorIssueVariant::AddReduction {
+                    grouped: true,
+                    width: issue.instruction.width,
+                },
+                _ => C220VectorIssueVariant::Other,
+            },
+            Some(C220VectorReadIssue::Ternary(issue))
+                if matches!(
+                    issue.instruction.operation,
+                    C220TernaryOperation::MultiplyAccumulate
+                        | C220TernaryOperation::MultiplyAddRelu
+                ) =>
+            {
+                C220VectorIssueVariant::Fma
+            }
+            Some(C220VectorReadIssue::Axpy(_)) => C220VectorIssueVariant::Fma,
+            Some(C220VectorReadIssue::SpecialUnary(issue)) => match issue.instruction.operation {
+                C220SpecialUnaryOperation::Ln => C220VectorIssueVariant::Log,
+                C220SpecialUnaryOperation::Exp => C220VectorIssueVariant::Exp,
+                C220SpecialUnaryOperation::Sqrt => C220VectorIssueVariant::SlowDivide,
+                _ => C220VectorIssueVariant::Other,
+            },
+            Some(C220VectorReadIssue::Conversion(issue)) => {
+                let id = issue.instruction.kind.conversion_id();
+                if matches!(
+                    issue.instruction.kind,
+                    C220ConversionKind::VectorDeqS16ToS8 { .. }
+                        | C220ConversionKind::ScalarDeqS16ToS8 { .. }
+                        | C220ConversionKind::ScalarDeqS32ToF16
+                ) {
+                    C220VectorIssueVariant::Conversion(id)
+                } else {
+                    C220VectorIssueVariant::Other
+                }
+            }
+            Some(C220VectorReadIssue::Fused(issue)) => match issue.instruction.operation {
+                C220FusedOperation::AddRelu | C220FusedOperation::SubtractRelu
+                    if matches!(
+                        issue.instruction.format,
+                        C220FusedFormat::F16ToS8 | C220FusedFormat::F32ToF16
+                    ) =>
+                {
+                    C220VectorIssueVariant::ReluConversion(issue.instruction.format)
+                }
+                C220FusedOperation::Multiply
+                    if issue.instruction.format == C220FusedFormat::F16ToS8 =>
+                {
+                    C220VectorIssueVariant::MulConversion
+                }
+                _ => C220VectorIssueVariant::Other,
+            },
+            Some(C220VectorReadIssue::Sort(issue)) => {
+                C220VectorIssueVariant::Sort(issue.instruction.width)
+            }
+            _ => C220VectorIssueVariant::Other,
+        };
+        let mut previous_variant = self.last_issue_variant;
+        let mut previous_admission_tick = self.last_uop_admission_tick;
         let mut entries = Vec::with_capacity(uops.len());
         let reduction_group = match compute {
             Some(C220VectorReadIssue::Reduction(issue))
@@ -346,10 +576,18 @@ impl C220VectorPipeline {
                 Some(C220VectorReadIssue::Nchw(_)) => uop.repeat_index % 2 == 1,
                 _ => false,
             };
-            let admission_tick = first_admission.max(next_admission_tick);
+            let conflict_tick = previous_variant.zip(previous_admission_tick).map_or(
+                0,
+                |(previous, previous_tick)| {
+                    previous_tick.saturating_add(issue_variant.minimum_gap_from(previous))
+                },
+            );
+            let admission_tick = first_admission.max(next_admission_tick).max(conflict_tick);
             next_admission_tick = admission_tick
                 .checked_add(self.rules.uop_issue_interval.get())
                 .ok_or(C220VectorPipelineError::TimeOverflow)?;
+            previous_variant = Some(issue_variant);
+            previous_admission_tick = Some(admission_tick);
             let synthetic_zero_reduction =
                 reduction_group.is_some_and(|(_, update)| update.is_some());
             let read = if let Some(issue) = compute
@@ -424,6 +662,10 @@ impl C220VectorPipeline {
             });
         }
         self.next_admission_tick = next_admission_tick;
+        if !uops.is_empty() {
+            self.last_issue_variant = previous_variant;
+            self.last_uop_admission_tick = previous_admission_tick;
+        }
         self.pending.extend(entries);
         Ok(self.pending_visibility_tick())
     }
@@ -983,7 +1225,7 @@ mod tests {
                 address: (lane * 4) as u64,
                 bank: C220UbBank::from_address((lane * 4) as u64),
                 width_bytes: 4,
-                data: 4.0_f32.to_le_bytes(),
+                data: super::super::store_data(4.0_f32.to_le_bytes()),
             })
             .collect::<Vec<_>>();
         pipeline

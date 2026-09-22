@@ -36,6 +36,7 @@ pub struct Fp32ValueStatus {
     pub zero_times_infinity: bool,
     pub division_by_zero: bool,
     pub indeterminate_division: bool,
+    pub invalid: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

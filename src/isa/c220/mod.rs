@@ -1,9 +1,15 @@
+pub mod axpy;
 pub mod compare;
+pub mod conversion;
+pub mod fused;
 pub mod gather;
+pub mod merge;
 pub mod mte;
 pub mod reduce;
 pub mod scalar;
 pub mod select;
+pub mod sort;
+pub mod special;
 pub mod ternary;
 pub mod vector;
 pub mod vector_scalar;

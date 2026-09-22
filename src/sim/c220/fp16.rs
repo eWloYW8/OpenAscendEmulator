@@ -227,15 +227,15 @@ pub fn evaluate_c220_fp16(
     C220Fp16Outcome { bits, status }
 }
 
-fn is_nan(bits: u16) -> bool {
+pub(crate) fn is_nan(bits: u16) -> bool {
     bits & EXPONENT == EXPONENT && bits & FRACTION != 0
 }
 
-fn is_infinite(bits: u16) -> bool {
+pub(crate) fn is_infinite(bits: u16) -> bool {
     bits & !SIGN == EXPONENT
 }
 
-fn to_f64(bits: u16) -> f64 {
+pub(crate) fn to_f64(bits: u16) -> f64 {
     let sign = if bits & SIGN == 0 { 1.0 } else { -1.0 };
     let exponent = i32::from((bits & EXPONENT) >> 10);
     let fraction = u32::from(bits & FRACTION);
@@ -249,7 +249,7 @@ fn to_f64(bits: u16) -> f64 {
     sign * magnitude
 }
 
-fn round_finite_to_f16(value: f64) -> u16 {
+pub(crate) fn round_finite_to_f16(value: f64) -> u16 {
     let sign = if value.is_sign_negative() { SIGN } else { 0 };
     let magnitude = value.abs();
     if magnitude == 0.0 {

@@ -92,7 +92,7 @@ pub fn plan_c220_transpose_issue(
             address,
             bank: C220UbBank::from_address(address),
             width_bytes: 2,
-            data: [0; 4],
+            data: [0; 8],
         });
     }
     Ok(C220TransposeIssue {
@@ -137,7 +137,7 @@ pub fn evaluate_c220_transpose(
             address,
             bank: C220UbBank::from_address(address),
             width_bytes: 2,
-            data: [bytes[0], bytes[1], 0, 0],
+            data: super::store_data(bytes),
         });
     }
     Ok((values, stores))

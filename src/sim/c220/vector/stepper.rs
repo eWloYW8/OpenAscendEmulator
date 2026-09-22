@@ -1,7 +1,13 @@
 use super::*;
 use crate::architecture::Architecture;
+use crate::isa::c220::axpy::C220AxpyInstruction;
+use crate::isa::c220::conversion::C220ConversionInstruction;
+use crate::isa::c220::fused::C220FusedInstruction;
 use crate::isa::c220::gather::{C220GatherInstruction, C220GatherKind};
+use crate::isa::c220::merge::C220MergeInstruction;
 use crate::isa::c220::reduce::C220ReductionInstruction;
+use crate::isa::c220::sort::C220SortInstruction;
+use crate::isa::c220::special::C220SpecialUnaryInstruction;
 use crate::isa::c220::ternary::C220TernaryInstruction;
 use crate::isa::c220::vector::{
     C220BroadcastInstruction, C220CopyInstruction, C220MovevInstruction, C220ShiftInstruction,
@@ -12,14 +18,24 @@ use crate::isa::flow::FlagInstruction;
 use crate::memory::sparse::MemoryByteState;
 use crate::sim::c220::fp16::C220Fp16Mode;
 use crate::sim::c220::mte::state::C220OutputToken;
+use crate::sim::c220::vector::axpy::{C220AxpyIssue, C220AxpyIssueInputs, plan_c220_axpy_issue};
 use crate::sim::c220::vector::broadcast::{C220BroadcastIssue, plan_c220_broadcast_issue};
+use crate::sim::c220::vector::conversion::{
+    C220ConversionIssue, C220ConversionIssueInputs, plan_c220_conversion_issue,
+};
 use crate::sim::c220::vector::copy::{C220CopyIssue, plan_c220_copy_issue};
+use crate::sim::c220::vector::fused::{
+    C220FusedIssue, C220FusedIssueInputs, plan_c220_fused_issue,
+};
 use crate::sim::c220::vector::gather::{C220GatherIssue, plan_c220_gather_issue};
+use crate::sim::c220::vector::merge::{C220MergeIssue, plan_c220_merge_issue};
 use crate::sim::c220::vector::reduce::{C220ReductionIssue, plan_c220_reduction_issue};
 use crate::sim::c220::vector::scalar::{
     C220VectorScalarIssue, C220VectorScalarOperand, plan_c220_vector_scalar_issue,
 };
 use crate::sim::c220::vector::shift::{C220ShiftIssue, plan_c220_shift_issue};
+use crate::sim::c220::vector::sort::{C220SortIssue, plan_c220_sort_issue};
+use crate::sim::c220::vector::special::{C220SpecialUnaryIssue, plan_c220_special_unary_issue};
 use crate::sim::c220::vector::ternary::{C220TernaryIssue, plan_c220_ternary_issue};
 use crate::sim::c220::vector::transpose::{C220TransposeIssue, plan_c220_transpose_issue};
 use crate::sim::c220::vector::{
@@ -47,6 +63,225 @@ struct ResolvedC220UnaryVector {
 }
 
 impl MteCoreStepper {
+    pub(crate) fn preview_c220_merge_word(
+        &self,
+        word: u32,
+    ) -> Result<C220MergeIssue, MteStepperError> {
+        let pc = self.scalar.pc();
+        if self.scalar.is_halted() {
+            return Err(MteStepperError::ProgramEnded { pc });
+        }
+        let machine = self.scalar.machine();
+        if machine.architecture() != Architecture::Dav2201 {
+            return Err(MteStepperError::UnsupportedWord { pc, word });
+        }
+        if self.c220.output_buffer_busy() {
+            return Err(MteStepperError::OutputDependencyOutstanding);
+        }
+        C220MergeInstruction::decode(word).ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+        Ok(plan_c220_merge_issue(pc, word, machine.xregs(), &self.ub)?)
+    }
+
+    pub(crate) fn preview_c220_sort_word(
+        &self,
+        word: u32,
+    ) -> Result<C220SortIssue, MteStepperError> {
+        let pc = self.scalar.pc();
+        if self.scalar.is_halted() {
+            return Err(MteStepperError::ProgramEnded { pc });
+        }
+        let machine = self.scalar.machine();
+        if machine.architecture() != Architecture::Dav2201 {
+            return Err(MteStepperError::UnsupportedWord { pc, word });
+        }
+        if self.c220.output_buffer_busy() {
+            return Err(MteStepperError::OutputDependencyOutstanding);
+        }
+        let instruction = C220SortInstruction::decode(word)
+            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+        let registers = machine.xregs();
+        Ok(plan_c220_sort_issue(
+            pc,
+            word,
+            registers[usize::from(instruction.control_register)],
+            C220VectorAddresses {
+                destination: registers[usize::from(instruction.destination_register)],
+                source_0: registers[usize::from(instruction.value_register)],
+                source_1: registers[usize::from(instruction.index_register)],
+            },
+            &self.ub,
+        )?)
+    }
+
+    pub(crate) fn preview_c220_fused_word(
+        &self,
+        word: u32,
+    ) -> Result<C220FusedIssue, MteStepperError> {
+        let pc = self.scalar.pc();
+        if self.scalar.is_halted() {
+            return Err(MteStepperError::ProgramEnded { pc });
+        }
+        let machine = self.scalar.machine();
+        if machine.architecture() != Architecture::Dav2201 {
+            return Err(MteStepperError::UnsupportedWord { pc, word });
+        }
+        if self.c220.output_buffer_busy() {
+            return Err(MteStepperError::OutputDependencyOutstanding);
+        }
+        let instruction = C220FusedInstruction::decode(word)
+            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+        let xregs = machine.xregs();
+        let mask_control = machine
+            .spr_value(3)
+            .ok_or(C220VectorError::MissingMaskState)?;
+        let deq_scale = machine.spr_value(12).unwrap_or(0);
+        let control = decode_c220_fp32_control(xregs[usize::from(instruction.control_register)])?;
+        let iteration_masks = decode_c220_repeat_masks(
+            mask_control,
+            machine
+                .spr_value(100)
+                .ok_or(C220VectorError::MissingMaskState)?,
+            machine
+                .spr_value(101)
+                .ok_or(C220VectorError::MissingMaskState)?,
+            instruction.lane_count(),
+            control.encoded_repeat_count,
+        )?;
+        Ok(plan_c220_fused_issue(
+            C220FusedIssueInputs {
+                pc,
+                word,
+                control,
+                addresses: C220VectorAddresses {
+                    source_0: xregs[usize::from(instruction.source_0_register)],
+                    source_1: xregs[usize::from(instruction.source_1_register)],
+                    destination: xregs[usize::from(instruction.destination_register)],
+                },
+                iteration_masks: &iteration_masks,
+                fp16_mode: C220Fp16Mode::from_control_spr(mask_control),
+                arithmetic_saturating: mask_control & (1 << 53) != 0,
+                integer_saturating: mask_control & (1 << 59) == 0,
+                descriptor_address: 32 * (deq_scale & 0x3fff),
+                deq_scale: deq_scale as u16,
+            },
+            &self.ub,
+        )?)
+    }
+
+    pub(crate) fn preview_c220_conversion_word(
+        &self,
+        word: u32,
+    ) -> Result<C220ConversionIssue, MteStepperError> {
+        let pc = self.scalar.pc();
+        if self.scalar.is_halted() {
+            return Err(MteStepperError::ProgramEnded { pc });
+        }
+        let machine = self.scalar.machine();
+        if machine.architecture() != Architecture::Dav2201 {
+            return Err(MteStepperError::UnsupportedWord { pc, word });
+        }
+        if self.c220.output_buffer_busy() {
+            return Err(MteStepperError::OutputDependencyOutstanding);
+        }
+        let instruction = C220ConversionInstruction::decode(word)
+            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+        let xregs = machine.xregs();
+        let mask_control = machine
+            .spr_value(3)
+            .ok_or(C220VectorError::MissingMaskState)?;
+        let control =
+            decode_c220_vector_unary_control(xregs[usize::from(instruction.control_register)]);
+        let deq_scale = machine.spr_value(12).unwrap_or(0);
+        let iteration_masks = decode_c220_repeat_masks(
+            mask_control,
+            machine
+                .spr_value(100)
+                .ok_or(C220VectorError::MissingMaskState)?,
+            machine
+                .spr_value(101)
+                .ok_or(C220VectorError::MissingMaskState)?,
+            instruction.lane_count(),
+            control.encoded_repeat_count,
+        )?;
+        Ok(plan_c220_conversion_issue(
+            C220ConversionIssueInputs {
+                pc,
+                word,
+                control,
+                addresses: C220VectorAddresses {
+                    source_0: xregs[usize::from(instruction.source_register)],
+                    source_1: 32 * (deq_scale & 0x3fff),
+                    destination: xregs[usize::from(instruction.destination_register)],
+                },
+                iteration_masks: &iteration_masks,
+                fp16_mode: C220Fp16Mode::from_control_spr(mask_control),
+                integer_saturating: mask_control & (1 << 59) == 0,
+                deq_scale,
+            },
+            &self.ub,
+        )?)
+    }
+
+    pub(crate) fn preview_c220_special_unary_word(
+        &self,
+        word: u32,
+    ) -> Result<C220SpecialUnaryIssue, MteStepperError> {
+        let instruction =
+            C220SpecialUnaryInstruction::decode(word).ok_or(MteStepperError::UnsupportedWord {
+                pc: self.scalar.pc(),
+                word,
+            })?;
+        let resolved = self.resolve_c220_unary_vector(
+            word,
+            instruction.destination_register,
+            instruction.source_register,
+            instruction.control_register,
+            instruction.width.element_bytes(),
+            true,
+        )?;
+        Ok(plan_c220_special_unary_issue(
+            resolved.pc,
+            word,
+            resolved.control,
+            resolved.addresses,
+            &resolved.iteration_masks,
+            C220Fp16Mode::from_control_spr(resolved.mask_control),
+            &self.ub,
+        )?)
+    }
+
+    pub(crate) fn preview_c220_axpy_word(
+        &self,
+        word: u32,
+    ) -> Result<C220AxpyIssue, MteStepperError> {
+        let instruction =
+            C220AxpyInstruction::decode(word).ok_or(MteStepperError::UnsupportedWord {
+                pc: self.scalar.pc(),
+                word,
+            })?;
+        let resolved = self.resolve_c220_unary_vector(
+            word,
+            instruction.destination_register,
+            instruction.source_register,
+            instruction.control_register,
+            instruction.width.destination_element_bytes(),
+            true,
+        )?;
+        Ok(plan_c220_axpy_issue(
+            C220AxpyIssueInputs {
+                pc: resolved.pc,
+                word,
+                scalar_bits: self.scalar.machine().xregs()[usize::from(instruction.scalar_register)]
+                    as u32,
+                control: resolved.control,
+                addresses: resolved.addresses,
+                iteration_masks: &resolved.iteration_masks,
+                fp16_mode: C220Fp16Mode::from_control_spr(resolved.mask_control),
+            },
+            &self.ub,
+        )?)
+    }
+
     pub(crate) fn preview_c220_gather_word(
         &self,
         word: u32,

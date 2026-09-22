@@ -269,7 +269,7 @@ pub fn plan_c220_gather_issue(
                         address,
                         bank: C220UbBank::from_address(address),
                         width_bytes: element_bytes,
-                        data: [0; 4],
+                        data: [0; 8],
                     });
                 }
             }
@@ -295,7 +295,7 @@ pub fn plan_c220_gather_issue(
                             address,
                             bank: C220UbBank::from_address(address),
                             width_bytes: 4,
-                            data: [0; 4],
+                            data: [0; 8],
                         });
                     }
                 }
@@ -391,7 +391,7 @@ fn evaluate_elements(
             address,
             bank: C220UbBank::from_address(address),
             width_bytes: width.element_bytes(),
-            data,
+            data: super::store_data(data),
         });
     }
     Ok((lanes, stores))
@@ -444,7 +444,7 @@ fn evaluate_blocks(
                 address,
                 bank: C220UbBank::from_address(address),
                 width_bytes: 4,
-                data,
+                data: super::store_data(data),
             });
         }
     }
@@ -529,6 +529,9 @@ mod tests {
             evaluate_c220_gather_data_uop(&issue, 0, 0, &source_0, &source_1).unwrap();
         assert_eq!(stores.len(), 16);
         assert_eq!(stores[0].address, 0x800);
-        assert_eq!(u32::from_le_bytes(stores[15].data), 0x100f);
+        assert_eq!(
+            u32::from_le_bytes(stores[15].data[..4].try_into().unwrap()),
+            0x100f
+        );
     }
 }

@@ -9,11 +9,16 @@ use crate::numeric::fp32::{
 use crate::sim::c220::fp16::C220Fp16Mode;
 use thiserror::Error;
 
+pub mod axpy;
 pub mod broadcast;
 pub mod compare;
+pub mod conversion;
 pub mod copy;
 mod f16;
+mod fma;
+pub mod fused;
 pub mod gather;
+pub mod merge;
 mod movev;
 pub mod nchw;
 pub mod pipeline;
@@ -24,10 +29,14 @@ mod s32;
 pub mod scalar;
 pub mod select;
 pub mod shift;
+pub mod sort;
+pub mod special;
+mod special_tables;
 mod stepper;
 pub mod ternary;
 pub mod timing;
 pub mod transpose;
+pub mod vmsu;
 
 pub use movev::{
     C220MovevControl, C220MovevStep, decode_c220_movev_control, execute_c220_movev_to_ub,
@@ -62,7 +71,14 @@ pub struct C220VectorStore {
     pub address: u64,
     pub bank: C220UbBank,
     pub width_bytes: u8,
-    pub data: [u8; 4],
+    pub data: [u8; 8],
+}
+
+pub(crate) fn store_data<const N: usize>(bytes: [u8; N]) -> [u8; 8] {
+    assert!(N <= 8, "C220 vector store payload exceeds one lane");
+    let mut data = [0; 8];
+    data[..N].copy_from_slice(&bytes);
+    data
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +225,8 @@ pub enum C220VectorError {
     UnsupportedElementWidth(u8),
     #[error("unsupported C220 vector arithmetic type selector {0}")]
     UnsupportedArithmeticType(u8),
+    #[error("C220 conversion kind is not executable yet")]
+    UnsupportedConversionKind,
     #[error("C220 vector lane group {0} is out of range")]
     InvalidLaneGroup(u8),
     #[error("C220 count mask requires zero high word, got {high:#x}")]
@@ -286,7 +304,7 @@ pub(crate) fn decode_c220_repeat_masks(
     lane_count: usize,
     encoded_repeat_count: u8,
 ) -> Result<Vec<[u64; 4]>, C220VectorError> {
-    let mask_mode = mask_control & !((1 << 48) | (1 << 53));
+    let mask_mode = mask_control & !((1 << 48) | (1 << 53) | (1 << 59));
     let repeat_count = match mask_mode {
         0 => u64::from(encoded_repeat_count),
         C220_COUNT_MASK_CONTROL => {
@@ -335,7 +353,7 @@ pub(crate) fn decode_c220_tile_mask(
     mask1: u64,
     lane_count: usize,
 ) -> Result<[u64; 4], C220VectorError> {
-    match control & !((1 << 48) | (1 << 53)) {
+    match control & !((1 << 48) | (1 << 53) | (1 << 59)) {
         0 => Ok([mask0, mask1, 0, 0]),
         C220_COUNT_MASK_CONTROL => {
             if mask1 != 0 {
@@ -405,7 +423,7 @@ pub(crate) fn plan_c220_unary_write_targets(
                 address,
                 bank: C220UbBank::from_address(address),
                 width_bytes: element_bytes,
-                data: [0; 4],
+                data: [0; 8],
             });
         }
     }
@@ -447,7 +465,11 @@ pub fn execute_c220_fp32_to_ub(
             .map(|store| {
                 (
                     store.address,
-                    store.data.map(MemoryByteState::Known).to_vec(),
+                    store.data[..usize::from(store.width_bytes)]
+                        .iter()
+                        .copied()
+                        .map(MemoryByteState::Known)
+                        .collect(),
                 )
             })
             .collect::<Vec<_>>();
@@ -569,7 +591,7 @@ pub(crate) fn evaluate_c220_fp32_repeat_from_bytes(
             address,
             bank: C220UbBank::from_address(address),
             width_bytes: 4,
-            data: lane.bits.to_le_bytes(),
+            data: store_data(lane.bits.to_le_bytes()),
         });
     }
     Ok(C220Fp32RepeatOutcome {
@@ -640,7 +662,7 @@ pub fn plan_c220_vector_arithmetic_issue(
                 address,
                 bank: C220UbBank::from_address(address),
                 width_bytes: result_element_bytes,
-                data: [0; 4],
+                data: [0; 8],
             });
         }
     }
@@ -674,7 +696,7 @@ pub(crate) fn vector_destination_address_for_width(
     lane_index: usize,
     element_bytes: u8,
 ) -> Result<u64, C220VectorError> {
-    if !matches!(element_bytes, 2 | 4) {
+    if !matches!(element_bytes, 1 | 2 | 4 | 8) {
         return Err(C220VectorError::UnsupportedElementWidth(element_bytes));
     }
     let lanes_per_block = C220_VECTOR_BLOCK_BYTES / usize::from(element_bytes);
@@ -738,7 +760,7 @@ pub(crate) fn plan_c220_vector_read_accesses(
     element_bytes: u8,
     lane_group: Option<u8>,
 ) -> Result<Vec<C220VectorReadAccess>, C220VectorError> {
-    if !matches!(element_bytes, 2 | 4) {
+    if !matches!(element_bytes, 1 | 2 | 4 | 8) {
         return Err(C220VectorError::UnsupportedElementWidth(element_bytes));
     }
     let lanes_per_block = C220_VECTOR_BLOCK_BYTES / usize::from(element_bytes);
@@ -796,6 +818,50 @@ pub(crate) fn plan_c220_vector_read_accesses(
                 active_lane_mask,
             });
         }
+    }
+    Ok(accesses)
+}
+
+pub(crate) fn plan_c220_destination_read_accesses(
+    control: C220VectorControl,
+    addresses: C220VectorAddresses,
+    repeat_index: usize,
+    active_mask: &[u64; 4],
+    element_bytes: u8,
+    lane_group: Option<u8>,
+) -> Result<Vec<C220VectorReadAccess>, C220VectorError> {
+    if !matches!(element_bytes, 1 | 2 | 4 | 8) {
+        return Err(C220VectorError::UnsupportedElementWidth(element_bytes));
+    }
+    let lanes_per_block = C220_VECTOR_BLOCK_BYTES / usize::from(element_bytes);
+    let lane_count = C220_VECTOR_TILE_BYTES / usize::from(element_bytes);
+    let mut accesses = Vec::with_capacity(C220_VECTOR_BLOCK_COUNT);
+    for block_index in 0..C220_VECTOR_BLOCK_COUNT {
+        let first_lane = block_index * lanes_per_block;
+        if first_lane >= lane_count
+            || lane_group.is_some_and(|group| first_lane / 64 != usize::from(group))
+        {
+            continue;
+        }
+        let active_lane_mask = ((active_mask[first_lane / 64] >> (first_lane % 64))
+            & ((1_u64 << lanes_per_block) - 1)) as u16;
+        if active_lane_mask == 0 {
+            continue;
+        }
+        accesses.push(C220VectorReadAccess {
+            source_index: 2,
+            block_index: block_index as u8,
+            buffer_offset: (block_index * C220_VECTOR_BLOCK_BYTES) as u16,
+            bytes: C220_VECTOR_BLOCK_BYTES as u16,
+            address: vector_destination_address_for_width(
+                control,
+                addresses,
+                repeat_index,
+                first_lane,
+                element_bytes,
+            )?,
+            active_lane_mask,
+        });
     }
     Ok(accesses)
 }

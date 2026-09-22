@@ -89,7 +89,7 @@ pub(super) fn evaluate_c220_f16_repeat_from_bytes(
             address,
             bank: C220UbBank::from_address(address),
             width_bytes: 2,
-            data: [bytes[0], bytes[1], 0, 0],
+            data: super::store_data(bytes),
         });
         lanes.push(C220F16LaneOutcome {
             active,

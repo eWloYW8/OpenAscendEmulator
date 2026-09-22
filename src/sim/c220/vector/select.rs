@@ -295,7 +295,7 @@ pub(crate) fn evaluate_c220_select_uop(
             address,
             bank: C220UbBank::from_address(address),
             width_bytes: issue.instruction.width.element_bytes(),
-            data: bits.to_le_bytes(),
+            data: super::store_data(bits.to_le_bytes()),
         });
     }
     Ok((values, stores))

@@ -85,7 +85,7 @@ impl C220MoveMaskIssue {
                     address,
                     bank: C220UbBank::from_address(address),
                     width_bytes: 4,
-                    data: bytes.try_into().expect("four-byte mask chunk"),
+                    data: super::store_data::<4>(bytes.try_into().expect("four-byte mask chunk")),
                 }
             })
             .collect()
@@ -438,7 +438,7 @@ pub fn evaluate_c220_packed_compare_uop(
                 address,
                 bank: C220UbBank::from_address(address),
                 width_bytes: 1,
-                data: [packed, 0, 0, 0],
+                data: super::store_data([packed]),
             });
         }
     }

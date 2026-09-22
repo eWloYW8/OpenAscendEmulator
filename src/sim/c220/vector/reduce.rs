@@ -76,6 +76,7 @@ impl C220ReductionValue {
                     zero_times_infinity: false,
                     division_by_zero: false,
                     indeterminate_division: false,
+                    invalid: false,
                 },
             },
         }
@@ -693,7 +694,7 @@ fn reduction_store(
         address,
         bank: C220UbBank::from_address(address),
         width_bytes,
-        data: bits.to_le_bytes(),
+        data: super::store_data(bits.to_le_bytes()),
     })
 }
 
@@ -778,7 +779,7 @@ fn push_target(
         address,
         bank: C220UbBank::from_address(address),
         width_bytes: element_bytes,
-        data: [0; 4],
+        data: [0; 8],
     });
     Ok(())
 }
@@ -831,5 +832,6 @@ const fn merge_fp32_status(
         indeterminate_division: first.indeterminate_division
             || second.indeterminate_division
             || current.indeterminate_division,
+        invalid: first.invalid || second.invalid || current.invalid,
     }
 }

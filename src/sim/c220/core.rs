@@ -4,15 +4,21 @@ use thiserror::Error;
 
 use crate::architecture::Architecture;
 use crate::image::loader::{DeviceKernelFetchError, LoadedDeviceKernel};
+use crate::isa::c220::axpy::C220AxpyInstruction;
 use crate::isa::c220::compare::{
     C220CompareMaskInstruction, C220MoveMaskDirection, C220MoveMaskInstruction,
     C220PackedCompareInstruction,
 };
+use crate::isa::c220::conversion::C220ConversionInstruction;
+use crate::isa::c220::fused::C220FusedInstruction;
 use crate::isa::c220::gather::{C220GatherInstruction, C220GatherKind};
+use crate::isa::c220::merge::C220MergeInstruction;
 use crate::isa::c220::mte::C220DmaMovDescriptor;
 use crate::isa::c220::reduce::C220ReductionInstruction;
 use crate::isa::c220::scalar::C220ScalarConversionHint;
 use crate::isa::c220::select::C220SelectInstruction;
+use crate::isa::c220::sort::C220SortInstruction;
+use crate::isa::c220::special::C220SpecialUnaryInstruction;
 use crate::isa::c220::ternary::C220TernaryInstruction;
 use crate::isa::c220::vector::{
     C220BroadcastInstruction, C220CopyInstruction, C220MoveVaInstruction, C220MovevInstruction,
@@ -36,13 +42,17 @@ use crate::sim::c220::timing::mte3::{
 };
 use crate::sim::c220::timing::scalar::{C220ScalarTimingLane, C220ScalarTimingTicket};
 use crate::sim::c220::va::C220VaRegisters;
+use crate::sim::c220::vector::axpy::C220AxpyIssue;
 use crate::sim::c220::vector::broadcast::C220BroadcastIssue;
 use crate::sim::c220::vector::compare::{
     C220CompareMask, C220CompareMaskIssue, C220MoveMaskIssue, C220PackedCompareIssue,
     plan_c220_compare_mask_issue, plan_c220_move_mask_issue, plan_c220_packed_compare_issue,
 };
+use crate::sim::c220::vector::conversion::C220ConversionIssue;
 use crate::sim::c220::vector::copy::C220CopyIssue;
+use crate::sim::c220::vector::fused::C220FusedIssue;
 use crate::sim::c220::vector::gather::C220GatherIssue;
+use crate::sim::c220::vector::merge::C220MergeIssue;
 use crate::sim::c220::vector::nchw::{C220NchwIssue, plan_c220_nchw_issue};
 use crate::sim::c220::vector::pipeline::{
     C220VectorAdvanceError, C220VectorPipeline, C220VectorPipelineError, C220VectorTimingRules,
@@ -52,16 +62,19 @@ use crate::sim::c220::vector::reduce::C220ReductionIssue;
 use crate::sim::c220::vector::scalar::C220VectorScalarIssue;
 use crate::sim::c220::vector::select::{C220SelectIssue, C220SelectMode, plan_c220_select_issue};
 use crate::sim::c220::vector::shift::C220ShiftIssue;
+use crate::sim::c220::vector::sort::C220SortIssue;
+use crate::sim::c220::vector::special::C220SpecialUnaryIssue;
 use crate::sim::c220::vector::ternary::C220TernaryIssue;
 use crate::sim::c220::vector::timing::{
     C220VectorUop, C220VectorUopKind, C220VectorUopRelease, C220VectorUopStages,
     C220VectorWritePlan, C220VectorWritePlanError,
 };
 use crate::sim::c220::vector::transpose::C220TransposeIssue;
+use crate::sim::c220::vector::vmsu::{C220VmsuError, C220VmsuPipeline};
 use crate::sim::c220::vector::{
     C220MovevStep, C220VectorArithmeticIssue, C220VectorError, C220VectorMaskState, C220VectorStore,
 };
-use crate::sim::machine::ScalarInstructionError;
+use crate::sim::machine::{ScalarInstructionError, ScalarMachineError};
 use crate::sim::mte_stepper::{MteCoreStepper, MteStepperError};
 use crate::sim::scalar_bus::UbScalarBusError;
 use crate::sim::stepper::ScalarProgramStep;
@@ -91,9 +104,15 @@ pub enum C220CoreInstruction {
     VectorSelect(C220SelectIssue),
     VectorPackedCompare(C220PackedCompareIssue),
     VectorReduction(C220ReductionIssue),
+    VectorSort(C220SortIssue),
     VectorTernary(C220TernaryIssue),
+    VectorAxpy(C220AxpyIssue),
+    VectorSpecialUnary(C220SpecialUnaryIssue),
+    VectorConversion(C220ConversionIssue),
+    VectorFused(C220FusedIssue),
     VectorGather(C220GatherIssue),
     VectorNchw(C220NchwIssue),
+    VectorMerge(C220MergeIssue),
     VectorToScalarFlag(FlagStep),
     Mte3 {
         step: C220OutputStep,
@@ -126,7 +145,12 @@ impl C220CoreInstruction {
             Self::VectorSelect(step) => Some(&step.write_targets),
             Self::VectorPackedCompare(step) => Some(&step.write_targets),
             Self::VectorReduction(step) => Some(&step.write_targets),
+            Self::VectorSort(step) => Some(&step.write_targets),
             Self::VectorTernary(step) => Some(&step.write_targets),
+            Self::VectorAxpy(step) => Some(&step.write_targets),
+            Self::VectorSpecialUnary(step) => Some(&step.write_targets),
+            Self::VectorConversion(step) => Some(&step.write_targets),
+            Self::VectorFused(step) => Some(&step.write_targets),
             Self::VectorGather(step) => Some(&step.write_targets),
             Self::VectorNchw(step) => Some(&step.write_targets),
             _ => None,
@@ -168,7 +192,22 @@ impl C220CoreInstruction {
             Self::VectorReduction(step) => {
                 C220VectorWritePlan::from_stores(&step.write_targets).map(Some)
             }
+            Self::VectorSort(step) => {
+                C220VectorWritePlan::from_stores(&step.write_targets).map(Some)
+            }
             Self::VectorTernary(step) => {
+                C220VectorWritePlan::from_stores(&step.write_targets).map(Some)
+            }
+            Self::VectorAxpy(step) => {
+                C220VectorWritePlan::from_stores(&step.write_targets).map(Some)
+            }
+            Self::VectorSpecialUnary(step) => {
+                C220VectorWritePlan::from_stores(&step.write_targets).map(Some)
+            }
+            Self::VectorConversion(step) => {
+                C220VectorWritePlan::from_stores(&step.write_targets).map(Some)
+            }
+            Self::VectorFused(step) => {
                 C220VectorWritePlan::from_stores(&step.write_targets).map(Some)
             }
             Self::VectorGather(step) => {
@@ -195,7 +234,16 @@ impl C220CoreInstruction {
             Self::VectorSelect(_) => Some(C220VectorUopStages::select()),
             Self::VectorPackedCompare(_) => Some(C220VectorUopStages::packed_compare()),
             Self::VectorReduction(step) => Some(C220VectorUopStages::reduction(step.instruction)),
+            Self::VectorSort(_) => Some(C220VectorUopStages::sort()),
             Self::VectorTernary(step) => Some(C220VectorUopStages::ternary(step.instruction)),
+            Self::VectorAxpy(_) => Some(C220VectorUopStages::axpy()),
+            Self::VectorSpecialUnary(step) => {
+                Some(C220VectorUopStages::special_unary(step.instruction))
+            }
+            Self::VectorConversion(step) => {
+                Some(C220VectorUopStages::conversion(step.instruction.kind))
+            }
+            Self::VectorFused(step) => Some(C220VectorUopStages::fused(step.instruction)),
             Self::VectorGather(step) => Some(C220VectorUopStages::gather(step.instruction.kind)),
             Self::VectorNchw(_) => Some(C220VectorUopStages::transpose()),
             _ => None,
@@ -271,6 +319,78 @@ impl C220CoreInstruction {
                         });
                     }
                 }
+            }
+            return Ok(uops);
+        }
+        if let Self::VectorConversion(step) = self {
+            let mut uops = Vec::new();
+            let stages = C220VectorUopStages::conversion(step.instruction.kind);
+            for repeat_index in 0..step.iteration_masks.len() {
+                for lane_group in 0..step.instruction.lane_groups() {
+                    let stores = step.stores_for_lane_group(repeat_index, lane_group);
+                    if stores.is_empty() {
+                        continue;
+                    }
+                    let writeback_ticks = C220VectorWritePlan::from_stores(&stores)?
+                        .writeback_ticks_for_repeat(repeat_index)
+                        .ok_or(C220CoreError::MissingVectorWriteback { repeat_index })?;
+                    uops.push(C220VectorUop {
+                        pc: step.pc,
+                        repeat_index,
+                        lane_group: Some(lane_group),
+                        kind: C220VectorUopKind::Ordinary,
+                        stages,
+                        writeback_ticks,
+                        writes_ub: true,
+                    });
+                }
+            }
+            if uops.is_empty() {
+                uops.push(C220VectorUop {
+                    pc: step.pc,
+                    repeat_index: 0,
+                    lane_group: Some(0),
+                    kind: C220VectorUopKind::Ordinary,
+                    stages: C220VectorUopStages::empty(),
+                    writeback_ticks: 1,
+                    writes_ub: false,
+                });
+            }
+            return Ok(uops);
+        }
+        if let Self::VectorFused(step) = self {
+            let mut uops = Vec::new();
+            let stages = C220VectorUopStages::fused(step.instruction);
+            for repeat_index in 0..step.iteration_masks.len() {
+                for lane_group in 0..step.instruction.lane_groups() {
+                    let stores = step.stores_for_lane_group(repeat_index, lane_group);
+                    if stores.is_empty() {
+                        continue;
+                    }
+                    let writeback_ticks = C220VectorWritePlan::from_stores(&stores)?
+                        .writeback_ticks_for_repeat(repeat_index)
+                        .ok_or(C220CoreError::MissingVectorWriteback { repeat_index })?;
+                    uops.push(C220VectorUop {
+                        pc: step.pc,
+                        repeat_index,
+                        lane_group: Some(lane_group),
+                        kind: C220VectorUopKind::Ordinary,
+                        stages,
+                        writeback_ticks,
+                        writes_ub: true,
+                    });
+                }
+            }
+            if uops.is_empty() {
+                uops.push(C220VectorUop {
+                    pc: step.pc,
+                    repeat_index: 0,
+                    lane_group: Some(0),
+                    kind: C220VectorUopKind::Ordinary,
+                    stages: C220VectorUopStages::empty(),
+                    writeback_ticks: 1,
+                    writes_ub: false,
+                });
             }
             return Ok(uops);
         }
@@ -416,6 +536,27 @@ impl C220CoreInstruction {
                 })
                 .collect();
         }
+        if let Self::VectorSort(step) = self {
+            if step.repeat_count == 0 {
+                return Ok(Vec::new());
+            }
+            let plan = self.vector_write_plan()?.expect("sort has write plan");
+            return (0..usize::from(step.repeat_count))
+                .map(|repeat_index| {
+                    Ok(C220VectorUop {
+                        pc: step.pc,
+                        repeat_index,
+                        lane_group: None,
+                        kind: C220VectorUopKind::Ordinary,
+                        stages: C220VectorUopStages::sort(),
+                        writeback_ticks: plan
+                            .writeback_ticks_for_repeat(repeat_index)
+                            .ok_or(C220CoreError::MissingVectorWriteback { repeat_index })?,
+                        writes_ub: true,
+                    })
+                })
+                .collect();
+        }
         if let Self::VectorSelect(step) = self {
             let plan = self.vector_write_plan()?.expect("select has write plan");
             let groups = step.instruction.width.groups_per_repeat() as u8;
@@ -539,6 +680,16 @@ impl C220CoreInstruction {
                 step.iteration_masks.len(),
                 step.instruction.width.lane_groups(),
             ),
+            Self::VectorAxpy(step) => (
+                step.pc,
+                step.iteration_masks.len(),
+                step.instruction.width.lane_groups(),
+            ),
+            Self::VectorSpecialUnary(step) => (
+                step.pc,
+                step.iteration_masks.len(),
+                step.instruction.width.lane_groups(),
+            ),
             Self::VectorScalar(step) => (
                 step.pc,
                 step.iteration_masks.len(),
@@ -625,9 +776,13 @@ pub enum C220CoreError {
     #[error(transparent)]
     VectorAdvance(#[from] C220VectorAdvanceError),
     #[error(transparent)]
+    Vmsu(#[from] C220VmsuError),
+    #[error(transparent)]
     OutputMemory(#[from] MappedMemoryError),
     #[error(transparent)]
     Scalar(#[from] ScalarInstructionError<UbScalarBusError<MappedMemoryError>>),
+    #[error(transparent)]
+    ScalarMachine(#[from] ScalarMachineError),
     #[error("timed core stalled without a future resume tick")]
     NonprogressingStall,
     #[error("tick counter overflowed")]
@@ -645,6 +800,7 @@ pub struct C220Core {
     scalar_timing: C220ScalarTimingLane,
     mte3: C220TimedMte3Lane,
     vector: C220VectorPipeline,
+    vmsu: C220VmsuPipeline,
     va: C220VaRegisters,
     last_vector_releases: Vec<C220VectorUopRelease>,
     pending_output: Option<C220PendingOutput>,
@@ -668,6 +824,7 @@ impl C220Core {
             scalar_timing: C220ScalarTimingLane::default(),
             mte3: C220TimedMte3Lane::new(timing.mte3),
             vector: C220VectorPipeline::new(timing.vector),
+            vmsu: C220VmsuPipeline::new(timing.vector),
             va: C220VaRegisters::default(),
             last_vector_releases: Vec::new(),
             pending_output: None,
@@ -690,6 +847,10 @@ impl C220Core {
 
     pub const fn vector_pipeline(&self) -> &C220VectorPipeline {
         &self.vector
+    }
+
+    pub const fn vmsu_pipeline(&self) -> &C220VmsuPipeline {
+        &self.vmsu
     }
 
     pub const fn compare_mask(&self) -> C220CompareMask {
@@ -718,6 +879,7 @@ impl C220Core {
         let gate = self.execution.gate_other_at(tick)?;
         self.scalar_timing.advance_to(tick);
         self.last_vector_releases = self.vector.advance_to(tick, self.execution.core_mut())?;
+        self.vmsu.advance_to(tick, self.execution.core_mut())?;
         self.commit_ready_output_at(tick)?;
         Ok(gate)
     }
@@ -808,7 +970,7 @@ impl C220Core {
                 && flag.source_pipe_code == 1
                 && flag.trigger_pipe_code == 5
                 && flag.operation == FlagOperation::Wait
-                && let Some(resume_tick) = self.vector.pending_visibility_tick()
+                && let Some(resume_tick) = self.pending_vector_visibility_tick()
                 && tick < resume_tick
             {
                 return Ok(C220CoreStep::Stalled(C220Stall {
@@ -883,6 +1045,17 @@ impl C220Core {
                 ticket,
             }
         } else {
+            if self.vmsu.is_active()
+                && is_c220_vector_word(word)
+                && let Some(resume_tick) = self.vmsu.pending_drain_tick()
+            {
+                return Ok(C220CoreStep::Stalled(C220Stall {
+                    tick,
+                    pc,
+                    resume_tick,
+                    cause: C220StallCause::VectorDependency,
+                }));
+            }
             match word {
                 _ if FlagInstruction::decode(Architecture::Dav2201, word).is_some_and(|flag| {
                     flag.source_pipe_code == 1 && flag.trigger_pipe_code == 0
@@ -898,7 +1071,7 @@ impl C220Core {
                                     flag_id: flag.flag_id,
                                 });
                             }
-                            let ready_tick = self.vector.pending_drain_tick().unwrap_or(tick);
+                            let ready_tick = self.pending_vector_drain_tick().unwrap_or(tick);
                             self.vector_to_scalar_flags.insert(flag.flag_id, ready_tick);
                         }
                         FlagOperation::Wait => {
@@ -1083,10 +1256,95 @@ impl C220Core {
                         .commit_c220_vector_issue(produces_output.then_some(destination));
                     instruction
                 }
+                _ if C220SortInstruction::decode(word).is_some() => {
+                    let step = self.execution.core().preview_c220_sort_word(word)?;
+                    let destination = step.addresses.destination;
+                    let produces_output = step.repeat_count != 0;
+                    let instruction = C220CoreInstruction::VectorSort(step);
+                    self.issue_vector_at(tick, &instruction)?;
+                    self.execution
+                        .core_mut()
+                        .commit_c220_vector_issue(produces_output.then_some(destination));
+                    instruction
+                }
+                _ if C220MergeInstruction::decode(word).is_some() => {
+                    if let Some(resume_tick) = self.vector.pending_drain_tick()
+                        && tick < resume_tick
+                    {
+                        return Ok(C220CoreStep::Stalled(C220Stall {
+                            tick,
+                            pc,
+                            resume_tick,
+                            cause: C220StallCause::VectorDependency,
+                        }));
+                    }
+                    let step = self.execution.core().preview_c220_merge_word(word)?;
+                    let destination = step
+                        .repeats
+                        .first()
+                        .map(|repeat| repeat.destination_address);
+                    if step.repeat_count() == 0 {
+                        self.execution
+                            .core_mut()
+                            .scalar_mut()
+                            .machine_mut()
+                            .set_spr_value(17, 0)?;
+                    } else {
+                        self.vmsu
+                            .issue_at(tick, step.clone(), self.execution.core().ub())?;
+                    }
+                    self.execution
+                        .core_mut()
+                        .commit_c220_vector_issue(destination);
+                    C220CoreInstruction::VectorMerge(step)
+                }
                 _ if C220TernaryInstruction::decode(word).is_some() => {
                     let step = self.execution.core().preview_c220_ternary_word(word)?;
                     let destination = step.addresses.destination;
                     let instruction = C220CoreInstruction::VectorTernary(step);
+                    self.issue_vector_at(tick, &instruction)?;
+                    self.execution
+                        .core_mut()
+                        .commit_c220_vector_issue(Some(destination));
+                    instruction
+                }
+                _ if C220AxpyInstruction::decode(word).is_some() => {
+                    let step = self.execution.core().preview_c220_axpy_word(word)?;
+                    let destination = step.addresses.destination;
+                    let instruction = C220CoreInstruction::VectorAxpy(step);
+                    self.issue_vector_at(tick, &instruction)?;
+                    self.execution
+                        .core_mut()
+                        .commit_c220_vector_issue(Some(destination));
+                    instruction
+                }
+                _ if C220SpecialUnaryInstruction::decode(word).is_some() => {
+                    let step = self
+                        .execution
+                        .core()
+                        .preview_c220_special_unary_word(word)?;
+                    let destination = step.addresses.destination;
+                    let instruction = C220CoreInstruction::VectorSpecialUnary(step);
+                    self.issue_vector_at(tick, &instruction)?;
+                    self.execution
+                        .core_mut()
+                        .commit_c220_vector_issue(Some(destination));
+                    instruction
+                }
+                _ if C220FusedInstruction::decode(word).is_some() => {
+                    let step = self.execution.core().preview_c220_fused_word(word)?;
+                    let destination = step.addresses.destination;
+                    let instruction = C220CoreInstruction::VectorFused(step);
+                    self.issue_vector_at(tick, &instruction)?;
+                    self.execution
+                        .core_mut()
+                        .commit_c220_vector_issue(Some(destination));
+                    instruction
+                }
+                _ if C220ConversionInstruction::decode(word).is_some() => {
+                    let step = self.execution.core().preview_c220_conversion_word(word)?;
+                    let destination = step.addresses.destination;
+                    let instruction = C220CoreInstruction::VectorConversion(step);
                     self.issue_vector_at(tick, &instruction)?;
                     self.execution
                         .core_mut()
@@ -1175,7 +1433,7 @@ impl C220Core {
                     })
                 ) =>
                 {
-                    if let Some(resume_tick) = self.vector.pending_drain_tick()
+                    if let Some(resume_tick) = self.pending_vector_drain_tick()
                         && tick < resume_tick
                     {
                         return Ok(C220CoreStep::Stalled(C220Stall {
@@ -1248,7 +1506,16 @@ impl C220Core {
             C220CoreInstruction::VectorReduction(issue) => {
                 Some(C220VectorReadIssue::Reduction(issue))
             }
+            C220CoreInstruction::VectorSort(issue) => Some(C220VectorReadIssue::Sort(issue)),
             C220CoreInstruction::VectorTernary(issue) => Some(C220VectorReadIssue::Ternary(issue)),
+            C220CoreInstruction::VectorAxpy(issue) => Some(C220VectorReadIssue::Axpy(issue)),
+            C220CoreInstruction::VectorSpecialUnary(issue) => {
+                Some(C220VectorReadIssue::SpecialUnary(issue))
+            }
+            C220CoreInstruction::VectorConversion(issue) => {
+                Some(C220VectorReadIssue::Conversion(issue))
+            }
+            C220CoreInstruction::VectorFused(issue) => Some(C220VectorReadIssue::Fused(issue)),
             C220CoreInstruction::VectorGather(issue) => Some(C220VectorReadIssue::Gather(issue)),
             C220CoreInstruction::VectorNchw(issue) => Some(C220VectorReadIssue::Nchw(issue)),
             _ => None,
@@ -1265,6 +1532,22 @@ impl C220Core {
             self.pending_output = None;
         }
         Ok(())
+    }
+
+    fn pending_vector_visibility_tick(&self) -> Option<u64> {
+        self.vector
+            .pending_visibility_tick()
+            .into_iter()
+            .chain(self.vmsu.pending_visibility_tick())
+            .max()
+    }
+
+    fn pending_vector_drain_tick(&self) -> Option<u64> {
+        self.vector
+            .pending_drain_tick()
+            .into_iter()
+            .chain(self.vmsu.pending_drain_tick())
+            .max()
     }
 }
 
@@ -1283,6 +1566,33 @@ fn is_mte3_word(word: u32) -> bool {
                 (1, 5) | (1, 4) | (5, 1)
             )
         })
+}
+
+fn is_c220_vector_word(word: u32) -> bool {
+    C220MoveVaInstruction::decode(word).is_some()
+        || C220MovevInstruction::decode(word).is_some()
+        || C220NchwInstruction::decode(word).is_some()
+        || C220MoveMaskInstruction::decode(word).is_some()
+        || C220CompareMaskInstruction::decode(word).is_some()
+        || C220SelectInstruction::decode(word).is_some()
+        || C220PackedCompareInstruction::decode(word).is_some()
+        || C220ReductionInstruction::decode(word).is_some()
+        || C220SortInstruction::decode(word).is_some()
+        || C220MergeInstruction::decode(word).is_some()
+        || C220TernaryInstruction::decode(word).is_some()
+        || C220AxpyInstruction::decode(word).is_some()
+        || C220SpecialUnaryInstruction::decode(word).is_some()
+        || C220FusedInstruction::decode(word).is_some()
+        || C220ConversionInstruction::decode(word).is_some()
+        || C220GatherInstruction::decode(word).is_some()
+        || C220VecArithmeticHint::from_word(word).is_some()
+        || C220VectorScalarInstruction::decode(word).is_some()
+        || C220ShiftInstruction::decode(word).is_some()
+        || C220CopyInstruction::decode(word).is_some()
+        || C220BroadcastInstruction::decode(word).is_some()
+        || C220TransposeInstruction::decode(word).is_some()
+        || FlagInstruction::decode(Architecture::Dav2201, word)
+            .is_some_and(|flag| flag.source_pipe_code == 1 || flag.trigger_pipe_code == 1)
 }
 
 #[cfg(test)]
@@ -2450,7 +2760,7 @@ mod tests {
     }
 
     #[test]
-    fn vabs_uses_modeled_fifteen_tick_execution_stage() {
+    fn vabs_uses_modeled_five_tick_execution_stage() {
         let word = 0x83c0_0300 | (3 << 17) | (4 << 12) | (5 << 2);
         let make_core = || {
             let memory = SparseMemory::new(vec![MemoryRegion::unknown(256)], 512, 512);
@@ -2508,7 +2818,7 @@ mod tests {
                 .unwrap()[0]
                 .stages
                 .execute_ticks,
-            15
+            5
         );
         let visible = timed.vector_pipeline().pending_visibility_tick().unwrap();
         timed.advance_to(visible).unwrap();
@@ -3179,6 +3489,98 @@ mod tests {
         assert_eq!(
             core.memory().read_known_at(0x2000, 128).unwrap(),
             0x4000_0000_u32.to_le_bytes().repeat(32)
+        );
+    }
+
+    #[test]
+    fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
+        let memory = SparseMemory::new(vec![MemoryRegion::unknown(256)], 512, 512);
+        let memory = MappedMemory::bind(memory, &[0x2000]).unwrap();
+        let mut ub = UbMemory::new(1024, 512);
+        for (list, keys) in [[10.0_f32, 6.0], [10.0, 5.0], [9.0, 4.0], [8.0, 3.0]]
+            .into_iter()
+            .enumerate()
+        {
+            for (index, key) in keys.into_iter().enumerate() {
+                let mut record = key.to_le_bytes().to_vec();
+                record.extend_from_slice(&((list * 10 + index) as u32).to_le_bytes());
+                ub.write_states(
+                    (list * 16 + index * 8) as u64,
+                    &record
+                        .into_iter()
+                        .map(MemoryByteState::Known)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            }
+        }
+        let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+        machine.set_xreg(1, 0x100).unwrap();
+        machine
+            .set_xreg(2, (2_u64 << 16) | (4_u64 << 32) | (6_u64 << 48))
+            .unwrap();
+        machine
+            .set_xreg(3, 2 | (2_u64 << 16) | (2_u64 << 32) | (2_u64 << 48))
+            .unwrap();
+        machine.set_xreg(4, 1 | (0xf << 8)).unwrap();
+        let execution = MteCoreStepper::new(ScalarStepper::new(machine, 0x4000), ub);
+        let rate = NonZeroU64::new(32).unwrap();
+        let mut core = C220Core::new(
+            execution,
+            memory,
+            C220CoreTimingRules {
+                mte2: C220Mte2TimingRules {
+                    issue_interval: NonZeroU64::new(1).unwrap(),
+                    startup_ticks: 0,
+                    bytes_per_tick: rate,
+                    retire_ticks: 0,
+                },
+                mte3: C220Mte3TimingRules {
+                    issue_interval: NonZeroU64::new(1).unwrap(),
+                    startup_ticks: 0,
+                    bytes_per_tick: rate,
+                    retire_ticks: 0,
+                },
+                vector: C220VectorTimingRules {
+                    dispatch_ticks: 1,
+                    uop_issue_interval: NonZeroU64::new(1).unwrap(),
+                    ub_response_ticks: 2,
+                },
+            },
+        )
+        .unwrap();
+        let word = 0x85c0_0003 | (1 << 17) | (2 << 12) | (3 << 7) | (4 << 2);
+        assert!(matches!(
+            core.step_word_at(0, word).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::VectorMerge(_),
+                ..
+            }
+        ));
+        let visibility = core.vmsu_pipeline().pending_visibility_tick().unwrap();
+        let retirement = core.vmsu_pipeline().pending_drain_tick().unwrap();
+        assert!(retirement > visibility);
+        core.advance_to(visibility).unwrap();
+        let output = core.execution().core().ub().read_known(0x100, 64).unwrap();
+        let payloads = output
+            .chunks_exact(8)
+            .map(|record| u32::from_le_bytes(record[4..8].try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(payloads, [0, 10, 20, 30, 1, 11, 21, 31]);
+        assert!(matches!(
+            core.step_word_at(visibility, C220_CAPTURED_MOVEV_WORD)
+                .unwrap(),
+            C220CoreStep::Stalled(C220Stall {
+                resume_tick,
+                cause: C220StallCause::VectorDependency,
+                ..
+            }) if resume_tick == retirement
+        ));
+        core.advance_to(retirement).unwrap();
+        assert!(!core.vmsu_pipeline().is_active());
+        assert_eq!(
+            core.execution().core().scalar().machine().spr_value(17),
+            Some(0)
         );
     }
 }

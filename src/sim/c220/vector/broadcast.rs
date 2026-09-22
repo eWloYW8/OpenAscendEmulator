@@ -113,7 +113,7 @@ pub fn plan_c220_broadcast_issue(
                     address: lane_address,
                     bank: C220UbBank::from_address(lane_address),
                     width_bytes: instruction.element_bytes,
-                    data: [0; 4],
+                    data: [0; 8],
                 });
             }
         }
@@ -166,7 +166,7 @@ pub fn evaluate_c220_broadcast_repeat(
                 address: lane_address,
                 bank: C220UbBank::from_address(lane_address),
                 width_bytes: instruction.element_bytes,
-                data,
+                data: super::store_data(data),
             });
         }
     }

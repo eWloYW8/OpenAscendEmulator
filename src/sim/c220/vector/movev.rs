@@ -130,7 +130,7 @@ pub(crate) fn plan_c220_movev_to_ub(
                 address,
                 bank: C220UbBank::from_address(address),
                 width_bytes: element_bytes as u8,
-                data: scalar_bytes,
+                data: super::store_data(scalar_bytes),
             });
         }
     }

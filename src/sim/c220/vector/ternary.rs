@@ -1,16 +1,18 @@
 use crate::architecture::c220::C220UbBank;
 use crate::isa::c220::ternary::{C220TernaryInstruction, C220TernaryOperation, C220TernaryWidth};
-use crate::isa::c220::vector_scalar::C220VectorScalarOperation;
 use crate::memory::ub::UbMemory;
 use crate::numeric::fp32::{Fp32ValueStatus, Fp32VectorOperation, evaluate_fp32_value};
-use crate::sim::c220::fp16::{
-    C220Fp16Mode, C220Fp16Status, evaluate_c220_fp16, evaluate_c220_fp16_relu,
-};
+use crate::sim::c220::fp16::{C220Fp16Mode, C220Fp16Status, evaluate_c220_fp16_relu};
 
+use super::fma::{
+    evaluate_c220_f16_mla, evaluate_c220_fp32_mla, evaluate_c220_mixed_mla, merge_fp16_status,
+    merge_fp32_status,
+};
 use super::{
-    C220_VECTOR_BLOCK_BYTES, C220_VECTOR_BLOCK_COUNT, C220_VECTOR_TILE_BYTES, C220VectorAddresses,
-    C220VectorControl, C220VectorError, C220VectorReadAccess, C220VectorStore, check_repeat_limit,
-    plan_c220_vector_read_accesses, vector_destination_address_for_width,
+    C220_VECTOR_BLOCK_BYTES, C220_VECTOR_TILE_BYTES, C220VectorAddresses, C220VectorControl,
+    C220VectorError, C220VectorReadAccess, C220VectorStore, check_repeat_limit,
+    plan_c220_destination_read_accesses, plan_c220_vector_read_accesses,
+    vector_destination_address_for_width,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,7 +115,7 @@ pub fn plan_c220_ternary_issue(
                 address,
                 bank: C220UbBank::from_address(address),
                 width_bytes: element_bytes,
-                data: [0; 4],
+                data: [0; 8],
             });
         }
     }
@@ -147,7 +149,7 @@ fn plan_ternary_reads(
         instruction.width.source_element_bytes(),
         group,
     )?;
-    accesses.extend(plan_destination_reads(
+    accesses.extend(plan_c220_destination_read_accesses(
         control,
         addresses,
         repeat_index,
@@ -155,47 +157,6 @@ fn plan_ternary_reads(
         instruction.width.destination_element_bytes(),
         group,
     )?);
-    Ok(accesses)
-}
-
-fn plan_destination_reads(
-    control: C220VectorControl,
-    addresses: C220VectorAddresses,
-    repeat_index: usize,
-    mask: &[u64; 4],
-    element_bytes: u8,
-    lane_group: Option<u8>,
-) -> Result<Vec<C220VectorReadAccess>, C220VectorError> {
-    let lanes_per_block = C220_VECTOR_BLOCK_BYTES / usize::from(element_bytes);
-    let lane_count = C220_VECTOR_TILE_BYTES / usize::from(element_bytes);
-    let mut accesses = Vec::with_capacity(C220_VECTOR_BLOCK_COUNT);
-    for block_index in 0..C220_VECTOR_BLOCK_COUNT {
-        let first_lane = block_index * lanes_per_block;
-        if first_lane >= lane_count
-            || lane_group.is_some_and(|group| first_lane / 64 != usize::from(group))
-        {
-            continue;
-        }
-        let active_lane_mask = ((mask[first_lane / 64] >> (first_lane % 64))
-            & ((1_u64 << lanes_per_block) - 1)) as u16;
-        if active_lane_mask == 0 {
-            continue;
-        }
-        accesses.push(C220VectorReadAccess {
-            source_index: 2,
-            block_index: block_index as u8,
-            buffer_offset: (block_index * C220_VECTOR_BLOCK_BYTES) as u16,
-            bytes: C220_VECTOR_BLOCK_BYTES as u16,
-            address: vector_destination_address_for_width(
-                control,
-                addresses,
-                repeat_index,
-                first_lane,
-                element_bytes,
-            )?,
-            active_lane_mask,
-        });
-    }
     Ok(accesses)
 }
 
@@ -288,7 +249,7 @@ pub(crate) fn evaluate_c220_ternary_repeat(
             address,
             bank: C220UbBank::from_address(address),
             width_bytes: result_bytes,
-            data,
+            data: super::store_data(data),
         });
         lanes.push(C220TernaryLaneOutcome {
             active,
@@ -313,20 +274,13 @@ fn evaluate_f16(
             (source_0, destination, source_1)
         }
     };
-    let product = evaluate_c220_fp16(
-        C220VectorScalarOperation::Multiply,
-        first_factor,
-        second_factor,
-        mode,
-    );
-    let sum = evaluate_c220_fp16(C220VectorScalarOperation::Add, product.bits, addend, mode);
-    let mut status = merge_fp16_status(product.status, sum.status);
+    let (sum, mut status) = evaluate_c220_f16_mla(first_factor, second_factor, addend, mode);
     let bits = if operation == C220TernaryOperation::MultiplyAddRelu {
-        let relu = evaluate_c220_fp16_relu(sum.bits, mode);
+        let relu = evaluate_c220_fp16_relu(sum, mode);
         status = merge_fp16_status(status, relu.status);
         relu.bits
     } else {
-        sum.bits
+        sum
     };
     (bits, status)
 }
@@ -343,56 +297,19 @@ fn evaluate_f32(
             (source_0, destination, source_1)
         }
     };
-    let product = evaluate_fp32_value(Fp32VectorOperation::Multiply, first_factor, second_factor);
-    let sum = evaluate_fp32_value(Fp32VectorOperation::Add, product.bits, addend);
-    let mut status = merge_fp32_status(product.status, sum.status);
+    let (sum, mut status) = evaluate_c220_fp32_mla(first_factor, second_factor, addend);
     let bits = if operation == C220TernaryOperation::MultiplyAddRelu {
-        let relu = evaluate_fp32_value(Fp32VectorOperation::Rectify, sum.bits, 0);
+        let relu = evaluate_fp32_value(Fp32VectorOperation::Rectify, sum, 0);
         status = merge_fp32_status(status, relu.status);
         relu.bits
     } else {
-        sum.bits
+        sum
     };
     (bits, status)
 }
 
 fn evaluate_mixed_mla(source_0: u16, source_1: u16, destination: u32) -> (u32, Fp32ValueStatus) {
-    let first = f16_to_f32_bits(source_0);
-    let second = f16_to_f32_bits(source_1);
-    let product = evaluate_fp32_value(Fp32VectorOperation::Multiply, first, second);
-    let sum = evaluate_fp32_value(Fp32VectorOperation::Add, product.bits, destination);
-    let mut status = merge_fp32_status(product.status, sum.status);
-    if status.nan_operand
-        || status.infinity_operand
-        || status.zero_times_infinity
-        || status.opposite_infinities
-    {
-        return (sum.bits, status);
-    }
-    let exact = (f32::from_bits(first) as f64) * (f32::from_bits(second) as f64)
-        + f32::from_bits(destination) as f64;
-    let value = exact as f32;
-    status.overflow = value.is_infinite() && exact.is_finite();
-    status.underflow = exact != 0.0 && value == 0.0;
-    (value.to_bits(), status)
-}
-
-fn f16_to_f32_bits(bits: u16) -> u32 {
-    let sign = u32::from(bits & 0x8000) << 16;
-    let exponent = u32::from((bits >> 10) & 0x1f);
-    let fraction = u32::from(bits & 0x03ff);
-    match (exponent, fraction) {
-        (0, 0) => sign,
-        (0, _) => {
-            let highest = 31 - fraction.leading_zeros();
-            let exponent = highest + 103;
-            let mantissa = (fraction << (23 - highest)) & 0x007f_ffff;
-            sign | (exponent << 23) | mantissa
-        }
-        (0x1f, 0) => sign | 0x7f80_0000,
-        (0x1f, _) => sign | 0x7fc0_0000,
-        _ => sign | ((exponent + 112) << 23) | (fraction << 13),
-    }
+    evaluate_c220_mixed_mla(source_0, source_1, destination)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
@@ -405,29 +322,6 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
             .try_into()
             .expect("four-byte lane"),
     )
-}
-
-fn merge_fp16_status(first: C220Fp16Status, second: C220Fp16Status) -> C220Fp16Status {
-    C220Fp16Status {
-        nan_operand: first.nan_operand || second.nan_operand,
-        infinity_operand: first.infinity_operand || second.infinity_operand,
-        invalid: first.invalid || second.invalid,
-        overflow: first.overflow || second.overflow,
-        underflow: first.underflow || second.underflow,
-    }
-}
-
-fn merge_fp32_status(first: Fp32ValueStatus, second: Fp32ValueStatus) -> Fp32ValueStatus {
-    Fp32ValueStatus {
-        overflow: first.overflow || second.overflow,
-        underflow: first.underflow || second.underflow,
-        nan_operand: first.nan_operand || second.nan_operand,
-        infinity_operand: first.infinity_operand || second.infinity_operand,
-        opposite_infinities: first.opposite_infinities || second.opposite_infinities,
-        zero_times_infinity: first.zero_times_infinity || second.zero_times_infinity,
-        division_by_zero: first.division_by_zero || second.division_by_zero,
-        indeterminate_division: first.indeterminate_division || second.indeterminate_division,
-    }
 }
 
 #[cfg(test)]

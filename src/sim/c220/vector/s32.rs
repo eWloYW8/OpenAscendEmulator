@@ -91,7 +91,7 @@ pub(super) fn evaluate_c220_s32_repeat_from_bytes(
             address,
             bank: C220UbBank::from_address(address),
             width_bytes: 4,
-            data: bits.to_le_bytes(),
+            data: super::store_data(bits.to_le_bytes()),
         });
         lanes.push(C220S32LaneOutcome { active, bits });
     }

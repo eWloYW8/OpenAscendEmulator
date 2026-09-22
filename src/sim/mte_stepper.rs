@@ -213,6 +213,10 @@ impl MteCoreStepper {
         &self.ub
     }
 
+    pub(crate) fn ub_mut(&mut self) -> &mut UbMemory {
+        &mut self.ub
+    }
+
     pub const fn pending_mte2_count(&self) -> usize {
         self.pending_mte2.len()
     }

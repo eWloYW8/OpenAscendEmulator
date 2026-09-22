@@ -122,7 +122,7 @@ pub fn evaluate_c220_copy_repeat(
             address,
             bank: C220UbBank::from_address(address),
             width_bytes: element_bytes,
-            data: bits.to_le_bytes(),
+            data: super::store_data(bits.to_le_bytes()),
         });
     }
     Ok((values, stores))

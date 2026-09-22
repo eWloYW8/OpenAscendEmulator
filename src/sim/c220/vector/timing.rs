@@ -2,10 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::architecture::c220::C220UbBank;
+use crate::isa::c220::conversion::C220ConversionKind;
+use crate::isa::c220::fused::C220FusedInstruction;
 use crate::isa::c220::gather::C220GatherKind;
 use crate::isa::c220::reduce::{
     C220ExtremumOperation, C220ReductionInstruction, C220ReductionKind, C220ReductionWidth,
 };
+use crate::isa::c220::special::{C220SpecialUnaryInstruction, C220SpecialUnaryOperation};
 use crate::isa::c220::ternary::C220TernaryInstruction;
 use crate::isa::c220::vector::{
     C220MovevInstruction, C220VecArithmeticHint, C220VecArithmeticOperation,
@@ -58,7 +61,7 @@ impl C220VectorUopStages {
             | C220VecArithmeticOperation::SubtractRectify => 7,
             C220VecArithmeticOperation::Maximum | C220VecArithmeticOperation::Minimum => 5,
             C220VecArithmeticOperation::Multiply => 8,
-            C220VecArithmeticOperation::Divide => 11,
+            C220VecArithmeticOperation::Divide => 14,
         };
         Some(Self {
             read_ticks: 6,
@@ -101,14 +104,14 @@ impl C220VectorUopStages {
     pub const fn abs() -> Self {
         Self {
             read_ticks: 6,
-            execute_ticks: 15,
+            execute_ticks: 5,
         }
     }
 
     pub const fn relu() -> Self {
         Self {
             read_ticks: 6,
-            execute_ticks: 6,
+            execute_ticks: 5,
         }
     }
 
@@ -173,6 +176,13 @@ impl C220VectorUopStages {
         }
     }
 
+    pub const fn sort() -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: 19,
+        }
+    }
+
     pub const fn select() -> Self {
         Self {
             read_ticks: 6,
@@ -182,21 +192,22 @@ impl C220VectorUopStages {
 
     pub const fn reduction(instruction: C220ReductionInstruction) -> Self {
         let execute_ticks = match (instruction.kind, instruction.width) {
-            (C220ReductionKind::WholeAdd { .. }, _) => 5,
+            (C220ReductionKind::WholeAdd { .. }, C220ReductionWidth::F16) => 24,
+            (C220ReductionKind::WholeAdd { .. }, C220ReductionWidth::F32) => 21,
             (
                 C220ReductionKind::WholeExtremum {
                     operation: C220ExtremumOperation::Maximum,
                     ..
                 },
                 C220ReductionWidth::F16,
-            ) => 24,
+            ) => 10,
             (
                 C220ReductionKind::WholeExtremum {
                     operation: C220ExtremumOperation::Maximum,
                     ..
                 },
                 C220ReductionWidth::F32,
-            ) => 21,
+            ) => 9,
             (
                 C220ReductionKind::WholeExtremum {
                     operation: C220ExtremumOperation::Minimum,
@@ -211,20 +222,20 @@ impl C220VectorUopStages {
                 },
                 C220ReductionWidth::F32,
             ) => 9,
-            (C220ReductionKind::GroupAdd, C220ReductionWidth::F16) => 7,
-            (C220ReductionKind::GroupAdd, C220ReductionWidth::F32) => 6,
+            (C220ReductionKind::GroupAdd, C220ReductionWidth::F16) => 16,
+            (C220ReductionKind::GroupAdd, C220ReductionWidth::F32) => 13,
             (
                 C220ReductionKind::GroupExtremum {
                     operation: C220ExtremumOperation::Maximum,
                 },
                 C220ReductionWidth::F16,
-            ) => 10,
+            ) => 7,
             (
                 C220ReductionKind::GroupExtremum {
                     operation: C220ExtremumOperation::Maximum,
                 },
                 C220ReductionWidth::F32,
-            ) => 9,
+            ) => 6,
             (
                 C220ReductionKind::GroupExtremum {
                     operation: C220ExtremumOperation::Minimum,
@@ -237,7 +248,7 @@ impl C220VectorUopStages {
                 },
                 C220ReductionWidth::F32,
             ) => 6,
-            (C220ReductionKind::PairAdd, _) => 1,
+            (C220ReductionKind::PairAdd, _) => 7,
         };
         Self {
             read_ticks: 6,
@@ -249,6 +260,40 @@ impl C220VectorUopStages {
         Self {
             read_ticks: 6,
             execute_ticks: 11,
+        }
+    }
+
+    pub const fn axpy() -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: 11,
+        }
+    }
+
+    pub const fn special_unary(instruction: C220SpecialUnaryInstruction) -> Self {
+        let execute_ticks = match instruction.operation {
+            C220SpecialUnaryOperation::Exp => 13,
+            C220SpecialUnaryOperation::Ln => 15,
+            C220SpecialUnaryOperation::Reciprocal | C220SpecialUnaryOperation::ReciprocalSqrt => 6,
+            C220SpecialUnaryOperation::Sqrt => 14,
+        };
+        Self {
+            read_ticks: 6,
+            execute_ticks,
+        }
+    }
+
+    pub const fn conversion(kind: C220ConversionKind) -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: kind.execute_ticks(),
+        }
+    }
+
+    pub const fn fused(instruction: C220FusedInstruction) -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: instruction.execute_ticks(),
         }
     }
 
@@ -364,6 +409,7 @@ impl C220VectorWriteBlock {
             1 => self.active_lane_mask == u32::MAX,
             2 => self.active_lane_mask == u16::MAX as u32,
             4 => self.active_lane_mask == 0xff,
+            8 => self.active_lane_mask == 0x0f,
             _ => false,
         }
     }
@@ -391,7 +437,7 @@ impl C220VectorWritePlan {
         let mut blocks: BTreeMap<(usize, usize), C220VectorWriteBlock> = BTreeMap::new();
         for store in stores {
             let width = usize::from(store.width_bytes);
-            if !matches!(width, 1 | 2 | 4) {
+            if !matches!(width, 1 | 2 | 4 | 8) {
                 return Err(C220VectorWritePlanError::ElementWidth(store.width_bytes));
             }
             let lanes_per_block = C220_VECTOR_BLOCK_BYTES / width;
@@ -541,9 +587,9 @@ mod tests {
             C220VectorUopStages::floating_binary_arithmetic(C220VecArithmeticOperation::Divide)
                 .unwrap()
                 .execute_ticks,
-            11
+            14
         );
-        assert_eq!(C220VectorUopStages::relu().execute_ticks, 6);
+        assert_eq!(C220VectorUopStages::relu().execute_ticks, 5);
     }
 
     #[test]
@@ -554,7 +600,7 @@ mod tests {
             address,
             bank: C220UbBank::from_address(address),
             width_bytes: 4,
-            data: [0; 4],
+            data: [0; 8],
         };
         let full = (0..8)
             .map(|lane| store(lane, lane as u64 * 4))
@@ -606,7 +652,7 @@ mod tests {
                             address,
                             bank: C220UbBank::from_address(address),
                             width_bytes: 4,
-                            data: [0; 4],
+                            data: [0; 8],
                         }
                     })
                 })

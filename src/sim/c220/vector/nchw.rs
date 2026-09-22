@@ -204,7 +204,7 @@ pub fn evaluate_c220_nchw_repeat(
                 address,
                 bank: C220UbBank::from_address(address),
                 width_bytes: width as u8,
-                data,
+                data: super::store_data(data),
             });
         }
     }
