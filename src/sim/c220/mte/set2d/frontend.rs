@@ -41,10 +41,12 @@ pub struct C220Set2dGates {
     pub l1_prefetch_blocked: bool,
 }
 
-pub struct C220Set2dOutputs<'a> {
-    pub l0a: &'a mut C220L0WritePipeline,
-    pub l0b: &'a mut C220L0WritePipeline,
-    pub l1: &'a mut C220MteL1WriteInterface,
+pub enum C220Set2dOutputs<'a> {
+    L0 {
+        l0a: &'a mut C220L0WritePipeline,
+        l0b: &'a mut C220L0WritePipeline,
+    },
+    L1(&'a mut C220MteL1WriteInterface),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +67,8 @@ pub struct C220Set2dSend {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220Set2dFrontendError {
+    #[error("SET_2D output route {0:?} is not connected to this generator")]
+    DisconnectedOutput(C220Set2dOutputRoute),
     #[error("SET_2D generator cannot accept a command")]
     CommandBusy,
     #[error("SET_2D time reversed from {previous} to {requested}")]
@@ -87,8 +91,9 @@ struct Generation {
     plan: C220Set2dUops,
 }
 
-/// One SET_2D generation engine shared by its three destinations. Generation
-/// and sending are independent callbacks, each limited to once per tick.
+/// One SET_2D generation engine. L0A/B share an instance; the L1 command lane
+/// owns a separate instance. Generation and sending are independent callbacks,
+/// each limited to once per tick.
 /// Commands expand lazily, and blocked output keeps the exact queue head.
 /// Idleness means all uops were sent, not that writes or commands have retired.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,10 +235,15 @@ impl C220Set2dFrontend {
                 let fragment = head
                     .uop
                     .output_fragment(head.instruction_id, head.uop_index);
-                let accepted = match head.uop.route {
-                    L0a(port) => outputs.l0a.push(tick, port, fragment)?,
-                    L0b(port) => outputs.l0b.push(tick, port, fragment)?,
-                    L1(port) => outputs.l1.push(tick, port, fragment)?,
+                let accepted = match (head.uop.route, outputs) {
+                    (L0a(port), C220Set2dOutputs::L0 { l0a, .. }) => {
+                        l0a.push(tick, port, fragment)?
+                    }
+                    (L0b(port), C220Set2dOutputs::L0 { l0b, .. }) => {
+                        l0b.push(tick, port, fragment)?
+                    }
+                    (L1(port), C220Set2dOutputs::L1(l1)) => l1.push(tick, port, fragment)?,
+                    (route, _) => return Err(C220Set2dFrontendError::DisconnectedOutput(route)),
                 };
                 if accepted {
                     sent = self.generated.pop_front();

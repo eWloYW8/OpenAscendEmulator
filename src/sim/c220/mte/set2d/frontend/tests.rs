@@ -90,10 +90,13 @@ fn three_routes_preserve_uops_through_distinct_gates_and_shared_outputs() {
                         &mut events,
                         &mut frontend,
                         gates,
-                        C220Set2dOutputs {
-                            l0a: &mut l0a,
-                            l0b: &mut l0b,
-                            l1: &mut l1,
+                        if destination == 2 {
+                            C220Set2dOutputs::L1(&mut l1)
+                        } else {
+                            C220Set2dOutputs::L0 {
+                                l0a: &mut l0a,
+                                l0b: &mut l0b,
+                            }
                         },
                     )
                     .unwrap();

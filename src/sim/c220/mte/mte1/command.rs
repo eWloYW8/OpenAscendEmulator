@@ -1,0 +1,62 @@
+use super::frontend::{C220Mte1ReadIssue, C220Mte1ReadKind, C220Mte1ReadTransfer};
+use crate::isa::c220::mte::set2d::C220Set2dFill;
+use crate::sim::c220::mte::set2d::C220Set2dIssue;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220Mte1Generator {
+    Read(C220Mte1ReadKind),
+    Set2d,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220Mte1Command {
+    Read(C220Mte1ReadTransfer),
+    Set2d(C220Set2dFill),
+}
+
+impl C220Mte1Command {
+    pub const fn generator(self) -> C220Mte1Generator {
+        match self {
+            Self::Read(transfer) => C220Mte1Generator::Read(transfer.kind()),
+            Self::Set2d(_) => C220Mte1Generator::Set2d,
+        }
+    }
+
+    /// Disabled commands bypass generation and leave the selected engine intact.
+    pub const fn is_disabled(self) -> bool {
+        match self {
+            Self::Read(transfer) => transfer.is_empty(),
+            Self::Set2d(fill) => fill.descriptor.is_disabled(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220Mte1Issue {
+    pub tick: u64,
+    pub instruction_id: u64,
+    pub uop_count: u64,
+    pub completion_ready: bool,
+}
+
+impl From<C220Mte1ReadIssue> for C220Mte1Issue {
+    fn from(issue: C220Mte1ReadIssue) -> Self {
+        Self {
+            tick: issue.tick,
+            instruction_id: issue.instruction_id,
+            uop_count: issue.request_count,
+            completion_ready: issue.completion_ready,
+        }
+    }
+}
+
+impl From<C220Set2dIssue> for C220Mte1Issue {
+    fn from(issue: C220Set2dIssue) -> Self {
+        Self {
+            tick: issue.tick,
+            instruction_id: issue.instruction_id,
+            uop_count: issue.uop_count,
+            completion_ready: issue.completion_ready,
+        }
+    }
+}

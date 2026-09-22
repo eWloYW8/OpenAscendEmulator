@@ -8,3 +8,7 @@ pub mod mte3;
 pub mod set2d;
 pub mod uop;
 pub use error::C220TransferError;
+mod pipeline;
+pub use pipeline::{
+    C220MtePipeline, C220MtePipelineConfig, C220MtePipelineError, C220MtePipelineEvent,
+};

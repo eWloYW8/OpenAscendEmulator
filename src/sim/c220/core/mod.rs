@@ -5,8 +5,9 @@ use crate::memory::mapped::MappedMemory;
 use crate::sim::c220::cube::{C220CubeExecutionOutcome, C220CubePipeline};
 use crate::sim::c220::device::C220Device;
 use crate::sim::c220::memory::{C220LocalMemory, C220LocalMemoryConfig};
-use crate::sim::c220::mte::mte1::{C220Mte1CommandState, C220Mte1Load2dOutcome, C220TimedMte1Lane};
+use crate::sim::c220::mte::mte1::{C220Mte1CommandState, C220Mte1Outcome};
 use crate::sim::c220::mte::mte2::C220Mte2Pipeline;
+use crate::sim::c220::mte::{C220MtePipeline, C220MtePipelineConfig};
 use crate::sim::c220::scalar::timing::C220ScalarTimingLane;
 use crate::sim::c220::schedule::{C220IssueClock, C220Stall, C220StallCause};
 use crate::sim::c220::state::C220State;
@@ -95,6 +96,7 @@ pub struct C220Core {
     mte2: C220Mte2Pipeline,
     scalar_timing: C220ScalarTimingLane,
     mte1: Mte1Engine,
+    mte_pipeline: Option<C220MtePipeline>,
     hardware_flags: C220HardwareFlagState,
     mte3: Mte3Engine,
     cube: CubeEngine,
@@ -137,6 +139,7 @@ impl C220Core {
             mte2: C220Mte2Pipeline::new(timing.mte2),
             scalar_timing: C220ScalarTimingLane::default(),
             mte1: Mte1Engine::default(),
+            mte_pipeline: None,
             hardware_flags: C220HardwareFlagState::default(),
             mte3: Mte3Engine::new(timing.mte3),
             cube: CubeEngine::new(cube_config)?,
@@ -166,8 +169,21 @@ impl C220Core {
         &self.scalar_timing
     }
 
-    pub const fn mte1_timing(&self) -> &C220TimedMte1Lane {
-        &self.mte1.timing
+    pub fn mte_pipeline(&self) -> Option<&C220MtePipeline> {
+        self.mte_pipeline.as_ref()
+    }
+
+    pub fn configure_mte_pipeline(
+        &mut self,
+        config: C220MtePipelineConfig,
+    ) -> Result<(), C220CoreError> {
+        if self.mte1.pending_commands().next().is_some()
+            || self.mte_pipeline.as_ref().is_some_and(|p| !p.is_idle())
+        {
+            return Err(C220CoreError::MtePipelineBusy);
+        }
+        self.mte_pipeline = Some(C220MtePipeline::new(self.mte1.tick(), config));
+        Ok(())
     }
 
     pub fn pending_mte1_commands(&self) -> impl Iterator<Item = C220Mte1CommandState> + '_ {
@@ -214,7 +230,7 @@ impl C220Core {
         &self.cube.outcomes
     }
 
-    pub fn last_mte1_outcomes(&self) -> &[C220Mte1Load2dOutcome] {
+    pub fn last_mte1_outcomes(&self) -> &[C220Mte1Outcome] {
         &self.mte1.outcomes
     }
 
@@ -324,9 +340,12 @@ impl C220Core {
                 .pending_drain_tick()
                 .map(|tick| (tick, C220StallCause::CubeDependency)),
             self.mte1
-                .timing
-                .pending_drain_tick()
+                .next_event_tick()
                 .map(|tick| (tick, C220StallCause::Mte1Dependency)),
+            self.mte_pipeline
+                .as_ref()
+                .and_then(C220MtePipeline::next_event_tick)
+                .map(|tick| (tick, C220StallCause::MtePhysicalDependency)),
         ]
         .into_iter()
         .flatten()

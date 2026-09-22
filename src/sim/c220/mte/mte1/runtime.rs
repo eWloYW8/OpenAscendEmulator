@@ -1,103 +1,192 @@
-use super::{C220Mte1Ticket, C220Mte1TimingError, C220TimedMte1Lane};
+use super::bias::{C220BtTransferError, C220BtTransferResult, prepare_c220_mov_l1_to_bt};
+use super::frontend::C220Mte1ReadTransfer;
+use super::load2d::{C220Load2dTransferError, C220Load2dTransferResult, prepare_c220_load2d};
+use super::{C220Mte1Command, C220Mte1Issue};
 use crate::isa::c220::hflag::C220MatrixMemory;
-use crate::isa::c220::mte::load2d::{C220Load2dDestination, C220Load2dTransfer};
-use crate::sim::c220::memory::C220LocalMemory;
-use crate::sim::c220::mte::mte1::load2d::{
-    C220Load2dTransferError, C220Load2dTransferResult, prepare_c220_load2d,
-};
+use crate::isa::c220::mte::load2d::C220Load2dDestination;
+use crate::isa::c220::mte::set2d::C220Set2dDestination;
+use crate::sim::c220::memory::{C220LocalBufferError, C220LocalMemory};
+use crate::sim::c220::mte::set2d::{C220Set2dResult, execute_c220_set2d};
+use crate::sim::c220::mte::{C220MtePipeline, C220MtePipelineError};
 use crate::sim::c220::sync::{
     C220HardwareFlagEvent, C220HardwareFlagState, C220HardwareFlagTimingError,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220Mte1RuntimeError {
     #[error(transparent)]
     Transfer(#[from] C220Load2dTransferError),
     #[error(transparent)]
+    Bt(#[from] C220BtTransferError),
+    #[error(transparent)]
+    Set2d(#[from] C220LocalBufferError),
+    #[error(transparent)]
     Synchronization(#[from] C220HardwareFlagTimingError),
+    #[error(transparent)]
+    Pipeline(#[from] C220MtePipelineError),
+    #[error("MTE1 cannot accept while busy")]
+    Busy,
+    #[error("MTE1 event {event_id} has no matching token")]
+    MissingEvent { event_id: u32 },
+    #[error("MTE1 time overflowed")]
+    TimeOverflow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220Mte1Load2dOutcome {
+pub enum C220Mte1TransferResult {
+    Load2d(C220Load2dTransferResult),
+    Bt(C220BtTransferResult),
+    Set2d(C220Set2dResult),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220Mte1Outcome {
     pub instruction_id: u64,
     pub pc: u64,
     pub retire_tick: u64,
-    pub transfer: C220Load2dTransfer,
-    pub result: C220Load2dTransferResult,
+    pub command: C220Mte1Command,
+    pub result: C220Mte1TransferResult,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220Mte1CommandState {
     pub instruction_id: u64,
     pub pc: u64,
-    /// Earliest retirement attempt under the configured aggregate timing rules.
-    pub eligible_tick: u64,
+    pub issue_tick: u64,
+    /// Absent until the final destination acknowledgment is observed.
+    pub completion_tick: Option<u64>,
     pub pending_hardware_sets: usize,
     pub hardware_flag_stall: Option<C220HardwareFlagTimingError>,
 }
 
 #[derive(Default)]
 pub(in crate::sim::c220) struct Mte1Engine {
-    pub(in crate::sim::c220) timing: C220TimedMte1Lane,
-    pending: VecDeque<PendingLoad2d>,
-    pub(in crate::sim::c220) outcomes: Vec<C220Mte1Load2dOutcome>,
+    pending: VecDeque<PendingCommand>,
+    pub(in crate::sim::c220) outcomes: Vec<C220Mte1Outcome>,
+    now: u64,
+    advanced: Option<u64>,
+    events: BTreeMap<u32, VecDeque<Option<u64>>>,
+    unsignaled: Option<u64>,
 }
 
-struct PendingLoad2d {
-    instruction_id: u64,
-    pc: u64,
-    retire_tick: u64,
-    transfer: C220Load2dTransfer,
+struct PendingCommand {
+    state: C220Mte1CommandState,
+    command: C220Mte1Command,
     sets: VecDeque<C220HardwareFlagEvent>,
-    hardware_flag_stall: Option<C220HardwareFlagTimingError>,
 }
 
 impl Mte1Engine {
+    pub(in crate::sim::c220) fn tick(&self) -> u64 {
+        self.now
+    }
+
+    pub(in crate::sim::c220) fn can_issue(
+        &self,
+        pipeline: &C220MtePipeline,
+        command: C220Mte1Command,
+    ) -> bool {
+        pipeline.can_issue_mte1(command) && self.pending.len() < 31
+    }
+
     pub(in crate::sim::c220) fn issue(
         &mut self,
+        pipeline: &mut C220MtePipeline,
         instruction_id: u64,
         pc: u64,
-        ticket: &C220Mte1Ticket,
+        command: C220Mte1Command,
         flags: &mut C220HardwareFlagState,
-    ) -> Result<(), C220Mte1TimingError> {
-        self.timing.issue(ticket)?;
-        let memory = match ticket.transfer.instruction.destination {
-            C220Load2dDestination::L0a => C220MatrixMemory::L0a,
-            C220Load2dDestination::L0b => C220MatrixMemory::L0b,
-            _ => unreachable!("MTE1 timing admitted a validated LOAD2D route"),
+    ) -> Result<C220Mte1Issue, C220Mte1RuntimeError> {
+        let memory = match command {
+            C220Mte1Command::Set2d(fill) => match fill.instruction.destination {
+                C220Set2dDestination::L0a => C220MatrixMemory::L0a,
+                C220Set2dDestination::L0b => C220MatrixMemory::L0b,
+                C220Set2dDestination::L1 => {
+                    return Err(C220MtePipelineError::WrongCommandLane.into());
+                }
+            },
+            C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(_)) => C220MatrixMemory::BiasTable,
+            C220Mte1Command::Read(C220Mte1ReadTransfer::Load2d(transfer)) => match transfer
+                .instruction
+                .destination
+            {
+                C220Load2dDestination::L0a => C220MatrixMemory::L0a,
+                C220Load2dDestination::L0b => C220MatrixMemory::L0b,
+                destination => {
+                    return Err(C220Load2dTransferError::UnsupportedDestination(destination).into());
+                }
+            },
         };
+        if !self.can_issue(pipeline, command) {
+            return Err(C220Mte1RuntimeError::Busy);
+        }
+        self.now
+            .checked_add(1)
+            .ok_or(C220Mte1RuntimeError::TimeOverflow)?;
+        let issue = pipeline.issue_mte1(instruction_id, command)?;
         let sets = flags.take_mte_sets(instruction_id, memory);
-        self.pending.push_back(PendingLoad2d {
-            instruction_id,
-            pc,
-            retire_tick: ticket.retire_tick,
-            transfer: ticket.transfer,
+        self.pending.push_back(PendingCommand {
+            state: C220Mte1CommandState {
+                instruction_id,
+                pc,
+                issue_tick: self.now,
+                completion_tick: issue.completion_ready.then_some(self.now),
+                pending_hardware_sets: sets.len(),
+                hardware_flag_stall: None,
+            },
+            command,
             sets,
-            hardware_flag_stall: None,
         });
-        Ok(())
+        self.unsignaled = Some(instruction_id);
+        Ok(issue)
     }
 
     pub(in crate::sim::c220) fn begin_advance(&mut self) {
         self.outcomes.clear();
-        self.timing.begin_retirements();
     }
-
     pub(in crate::sim::c220) fn pending_commands(
         &self,
     ) -> impl Iterator<Item = C220Mte1CommandState> + '_ {
-        self.pending.iter().map(|pending| C220Mte1CommandState {
-            instruction_id: pending.instruction_id,
-            pc: pending.pc,
-            eligible_tick: pending.retire_tick,
-            pending_hardware_sets: pending.sets.len(),
-            hardware_flag_stall: pending.hardware_flag_stall,
-        })
+        self.pending.iter().map(|p| p.state)
+    }
+    pub(in crate::sim::c220) fn next_event_tick(&self) -> Option<u64> {
+        (!self.pending.is_empty()).then(|| self.now.saturating_add(1))
     }
 
-    pub(in crate::sim::c220) fn next_retire_tick(&self) -> Option<u64> {
-        self.pending.front().map(|pending| pending.retire_tick)
+    pub(in crate::sim::c220) fn set_event(&mut self, event_id: u32) {
+        let dependency = self
+            .unsignaled
+            .take()
+            .filter(|id| self.pending.iter().any(|p| p.state.instruction_id == *id));
+        self.events
+            .entry(event_id)
+            .or_default()
+            .push_back(dependency);
+    }
+
+    pub(in crate::sim::c220) fn wait_event(
+        &mut self,
+        event_id: u32,
+    ) -> Result<bool, C220Mte1RuntimeError> {
+        let tokens = self
+            .events
+            .get_mut(&event_id)
+            .ok_or(C220Mte1RuntimeError::MissingEvent { event_id })?;
+        let target = tokens
+            .front()
+            .ok_or(C220Mte1RuntimeError::MissingEvent { event_id })?;
+        if target.is_some_and(|target| {
+            self.pending
+                .iter()
+                .any(|p| p.state.instruction_id <= target)
+        }) {
+            return Ok(false);
+        }
+        tokens.pop_front();
+        if tokens.is_empty() {
+            self.events.remove(&event_id);
+        }
+        Ok(true)
     }
 
     pub(in crate::sim::c220) fn commit_ready_at(
@@ -106,12 +195,19 @@ impl Mte1Engine {
         memory: &mut C220LocalMemory,
         flags: &mut C220HardwareFlagState,
     ) -> Result<(), C220Mte1RuntimeError> {
+        if self.advanced == Some(tick) {
+            return Ok(());
+        }
         flags.advance_to(tick)?;
-        while let Some(pending) = self.pending.front_mut() {
-            if pending.retire_tick > tick {
-                break;
-            }
-            pending.hardware_flag_stall = None;
+        // Command retirement precedes downstream queue consumers in this tick.
+        // A completion observed later becomes eligible on the next clock.
+        if let Some(pending) = self.pending.front_mut()
+            && pending
+                .state
+                .completion_tick
+                .is_some_and(|done| done < tick)
+        {
+            pending.state.hardware_flag_stall = None;
             let mut index = 0;
             while let Some(&event) = pending.sets.get(index) {
                 match flags.schedule_event(event, tick) {
@@ -119,32 +215,56 @@ impl Mte1Engine {
                         pending.sets.remove(index);
                     }
                     Err(error @ C220HardwareFlagTimingError::AlmostFull { .. }) => {
-                        pending.hardware_flag_stall.get_or_insert(error);
+                        pending.state.hardware_flag_stall.get_or_insert(error);
                         index += 1;
                     }
                     Err(error) => return Err(error.into()),
                 }
             }
-            if let Some(error) = pending.hardware_flag_stall {
+            pending.state.pending_hardware_sets = pending.sets.len();
+            if let Some(error) = pending.state.hardware_flag_stall {
                 return Err(error.into());
             }
-            let prepared = prepare_c220_load2d(memory, pending.transfer)?;
-            let outcome = C220Mte1Load2dOutcome {
-                instruction_id: pending.instruction_id,
-                pc: pending.pc,
-                retire_tick: tick,
-                transfer: pending.transfer,
-                result: prepared.result,
+            let result = match pending.command {
+                C220Mte1Command::Set2d(fill) => {
+                    C220Mte1TransferResult::Set2d(execute_c220_set2d(memory, fill)?)
+                }
+                C220Mte1Command::Read(C220Mte1ReadTransfer::Load2d(transfer)) => {
+                    let prepared = prepare_c220_load2d(memory, transfer)?;
+                    let result = prepared.result;
+                    prepared.commit(memory)?;
+                    C220Mte1TransferResult::Load2d(result)
+                }
+                C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(transfer)) => {
+                    C220Mte1TransferResult::Bt(
+                        prepare_c220_mov_l1_to_bt(memory, transfer)?.commit(memory)?,
+                    )
+                }
             };
-            prepared.commit(memory)?;
-            assert!(
-                self.timing.retire_ready_front(tick),
-                "completed command owns a timing slot"
-            );
+            let outcome = C220Mte1Outcome {
+                instruction_id: pending.state.instruction_id,
+                pc: pending.state.pc,
+                retire_tick: tick,
+                command: pending.command,
+                result,
+            };
             self.pending.pop_front();
             self.outcomes.push(outcome);
         }
+        self.now = tick;
+        self.advanced = Some(tick);
         Ok(())
+    }
+
+    pub(in crate::sim::c220) fn observe_completions(&mut self, tick: u64, ids: &[u64]) {
+        for id in ids {
+            let pending = self
+                .pending
+                .iter_mut()
+                .find(|p| p.state.instruction_id == *id)
+                .expect("completion owns a pending command");
+            pending.state.completion_tick = Some(tick);
+        }
     }
 }
 
@@ -152,158 +272,126 @@ impl Mte1Engine {
 mod tests {
     use super::*;
     use crate::isa::c220::hflag::C220HardwareFlagInstruction;
-    use crate::isa::c220::mte::load2d::{C220Load2dDestination, C220Load2dInstruction};
+    use crate::isa::c220::mte::load2d::C220Load2dInstruction;
+    use crate::sim::c220::memory::l1::C220L1Geometry;
+    use crate::sim::c220::mte::C220MtePipelineConfig;
+    use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadBandwidths;
+    use std::num::NonZeroU32;
 
-    #[test]
-    fn load2d_samples_memory_at_ordered_retirement() {
-        let mut engine = Mte1Engine::default();
-        let mut flags = C220HardwareFlagState::default();
-        let mut memory = C220LocalMemory::new(Default::default()).unwrap();
-        let mut registers = [0; 32];
-        registers[3] = (3 << 16) | (1 << 24);
-        let slow = C220Load2dInstruction::decode(0x6000_2181)
-            .unwrap()
-            .capture(&registers)
-            .unwrap();
-        let first = engine.timing.preview_issue(0, slow).unwrap();
-        engine.issue(10, 0x1000, &first, &mut flags).unwrap();
-        let flag_word = (2 << 29) | (15 << 21) | (3 << 10) | (2 << 7);
-        let set_a = C220HardwareFlagInstruction::decode(flag_word | (1 << 15))
-            .unwrap()
-            .resolve(0x1004, &registers)
-            .unwrap();
-        let set_b = C220HardwareFlagInstruction::decode(flag_word | (2 << 15))
-            .unwrap()
-            .resolve(0x1008, &registers)
-            .unwrap();
-        flags.enqueue_mte_set(11, set_b, 1).unwrap();
-        flags.enqueue_mte_set(12, set_b, 1).unwrap();
-        flags.enqueue_mte_set(13, set_a, 1).unwrap();
-        assert_eq!(flags.pending_mte_set_count(), 2);
-        registers[3] = (1 << 16) | (1 << 24);
-        let fast = C220Load2dInstruction::decode(0x6000_2180)
-            .unwrap()
-            .capture(&registers)
-            .unwrap();
-        let second = engine.timing.preview_issue(1, fast).unwrap();
-        assert!(second.data_ready_tick < first.data_ready_tick);
-        assert_eq!(second.retire_tick, first.retire_tick + 1);
-        engine.issue(14, 0x1010, &second, &mut flags).unwrap();
-        assert_eq!(flags.pending_mte_set_count(), 1);
-        assert_eq!(flags.count(2, C220MatrixMemory::L0a, 0), 0);
-        assert_eq!(
-            engine
-                .timing
-                .pending_visibility_tick(C220Load2dDestination::L0a),
-            Some(second.retire_tick)
-        );
-
-        engine
-            .commit_ready_at(first.data_ready_tick, &mut memory, &mut flags)
-            .unwrap();
-        assert!(engine.outcomes.is_empty());
-        assert_eq!(memory.l0a().tracked_bytes(), 0);
-        assert_eq!(memory.l0b().tracked_bytes(), 0);
-        memory.l1_mut().write_known(0, &vec![7; 1536]).unwrap();
-        engine
-            .commit_ready_at(first.retire_tick, &mut memory, &mut flags)
-            .unwrap();
-        assert_eq!(memory.l0b().read_known(0, 1536).unwrap(), vec![7; 1536]);
-        assert_eq!(engine.outcomes[0].instruction_id, 10);
-        assert_eq!(engine.outcomes[0].pc, 0x1000);
-        assert_eq!(engine.outcomes[0].result.known_bytes, 1536);
-        assert_eq!(flags.count(2, C220MatrixMemory::L0b, 0), 0);
-        assert_eq!(flags.pending_mte_set_count(), 1);
-        assert_eq!(engine.next_retire_tick(), Some(second.retire_tick));
-
-        engine.begin_advance();
-        memory.l1_mut().write_known(0, &[9; 512]).unwrap();
-        engine
-            .commit_ready_at(second.retire_tick, &mut memory, &mut flags)
-            .unwrap();
-        assert_eq!(memory.l0a().read_known(0, 512).unwrap(), vec![9; 512]);
-        assert_eq!(engine.outcomes.len(), 1);
-        assert_eq!(engine.outcomes[0].instruction_id, 14);
-        assert_eq!(engine.outcomes[0].result.known_bytes, 512);
-        assert_eq!(engine.next_retire_tick(), None);
-        assert_eq!(flags.count(2, C220MatrixMemory::L0a, 0), 0);
-        flags.advance_to(second.retire_tick + 1).unwrap();
-        assert_eq!(flags.count(2, C220MatrixMemory::L0a, 0), 1);
-        assert_eq!(flags.count(2, C220MatrixMemory::L0b, 0), 0);
-        let next_issue_tick = second.retire_tick + 1;
-        assert_eq!(engine.timing.last_retirements(), &[second]);
-        assert_eq!(engine.timing.pending_retirement_count(), 0);
-        let third = engine.timing.preview_issue(next_issue_tick, slow).unwrap();
-        engine.issue(15, 0x1014, &third, &mut flags).unwrap();
-        assert_eq!(flags.pending_mte_set_count(), 0);
-        engine
-            .commit_ready_at(third.retire_tick, &mut memory, &mut flags)
-            .unwrap();
-        flags.advance_to(third.retire_tick + 1).unwrap();
-        assert_eq!(flags.count(2, C220MatrixMemory::L0b, 0), 1);
+    fn advance(
+        engine: &mut Mte1Engine,
+        pipeline: &mut C220MtePipeline,
+        tick: u64,
+        memory: &mut C220LocalMemory,
+        flags: &mut C220HardwareFlagState,
+    ) -> Result<(), C220Mte1RuntimeError> {
+        engine.commit_ready_at(tick, memory, flags)?;
+        pipeline.advance(tick)?;
+        engine.observe_completions(tick, pipeline.mte1_completions());
+        Ok(())
     }
 
     #[test]
-    fn blocked_retirement_keeps_its_slot_and_releases_other_attached_sets() {
+    fn destination_completion_and_flag_credit_gate_commit_and_event_visibility() {
+        let width = NonZeroU32::new(256).unwrap();
         let mut engine = Mte1Engine::default();
-        let mut flags = C220HardwareFlagState::default();
         let mut memory = C220LocalMemory::new(Default::default()).unwrap();
-        memory.l1_mut().write_known(0, &[7; 512]).unwrap();
+        let mut flags = C220HardwareFlagState::default();
+        let mut pipeline = C220MtePipeline::new(
+            0,
+            C220MtePipelineConfig {
+                l1: C220L1Geometry::new(32, 4, 1, 0).unwrap(),
+                read_width: width,
+                output_bandwidths: C220Mte1ReadBandwidths {
+                    l0a: width,
+                    l0b: width,
+                    bt: width,
+                },
+                set2d_bandwidths: crate::sim::c220::mte::set2d::C220Set2dBandwidths {
+                    l0a: width,
+                    l0b: width,
+                    l1: width,
+                },
+            },
+        );
         let mut registers = [0; 32];
         registers[3] = (1 << 16) | (1 << 24);
-        let load = C220Load2dInstruction::decode(0x6000_2180).unwrap();
-        let first = engine
-            .timing
-            .preview_issue(0, load.capture(&registers).unwrap())
-            .unwrap();
-        engine.issue(1, 0, &first, &mut flags).unwrap();
-        let flag = (2 << 29) | (15 << 21) | (1 << 15) | (3 << 10) | (2 << 7);
-        let set0 = C220HardwareFlagInstruction::decode(flag)
+        let transfer = C220Load2dInstruction::decode(0x6000_2180)
             .unwrap()
-            .resolve(4, &registers)
+            .capture(&registers)
             .unwrap();
-        let set1 = C220HardwareFlagInstruction::decode(flag | 1)
+        let flag_word = (2 << 29) | (15 << 21) | (1 << 15) | (3 << 10) | (2 << 7);
+        let set = C220HardwareFlagInstruction::decode(flag_word)
             .unwrap()
-            .resolve(8, &registers)
+            .resolve(0, &registers)
+            .unwrap();
+        let wait = C220HardwareFlagInstruction::decode(flag_word | (1 << 5))
+            .unwrap()
+            .resolve(0, &registers)
             .unwrap();
         for _ in 0..crate::sim::c220::sync::C220_HARDWARE_FLAG_ALMOST_FULL {
-            flags.schedule_set(set0, 0).unwrap();
+            flags.schedule_set(set, 0).unwrap();
         }
-        flags.enqueue_mte_set(2, set0, 1).unwrap();
-        flags.enqueue_mte_set(3, set1, 1).unwrap();
-        registers[0] = 512;
-        let second = engine
-            .timing
-            .preview_issue(1, load.capture(&registers).unwrap())
+        flags.enqueue_mte_set(1, set, 0).unwrap();
+        advance(&mut engine, &mut pipeline, 0, &mut memory, &mut flags).unwrap();
+        let command = C220Mte1Command::Read(C220Mte1ReadTransfer::Load2d(transfer));
+        let issue = engine
+            .issue(&mut pipeline, 2, 4, command, &mut flags)
             .unwrap();
-        engine.issue(4, 12, &second, &mut flags).unwrap();
-        engine.begin_advance();
-        engine
-            .commit_ready_at(first.retire_tick, &mut memory, &mut flags)
-            .unwrap();
-        assert_eq!(engine.timing.last_retirements(), &[first]);
-        assert_eq!(engine.timing.pending_retirement_count(), 1);
-        engine.begin_advance();
+        assert_eq!(issue.uop_count, 2);
+        assert!(!engine.can_issue(&pipeline, command));
+        engine.set_event(7);
+        assert!(!engine.wait_event(7).unwrap());
+        memory.l1_mut().write_known(0, &[7; 512]).unwrap();
+        let completed = (1..100)
+            .find(|&tick| {
+                advance(&mut engine, &mut pipeline, tick, &mut memory, &mut flags).unwrap();
+                assert!(engine.outcomes.is_empty());
+                engine
+                    .pending_commands()
+                    .next()
+                    .unwrap()
+                    .completion_tick
+                    .is_some()
+            })
+            .expect("destination completion");
+        assert!(pipeline.selected_generator_idle());
+        assert_eq!(memory.l0a().tracked_bytes(), 0);
+        assert!(!engine.wait_event(7).unwrap());
         assert!(matches!(
-            engine.commit_ready_at(second.retire_tick, &mut memory, &mut flags),
+            advance(
+                &mut engine,
+                &mut pipeline,
+                completed + 1,
+                &mut memory,
+                &mut flags
+            ),
             Err(C220Mte1RuntimeError::Synchronization(
-                C220HardwareFlagTimingError::AlmostFull {
-                    event_id: 0,
-                    count: 32
-                }
+                C220HardwareFlagTimingError::AlmostFull { .. }
             ))
         ));
-        assert_eq!(engine.timing.pending_retirement_count(), 1);
-        assert!(engine.timing.last_retirements().is_empty());
-        assert!(engine.outcomes.is_empty());
-        assert_eq!(memory.l0a().tracked_bytes(), 512);
-        let pending = engine.pending_commands().next().unwrap();
-        assert_eq!(pending.instruction_id, 4);
-        assert_eq!(pending.pending_hardware_sets, 1);
-        assert!(pending.hardware_flag_stall.is_some());
         assert_eq!(
-            flags.counter_snapshot(2, C220MatrixMemory::L0a, 1).pending,
+            engine
+                .pending_commands()
+                .next()
+                .unwrap()
+                .pending_hardware_sets,
             1
         );
+        assert_eq!(memory.l0a().tracked_bytes(), 0);
+        flags.consume_wait(wait).unwrap();
+        memory.l1_mut().write_known(0, &[9; 512]).unwrap();
+        advance(
+            &mut engine,
+            &mut pipeline,
+            completed + 1,
+            &mut memory,
+            &mut flags,
+        )
+        .unwrap();
+        assert_eq!(engine.outcomes[0].retire_tick, completed + 1);
+        assert_eq!(memory.l0a().read_known(0, 512).unwrap(), vec![9; 512]);
+        assert!(engine.pending_commands().next().is_none());
+        assert!(engine.wait_event(7).unwrap());
     }
 }

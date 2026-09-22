@@ -24,6 +24,17 @@ pub enum C220Mte1ReadKind {
     Bt,
 }
 
+impl C220Mte1ReadKind {
+    pub(in crate::sim::c220::mte) const ALL: [Self; 2] = [Self::Load2d, Self::Bt];
+
+    pub(in crate::sim::c220::mte) const fn index(self) -> usize {
+        match self {
+            Self::Load2d => 0,
+            Self::Bt => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220Mte1ReadBandwidths {
     pub l0a: NonZeroU32,
@@ -38,6 +49,13 @@ pub enum C220Mte1ReadTransfer {
 }
 
 impl C220Mte1ReadTransfer {
+    pub const fn is_empty(self) -> bool {
+        match self {
+            Self::Load2d(transfer) => transfer.descriptor.repeat_count == 0,
+            Self::Bt(transfer) => transfer.descriptor.is_empty(),
+        }
+    }
+
     pub const fn kind(self) -> C220Mte1ReadKind {
         match self {
             Self::Load2d(_) => C220Mte1ReadKind::Load2d,

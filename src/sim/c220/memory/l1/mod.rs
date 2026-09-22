@@ -5,8 +5,8 @@ mod transport;
 pub use arbiter::{C220L1Access, C220L1Arbiter, C220L1Decision, C220L1Geometry};
 pub use service::C220L1Pipeline;
 pub use transport::{
-    C220_L1_TRANSPORT_CAPACITY, C220_L1_TRANSPORT_TICKS, C220L1Transit, C220L1Transport,
-    C220L1TransportError,
+    C220_L1_TRANSPORT_CAPACITY, C220_L1_TRANSPORT_TICKS, C220L1Callback, C220L1EventOutcome,
+    C220L1Events, C220L1Transit, C220L1Transport, C220L1TransportError,
 };
 
 use thiserror::Error;
@@ -47,6 +47,38 @@ pub struct C220L1Response {
     pub bank_mask: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum C220L1Receiver {
+    Read = 0,
+    Write = 1,
+}
+
+impl C220L1Receiver {
+    const ALL: [Self; 2] = [Self::Read, Self::Write];
+
+    pub const fn contains(self, port: C220L1Port) -> bool {
+        matches!(
+            (self, port),
+            (Self::Read, C220L1Port::MteRead)
+                | (Self::Write, C220L1Port::FixpWrite | C220L1Port::MteWrite)
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct C220L1RequestCycle {
+    pub tick: u64,
+    pub decisions: [Option<C220L1Decision>; 3],
+    pub accepted: [bool; 3],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct C220L1ResponseCycle {
+    pub tick: u64,
+    pub responses: [Option<C220L1Response>; 3],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220L1Cycle {
     pub tick: u64,
@@ -60,8 +92,14 @@ pub struct C220L1Cycle {
 pub enum C220L1Error {
     #[error("L1 geometry exceeds the supported bank-mask layout")]
     UnsupportedGeometry,
-    #[error("L1 cycle {requested} must follow the last cycle {previous}")]
-    NonIncreasingTick { previous: u64, requested: u64 },
+    #[error("L1 time reversed from {previous} to {requested}")]
+    TimeReversed { previous: u64, requested: u64 },
+    #[error("L1 {receiver:?} {phase} callback already ran at tick {tick}")]
+    RepeatedCallback {
+        receiver: C220L1Receiver,
+        phase: &'static str,
+        tick: u64,
+    },
     #[error("L1 response tick overflowed")]
     TimeOverflow,
 }

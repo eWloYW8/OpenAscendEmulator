@@ -1,9 +1,12 @@
 use std::collections::VecDeque;
 
 use super::{
-    C220L1Cycle, C220L1Error, C220L1Geometry, C220L1Pipeline, C220L1Port, C220L1Request,
-    C220L1Response,
+    C220L1Cycle, C220L1Error, C220L1Geometry, C220L1Pipeline, C220L1Port, C220L1Receiver,
+    C220L1Request, C220L1RequestCycle, C220L1Response, C220L1ResponseCycle,
 };
+
+mod events;
+pub use events::{C220L1Callback, C220L1EventOutcome, C220L1Events};
 
 pub const C220_L1_TRANSPORT_CAPACITY: usize = 2;
 pub const C220_L1_TRANSPORT_TICKS: u64 = 1;
@@ -19,8 +22,6 @@ pub struct C220L1Transit<T> {
 pub enum C220L1TransportError {
     #[error("L1 transport time reversed from {previous} to {requested}")]
     TimeReversed { previous: u64, requested: u64 },
-    #[error("L1 transport skipped a busy cycle: expected {expected}, got {requested}")]
-    SkippedCycle { expected: u64, requested: u64 },
     #[error("L1 transport time overflowed")]
     TimeOverflow,
     #[error(transparent)]
@@ -29,14 +30,14 @@ pub enum C220L1TransportError {
 
 /// Shared L1 service with independent, bounded request and response transports.
 /// Producers and consumers explicitly enqueue/dequeue at their callback phase;
-/// `advance` runs the L1 receiver and service phase once per cycle.
+/// `advance` is a convenience composition. Event owners can independently
+/// invoke the read/write receivers and response senders in callback order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220L1Transport {
     service: C220L1Pipeline,
     requests: [VecDeque<C220L1Transit<C220L1Request>>; 3],
     responses: [VecDeque<C220L1Transit<C220L1Response>>; 3],
     observed_tick: Option<u64>,
-    next_service_tick: Option<u64>,
 }
 
 impl C220L1Transport {
@@ -46,7 +47,6 @@ impl C220L1Transport {
             requests: std::array::from_fn(|_| VecDeque::new()),
             responses: std::array::from_fn(|_| VecDeque::new()),
             observed_tick: None,
-            next_service_tick: None,
         }
     }
 
@@ -85,9 +85,6 @@ impl C220L1Transport {
             return Ok(false);
         }
         let ready_tick = transport_ready(tick)?;
-        if self.is_idle() {
-            self.next_service_tick = Some(self.next_service_tick.unwrap_or(tick).max(tick));
-        }
         self.requests[port as usize].push_back(C220L1Transit {
             sent_tick: tick,
             ready_tick,
@@ -140,7 +137,63 @@ impl C220L1Transport {
                 });
             }
         }
-        self.next_service_tick = Some(next_service_tick);
+        self.observed_tick = Some(tick);
+        Ok(cycle)
+    }
+
+    /// A notified receiver examines current queue heads, not just the queue
+    /// which caused the notification. Request transport age is checked by the
+    /// readiness probe; the write receiver can consume both nonempty ports.
+    pub fn receive_requests(
+        &mut self,
+        tick: u64,
+        receiver: C220L1Receiver,
+    ) -> Result<C220L1RequestCycle, C220L1TransportError> {
+        self.check_time(tick)?;
+        let heads =
+            std::array::from_fn(|index| self.requests[index].front().map(|head| head.payload));
+        let cycle = self.service.receive(tick, receiver, heads)?;
+        for (queue, accepted) in self.requests.iter_mut().zip(cycle.accepted) {
+            if accepted {
+                queue.pop_front();
+            }
+        }
+        self.observed_tick = Some(tick);
+        Ok(cycle)
+    }
+
+    pub fn send_responses(
+        &mut self,
+        tick: u64,
+        receiver: C220L1Receiver,
+    ) -> Result<C220L1ResponseCycle, C220L1TransportError> {
+        self.check_time(tick)?;
+        let credits =
+            std::array::from_fn(|index| self.responses[index].len() < C220_L1_TRANSPORT_CAPACITY);
+        let will_send = C220L1Port::ALL.into_iter().any(|port| {
+            receiver.contains(port)
+                && credits[port as usize]
+                && self
+                    .service
+                    .pending(port)
+                    .front()
+                    .is_some_and(|head| head.ready_tick <= tick)
+        });
+        let ready_tick = if will_send {
+            transport_ready(tick)?
+        } else {
+            tick
+        };
+        let cycle = self.service.respond(tick, receiver, credits)?;
+        for (queue, response) in self.responses.iter_mut().zip(cycle.responses) {
+            if let Some(payload) = response {
+                queue.push_back(C220L1Transit {
+                    sent_tick: tick,
+                    ready_tick,
+                    payload,
+                });
+            }
+        }
         self.observed_tick = Some(tick);
         Ok(cycle)
     }
@@ -151,15 +204,6 @@ impl C220L1Transport {
         {
             return Err(C220L1TransportError::TimeReversed {
                 previous,
-                requested: tick,
-            });
-        }
-        if !self.is_idle()
-            && let Some(expected) = self.next_service_tick
-            && tick > expected
-        {
-            return Err(C220L1TransportError::SkippedCycle {
-                expected,
                 requested: tick,
             });
         }

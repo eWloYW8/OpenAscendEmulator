@@ -3,6 +3,12 @@ use std::collections::{BTreeMap, VecDeque};
 use super::C220MteOutputFragment;
 use crate::sim::c220::memory::l1::{C220L1Access, C220L1Request};
 
+mod events;
+pub use events::{
+    C220MteL1WriteCallback, C220MteL1WriteEventInputs, C220MteL1WriteEventOutcome,
+    C220MteL1WriteEvents,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum C220MteL1WritePort {
@@ -13,7 +19,7 @@ pub enum C220MteL1WritePort {
 }
 
 impl C220MteL1WritePort {
-    const ALL: [Self; 4] = [Self::Port0, Self::Port1, Self::Port2, Self::Port3];
+    pub(super) const ALL: [Self; 4] = [Self::Port0, Self::Port1, Self::Port2, Self::Port3];
 
     pub const fn input_ticks(self) -> u64 {
         match self {

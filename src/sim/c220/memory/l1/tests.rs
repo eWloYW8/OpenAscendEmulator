@@ -99,7 +99,7 @@ fn bank_conflicts_cache_tags_and_response_backpressure() {
     let prior = pipeline.clone();
     assert!(matches!(
         pipeline.step(18, [None; 3], [true; 3]),
-        Err(C220L1Error::NonIncreasingTick { .. })
+        Err(C220L1Error::RepeatedCallback { .. })
     ));
     assert_eq!(pipeline, prior);
     assert_eq!(
@@ -110,5 +110,29 @@ fn bank_conflicts_cache_tags_and_response_backpressure() {
     assert_eq!(
         C220L1Geometry::new(0, 4, 2, 12),
         Err(C220L1Error::UnsupportedGeometry)
+    );
+
+    for tick in [1, u64::from(u32::MAX) + 1] {
+        let mut pipeline = C220L1Pipeline::new(geometry);
+        let mut heads = [Some(request); 3];
+        let write = pipeline
+            .receive(tick, C220L1Receiver::Write, heads)
+            .unwrap();
+        assert_eq!(write.accepted, [true, tick > u64::from(u32::MAX), false]);
+        for (head, accepted) in heads.iter_mut().zip(write.accepted) {
+            if accepted {
+                *head = None;
+            }
+        }
+        let read = pipeline.receive(tick, C220L1Receiver::Read, heads).unwrap();
+        assert_eq!(read.accepted[2], tick > u64::from(u32::MAX));
+    }
+    let mut pipeline = C220L1Pipeline::new(geometry);
+    assert_eq!(
+        pipeline
+            .receive(0, C220L1Receiver::Read, [None, None, Some(request)])
+            .unwrap()
+            .accepted,
+        [false; 3]
     );
 }

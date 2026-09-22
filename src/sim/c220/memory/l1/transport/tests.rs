@@ -10,18 +10,57 @@ fn request(id: u64, address: u64) -> C220L1Request {
 
 #[test]
 fn transport_visibility_shared_write_notifications_and_credit_stalls() {
+    use crate::sim::common::event::EventDispatcher;
     use C220L1Port::{FixpWrite, MteRead, MteWrite};
+    let mut events = EventDispatcher::new(0);
+    let clock = events.add_event();
+    let binding = C220L1Events::register(&mut events, clock, |callback| callback);
+    let mut advance = |link: &mut C220L1Transport, tick| {
+        events.advance_to(tick).unwrap();
+        events.notify_at(clock, tick);
+        events.notify_at(clock, tick);
+        let mut cycle = C220L1Cycle {
+            tick,
+            decisions: [None; 3],
+            accepted: [false; 3],
+            responses: [None; 3],
+        };
+        let mut callbacks = Vec::new();
+        while let Some(invocation) = events.next_callback() {
+            assert!(!callbacks.contains(&invocation.callback));
+            callbacks.push(invocation.callback);
+            match binding
+                .handle(invocation.callback, &mut events, link)
+                .unwrap()
+            {
+                C220L1EventOutcome::Received(received) => {
+                    for index in 0..3 {
+                        cycle.decisions[index] =
+                            cycle.decisions[index].or(received.decisions[index]);
+                        cycle.accepted[index] |= received.accepted[index];
+                    }
+                }
+                C220L1EventOutcome::Responded(sent) => {
+                    for index in 0..3 {
+                        cycle.responses[index] = cycle.responses[index].or(sent.responses[index]);
+                    }
+                }
+                C220L1EventOutcome::Readiness => {}
+            }
+        }
+        cycle
+    };
     let geometry = C220L1Geometry::new(32, 4, 1, 0).unwrap();
     let mut link = C220L1Transport::new(geometry);
     link.send_request(0, MteRead, request(0, 0)).unwrap();
-    assert_eq!(link.advance(0).unwrap().accepted, [false; 3]);
+    assert_eq!(advance(&mut link, 0).accepted, [false; 3]);
     link.send_request(1, FixpWrite, request(1, 0)).unwrap();
-    let cycle = link.advance(1).unwrap();
+    let cycle = advance(&mut link, 1);
     assert!(cycle.decisions[0].unwrap().granted);
     assert!(!cycle.decisions[2].unwrap().granted);
     assert_eq!(cycle.accepted, [false; 3]);
-    assert_eq!(link.advance(2).unwrap().accepted, [true, false, false]);
-    assert_eq!(link.advance(3).unwrap().accepted, [false, false, true]);
+    assert_eq!(advance(&mut link, 2).accepted, [true, false, false]);
+    assert_eq!(advance(&mut link, 3).accepted, [false, false, true]);
     assert!(link.receive_response(3, FixpWrite).unwrap().is_none());
     assert_eq!(
         link.receive_response(4, FixpWrite)
@@ -32,7 +71,7 @@ fn transport_visibility_shared_write_notifications_and_credit_stalls() {
         1
     );
     for tick in 4..=11 {
-        link.advance(tick).unwrap();
+        advance(&mut link, tick);
     }
     assert!(link.receive_response(11, MteRead).unwrap().is_none());
     let response = link.receive_response(12, MteRead).unwrap().unwrap();
@@ -81,8 +120,10 @@ fn transport_visibility_shared_write_notifications_and_credit_stalls() {
     assert_eq!(link.service().pending(FixpWrite).len(), 2);
     let before = link.clone();
     assert!(matches!(
-        link.advance(8),
-        Err(C220L1TransportError::SkippedCycle { .. })
+        link.advance(6),
+        Err(C220L1TransportError::Service(
+            C220L1Error::RepeatedCallback { .. }
+        ))
     ));
     assert_eq!(link, before);
     assert!(matches!(

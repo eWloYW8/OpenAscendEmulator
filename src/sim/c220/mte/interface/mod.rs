@@ -11,8 +11,9 @@ pub use l0_write::{
     C220L0WritePort, C220L0WriteSend,
 };
 pub use l1::{
-    C220MteL1Cycle, C220MteL1CycleInputs, C220MteL1Error, C220MteL1Interface, C220MteL1Queues,
-    C220MteL1ReadOperation, C220MteL1ReadRequest, C220MteL1ReadSend,
+    C220MteL1Callback, C220MteL1Cycle, C220MteL1CycleInputs, C220MteL1Error, C220MteL1EventOutcome,
+    C220MteL1Events, C220MteL1Interface, C220MteL1Queues, C220MteL1ReadOperation,
+    C220MteL1ReadRequest, C220MteL1ReadSend,
 };
 pub use l1_output::{
     C220MteL1Output, C220MteL1OutputCredits, C220MteL1OutputCycle, C220MteL1OutputDestination,
@@ -23,7 +24,8 @@ pub use l1_read::{
     C220MteL1ReadPort,
 };
 pub use l1_write::{
-    C220MteL1WriteAcknowledgment, C220MteL1WriteEntry, C220MteL1WriteError,
+    C220MteL1WriteAcknowledgment, C220MteL1WriteCallback, C220MteL1WriteEntry, C220MteL1WriteError,
+    C220MteL1WriteEventInputs, C220MteL1WriteEventOutcome, C220MteL1WriteEvents,
     C220MteL1WriteInterface, C220MteL1WritePort, C220MteL1WriteQueues, C220MteL1WriteRequest,
     C220MteL1WriteSend,
 };

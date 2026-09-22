@@ -16,13 +16,29 @@ impl C220Core {
         instruction: C220HardwareFlagInstruction,
     ) -> Result<C220CoreStep, C220CoreError> {
         let step = instruction.resolve(pc, self.state.scalar().machine().xregs())?;
+        if instruction.trigger
+            && instruction.source_pipe == C220HardwareFlagSourcePipe::Mte1
+            && self
+                .mte_pipeline
+                .as_ref()
+                .is_some_and(|p| !p.selected_generator_idle())
+        {
+            return Ok(C220CoreStep::Stalled(C220Stall {
+                tick,
+                pc,
+                resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+                cause: C220StallCause::HardwareFlagDependency,
+            }));
+        }
         let token_ready_tick = match instruction.operation {
             C220HardwareFlagOperation::Set => {
                 if !instruction.trigger {
                     match (instruction.source_pipe, instruction.memory) {
                         (
                             C220HardwareFlagSourcePipe::Mte1,
-                            C220MatrixMemory::L0a | C220MatrixMemory::L0b,
+                            C220MatrixMemory::L0a
+                            | C220MatrixMemory::L0b
+                            | C220MatrixMemory::BiasTable,
                         ) => {
                             self.hardware_flags.enqueue_mte_set(
                                 self.next_instruction_id,

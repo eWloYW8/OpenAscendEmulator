@@ -7,7 +7,6 @@ use crate::isa::c220::hflag::{
 use crate::memory::mapped::MappedMemoryError;
 use crate::sim::c220::cube::C220CubeTimingError;
 use crate::sim::c220::memory::C220L0cError;
-use crate::sim::c220::mte::mte1::C220Mte1TimingError;
 use crate::sim::c220::mte::mte1::load2d::C220Load2dTransferError;
 use crate::sim::c220::mte::mte2::C220Mte2TimingError;
 use crate::sim::c220::mte::mte3::C220Mte3TimingError;
@@ -19,6 +18,12 @@ use crate::sim::common::scalar::ScalarInstructionError;
 
 #[derive(Debug, Error)]
 pub enum C220CoreError {
+    #[error("MTE requires explicit L1 geometry and bandwidth configuration")]
+    MteUnconfigured,
+    #[error("MTE cannot be reconfigured while commands or physical transfers are active")]
+    MtePipelineBusy,
+    #[error(transparent)]
+    MtePipeline(#[from] crate::sim::c220::mte::C220MtePipelineError),
     #[error(transparent)]
     CubeRuntime(#[from] crate::sim::c220::cube::C220CubeRuntimeError),
     #[error(transparent)]
@@ -33,8 +38,6 @@ pub enum C220CoreError {
     Mte2Timing(#[from] C220Mte2TimingError),
     #[error(transparent)]
     Execution(#[from] C220ExecutionError),
-    #[error(transparent)]
-    Mte1Timing(#[from] C220Mte1TimingError),
     #[error(transparent)]
     Mte1Runtime(#[from] crate::sim::c220::mte::mte1::C220Mte1RuntimeError),
     #[error(transparent)]
@@ -63,6 +66,8 @@ pub enum C220CoreError {
     VectorScalarWaitWithoutFlag { flag_id: u32 },
     #[error("C220 Cube execution requires initialized SPR3 control state")]
     MissingCubeControlSpr,
+    #[error("C220 SET_2D requires initialized SPR15 fill pattern")]
+    MissingSet2dPatternSpr,
     #[error("C220 Cube timing requires initialized SPR{spr} control state")]
     MissingCubeTimingSpr { spr: u16 },
     #[error(

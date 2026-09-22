@@ -1,10 +1,14 @@
 use super::*;
 use crate::isa::c220::mte::bias::C220MovL1ToBtInstruction;
 use crate::isa::c220::mte::load2d::C220Load2dInstruction;
-use crate::sim::c220::memory::l1::{C220L1Geometry, C220L1Port, C220L1Request, C220L1Transport};
+use crate::sim::c220::memory::l1::{
+    C220L1Callback, C220L1Events, C220L1Geometry, C220L1Port, C220L1Request, C220L1Transport,
+};
 use crate::sim::c220::mte::C220MteGeneratorCallback;
 use crate::sim::c220::mte::interface::{
-    C220L0WritePipeline, C220MteL1CycleInputs, C220MteL1OutputCredits,
+    C220L0WriteCallback, C220L0WriteEventOutcome, C220L0WriteEvents, C220L0WritePipeline,
+    C220MteL1Callback, C220MteL1CycleInputs, C220MteL1EventOutcome, C220MteL1Events,
+    C220MteL1OutputCredits,
 };
 use crate::sim::c220::mte::mte1::bias::c220_bt_uops;
 use crate::sim::common::event::EventDispatcher;
@@ -264,6 +268,13 @@ fn bt_frontend_preserves_physical_requests_backpressure_and_retirement() {
 
 #[test]
 fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators() {
+    #[derive(Clone, Copy)]
+    enum Callback {
+        Generator(C220Mte1ReadKind, C220MteGeneratorCallback),
+        Memory(C220L1Callback),
+        L1(C220MteL1Callback),
+        L0(bool, C220L0WriteCallback),
+    }
     for word in [0x6000_2180, 0x6000_2181, 0x6000_218d, 0x6000_21a0] {
         let mut registers = [0; 32];
         registers[0] = 0x800;
@@ -284,11 +295,18 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
         let mut l0b = C220L0WritePipeline::default();
         let mut events = EventDispatcher::new(0);
         let clock = events.add_event();
+        let memory_events = C220L1Events::register(&mut events, clock, Callback::Memory);
+        let l1_events = C220MteL1Events::register(&mut events, clock, Callback::L1);
+        let l0a_events =
+            C220L0WriteEvents::register(&mut events, clock, |phase| Callback::L0(false, phase));
+        let l0b_events =
+            C220L0WriteEvents::register(&mut events, clock, |phase| Callback::L0(true, phase));
         let load_events = C220Mte1ReadEvents::register(&mut events, clock, |phase| {
-            (C220Mte1ReadKind::Load2d, phase)
+            Callback::Generator(C220Mte1ReadKind::Load2d, phase)
         });
-        let bt_events =
-            C220Mte1ReadEvents::register(&mut events, clock, |phase| (C220Mte1ReadKind::Bt, phase));
+        let bt_events = C220Mte1ReadEvents::register(&mut events, clock, |phase| {
+            Callback::Generator(C220Mte1ReadKind::Bt, phase)
+        });
         load_events
             .issue(
                 &mut events,
@@ -311,35 +329,108 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
         let mut output_bytes = [0_u32; 2];
         let mut shared_full = false;
         let mut idle_before_retirement = false;
+        let mut bt_tails = BTreeMap::new();
         for tick in 0..300 {
-            for cycle in [l0a.step(tick).unwrap(), l0b.step(tick).unwrap()] {
-                if let Some(id) = cycle.retired_instruction {
-                    assert!(retired.insert(id));
-                }
-            }
-            let response = l1
-                .receive_response(tick, C220L1Port::MteRead)
-                .unwrap()
-                .map(|r| r.request.id);
-            let cycle = interface
-                .step(
-                    tick,
-                    C220MteL1CycleInputs {
-                        request_ready: tick >= 20 && l1.request_ready(C220L1Port::MteRead),
-                        response,
-                        output_credits: C220MteL1OutputCredits {
-                            l0a: [l0a.can_push(C220L0WritePort::Port0), false, false],
-                            l0b: [l0b.can_push(C220L0WritePort::Port0), false, false],
-                        },
-                    },
-                )
-                .unwrap();
             events.advance_to(tick).unwrap();
             events.notify_at(clock, tick);
             events.notify_at(clock, tick);
             let mut phases = [Vec::new(), Vec::new()];
+            let mut l1_phases = Vec::new();
             while let Some(invocation) = events.next_callback() {
-                let (kind, phase) = invocation.callback;
+                let (kind, phase) = match invocation.callback {
+                    Callback::Memory(phase) => {
+                        memory_events.handle(phase, &mut events, &mut l1).unwrap();
+                        continue;
+                    }
+                    Callback::Generator(kind, phase) => (kind, phase),
+                    Callback::L0(is_b, phase) => {
+                        let (binding, pipeline) = if is_b {
+                            (&l0b_events, &mut l0b)
+                        } else {
+                            (&l0a_events, &mut l0a)
+                        };
+                        if let C220L0WriteEventOutcome::Acknowledged(Some(ack)) =
+                            binding.handle(phase, &mut events, pipeline).unwrap()
+                            && let Some(id) = ack.retired_instruction()
+                        {
+                            assert!(retired.insert(id));
+                        }
+                        continue;
+                    }
+                    Callback::L1(phase) => {
+                        assert!(!l1_phases.contains(&phase));
+                        l1_phases.push(phase);
+                        let response = l1
+                            .responses(C220L1Port::MteRead)
+                            .front()
+                            .filter(|head| head.ready_tick <= tick)
+                            .map(|head| head.payload.request.id);
+                        let inputs = C220MteL1CycleInputs {
+                            request_ready: tick >= 20 && l1.request_ready(C220L1Port::MteRead),
+                            response,
+                            output_credits: C220MteL1OutputCredits {
+                                l0a: [l0a.can_push(C220L0WritePort::Port0), false, false],
+                                l0b: [l0b.can_push(C220L0WritePort::Port0), false, false],
+                            },
+                        };
+                        match l1_events
+                            .handle(phase, &mut events, &mut interface, inputs)
+                            .unwrap()
+                        {
+                            C220MteL1EventOutcome::Request(send) => {
+                                if let Some(request) = send.sent {
+                                    assert!(ids.insert(request.id));
+                                    if let C220Mte1ReadUop::Load2d(uop) = request.operation.payload
+                                    {
+                                        reads.push(uop);
+                                    }
+                                    assert!(
+                                        l1.send_request(
+                                            tick,
+                                            C220L1Port::MteRead,
+                                            request.l1_request()
+                                        )
+                                        .unwrap()
+                                    );
+                                }
+                            }
+                            C220MteL1EventOutcome::Response(Some(request)) => {
+                                let received = l1
+                                    .receive_response(tick, C220L1Port::MteRead)
+                                    .unwrap()
+                                    .unwrap();
+                                assert_eq!(received.request.id, request.id);
+                            }
+                            C220MteL1EventOutcome::Output(output) => {
+                                if let Some(sent) = output.sent {
+                                    output_bytes[(sent.fragment.instruction_id - 1) as usize] +=
+                                        sent.fragment.bytes;
+                                    match sent.destination {
+                                        C220MteL1OutputDestination::L0a(port) => {
+                                            assert!(l0a.push(tick, port, sent.fragment).unwrap())
+                                        }
+                                        C220MteL1OutputDestination::L0b(port) => {
+                                            assert!(l0b.push(tick, port, sent.fragment).unwrap())
+                                        }
+                                        C220MteL1OutputDestination::Bt => {
+                                            if sent.fragment.last_in_uop {
+                                                bt_tails.insert(sent.fragment.request_id, tick);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            C220MteL1EventOutcome::Retired(Some(event)) => {
+                                assert_eq!(tick, bt_tails[&event.fragment.request_id] + 5);
+                                if event.fragment.last_in_instruction {
+                                    assert!(retired.insert(event.fragment.instruction_id));
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                };
                 let (binding, frontend, index) = match kind {
                     C220Mte1ReadKind::Load2d => (&load_events, &mut load, 0),
                     C220Mte1ReadKind::Bt => (&bt_events, &mut bt, 1),
@@ -370,34 +461,6 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
             let inputs = interface.queue_state().inputs;
             assert!(inputs[0] <= 5 && inputs[1] == 0 && inputs[2] == 0);
             shared_full |= inputs[0] == 5;
-            if let Some(request) = cycle.sent {
-                assert!(ids.insert(request.id));
-                if let C220Mte1ReadUop::Load2d(uop) = request.operation.payload {
-                    reads.push(uop);
-                }
-                assert!(
-                    l1.send_request(tick, C220L1Port::MteRead, request.l1_request())
-                        .unwrap()
-                );
-            }
-            if let Some(sent) = cycle.output.sent {
-                output_bytes[(sent.fragment.instruction_id - 1) as usize] += sent.fragment.bytes;
-                match sent.destination {
-                    C220MteL1OutputDestination::L0a(port) => {
-                        assert!(l0a.push(tick, port, sent.fragment).unwrap())
-                    }
-                    C220MteL1OutputDestination::L0b(port) => {
-                        assert!(l0b.push(tick, port, sent.fragment).unwrap())
-                    }
-                    C220MteL1OutputDestination::Bt => {}
-                }
-            }
-            if let Some(event) = cycle.output.retired
-                && event.fragment.last_in_instruction
-            {
-                assert!(retired.insert(event.fragment.instruction_id));
-            }
-            l1.advance(tick).unwrap();
             if load.is_idle()
                 && bt.is_idle()
                 && interface.is_idle()

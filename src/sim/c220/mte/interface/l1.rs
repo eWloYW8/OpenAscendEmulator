@@ -9,6 +9,9 @@ use super::{
 };
 use crate::sim::c220::memory::l1::{C220L1Access, C220L1Request};
 
+mod events;
+pub use events::{C220MteL1Callback, C220MteL1EventOutcome, C220MteL1Events};
+
 const INPUT_TICKS: u64 = 4;
 const INPUT_CAPACITY: usize = 5;
 

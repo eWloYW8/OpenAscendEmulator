@@ -1,8 +1,7 @@
 use crate::isa::c220::hflag::C220HardwareFlagStep;
-use crate::isa::c220::mte::load2d::C220Load2dTransfer;
 use crate::isa::flow::FlagStep;
 use crate::sim::c220::cube::C220CubeIssue;
-use crate::sim::c220::mte::mte1::C220Mte1Ticket;
+use crate::sim::c220::mte::mte1::{C220Mte1Command, C220Mte1Issue};
 use crate::sim::c220::mte::mte2::C220Mte2Step;
 use crate::sim::c220::mte::mte3::C220Mte3Ticket;
 use crate::sim::c220::mte::mte3::C220OutputStep;
@@ -18,11 +17,11 @@ pub enum C220CoreInstruction {
         timing: Option<C220ScalarTimingTicket>,
     },
     Barrier(ScalarProgramStep),
-    Mte1Load2d {
+    Mte1 {
         instruction_id: u64,
         pc: u64,
-        transfer: C220Load2dTransfer,
-        ticket: Box<C220Mte1Ticket>,
+        command: C220Mte1Command,
+        issue: C220Mte1Issue,
     },
     Mte1Flag(FlagStep),
     HardwareFlag {
