@@ -51,6 +51,12 @@ impl PendingVectorRead {
         selection_mask: Option<&C220SelectionMaskBlock>,
     ) -> Result<(C220VectorReadSample, Vec<C220VectorStore>), C220VectorError> {
         let lane_group = self.lane_group.unwrap_or_default();
+        let lane_active = |index: usize| {
+            self.lane_slice.map_or_else(
+                || index / 64 == usize::from(lane_group),
+                |(first, count)| index >= first && index < first + count,
+            ) && self.mask[index / 64] & (1_u64 << (index % 64)) != 0
+        };
         let mut reduction_update = None;
         let mut conversion_lanes = None;
         let mut fused_lanes = None;
@@ -555,8 +561,7 @@ impl PendingVectorRead {
                         .into_iter()
                         .enumerate()
                         .map(|(index, value)| C220VectorLaneOutcome {
-                            active: index / 64 == usize::from(lane_group)
-                                && self.mask[index / 64] & (1_u64 << (index % 64)) != 0,
+                            active: lane_active(index),
                             bits: value.bits,
                             fp16_status: value.fp16_status,
                             fp32_status: value.fp32_status,
@@ -584,8 +589,7 @@ impl PendingVectorRead {
                         .into_iter()
                         .enumerate()
                         .map(|(index, bits)| C220VectorLaneOutcome {
-                            active: index / 64 == usize::from(lane_group)
-                                && self.mask[index / 64] & (1_u64 << (index % 64)) != 0,
+                            active: lane_active(index),
                             bits,
                             fp16_status: None,
                             fp32_status: None,
@@ -612,8 +616,7 @@ impl PendingVectorRead {
                         .into_iter()
                         .enumerate()
                         .map(|(index, bits)| C220VectorLaneOutcome {
-                            active: index / 64 == usize::from(lane_group)
-                                && self.mask[index / 64] & (1_u64 << (index % 64)) != 0,
+                            active: lane_active(index),
                             bits,
                             fp16_status: None,
                             fp32_status: None,
@@ -699,6 +702,7 @@ impl PendingVectorRead {
                 read1_grants: self.port1.request.grants().to_vec(),
                 source_0_bytes: self.source_0_bytes.clone(),
                 source_1_bytes: self.source_1_bytes.clone(),
+                destination_bytes: self.destination_bytes.clone(),
                 lanes,
                 conversion_lanes,
                 fused_lanes,

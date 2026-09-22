@@ -8,6 +8,7 @@ mod mask;
 pub mod ops;
 pub mod pipeline;
 pub mod read;
+mod repeat;
 pub(super) mod runtime;
 pub mod timing;
 mod uop;

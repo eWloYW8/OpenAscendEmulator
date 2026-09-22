@@ -1,5 +1,6 @@
 use crate::isa::c220::vector::merge::{C220MergeInstruction, C220MergeWidth};
 use crate::isa::c220::vector::sort::C220SortWidth;
+use crate::memory::sparse::MemoryByteState;
 use crate::memory::ub::UbMemory;
 
 use super::sort::c220_sort_value_precedes;
@@ -69,6 +70,79 @@ pub struct C220MergeRecord {
 pub struct C220MergeRepeatData {
     pub repeat_index: usize,
     pub lists: [Vec<C220MergeRecord>; 4],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct C220MergeRepeatResult {
+    pub consumed: [u16; 4],
+    pub records_written: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct C220MergeResult {
+    pub repeats: Vec<C220MergeRepeatResult>,
+    pub status: u64,
+}
+
+pub(crate) fn execute_c220_merge(
+    issue: &C220MergeIssue,
+    ub: &mut UbMemory,
+) -> Result<C220MergeResult, C220VectorError> {
+    let mut result = C220MergeResult {
+        repeats: Vec::new(),
+        status: 0,
+    };
+    for (repeat_index, repeat) in issue.repeats.iter().enumerate() {
+        let data = load_c220_merge_repeat(issue, repeat_index, ub)?;
+        let mut consumed = [0_u16; 4];
+        let mut records_written = 0;
+        loop {
+            let winner = data
+                .lists
+                .iter()
+                .enumerate()
+                .filter_map(|(list, records)| records.get(usize::from(consumed[list])))
+                .reduce(|left, right| {
+                    if merge_record_precedes(issue.instruction.width, left, right) {
+                        left
+                    } else {
+                        right
+                    }
+                });
+            let Some(record) = winner else { break };
+            let mut bytes = record.bytes;
+            if issue.instruction.width == C220MergeWidth::F16 {
+                bytes[2..4].fill(0);
+            }
+            let address = repeat
+                .destination_address
+                .checked_add(records_written as u64 * RECORD_BYTES)
+                .ok_or(C220VectorError::AddressOverflow {
+                    base: repeat.destination_address,
+                    lane: records_written,
+                })?;
+            ub.write_states(address, &bytes.map(MemoryByteState::Known))?;
+            records_written += 1;
+            let list = usize::from(record.source_list);
+            consumed[list] += 1;
+            if issue.control.exhausted_suspension
+                && usize::from(consumed[list]) == data.lists[list].len()
+            {
+                result.status = consumed
+                    .iter()
+                    .enumerate()
+                    .fold(0, |status, (list, &count)| {
+                        status | (u64::from(count) << (list * 16))
+                    });
+                break;
+            }
+        }
+        result.repeats.push(C220MergeRepeatResult {
+            consumed,
+            records_written,
+        });
+    }
+    Ok(result)
 }
 
 pub fn plan_c220_merge_issue(

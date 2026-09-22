@@ -1,5 +1,5 @@
 use crate::sim::c220::memory::C220UbCycle;
-use crate::sim::c220::vector::ops::merge::C220MergeIssue;
+use crate::sim::c220::vector::ops::merge::{C220MergeIssue, C220MergeResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220VmsuReadBatchTrace {
@@ -28,10 +28,11 @@ pub struct C220VmsuWriteGroupTrace {
     pub first_output: usize,
     pub records: u8,
     pub destination: u64,
+    pub request_bytes: u32,
     pub creation_tick: u64,
     pub submission_tick: u64,
     pub lane_departure_tick: u64,
-    pub grant_tick: u64,
+    pub request_completion_tick: u64,
     pub done_tick: u64,
 }
 
@@ -52,5 +53,7 @@ pub struct C220VmsuTrace {
     pub issue: C220MergeIssue,
     pub admission_tick: u64,
     pub repeats: Vec<C220VmsuRepeatTrace>,
+    pub functional_tick: Option<u64>,
+    pub result: Option<C220MergeResult>,
     pub retirement_tick: Option<u64>,
 }

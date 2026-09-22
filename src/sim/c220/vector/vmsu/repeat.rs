@@ -2,10 +2,10 @@ use std::collections::VecDeque;
 
 use super::{C220VmsuError, trace::*, writeback::Writeback};
 use crate::isa::c220::vector::merge::C220MergeWidth;
-use crate::memory::ub::UbMemory;
 use crate::sim::c220::memory::{C220UbCycle, C220UbRequest};
+use crate::sim::c220::numeric::fp16::{is_nan, to_f64};
 use crate::sim::c220::vector::ops::merge::{
-    C220MergeIssue, C220MergeRecord, C220MergeRepeat, C220MergeRepeatData, merge_record_precedes,
+    C220MergeIssue, C220MergeRecord, C220MergeRepeat, C220MergeRepeatData,
 };
 
 const RECORD_BYTES: u64 = 8;
@@ -47,7 +47,7 @@ pub(super) struct RepeatMachine {
     consumed: [u16; 4],
     exhausted_suspension: bool,
     output_complete: bool,
-    current_group: Vec<C220MergeRecord>,
+    current_group: u8,
     rr_cursor: usize,
 }
 
@@ -82,7 +82,7 @@ impl RepeatMachine {
             consumed: [0; 4],
             exhausted_suspension: issue.control.exhausted_suspension,
             output_complete: false,
-            current_group: Vec::with_capacity(WRITE_GROUP_RECORDS),
+            current_group: 0,
             rr_cursor: 0,
         })
     }
@@ -137,7 +137,6 @@ impl RepeatMachine {
                 return Ok(tick);
             }
             future.step(&mut trace)?;
-            future.writeback.discard_projected_writes();
             trace.read_batches.clear();
             trace.comparisons.clear();
             trace.write_groups.clear();
@@ -146,18 +145,11 @@ impl RepeatMachine {
         Err(C220VmsuError::NonprogressingSchedule)
     }
 
-    pub(super) fn commit_writes(
-        &mut self,
-        tick: u64,
-        ub: &mut UbMemory,
-        trace: &mut C220VmsuRepeatTrace,
-    ) -> Result<(), C220VmsuError> {
-        self.writeback.commit(tick, ub)?;
+    pub(super) fn observe_completion(&self, tick: u64, trace: &mut C220VmsuRepeatTrace) {
         if self.is_complete(tick) {
             trace.completion_tick = self.completion_tick();
             trace.consumed = self.consumed;
         }
-        Ok(())
     }
 
     pub(super) fn step(&mut self, trace: &mut C220VmsuRepeatTrace) -> Result<(), C220VmsuError> {
@@ -235,7 +227,7 @@ impl RepeatMachine {
                 ready_tick,
             });
         }
-        self.writeback.finish(tick, trace)?;
+        self.writeback.finish(tick, trace);
 
         if !self.output_complete {
             for (pair, queue) in self.pair_queues.iter_mut().enumerate() {
@@ -248,7 +240,7 @@ impl RepeatMachine {
                 let right_state = source_state(data, &self.ready, self.source_cursors, right, tick);
                 let selected = match (left_state, right_state) {
                     (SourceState::Ready(left_record), SourceState::Ready(right_record)) => {
-                        Some(if merge_record_precedes(width, left_record, right_record) {
+                        Some(if timing_precedes(width, left_record, right_record) {
                             left
                         } else {
                             right
@@ -287,13 +279,13 @@ impl RepeatMachine {
                     }
                 });
                 let selected_pair = match pair_states {
-                    [PairState::Ready(left), PairState::Ready(right)] => Some(
-                        if merge_record_precedes(width, &left.record, &right.record) {
+                    [PairState::Ready(left), PairState::Ready(right)] => {
+                        Some(if timing_precedes(width, &left.record, &right.record) {
                             0
                         } else {
                             1
-                        },
-                    ),
+                        })
+                    }
                     [PairState::Ready(_), PairState::Exhausted] => Some(0),
                     [PairState::Exhausted, PairState::Ready(_)] => Some(1),
                     _ => None,
@@ -302,10 +294,7 @@ impl RepeatMachine {
                     let result = self.pair_queues[pair]
                         .pop_front()
                         .expect("ready pair result");
-                    let mut record = result.record;
-                    if width == C220MergeWidth::F16 {
-                        record.bytes[2..4].fill(0);
-                    }
+                    let record = result.record;
                     let output_index = self.produced_records;
                     self.produced_records += 1;
                     let list = usize::from(record.source_list);
@@ -314,7 +303,7 @@ impl RepeatMachine {
                         || (self.exhausted_suspension
                             && usize::from(self.consumed[list]) == data.lists[list].len());
                     trace.consumed = self.consumed;
-                    self.current_group.push(record);
+                    self.current_group += 1;
                     trace.comparisons.push(C220VmsuCompareTrace {
                         repeat_index: data.repeat_index,
                         output_index,
@@ -323,9 +312,11 @@ impl RepeatMachine {
                         cmp0_tick: result.cmp0_tick,
                         cmp1_tick: tick,
                     });
-                    if self.current_group.len() == WRITE_GROUP_RECORDS || self.output_complete {
+                    if usize::from(self.current_group) == WRITE_GROUP_RECORDS
+                        || self.output_complete
+                    {
                         let records = std::mem::take(&mut self.current_group);
-                        let first_output = self.produced_records - records.len();
+                        let first_output = self.produced_records - usize::from(records);
                         let destination = repeat
                             .destination_address
                             .checked_add(first_output as u64 * RECORD_BYTES)
@@ -339,6 +330,17 @@ impl RepeatMachine {
 
         self.next_tick = tick.checked_add(1).ok_or(C220VmsuError::TimeOverflow)?;
         Ok(())
+    }
+}
+
+fn timing_precedes(width: C220MergeWidth, left: &C220MergeRecord, right: &C220MergeRecord) -> bool {
+    match width {
+        C220MergeWidth::F16 => {
+            !is_nan(left.key_bits as u16)
+                && !is_nan(right.key_bits as u16)
+                && to_f64(left.key_bits as u16) >= to_f64(right.key_bits as u16)
+        }
+        C220MergeWidth::F32 => f32::from_bits(left.key_bits) >= f32::from_bits(right.key_bits),
     }
 }
 

@@ -102,7 +102,7 @@ fn widened_s16_binary_arithmetic_writes_one_s32_uop() {
                 expected.to_le_bytes()
             );
         }
-        let samples = core.vector_pipeline().last_read_samples();
+        let samples = core.vector_pipeline().last_functional_samples();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].lanes.len(), 64);
         assert_eq!(samples[0].accesses.len(), 4);

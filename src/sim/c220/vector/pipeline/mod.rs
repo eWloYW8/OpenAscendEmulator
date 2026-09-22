@@ -1,6 +1,8 @@
 mod admission;
+mod functional;
 mod hazards;
 mod updates;
+use functional::FunctionalInstruction;
 use hazards::C220VectorIssueVariant;
 pub(crate) use hazards::C220VectorQueueClass;
 
@@ -61,6 +63,8 @@ struct PendingVectorUop {
     queue_class: C220VectorQueueClass,
     admission_tick: u64,
     admitted: bool,
+    issue_gap: u64,
+    deferred_compute: bool,
     stores: Vec<C220VectorStore>,
     read: Option<PendingVectorRead>,
     shared_read_from_previous: bool,
@@ -92,6 +96,7 @@ struct PendingReductionUpdate {
 pub struct C220VectorPipeline {
     rules: C220VectorTimingRules,
     next_admission_tick: u64,
+    next_actual_admission_tick: u64,
     next_service_tick: u64,
     observed_tick: Option<u64>,
     last_release_tick: Option<u64>,
@@ -99,6 +104,8 @@ pub struct C220VectorPipeline {
     last_uop_admission_tick: Option<u64>,
     pending: VecDeque<PendingVectorUop>,
     last_read_samples: Vec<C220VectorReadSample>,
+    last_functional_samples: Vec<C220VectorReadSample>,
+    functional_instructions: BTreeMap<u64, FunctionalInstruction>,
     last_ub_cycles: Vec<C220UbCycle>,
     last_va_updates: Vec<C220VaUpdate>,
     compare_mask: C220CompareMask,
@@ -113,6 +120,7 @@ impl C220VectorPipeline {
         Self {
             rules,
             next_admission_tick: 0,
+            next_actual_admission_tick: 0,
             next_service_tick: 0,
             observed_tick: None,
             last_release_tick: None,
@@ -120,6 +128,8 @@ impl C220VectorPipeline {
             last_uop_admission_tick: None,
             pending: VecDeque::new(),
             last_read_samples: Vec::new(),
+            last_functional_samples: Vec::new(),
+            functional_instructions: BTreeMap::new(),
             last_ub_cycles: Vec::new(),
             last_va_updates: Vec::new(),
             compare_mask: C220CompareMask::default(),
@@ -168,6 +178,11 @@ impl C220VectorPipeline {
 
     pub fn last_read_samples(&self) -> &[C220VectorReadSample] {
         &self.last_read_samples
+    }
+
+    /// Whole-repeat numerical results, separate from timing-only UB request samples.
+    pub fn last_functional_samples(&self) -> &[C220VectorReadSample] {
+        &self.last_functional_samples
     }
 
     pub fn last_ub_cycles(&self) -> &[C220UbCycle] {
@@ -253,7 +268,13 @@ impl C220VectorPipeline {
                     .map(|ready| ready.saturating_sub(u64::from(entry.uop.stages.execute_ticks)));
             }
             previous_release = Some(release);
-            let visible = if entry.stores.is_empty() {
+            let visible = if entry.deferred_compute {
+                entry.instruction_last.then(|| {
+                    entry
+                        .visible_tick
+                        .unwrap_or_else(|| release.saturating_add(1))
+                })
+            } else if entry.stores.is_empty() {
                 None
             } else {
                 Some(
@@ -348,6 +369,7 @@ impl C220VectorPipeline {
 
     pub(crate) fn begin_advance(&mut self) {
         self.last_read_samples.clear();
+        self.last_functional_samples.clear();
         self.last_ub_cycles.clear();
         self.last_va_updates.clear();
     }
@@ -426,6 +448,9 @@ impl C220VectorPipeline {
     }
 
     fn admit_ready(&mut self, tick: u64) -> Result<(), C220VectorAdvanceError> {
+        if tick < self.next_actual_admission_tick {
+            return Ok(());
+        }
         let occupied = self
             .pending
             .iter()
@@ -450,6 +475,9 @@ impl C220VectorPipeline {
         let entry = &mut self.pending[index];
         entry.admitted = true;
         entry.admission_tick = tick;
+        self.next_actual_admission_tick = tick
+            .checked_add(entry.issue_gap)
+            .ok_or(C220VectorAdvanceError::TimeOverflow)?;
         if entry.read.is_none() && !entry.shared_read_from_previous {
             let execute_ready_tick = tick
                 .checked_add(u64::from(entry.uop.stages.read_ticks))
@@ -567,6 +595,9 @@ impl C220VectorPipeline {
                 C220UbPort::VectorWrite => continue,
             }
             .expect("decision belongs to a selected read");
+            if self.pending[index].deferred_compute {
+                continue;
+            }
             self.pending[index]
                 .read
                 .as_mut()
@@ -612,6 +643,7 @@ impl C220VectorPipeline {
             }
             let admission_tick = self.pending[index].admission_tick;
             let read_ticks = self.pending[index].uop.stages.read_ticks;
+            let deferred_compute = self.pending[index].deferred_compute;
             let Some(read) = self.pending[index].read.as_mut() else {
                 continue;
             };
@@ -628,6 +660,23 @@ impl C220VectorPipeline {
                 continue;
             };
             if read.is_sampled() || ready_tick > tick {
+                continue;
+            }
+            if deferred_compute {
+                self.last_read_samples.push(read.timing_sample());
+                read.mark_sampled();
+                let entry = &mut self.pending[index];
+                let execute_ready_tick = ready_tick
+                    .checked_add(u64::from(entry.uop.stages.execute_ticks))
+                    .ok_or(C220VectorAdvanceError::TimeOverflow)?;
+                entry.execute_ready_tick = Some(execute_ready_tick);
+                if entry.write.is_none() {
+                    entry.eligible_tick = Some(
+                        execute_ready_tick
+                            .checked_add(entry.uop.writeback_ticks as u64)
+                            .ok_or(C220VectorAdvanceError::TimeOverflow)?,
+                    );
+                }
                 continue;
             }
             let (sample, stores) =
@@ -744,7 +793,16 @@ impl C220VectorPipeline {
             if entry.instruction_last {
                 completed_groups.push((entry.instruction_group, release_tick));
             }
-            if entry.stores.is_empty() {
+            if entry.deferred_compute {
+                entry.committed = !entry.instruction_last;
+                if entry.instruction_last {
+                    entry.visible_tick = Some(
+                        release_tick
+                            .checked_add(1)
+                            .ok_or(C220VectorAdvanceError::TimeOverflow)?,
+                    );
+                }
+            } else if entry.stores.is_empty() {
                 entry.committed = true;
             } else {
                 entry.visible_tick = Some(
@@ -784,10 +842,15 @@ impl C220VectorPipeline {
         tick: u64,
         core: &mut C220State,
     ) -> Result<(), C220VectorAdvanceError> {
-        for entry in &mut self.pending {
+        for index in 0..self.pending.len() {
+            let entry = &self.pending[index];
             if !entry.committed && entry.visible_tick.is_some_and(|visible| visible <= tick) {
-                core.commit_c220_vector_stores(&entry.stores)?;
-                entry.committed = true;
+                if entry.deferred_compute {
+                    self.complete_functional_instruction(entry.instruction_group, tick, core)?;
+                } else {
+                    core.commit_c220_vector_stores(&entry.stores)?;
+                }
+                self.pending[index].committed = true;
             }
         }
         Ok(())
@@ -806,6 +869,8 @@ fn write_targets_match(actual: &[C220VectorStore], planned: &[C220VectorStore]) 
 
 #[derive(Debug, Error)]
 pub enum C220VectorAdvanceError {
+    #[error(transparent)]
+    ReadSetup(#[from] C220VectorReadError),
     #[error(transparent)]
     Timeline(#[from] C220VectorTimelineError),
     #[error(transparent)]

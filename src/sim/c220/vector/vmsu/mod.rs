@@ -11,7 +11,9 @@ use crate::memory::ub::{UbMemory, UbMemoryError};
 use crate::sim::c220::memory::C220UbRequestError;
 use crate::sim::c220::state::C220State;
 use crate::sim::c220::vector::C220VectorError;
-use crate::sim::c220::vector::ops::merge::{C220MergeIssue, load_c220_merge_repeat};
+use crate::sim::c220::vector::ops::merge::{
+    C220MergeIssue, execute_c220_merge, load_c220_merge_repeat,
+};
 use crate::sim::c220::vector::pipeline::C220VectorTimingRules;
 use crate::sim::common::scalar::ScalarMachineError;
 use repeat::RepeatMachine;
@@ -41,6 +43,7 @@ pub enum C220VmsuError {
 struct ActiveVmsu {
     trace: C220VmsuTrace,
     repeat: Option<RepeatMachine>,
+    functional_due: Option<u64>,
     projected_visibility: u64,
 }
 
@@ -73,7 +76,7 @@ impl C220VmsuPipeline {
             .or(self.last_completed.as_ref())
     }
 
-    /// Earliest completion of the current repeat without competing UB traffic.
+    /// Retry boundary for functional completion. Later repeats must be rechecked.
     pub fn pending_visibility_tick(&self) -> Option<u64> {
         self.active
             .as_ref()
@@ -86,7 +89,7 @@ impl C220VmsuPipeline {
             active
                 .trace
                 .retirement_tick
-                .or_else(|| active.projected_visibility.checked_add(2))
+                .or_else(|| active.projected_visibility.checked_add(1))
         })
     }
 
@@ -109,16 +112,22 @@ impl C220VmsuPipeline {
         let data = load_c220_merge_repeat(&issue, 0, ub)?;
         let repeat =
             RepeatMachine::new(&issue, data, admission_tick, self.rules.ub_response_ticks)?;
-        let projected_visibility = repeat.projected_completion()?;
+        let projected_visibility = repeat
+            .projected_completion()?
+            .checked_add(1)
+            .ok_or(C220VmsuError::TimeOverflow)?;
         let trace = C220VmsuTrace {
             issue,
             admission_tick,
             repeats: vec![repeat.empty_trace(admission_tick)],
+            functional_tick: None,
+            result: None,
             retirement_tick: None,
         };
         self.active = Some(ActiveVmsu {
             trace,
             repeat: Some(repeat),
+            functional_due: None,
             projected_visibility,
         });
         self.observed_tick = Some(tick);
@@ -131,6 +140,7 @@ impl C220VmsuPipeline {
             .repeat
             .as_ref()
             .map(RepeatMachine::next_tick)
+            .or(active.functional_due)
             .or(active.trace.retirement_tick)
     }
 
@@ -146,7 +156,7 @@ impl C220VmsuPipeline {
                     .repeats
                     .last_mut()
                     .expect("active repeat trace");
-                repeat.commit_writes(event_tick, core.ub_mut(), trace)?;
+                repeat.observe_completion(event_tick, trace);
                 if !repeat.is_complete(event_tick) {
                     repeat.step(trace)?;
                     continue;
@@ -159,16 +169,18 @@ impl C220VmsuPipeline {
                         event_tick,
                         self.rules.ub_response_ticks,
                     )?;
-                    active.projected_visibility = next.projected_completion()?;
+                    active.projected_visibility = next
+                        .projected_completion()?
+                        .checked_add(1)
+                        .ok_or(C220VmsuError::TimeOverflow)?;
                     active.trace.repeats.push(next.empty_trace(event_tick));
                     active.repeat = Some(next);
                 } else {
-                    let status = if active.trace.issue.control.exhausted_suspension {
-                        pack_u16x4(trace.consumed)
-                    } else {
-                        0
-                    };
-                    core.scalar_mut().machine_mut().set_spr_value(17, status)?;
+                    active.functional_due = Some(
+                        event_tick
+                            .checked_add(1)
+                            .ok_or(C220VmsuError::TimeOverflow)?,
+                    );
                     active.trace.retirement_tick = Some(
                         event_tick
                             .checked_add(2)
@@ -176,6 +188,14 @@ impl C220VmsuPipeline {
                     );
                     active.repeat = None;
                 }
+            } else if let Some(functional_tick) = active.functional_due {
+                let result = execute_c220_merge(&active.trace.issue, core.ub_mut())?;
+                core.scalar_mut()
+                    .machine_mut()
+                    .set_spr_value(17, result.status)?;
+                active.trace.result = Some(result);
+                active.trace.functional_tick = Some(functional_tick);
+                active.functional_due = None;
             } else {
                 self.last_completed = self.active.take().map(|active| active.trace);
             }
@@ -195,11 +215,4 @@ impl C220VmsuPipeline {
         }
         Ok(())
     }
-}
-
-const fn pack_u16x4(values: [u16; 4]) -> u64 {
-    values[0] as u64
-        | ((values[1] as u64) << 16)
-        | ((values[2] as u64) << 32)
-        | ((values[3] as u64) << 48)
 }

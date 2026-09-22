@@ -205,7 +205,10 @@ impl ReadPort {
         )
     }
 
-    fn gather_pair(accesses: &[C220VectorReadAccess]) -> Result<(Self, Self), C220UbRequestError> {
+    fn routed_pair(
+        accesses: &[C220VectorReadAccess],
+        source_ports: [usize; 3],
+    ) -> Result<(Self, Self), C220UbRequestError> {
         let mut spans = [Vec::<ReadSpan>::new(), Vec::<ReadSpan>::new()];
         let mut unique = BTreeMap::<(u64, u16), (usize, usize)>::new();
         for access in accesses {
@@ -217,7 +220,7 @@ impl ReadPort {
                 spans[port][index].destinations.push(destination);
                 continue;
             }
-            let port = usize::from(access.source_index.min(1));
+            let port = source_ports[usize::from(access.source_index)];
             let index = spans[port].len();
             spans[port].push(ReadSpan {
                 address: access.address,
@@ -265,6 +268,78 @@ impl ReadPort {
 }
 
 impl PendingVectorRead {
+    pub(super) fn configure_accumulator_timing(
+        &mut self,
+        schedule: super::repeat::AccumulatorSchedule,
+    ) -> Result<(), C220VectorReadError> {
+        self.accesses
+            .retain(|access| schedule.reads_source(self.repeat_index, access.source_index));
+        (self.port0, self.port1) =
+            ReadPort::routed_pair(&self.accesses, schedule.source_ports(self.repeat_index))?;
+        Ok(())
+    }
+
+    pub(super) fn configure_ordinary_timing(
+        &mut self,
+        schedule: super::repeat::OrdinaryReadSchedule,
+    ) -> Result<(), C220VectorReadError> {
+        self.accesses
+            .retain(|access| schedule.reads_source(self.repeat_index, access.source_index));
+        let for_source = |source| {
+            self.accesses
+                .iter()
+                .copied()
+                .filter(|access| access.source_index == source)
+                .collect::<Vec<_>>()
+        };
+        self.port0 = ReadPort::new(&for_source(0))?;
+        self.port1 = ReadPort::new(&for_source(1))?;
+        self.destination_port = ReadPort::new(&[])?;
+        Ok(())
+    }
+
+    pub(super) fn capture_functional_inputs(
+        &mut self,
+        ub: &UbMemory,
+    ) -> Result<(), C220VectorError> {
+        for access in &self.accesses {
+            let bytes = ub.read_known(access.address, usize::from(access.bytes))?;
+            let destination = match access.source_index {
+                0 => &mut self.source_0_bytes,
+                1 => &mut self.source_1_bytes,
+                2 => &mut self.destination_bytes,
+                _ => unreachable!("unknown vector read destination"),
+            };
+            let offset = usize::from(access.buffer_offset);
+            destination[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        }
+        Ok(())
+    }
+
+    pub(super) fn timing_sample(&self) -> C220VectorReadSample {
+        C220VectorReadSample {
+            pc: self.pc,
+            word: self.word,
+            repeat_index: self.repeat_index,
+            lane_group: self.lane_group,
+            tick: self.ready_tick.expect("read sample has a ready tick"),
+            accesses: self.accesses.clone(),
+            read0_grants: self.port0.request.grants().to_vec(),
+            read1_grants: self.port1.request.grants().to_vec(),
+            source_0_bytes: Vec::new(),
+            source_1_bytes: Vec::new(),
+            destination_bytes: Vec::new(),
+            lanes: Vec::new(),
+            conversion_lanes: None,
+            fused_lanes: None,
+            sort_lanes: None,
+            compare_update: None,
+            selection_update: None,
+            reduction_update: None,
+            va_update: None,
+        }
+    }
+
     fn port(&self, port: C220UbPort) -> &ReadPort {
         match port {
             C220UbPort::VectorRead0 => &self.port0,
@@ -464,6 +539,7 @@ pub struct C220VectorReadSample {
     pub read1_grants: Vec<Option<u64>>,
     pub source_0_bytes: Vec<u8>,
     pub source_1_bytes: Vec<u8>,
+    pub destination_bytes: Vec<u8>,
     pub lanes: Vec<C220VectorLaneOutcome>,
     pub conversion_lanes: Option<Vec<C220ConversionLaneOutcome>>,
     pub fused_lanes: Option<Vec<C220FusedLaneOutcome>>,

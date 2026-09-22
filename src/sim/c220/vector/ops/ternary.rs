@@ -427,12 +427,12 @@ mod tests {
             .unwrap()
             .uops()
             .unwrap();
-        assert_eq!(uops.len(), 1);
+        assert_eq!(uops.len(), 2);
         assert!(matches!(
             uops[0].kind,
             crate::sim::c220::vector::timing::C220VectorUopKind::LaneSlice {
                 first_lane: 0,
-                lane_count: 128
+                lane_count: 64
             }
         ));
         assert!(uops.iter().all(|uop| uop.stages.execute_ticks == 11));

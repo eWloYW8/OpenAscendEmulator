@@ -592,21 +592,6 @@ impl PendingVectorRead {
                 )
             }
         };
-        let port0_accesses = accesses
-            .iter()
-            .copied()
-            .filter(|access| access.source_index == 0)
-            .collect::<Vec<_>>();
-        let port1_accesses = accesses
-            .iter()
-            .copied()
-            .filter(|access| access.source_index == 1)
-            .collect::<Vec<_>>();
-        let destination_accesses = accesses
-            .iter()
-            .copied()
-            .filter(|access| access.source_index == 2)
-            .collect::<Vec<_>>();
         let source_0_bytes = vec![
             0;
             if matches!(
@@ -618,13 +603,29 @@ impl PendingVectorRead {
                 C220_VECTOR_TILE_BYTES
             }
         ];
-        let (port0, port1) = if matches!(operation, C220VectorReadOperation::GatherData { .. }) {
-            ReadPort::gather_pair(&accesses)?
-        } else {
-            (
-                ReadPort::new(&port0_accesses)?,
-                ReadPort::new(&port1_accesses)?,
-            )
+        let (port0, port1, destination_port) = match &operation {
+            C220VectorReadOperation::GatherData { .. } => {
+                let (port0, port1) = ReadPort::routed_pair(&accesses, [0, 1, 1])?;
+                (port0, port1, ReadPort::new(&[])?)
+            }
+            C220VectorReadOperation::Ternary { .. } | C220VectorReadOperation::Axpy { .. } => {
+                let (port0, port1) = ReadPort::routed_pair(&accesses, [0, 0, 1])?;
+                (port0, port1, ReadPort::new(&[])?)
+            }
+            _ => {
+                let for_source = |source_index| {
+                    accesses
+                        .iter()
+                        .copied()
+                        .filter(|access| access.source_index == source_index)
+                        .collect::<Vec<_>>()
+                };
+                (
+                    ReadPort::new(&for_source(0))?,
+                    ReadPort::new(&for_source(1))?,
+                    ReadPort::new(&for_source(2))?,
+                )
+            }
         };
         Ok(Self {
             pc,
@@ -639,7 +640,7 @@ impl PendingVectorRead {
             accesses,
             port0,
             port1,
-            destination_port: ReadPort::new(&destination_accesses)?,
+            destination_port,
             source_0_bytes,
             source_1_bytes: vec![0; C220_VECTOR_TILE_BYTES],
             destination_bytes: vec![0; C220_VECTOR_TILE_BYTES],

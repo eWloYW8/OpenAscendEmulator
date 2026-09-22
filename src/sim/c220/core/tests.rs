@@ -764,7 +764,7 @@ fn vector_scalar_s32_and_f32_capture_scalar_and_delay_writeback() {
                 .is_empty()
         );
         assert_eq!(
-            core.vector_pipeline().last_read_samples()[0].lanes[0]
+            core.vector_pipeline().last_functional_samples()[0].lanes[0]
                 .fp32_status
                 .is_some(),
             opcode & 0x00c0_0000 == 0x00c0_0000
@@ -924,7 +924,7 @@ fn vector_scalar_16_bit_forms_use_native_uop_widths_and_preserve_inactive_tail()
         assert_eq!(core.state().ub().read_known(0x282, 2).unwrap(), [0xaa; 2]);
         assert_eq!(core.vector_pipeline().pending_uops(), 0);
         assert_eq!(
-            core.vector_pipeline().last_read_samples()[0].lanes[0]
+            core.vector_pipeline().last_functional_samples()[0].lanes[0]
                 .fp16_status
                 .is_some(),
             is_f16
@@ -1031,7 +1031,7 @@ fn vector_s32_binary_operations_use_delayed_reads_and_captured_saturation() {
             expected.to_le_bytes()
         );
         assert!(
-            core.vector_pipeline().last_read_samples()[0].lanes[0]
+            core.vector_pipeline().last_functional_samples()[0].lanes[0]
                 .fp32_status
                 .is_none()
         );
@@ -1669,12 +1669,17 @@ fn vector_read_samples_ub_after_issue_without_an_implicit_raw_wait() {
     assert_eq!(sample.tick, last_grant + 6);
     assert_eq!(sample.accesses.len(), 8);
     assert!(sample.accesses.iter().all(|access| access.block_index < 4));
-    assert_eq!(&sample.source_0_bytes[..4], &0x4000_0000_u32.to_le_bytes());
-    assert_eq!(&sample.source_1_bytes[..4], &0x3f80_0000_u32.to_le_bytes());
-    assert_eq!(sample.lanes[0].bits, 0x4040_0000);
+    assert!(sample.source_0_bytes.is_empty());
+    assert!(sample.lanes.is_empty());
+    assert!(core.vector_pipeline().last_functional_samples().is_empty());
     assert!(core.state().ub().read_known(0x400, 4).is_err());
     let arithmetic_visible = core.vector_pipeline().pending_visibility_tick().unwrap();
     core.advance_to(arithmetic_visible).unwrap();
+    let sample = &core.vector_pipeline().last_functional_samples()[0];
+    assert_eq!(sample.tick, arithmetic_visible);
+    assert_eq!(&sample.source_0_bytes[..4], &0x4000_0000_u32.to_le_bytes());
+    assert_eq!(&sample.source_1_bytes[..4], &0x3f80_0000_u32.to_le_bytes());
+    assert_eq!(sample.lanes[0].bits, 0x4040_0000);
     assert_eq!(
         core.state().ub().read_known(0x400, 4).unwrap(),
         0x4040_0000_u32.to_le_bytes()

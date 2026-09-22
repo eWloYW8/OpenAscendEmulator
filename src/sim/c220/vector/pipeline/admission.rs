@@ -1,3 +1,4 @@
+use super::functional::FunctionalInstruction;
 use super::hazards::{C220VectorIssueVariant, C220VectorQueueClass};
 use super::{
     C220VectorPipeline, C220VectorPipelineError, PendingReductionUpdate, PendingVectorUop,
@@ -8,6 +9,7 @@ use crate::sim::c220::vector::ops::reduce::{
     C220ReductionState, C220ReductionStateUpdate, C220ReductionValue,
 };
 use crate::sim::c220::vector::read::{C220VectorReadIssue, PendingVectorRead};
+use crate::sim::c220::vector::repeat::{AccumulatorSchedule, OrdinaryReadSchedule};
 use crate::sim::c220::vector::timing::{
     C220VectorTimelineError, C220VectorUop, C220VectorUopKind, C220VectorWritePlan,
 };
@@ -58,6 +60,9 @@ impl C220VectorPipeline {
             }
             .into());
         }
+        let accumulator = compute.and_then(AccumulatorSchedule::from_issue);
+        let ordinary_reads = compute.and_then(OrdinaryReadSchedule::from_issue);
+        let functional = compute.and_then(FunctionalInstruction::from_issue);
         let mut grouped = vec![Vec::new(); uops.len()];
         for &store in stores {
             if !matches!(store.width_bytes, 1 | 2 | 4 | 8) {
@@ -69,6 +74,9 @@ impl C220VectorPipeline {
                 .address
                 .checked_add(u64::from(store.width_bytes))
                 .ok_or(C220VectorPipelineError::StoreAddressOverflow)?;
+            if accumulator.is_some_and(|schedule| !schedule.has_traffic(store.repeat_index)) {
+                continue;
+            }
             let logical_lane = match compute {
                 Some(C220VectorReadIssue::Conversion(issue)) => issue
                     .logical_lane_for_store(&store)
@@ -88,7 +96,7 @@ impl C220VectorPipeline {
             let index = uops
                 .iter()
                 .position(|uop| {
-                    uop.writes_ub
+                    (uop.writes_ub || accumulator.is_some())
                         && uop.repeat_index == store.repeat_index
                         && if matches!(
                             uop.kind,
@@ -105,11 +113,13 @@ impl C220VectorPipeline {
                 .ok_or(C220VectorPipelineError::StoreUopMismatch)?;
             grouped[index].push(store);
         }
-        if uops
-            .iter()
-            .enumerate()
-            .any(|(index, uop)| uop.writes_ub == grouped[index].is_empty())
-        {
+        if uops.iter().enumerate().any(|(index, uop)| {
+            if accumulator.is_some() {
+                uop.lane_group.is_some() == grouped[index].is_empty()
+            } else {
+                uop.writes_ub == grouped[index].is_empty()
+            }
+        }) {
             return Err(C220VectorPipelineError::StoreUopMismatch);
         }
 
@@ -162,16 +172,23 @@ impl C220VectorPipeline {
                 },
             );
             let admission_tick = first_admission.max(next_admission_tick).max(conflict_tick);
+            let issue_gap = accumulator
+                .zip(uop.kind.lane_slice())
+                .map_or(1, |(schedule, (first, lanes))| {
+                    schedule.issue_gap(uop.repeat_index, first, lanes)
+                })
+                .max(self.rules.uop_issue_interval.get());
             next_admission_tick = admission_tick
-                .checked_add(self.rules.uop_issue_interval.get())
+                .checked_add(issue_gap)
                 .ok_or(C220VectorPipelineError::TimeOverflow)?;
             previous_variant = Some(issue_variant);
             previous_admission_tick = Some(admission_tick);
             let synthetic_zero_reduction =
                 reduction_group.is_some_and(|(_, update)| update.is_some());
-            let read = if let Some(issue) = compute
+            let mut read = if let Some(issue) = compute
                 && !shared_read_from_previous
                 && !synthetic_zero_reduction
+                && !(functional.is_some() && uop.lane_group.is_none())
             {
                 Some(PendingVectorRead::new(
                     issue,
@@ -182,7 +199,13 @@ impl C220VectorPipeline {
             } else {
                 None
             };
-            let write = if stores.is_empty() {
+            if let (Some(read), Some(schedule)) = (&mut read, accumulator) {
+                read.configure_accumulator_timing(schedule)?;
+            }
+            if let (Some(read), Some(schedule)) = (&mut read, ordinary_reads) {
+                read.configure_ordinary_timing(schedule)?;
+            }
+            let write = if stores.is_empty() || !uop.writes_ub {
                 None
             } else {
                 let plan = C220VectorWritePlan::from_stores(&stores)?;
@@ -200,6 +223,8 @@ impl C220VectorPipeline {
                 queue_class,
                 admission_tick,
                 admitted: false,
+                issue_gap,
+                deferred_compute: functional.is_some(),
                 stores,
                 read,
                 shared_read_from_previous,
@@ -225,6 +250,12 @@ impl C220VectorPipeline {
             });
         }
         self.next_admission_tick = next_admission_tick;
+        if !uops.is_empty()
+            && let Some(functional) = functional
+        {
+            self.functional_instructions
+                .insert(instruction_group, functional);
+        }
         if !uops.is_empty() {
             self.last_issue_variant = previous_variant;
             self.last_uop_admission_tick = previous_admission_tick;

@@ -9,6 +9,7 @@ use crate::sim::c220::vector::{C220_VECTOR_BLOCK_BYTES, C220_VECTOR_BLOCK_COUNT,
 
 use super::C220VectorUopError;
 use super::instruction::C220VectorInstruction;
+use super::repeat::AccumulatorSchedule;
 
 struct VectorUopInputs {
     pc: u64,
@@ -105,6 +106,41 @@ fn whole_repeat_uops(
         });
     }
     Ok(ensure_vector_uop(pc, uops))
+}
+
+fn accumulator_uops(
+    pc: u64,
+    schedule: AccumulatorSchedule,
+    stages: C220VectorUopStages,
+    plan: &C220VectorWritePlan,
+) -> Vec<C220VectorUop> {
+    let mut uops = Vec::new();
+    for repeat in 0..schedule.repeat_count {
+        if !schedule.has_traffic(repeat) {
+            continue;
+        }
+        let lanes = schedule.lanes_per_uop(repeat);
+        for first in (0..schedule.lane_count).step_by(lanes) {
+            let Some(writeback_ticks) = plan.writeback_ticks_for_lane_slice(repeat, first, lanes)
+            else {
+                continue;
+            };
+            let writes_ub = schedule.writes_destination(repeat);
+            uops.push(C220VectorUop {
+                pc,
+                repeat_index: repeat,
+                lane_group: Some((first / 64) as u8),
+                kind: C220VectorUopKind::LaneSlice {
+                    first_lane: first as u16,
+                    lane_count: lanes as u16,
+                },
+                stages,
+                writeback_ticks: if writes_ub { writeback_ticks } else { 1 },
+                writes_ub,
+            });
+        }
+    }
+    ensure_vector_uop(pc, uops)
 }
 
 impl C220VectorInstruction {
@@ -330,35 +366,29 @@ impl C220VectorInstruction {
             ));
         }
         if let Self::Ternary(step) = self {
-            let lane_count = step.instruction.width.lane_count();
-            let lanes_per_uop = match step.instruction.width {
-                crate::isa::c220::vector::ternary::C220TernaryWidth::F16 => 128,
-                crate::isa::c220::vector::ternary::C220TernaryWidth::F16ToF32
-                | crate::isa::c220::vector::ternary::C220TernaryWidth::F32 => 64,
-            };
             let plan = self.write_plan()?;
-            return Ok(lane_sliced_uops(
+            return Ok(accumulator_uops(
                 step.pc,
-                step.iteration_masks.len(),
-                lane_count,
-                lanes_per_uop,
+                AccumulatorSchedule::new(
+                    step.control,
+                    step.iteration_masks.len(),
+                    step.instruction.width.lane_count(),
+                    true,
+                ),
                 C220VectorUopStages::ternary(step.instruction),
                 &plan,
             ));
         }
         if let Self::Axpy(step) = self {
-            let lane_count = step.instruction.width.lane_count();
-            let lanes_per_uop = match step.instruction.width {
-                crate::isa::c220::vector::axpy::C220AxpyWidth::F16 => 128,
-                crate::isa::c220::vector::axpy::C220AxpyWidth::F16ToF32
-                | crate::isa::c220::vector::axpy::C220AxpyWidth::F32 => 64,
-            };
             let plan = self.write_plan()?;
-            return Ok(lane_sliced_uops(
+            return Ok(accumulator_uops(
                 step.pc,
-                step.iteration_masks.len(),
-                lane_count,
-                lanes_per_uop,
+                AccumulatorSchedule::new(
+                    step.control,
+                    step.iteration_masks.len(),
+                    step.instruction.width.lane_count(),
+                    false,
+                ),
                 C220VectorUopStages::axpy(),
                 &plan,
             ));

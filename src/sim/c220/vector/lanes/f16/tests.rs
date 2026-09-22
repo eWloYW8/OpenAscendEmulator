@@ -181,7 +181,7 @@ fn f16_arithmetic_captures_mode_and_commits_one_native_uop() {
                 expected.to_le_bytes()
             );
         }
-        let samples = core.vector_pipeline().last_read_samples();
+        let samples = core.vector_pipeline().last_functional_samples();
         assert_eq!(samples.len(), 1);
         assert!(samples[0].lanes[0].fp16_status.is_some());
         assert!(samples[0].lanes[64].fp16_status.is_some());
