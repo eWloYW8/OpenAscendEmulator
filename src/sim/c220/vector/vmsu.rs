@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use crate::memory::sparse::MemoryByteState;
 use crate::memory::ub::{UbMemory, UbMemoryError};
+use crate::sim::c220::core::functional::C220FunctionalCore;
 use crate::sim::c220::ub_arbiter::{C220UbCycle, C220UbRequest, C220UbRequestError};
 use crate::sim::c220::vector::C220VectorError;
 use crate::sim::c220::vector::merge::{
@@ -11,8 +12,7 @@ use crate::sim::c220::vector::merge::{
     merge_record_precedes,
 };
 use crate::sim::c220::vector::pipeline::C220VectorTimingRules;
-use crate::sim::machine::ScalarMachineError;
-use crate::sim::mte_stepper::MteCoreStepper;
+use crate::sim::common::scalar::ScalarMachineError;
 
 const RECORD_BYTES: u64 = 8;
 const READ_BATCH_RECORDS: usize = 8;
@@ -244,7 +244,7 @@ impl C220VmsuPipeline {
     pub fn advance_to(
         &mut self,
         tick: u64,
-        core: &mut MteCoreStepper,
+        core: &mut C220FunctionalCore,
     ) -> Result<(), C220VmsuError> {
         if let Some(previous) = self.observed_tick
             && tick < previous

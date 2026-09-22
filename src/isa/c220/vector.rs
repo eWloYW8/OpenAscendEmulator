@@ -307,29 +307,31 @@ impl C220VecArithmeticHint {
     }
 
     pub const fn has_s32_value_path(self) -> bool {
-        self.dtype_selector == 0
-            && matches!(
-                self.operation,
-                C220VecArithmeticOperation::Add
-                    | C220VecArithmeticOperation::Subtract
-                    | C220VecArithmeticOperation::Multiply
-                    | C220VecArithmeticOperation::Maximum
-                    | C220VecArithmeticOperation::Minimum
-            )
+        (self.dtype_selector == 4 && matches!(self.operation, C220VecArithmeticOperation::Rectify))
+            || (self.dtype_selector == 0
+                && matches!(
+                    self.operation,
+                    C220VecArithmeticOperation::Add
+                        | C220VecArithmeticOperation::Subtract
+                        | C220VecArithmeticOperation::Multiply
+                        | C220VecArithmeticOperation::Maximum
+                        | C220VecArithmeticOperation::Minimum
+                ))
     }
 
     pub const fn has_s16_value_path(self) -> bool {
-        self.dtype_selector == 2
-            && matches!(
-                self.operation,
-                C220VecArithmeticOperation::Add
-                    | C220VecArithmeticOperation::Subtract
-                    | C220VecArithmeticOperation::AddRectify
-                    | C220VecArithmeticOperation::SubtractRectify
-                    | C220VecArithmeticOperation::Multiply
-                    | C220VecArithmeticOperation::Maximum
-                    | C220VecArithmeticOperation::Minimum
-            )
+        (self.dtype_selector == 6 && matches!(self.operation, C220VecArithmeticOperation::Absolute))
+            || (self.dtype_selector == 2
+                && matches!(
+                    self.operation,
+                    C220VecArithmeticOperation::Add
+                        | C220VecArithmeticOperation::Subtract
+                        | C220VecArithmeticOperation::AddRectify
+                        | C220VecArithmeticOperation::SubtractRectify
+                        | C220VecArithmeticOperation::Multiply
+                        | C220VecArithmeticOperation::Maximum
+                        | C220VecArithmeticOperation::Minimum
+                ))
     }
 
     pub const fn has_f16_value_path(self) -> bool {

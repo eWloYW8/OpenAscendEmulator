@@ -6,7 +6,7 @@ pub(crate) struct C220OutputToken {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct C220MteState {
+pub(crate) struct C220ExecutionState {
     pub isa_instance_index: u32,
     pub vector_flags: [Option<C220Mte2TransferPlan>; 2],
     pub unsignaled_output: Option<C220OutputToken>,
@@ -17,7 +17,7 @@ pub(crate) struct C220MteState {
     pub mte3_completion_flags: [Option<C220OutputToken>; 4],
 }
 
-impl C220MteState {
+impl C220ExecutionState {
     pub fn barrier_busy(&self) -> bool {
         self.vector_flags.iter().any(Option::is_some)
             || self.output_buffer_busy()

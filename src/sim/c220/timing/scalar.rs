@@ -1,14 +1,15 @@
 use crate::architecture::Architecture;
+use crate::isa::c220::cube::C220CubeInstruction;
 use crate::isa::c220::scalar::C220ScalarConversionHint;
 use crate::isa::c220::vector::{
     C220BroadcastInstruction, C220CopyInstruction, C220MovevInstruction, C220ShiftInstruction,
     C220TransposeInstruction, C220VecArithmeticHint,
 };
 use crate::isa::c220::vector_scalar::C220VectorScalarInstruction;
-use crate::isa::decode::{
-    AicDecoderHint, ScalarKey0Operation, ScalarKey7Operation, ScalarLoadStoreOperation,
+use crate::isa::scalar::{
+    ScalarInstruction, ScalarKey0Operation, ScalarKey7Operation, ScalarLoadStoreOperation,
 };
-use crate::sim::machine::SCALAR_X_REGISTER_COUNT;
+use crate::sim::common::scalar::SCALAR_X_REGISTER_COUNT;
 
 pub const SCALAR_CONVERSION_LATENCY_TICKS: u64 = 2;
 pub const SCALAR_CONVERSION_EXECUTION_STAGE: u8 = 2;
@@ -47,6 +48,13 @@ impl C220ScalarTimingLane {
                     Some(resume_tick.map_or(retire_tick, |prior: u64| prior.max(retire_tick)));
             }
         };
+        if let Some(instruction) = C220CubeInstruction::decode(word) {
+            include(instruction.xd);
+            include(instruction.xn);
+            include(instruction.xm);
+            include(instruction.xt);
+            return resume_tick;
+        }
         if let Some(instruction) = C220VectorScalarInstruction::decode(word) {
             include(instruction.destination_register);
             include(instruction.source_register);
@@ -93,14 +101,18 @@ impl C220ScalarTimingLane {
             include(instruction.control_register);
             return resume_tick;
         }
-        let hint = AicDecoderHint::from_word(Architecture::Dav2201, word)?;
+        if let Some(instruction) = C220ScalarConversionHint::from_word(word) {
+            include(instruction.source_register);
+            return resume_tick;
+        }
+        let hint = ScalarInstruction::from_word(Architecture::Dav2201, word)?;
         match hint {
-            AicDecoderHint::ScalarIndexedLoad {
+            ScalarInstruction::ScalarIndexedLoad {
                 base_register,
                 offset_register,
                 ..
             }
-            | AicDecoderHint::ScalarIndexedImmediateStore {
+            | ScalarInstruction::ScalarIndexedImmediateStore {
                 base_register,
                 offset_register,
                 ..
@@ -108,11 +120,11 @@ impl C220ScalarTimingLane {
                 include(base_register);
                 include(offset_register);
             }
-            AicDecoderHint::ScalarPairLoad { base_register, .. }
-            | AicDecoderHint::ScalarStoreImmediate { base_register, .. } => {
+            ScalarInstruction::ScalarPairLoad { base_register, .. }
+            | ScalarInstruction::ScalarStoreImmediate { base_register, .. } => {
                 include(base_register);
             }
-            AicDecoderHint::ScalarPairStore {
+            ScalarInstruction::ScalarPairStore {
                 first_source_register,
                 second_source_register,
                 base_register,
@@ -122,7 +134,7 @@ impl C220ScalarTimingLane {
                 include(second_source_register);
                 include(base_register);
             }
-            AicDecoderHint::ScalarLoadStoreImmediate {
+            ScalarInstruction::ScalarLoadStoreImmediate {
                 operation,
                 data_register,
                 base_register,
@@ -133,7 +145,7 @@ impl C220ScalarTimingLane {
                     include(data_register);
                 }
             }
-            AicDecoderHint::ScalarKey0 {
+            ScalarInstruction::ScalarKey0 {
                 operation,
                 destination_register,
                 first_source_register,
@@ -146,17 +158,17 @@ impl C220ScalarTimingLane {
                     include(destination_register);
                 }
             }
-            AicDecoderHint::ScalarCompare {
+            ScalarInstruction::ScalarCompare {
                 first_source_register,
                 second_source_register,
                 ..
             }
-            | AicDecoderHint::ScalarCompareRegister {
+            | ScalarInstruction::ScalarCompareRegister {
                 first_source_register,
                 second_source_register,
                 ..
             }
-            | AicDecoderHint::ScalarSelect {
+            | ScalarInstruction::ScalarSelect {
                 first_source_register,
                 second_source_register,
                 ..
@@ -164,46 +176,45 @@ impl C220ScalarTimingLane {
                 include(first_source_register);
                 include(second_source_register);
             }
-            AicDecoderHint::ScalarCompareImmediate {
+            ScalarInstruction::ScalarCompareImmediate {
                 source_register, ..
             }
-            | AicDecoderHint::ScalarKey2MoveRegister {
+            | ScalarInstruction::ScalarKey2MoveRegister {
                 source_register, ..
             }
-            | AicDecoderHint::ScalarKey2Negate {
+            | ScalarInstruction::ScalarKey2Negate {
                 source_register, ..
             }
-            | AicDecoderHint::ScalarKey2Absolute {
+            | ScalarInstruction::ScalarKey2Absolute {
                 source_register, ..
             }
-            | AicDecoderHint::ScalarKey2IntegerSqrt {
+            | ScalarInstruction::ScalarKey2IntegerSqrt {
                 source_register, ..
             }
-            | AicDecoderHint::ScalarKey2BitwiseNot {
+            | ScalarInstruction::ScalarKey2BitwiseNot {
                 source_register, ..
             }
-            | AicDecoderHint::ScalarKey2MoveToSpr {
+            | ScalarInstruction::ScalarKey2MoveToSpr {
                 source_register, ..
             }
-            | AicDecoderHint::ScalarKey2ZeroExtend {
+            | ScalarInstruction::ScalarKey2ZeroExtend {
                 source_register, ..
             }
-            | AicDecoderHint::ScalarKey2SignExtend {
+            | ScalarInstruction::ScalarKey2SignExtend {
                 source_register, ..
             }
-            | AicDecoderHint::ScalarKey2FindFirst {
+            | ScalarInstruction::ScalarKey2FindFirst {
                 source_register, ..
             }
-            | AicDecoderHint::ScalarKey8 {
+            | ScalarInstruction::ScalarKey8 {
                 source_register, ..
             } => include(source_register),
-            AicDecoderHint::C220ScalarConversion(hint) => include(hint.source_register),
-            AicDecoderHint::ScalarKey2ShiftLeft {
+            ScalarInstruction::ScalarKey2ShiftLeft {
                 destination_register,
                 count_register,
                 ..
             }
-            | AicDecoderHint::ScalarKey2ShiftRight {
+            | ScalarInstruction::ScalarKey2ShiftRight {
                 destination_register,
                 count_register,
                 ..
@@ -213,12 +224,12 @@ impl C220ScalarTimingLane {
                     include(register);
                 }
             }
-            AicDecoderHint::ScalarKey2Insert {
+            ScalarInstruction::ScalarKey2Insert {
                 destination_register,
                 source_register,
                 ..
             }
-            | AicDecoderHint::ScalarKey2BitSet {
+            | ScalarInstruction::ScalarKey2BitSet {
                 destination_register,
                 source_register,
                 ..
@@ -226,19 +237,18 @@ impl C220ScalarTimingLane {
                 include(destination_register);
                 include(source_register);
             }
-            AicDecoderHint::ScalarKey2InsertImmediate {
+            ScalarInstruction::ScalarKey2InsertImmediate {
                 destination_register,
                 ..
             } => include(destination_register),
-            AicDecoderHint::ScalarKey7 {
+            ScalarInstruction::ScalarKey7 {
                 operation: ScalarKey7Operation::MoveKeep,
                 destination_register,
                 ..
             } => include(destination_register),
-            AicDecoderHint::ScalarMoveX8Immediate { .. }
-            | AicDecoderHint::ScalarKey2MoveFromSpr { .. }
-            | AicDecoderHint::ScalarKey7 { .. }
-            | AicDecoderHint::C310MovAlignV2 { .. } => {}
+            ScalarInstruction::ScalarMoveX8Immediate { .. }
+            | ScalarInstruction::ScalarKey2MoveFromSpr { .. }
+            | ScalarInstruction::ScalarKey7 { .. } => {}
         }
         resume_tick
     }

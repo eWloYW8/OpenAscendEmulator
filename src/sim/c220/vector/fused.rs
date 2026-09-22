@@ -59,6 +59,14 @@ pub struct C220FusedIssueInputs<'a> {
     pub deq_scale: u16,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct C220FusedValueInputs<'a> {
+    pub issue: &'a C220FusedIssue,
+    pub repeat_index: usize,
+    pub lane_group: u8,
+    pub lane_slice: Option<(usize, usize)>,
+}
+
 impl C220FusedIssue {
     pub fn read_accesses_for_repeat(
         &self,
@@ -250,17 +258,16 @@ fn plan_write_targets(
     Ok(targets)
 }
 
-pub fn evaluate_c220_fused_repeat(
-    issue: &C220FusedIssue,
-    repeat_index: usize,
-    lane_group: u8,
+pub(crate) fn evaluate_c220_fused_repeat(
+    inputs: C220FusedValueInputs<'_>,
     source_0_bytes: &[u8],
     source_1_bytes: &[u8],
     descriptor_bytes: &[u8],
     ub: &UbMemory,
 ) -> Result<(Vec<C220FusedLaneOutcome>, Vec<C220VectorStore>), C220VectorError> {
-    if lane_group >= issue.instruction.lane_groups() {
-        return Err(C220VectorError::InvalidLaneGroup(lane_group));
+    let issue = inputs.issue;
+    if inputs.lane_group >= issue.instruction.lane_groups() {
+        return Err(C220VectorError::InvalidLaneGroup(inputs.lane_group));
     }
     let required_source_bytes =
         issue.instruction.lane_count() * usize::from(issue.instruction.source_element_bytes());
@@ -281,7 +288,7 @@ pub fn evaluate_c220_fused_repeat(
     }
     let mask = issue
         .iteration_masks
-        .get(repeat_index)
+        .get(inputs.repeat_index)
         .ok_or(C220VectorError::MissingMaskState)?;
     let mut lanes = Vec::with_capacity(issue.instruction.lane_count());
     let mut stores = Vec::with_capacity(64);
@@ -296,8 +303,13 @@ pub fn evaluate_c220_fused_repeat(
             lane_index,
             issue.instruction.source_element_bytes(),
         );
-        let active = lane_index / 64 == usize::from(lane_group)
-            && mask[lane_index / 64] & (1_u64 << (lane_index % 64)) != 0;
+        let in_uop = inputs.lane_slice.map_or_else(
+            || lane_index / 64 == usize::from(inputs.lane_group),
+            |(first_lane, lane_count)| {
+                lane_index >= first_lane && lane_index < first_lane + lane_count
+            },
+        );
+        let active = in_uop && mask[lane_index / 64] & (1_u64 << (lane_index % 64)) != 0;
         if !active {
             lanes.push(C220FusedLaneOutcome {
                 active,
@@ -315,13 +327,13 @@ pub fn evaluate_c220_fused_repeat(
         let address = vector_destination_address_for_width(
             issue.control,
             issue.addresses,
-            repeat_index,
+            inputs.repeat_index,
             lane_index,
             width,
         )?;
         ub.check_range(address, usize::from(width))?;
         stores.push(C220VectorStore {
-            repeat_index,
+            repeat_index: inputs.repeat_index,
             lane_index,
             address,
             bank: C220UbBank::from_address(address),

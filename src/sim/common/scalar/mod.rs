@@ -1,32 +1,25 @@
 use crate::architecture::Architecture;
-use crate::isa::c220::vector::C220MovemaskHint;
-use crate::isa::c310::vector::C310ObservedMovemaskHint;
-use crate::isa::decode::{
-    AicClass, AicDecoderHint, ScalarKey0Operation, ScalarKey7Operation, ScalarKey8Operation,
+use crate::isa::class::AicClass;
+use crate::isa::flow::{
+    ConditionalJump, ConditionalJumpTarget, DcciInstruction, DcciStep, DsbStep, FlowEnd, FlowNop,
+    JumpCompare, JumpCompareError, JumpCompareTarget, JumpTarget, PipelineBarrierStep,
+    UnconditionalJump, compare_values,
+};
+use crate::isa::scalar::{
+    ScalarInstruction, ScalarKey0Operation, ScalarKey7Operation, ScalarKey8Operation,
     ScalarLoadStoreOperation, ScalarStoreImmediateValue,
 };
-use crate::isa::flow::{
-    C310BufferInstruction, C310BufferStep, ConditionalJump, ConditionalJumpTarget, DcciInstruction,
-    DcciStep, DsbStep, FlowEnd, FlowNop, JumpCompare, JumpCompareError, JumpCompareTarget,
-    JumpTarget, PipelineBarrierStep, UnconditionalJump, compare_values,
-};
-use crate::sim::c220::scalar::execute_scalar_conversion;
-use crate::sim::c310::buffer::C310BufferDisposition;
-use crate::sim::c310::predicate_buffer::{
-    C310PushPbDisposition, C310PushPbInstruction, C310PushPbStep,
-};
-use crate::sim::c310::vector::C310ObservedMovemaskStep;
-use crate::sim::c310::vector_queue::{
-    C310VfQueueDisposition, C310VfQueueInstruction, C310VfQueueStep,
-};
-use crate::sim::scalar_integer::{
+use crate::sim::common::scalar::alu::{
     ScalarIntegerError, evaluate_scalar_integer_immediate, update_neg_overflow_spr2,
     update_overflow_spr2,
 };
 use thiserror::Error;
 
+pub(crate) mod alu;
+pub(crate) mod bus;
 mod integer;
 mod memory;
+pub(crate) mod stepper;
 
 pub const SCALAR_X_REGISTER_COUNT: usize = 32;
 const SCALAR_SPR_SNAPSHOT_CAPACITY: usize = 243;
@@ -99,8 +92,6 @@ pub enum ScalarInstructionStep {
     IndexedImmediateStore(ScalarIndexedImmediateStoreStep),
     Flow(ScalarFlowStep),
     CacheHint(ScalarCacheHintStep),
-    C220Movemask(C220MovemaskStep),
-    C310Movemask(C310ObservedMovemaskStep),
     Compare(ScalarCompareStep),
     CompareRegister(ScalarCompareRegisterStep),
     CompareImmediate(ScalarCompareImmediateStep),
@@ -108,19 +99,6 @@ pub enum ScalarInstructionStep {
     Dcci(DcciStep),
     Dsb(DsbStep),
     Barrier(PipelineBarrierStep),
-    Buffer(C310BufferStep),
-    PushPb(C310PushPbStep),
-    VfQueue(C310VfQueueStep),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220MovemaskStep {
-    pub pc: u64,
-    pub word: u32,
-    pub source_register: u8,
-    pub source_value: u64,
-    pub destination_spr: u16,
-    pub prior_destination_value: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,27 +149,6 @@ pub trait ScalarMemoryBus {
 
     fn synchronize_barrier(&mut self, _step: PipelineBarrierStep) -> Result<bool, Self::Error> {
         Ok(false)
-    }
-
-    fn execute_c310_buffer(
-        &mut self,
-        _step: C310BufferStep,
-    ) -> Result<C310BufferDisposition, Self::Error> {
-        Ok(C310BufferDisposition::Unsupported)
-    }
-
-    fn execute_c310_push_pb(
-        &mut self,
-        _step: C310PushPbStep,
-    ) -> Result<C310PushPbDisposition, Self::Error> {
-        Ok(C310PushPbDisposition::Unsupported)
-    }
-
-    fn enqueue_c310_vf(
-        &mut self,
-        _step: C310VfQueueStep,
-    ) -> Result<C310VfQueueDisposition, Self::Error> {
-        Ok(C310VfQueueDisposition::Unsupported)
     }
 }
 
@@ -378,34 +335,6 @@ pub enum ScalarInstructionError<E: std::error::Error + 'static> {
     SynchronizationUnsupported { pc: u64, word: u32 },
     #[error("pipeline synchronization backend failed: {0}")]
     SynchronizationBackend(#[source] E),
-    #[error("buffer instruction {word:#010x} at PC {pc:#x} is not supported by this backend")]
-    BufferUnsupported { pc: u64, word: u32 },
-    #[error("buffer instruction {word:#010x} at PC {pc:#x} stalled")]
-    BufferStalled { pc: u64, word: u32 },
-    #[error("buffer instruction backend failed: {0}")]
-    BufferBackend(#[source] E),
-    #[error("predicate-buffer push {word:#010x} at PC {pc:#x} is not supported by this backend")]
-    PushPbUnsupported { pc: u64, word: u32 },
-    #[error("predicate-buffer push {word:#010x} at PC {pc:#x} stalled")]
-    PushPbStalled { pc: u64, word: u32 },
-    #[error("predicate-buffer backend failed: {0}")]
-    PushPbBackend(#[source] E),
-    #[error(
-        "vector queue words {first_word:#010x}/{second_word:#010x} at PC {pc:#x} are not supported by this backend"
-    )]
-    VfQueueUnsupported {
-        pc: u64,
-        first_word: u32,
-        second_word: u32,
-    },
-    #[error("vector queue words {first_word:#010x}/{second_word:#010x} at PC {pc:#x} stalled")]
-    VfQueueStalled {
-        pc: u64,
-        first_word: u32,
-        second_word: u32,
-    },
-    #[error("vector queue backend failed: {0}")]
-    VfQueueBackend(#[source] E),
     #[error("scalar program already ended before PC {pc:#x}")]
     ProgramEnded { pc: u64 },
 }
@@ -429,41 +358,6 @@ pub enum ScalarMachineError {
 }
 
 impl ScalarMachine {
-    pub fn enqueue_c310_vf<B: ScalarMemoryBus>(
-        &mut self,
-        pc: u64,
-        first_word: u32,
-        second_word: u32,
-        bus: &mut B,
-    ) -> Result<ScalarInstructionStep, ScalarInstructionError<B::Error>> {
-        let instruction =
-            C310VfQueueInstruction::decode(self.architecture, first_word, second_word).ok_or(
-                ScalarMachineError::UnsupportedWord {
-                    pc,
-                    word: first_word,
-                },
-            )?;
-        let step = instruction.resolve(pc, &self.xregs);
-        match bus
-            .enqueue_c310_vf(step)
-            .map_err(ScalarInstructionError::VfQueueBackend)?
-        {
-            C310VfQueueDisposition::Accepted => Ok(ScalarInstructionStep::VfQueue(step)),
-            C310VfQueueDisposition::Stalled => Err(ScalarInstructionError::VfQueueStalled {
-                pc,
-                first_word,
-                second_word,
-            }),
-            C310VfQueueDisposition::Unsupported => {
-                Err(ScalarInstructionError::VfQueueUnsupported {
-                    pc,
-                    first_word,
-                    second_word,
-                })
-            }
-        }
-    }
-
     pub const fn new(
         architecture: Architecture,
         xregs: [u64; SCALAR_X_REGISTER_COUNT],
@@ -567,67 +461,17 @@ impl ScalarMachine {
         Ok(())
     }
 
-    pub fn execute_c220_movemask_word(
-        &mut self,
-        pc: u64,
-        word: u32,
-    ) -> Result<C220MovemaskStep, ScalarMachineError> {
-        if self.architecture != Architecture::Dav2201 {
-            return Err(ScalarMachineError::UnsupportedWord { pc, word });
-        }
-        let hint = C220MovemaskHint::from_word(word)
-            .ok_or(ScalarMachineError::UnsupportedWord { pc, word })?;
-        let source_value = self.xregs[usize::from(hint.source_register)];
-        let prior_destination_value = self.spr_value(hint.destination_spr);
-        self.set_spr_value(hint.destination_spr, source_value)?;
-        Ok(C220MovemaskStep {
-            pc,
-            word,
-            source_register: hint.source_register,
-            source_value,
-            destination_spr: hint.destination_spr,
-            prior_destination_value,
-        })
-    }
-
-    pub fn execute_c310_movemask_word(
-        &mut self,
-        pc: u64,
-        word: u32,
-    ) -> Result<C310ObservedMovemaskStep, ScalarMachineError> {
-        if self.architecture != Architecture::Dav3510 {
-            return Err(ScalarMachineError::UnsupportedWord { pc, word });
-        }
-        let hint = C310ObservedMovemaskHint::from_word(word)
-            .ok_or(ScalarMachineError::UnsupportedWord { pc, word })?;
-        let prior_value = self.spr_value(hint.destination_spr).ok_or(
-            ScalarMachineError::SprValueUnavailable {
-                pc,
-                spr: hint.destination_spr,
-            },
-        )?;
-        let value = self.xregs[usize::from(hint.source_x_register)];
-        self.set_spr_value(hint.destination_spr, value)?;
-        Ok(C310ObservedMovemaskStep {
-            pc,
-            word,
-            hint,
-            prior_value,
-            value,
-        })
-    }
-
     pub fn execute_compare_word(
         &mut self,
         pc: u64,
         word: u32,
     ) -> Result<ScalarCompareStep, ScalarMachineError> {
-        let Some(AicDecoderHint::ScalarCompare {
+        let Some(ScalarInstruction::ScalarCompare {
             dtype_field,
             condition_field,
             first_source_register,
             second_source_register,
-        }) = AicDecoderHint::from_word(self.architecture, word)
+        }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMachineError::UnsupportedWord { pc, word });
         };
@@ -662,13 +506,13 @@ impl ScalarMachine {
         pc: u64,
         word: u32,
     ) -> Result<ScalarCompareRegisterStep, ScalarMachineError> {
-        let Some(AicDecoderHint::ScalarCompareRegister {
+        let Some(ScalarInstruction::ScalarCompareRegister {
             dtype_field,
             condition_field,
             destination_register,
             first_source_register,
             second_source_register,
-        }) = AicDecoderHint::from_word(self.architecture, word)
+        }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMachineError::UnsupportedWord { pc, word });
         };
@@ -705,11 +549,11 @@ impl ScalarMachine {
         pc: u64,
         word: u32,
     ) -> Result<ScalarCompareImmediateStep, ScalarMachineError> {
-        let Some(AicDecoderHint::ScalarCompareImmediate {
+        let Some(ScalarInstruction::ScalarCompareImmediate {
             condition_field,
             source_register,
             encoded_immediate,
-        }) = AicDecoderHint::from_word(self.architecture, word)
+        }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMachineError::UnsupportedWord { pc, word });
         };
@@ -747,12 +591,12 @@ impl ScalarMachine {
         pc: u64,
         word: u32,
     ) -> Result<ScalarSelectStep, ScalarMachineError> {
-        let Some(AicDecoderHint::ScalarSelect {
+        let Some(ScalarInstruction::ScalarSelect {
             dtype_field,
             destination_register,
             first_source_register,
             second_source_register,
-        }) = AicDecoderHint::from_word(self.architecture, word)
+        }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMachineError::UnsupportedWord { pc, word });
         };
@@ -788,11 +632,11 @@ impl ScalarMachine {
         pc: u64,
         word: u32,
     ) -> Result<ScalarSprReadStep, ScalarMachineError> {
-        let Some(AicDecoderHint::ScalarKey2MoveFromSpr {
+        let Some(ScalarInstruction::ScalarKey2MoveFromSpr {
             destination_register,
             encoded_source_spr,
             ..
-        }) = AicDecoderHint::from_word(self.architecture, word)
+        }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMachineError::UnsupportedWord { pc, word });
         };
@@ -847,11 +691,11 @@ impl ScalarMachine {
         pc: u64,
         word: u32,
     ) -> Result<ScalarSprStep, ScalarMachineError> {
-        let Some(AicDecoderHint::ScalarKey2MoveToSpr {
+        let Some(ScalarInstruction::ScalarKey2MoveToSpr {
             encoded_destination_spr,
             source_register,
             ..
-        }) = AicDecoderHint::from_word(self.architecture, word)
+        }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMachineError::UnsupportedWord { pc, word });
         };
@@ -905,13 +749,13 @@ impl ScalarMachine {
         pc: u64,
         word: u32,
     ) -> Result<ScalarCacheHintStep, ScalarMachineError> {
-        let Some(AicDecoderHint::ScalarKey8 {
+        let Some(ScalarInstruction::ScalarKey8 {
             operation: ScalarKey8Operation::DcPreload,
             destination_register: None,
             source_register,
             encoded_immediate,
             ..
-        }) = AicDecoderHint::from_word(self.architecture, word)
+        }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMachineError::UnsupportedWord { pc, word });
         };
@@ -964,36 +808,6 @@ impl ScalarMachine {
         word: u32,
         bus: &mut B,
     ) -> Result<ScalarInstructionStep, ScalarInstructionError<B::Error>> {
-        if let Some(instruction) = C310PushPbInstruction::decode(self.architecture, word) {
-            let step = instruction.resolve(pc, &self.xregs);
-            return match bus
-                .execute_c310_push_pb(step)
-                .map_err(ScalarInstructionError::PushPbBackend)?
-            {
-                C310PushPbDisposition::Accepted => Ok(ScalarInstructionStep::PushPb(step)),
-                C310PushPbDisposition::Stalled => {
-                    Err(ScalarInstructionError::PushPbStalled { pc, word })
-                }
-                C310PushPbDisposition::Unsupported => {
-                    Err(ScalarInstructionError::PushPbUnsupported { pc, word })
-                }
-            };
-        }
-        if let Some(instruction) = C310BufferInstruction::decode(self.architecture, word) {
-            let step = instruction.resolve(pc, &self.xregs);
-            return match bus
-                .execute_c310_buffer(step)
-                .map_err(ScalarInstructionError::BufferBackend)?
-            {
-                C310BufferDisposition::Accepted => Ok(ScalarInstructionStep::Buffer(step)),
-                C310BufferDisposition::Stalled => {
-                    Err(ScalarInstructionError::BufferStalled { pc, word })
-                }
-                C310BufferDisposition::Unsupported => {
-                    Err(ScalarInstructionError::BufferUnsupported { pc, word })
-                }
-            };
-        }
         if matches!(AicClass::from_word(word), AicClass::FlowControl) {
             if let Some(step) = PipelineBarrierStep::decode(self.architecture, pc, word) {
                 if !bus
@@ -1027,68 +841,55 @@ impl ScalarMachine {
                 self.execute_flow_word(pc, word)?,
             ));
         }
-        if self.architecture == Architecture::Dav2201 && C220MovemaskHint::from_word(word).is_some()
-        {
-            return Ok(ScalarInstructionStep::C220Movemask(
-                self.execute_c220_movemask_word(pc, word)?,
-            ));
-        }
-        if self.architecture == Architecture::Dav3510
-            && C310ObservedMovemaskHint::from_word(word).is_some()
-        {
-            return Ok(ScalarInstructionStep::C310Movemask(
-                self.execute_c310_movemask_word(pc, word)?,
-            ));
-        }
-        match AicDecoderHint::from_word(self.architecture, word) {
-            Some(AicDecoderHint::ScalarCompare { .. }) => Ok(ScalarInstructionStep::Compare(
+        match ScalarInstruction::from_word(self.architecture, word) {
+            Some(ScalarInstruction::ScalarCompare { .. }) => Ok(ScalarInstructionStep::Compare(
                 self.execute_compare_word(pc, word)?,
             )),
-            Some(AicDecoderHint::ScalarCompareRegister { .. }) => {
+            Some(ScalarInstruction::ScalarCompareRegister { .. }) => {
                 Ok(ScalarInstructionStep::CompareRegister(
                     self.execute_compare_register_word(pc, word)?,
                 ))
             }
-            Some(AicDecoderHint::ScalarCompareImmediate { .. }) => {
+            Some(ScalarInstruction::ScalarCompareImmediate { .. }) => {
                 Ok(ScalarInstructionStep::CompareImmediate(
                     self.execute_compare_immediate_word(pc, word)?,
                 ))
             }
-            Some(AicDecoderHint::ScalarSelect { .. }) => Ok(ScalarInstructionStep::Select(
+            Some(ScalarInstruction::ScalarSelect { .. }) => Ok(ScalarInstructionStep::Select(
                 self.execute_select_word(pc, word)?,
             )),
-            Some(AicDecoderHint::ScalarPairLoad { .. }) => Ok(ScalarInstructionStep::PairLoad(
+            Some(ScalarInstruction::ScalarPairLoad { .. }) => Ok(ScalarInstructionStep::PairLoad(
                 self.execute_pair_load_word(pc, word, bus)?,
             )),
-            Some(AicDecoderHint::ScalarPairStore { .. }) => Ok(ScalarInstructionStep::PairStore(
-                self.execute_pair_store_word(pc, word, bus)?,
-            )),
-            Some(AicDecoderHint::ScalarIndexedLoad { .. }) => Ok(
+            Some(ScalarInstruction::ScalarPairStore { .. }) => Ok(
+                ScalarInstructionStep::PairStore(self.execute_pair_store_word(pc, word, bus)?),
+            ),
+            Some(ScalarInstruction::ScalarIndexedLoad { .. }) => Ok(
                 ScalarInstructionStep::IndexedLoad(self.execute_indexed_load_word(pc, word, bus)?),
             ),
-            Some(AicDecoderHint::ScalarIndexedImmediateStore { .. }) => {
+            Some(ScalarInstruction::ScalarIndexedImmediateStore { .. }) => {
                 Ok(ScalarInstructionStep::IndexedImmediateStore(
                     self.execute_indexed_immediate_store_word(pc, word, bus)?,
                 ))
             }
-            Some(AicDecoderHint::ScalarKey8 {
+            Some(ScalarInstruction::ScalarKey8 {
                 operation: ScalarKey8Operation::DcPreload,
                 ..
             }) => Ok(ScalarInstructionStep::CacheHint(
                 self.execute_cache_hint_word(pc, word)?,
             )),
-            Some(AicDecoderHint::ScalarLoadStoreImmediate { .. }) => Ok(
+            Some(ScalarInstruction::ScalarLoadStoreImmediate { .. }) => Ok(
                 ScalarInstructionStep::Memory(self.execute_memory_word(pc, word, bus)?),
             ),
-            Some(AicDecoderHint::ScalarStoreImmediate { .. }) => {
+            Some(ScalarInstruction::ScalarStoreImmediate { .. }) => {
                 Ok(ScalarInstructionStep::ImmediateStore(
                     self.execute_immediate_store_word(pc, word, bus)?,
                 ))
             }
-            Some(AicDecoderHint::ScalarKey2MoveFromSpr { .. }) => Ok(
+            Some(ScalarInstruction::ScalarKey2MoveFromSpr { .. }) => Ok(
                 ScalarInstructionStep::SprRead(self.execute_spr_read_word(pc, word)?),
             ),
-            Some(AicDecoderHint::ScalarKey2MoveToSpr { .. }) => Ok(
+            Some(ScalarInstruction::ScalarKey2MoveToSpr { .. }) => Ok(
                 ScalarInstructionStep::SprWrite(self.execute_spr_word(pc, word)?),
             ),
             _ => Ok(ScalarInstructionStep::Register(
@@ -1115,5 +916,5 @@ fn evaluate_integer_compare(
 }
 
 #[cfg(test)]
-#[path = "machine/tests.rs"]
+#[path = "tests.rs"]
 mod tests;

@@ -25,6 +25,7 @@ pub(super) struct C220F16ValueInputs {
     pub addresses: C220VectorAddresses,
     pub repeat_index: usize,
     pub lane_group: u8,
+    pub lane_slice: Option<(usize, usize)>,
     pub mask: [u64; 4],
     pub mode: C220Fp16Mode,
 }
@@ -52,8 +53,13 @@ pub(super) fn evaluate_c220_f16_repeat_from_bytes(
     let mut lanes = Vec::with_capacity(C220_VECTOR_TILE_BYTES / 2);
     let mut stores = Vec::with_capacity(64);
     for lane_index in 0..C220_VECTOR_TILE_BYTES / 2 {
-        let active = lane_index / 64 == usize::from(inputs.lane_group)
-            && inputs.mask[lane_index / 64] & (1_u64 << (lane_index % 64)) != 0;
+        let in_uop = inputs.lane_slice.map_or_else(
+            || lane_index / 64 == usize::from(inputs.lane_group),
+            |(first_lane, lane_count)| {
+                lane_index >= first_lane && lane_index < first_lane + lane_count
+            },
+        );
+        let active = in_uop && inputs.mask[lane_index / 64] & (1_u64 << (lane_index % 64)) != 0;
         if !active {
             lanes.push(C220F16LaneOutcome {
                 active: false,

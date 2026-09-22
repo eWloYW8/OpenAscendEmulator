@@ -89,7 +89,7 @@ impl HbmPvMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::machine::ScalarMemoryBus;
+    use crate::sim::common::scalar::ScalarMemoryBus;
 
     #[test]
     fn scalar_bus_uses_one_live_hbm_allocation() {

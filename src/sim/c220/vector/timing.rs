@@ -36,6 +36,20 @@ impl C220VectorUopStages {
         }
     }
 
+    pub const fn control() -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: 1,
+        }
+    }
+
+    pub const fn no_effect() -> Self {
+        Self {
+            read_ticks: 6,
+            execute_ticks: 1,
+        }
+    }
+
     pub const fn movev(instruction: C220MovevInstruction) -> Option<Self> {
         if instruction.supported_element_bytes().is_none() {
             return None;
@@ -77,12 +91,14 @@ impl C220VectorUopStages {
             })
         } else if hint.has_s32_value_path() || hint.has_s16_value_path() {
             let execute_ticks = match hint.operation {
+                C220VecArithmeticOperation::Absolute => 1,
                 C220VecArithmeticOperation::Add
                 | C220VecArithmeticOperation::Subtract
                 | C220VecArithmeticOperation::AddRectify
                 | C220VecArithmeticOperation::SubtractRectify
                 | C220VecArithmeticOperation::Maximum
-                | C220VecArithmeticOperation::Minimum => 5,
+                | C220VecArithmeticOperation::Minimum
+                | C220VecArithmeticOperation::Rectify => 5,
                 C220VecArithmeticOperation::Multiply => 6,
                 _ => return None,
             };
@@ -193,6 +209,7 @@ impl C220VectorUopStages {
     pub const fn reduction(instruction: C220ReductionInstruction) -> Self {
         let execute_ticks = match (instruction.kind, instruction.width) {
             (C220ReductionKind::WholeAdd { .. }, C220ReductionWidth::F16) => 24,
+            (C220ReductionKind::WholeAdd { .. }, C220ReductionWidth::S16) => 24,
             (C220ReductionKind::WholeAdd { .. }, C220ReductionWidth::F32) => 21,
             (
                 C220ReductionKind::WholeExtremum {
@@ -210,6 +227,13 @@ impl C220VectorUopStages {
             ) => 9,
             (
                 C220ReductionKind::WholeExtremum {
+                    operation: C220ExtremumOperation::Maximum,
+                    ..
+                },
+                C220ReductionWidth::S16,
+            ) => 11,
+            (
+                C220ReductionKind::WholeExtremum {
                     operation: C220ExtremumOperation::Minimum,
                     ..
                 },
@@ -222,7 +246,15 @@ impl C220VectorUopStages {
                 },
                 C220ReductionWidth::F32,
             ) => 9,
+            (
+                C220ReductionKind::WholeExtremum {
+                    operation: C220ExtremumOperation::Minimum,
+                    ..
+                },
+                C220ReductionWidth::S16,
+            ) => 11,
             (C220ReductionKind::GroupAdd, C220ReductionWidth::F16) => 16,
+            (C220ReductionKind::GroupAdd, C220ReductionWidth::S16) => 16,
             (C220ReductionKind::GroupAdd, C220ReductionWidth::F32) => 13,
             (
                 C220ReductionKind::GroupExtremum {
@@ -238,6 +270,12 @@ impl C220VectorUopStages {
             ) => 6,
             (
                 C220ReductionKind::GroupExtremum {
+                    operation: C220ExtremumOperation::Maximum,
+                },
+                C220ReductionWidth::S16,
+            ) => 7,
+            (
+                C220ReductionKind::GroupExtremum {
                     operation: C220ExtremumOperation::Minimum,
                 },
                 C220ReductionWidth::F16,
@@ -248,6 +286,12 @@ impl C220VectorUopStages {
                 },
                 C220ReductionWidth::F32,
             ) => 6,
+            (
+                C220ReductionKind::GroupExtremum {
+                    operation: C220ExtremumOperation::Minimum,
+                },
+                C220ReductionWidth::S16,
+            ) => 7,
             (C220ReductionKind::PairAdd, _) => 7,
         };
         Self {
@@ -323,8 +367,36 @@ impl C220VectorUopStages {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220VectorUopKind {
     Ordinary,
+    LaneSlice { first_lane: u16, lane_count: u16 },
+    MoveVa,
     GatherIndex { group: u8 },
     GatherData { group: u8 },
+}
+
+impl C220VectorUopKind {
+    pub const fn contains_lane(self, lane: usize, lane_group: Option<u8>) -> bool {
+        match self {
+            Self::LaneSlice {
+                first_lane,
+                lane_count,
+            } => lane >= first_lane as usize && lane < first_lane as usize + lane_count as usize,
+            Self::GatherData { group } => lane / 16 == group as usize,
+            _ => match lane_group {
+                Some(group) => lane / 64 == group as usize,
+                None => true,
+            },
+        }
+    }
+
+    pub const fn lane_slice(self) -> Option<(usize, usize)> {
+        match self {
+            Self::LaneSlice {
+                first_lane,
+                lane_count,
+            } => Some((first_lane as usize, lane_count as usize)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,20 +578,42 @@ impl C220VectorWritePlan {
         self.writeback_ticks_matching(repeat_index, Some(lane_group))
     }
 
+    pub fn writeback_ticks_for_lane_slice(
+        &self,
+        repeat_index: usize,
+        first_lane: usize,
+        lane_count: usize,
+    ) -> Option<usize> {
+        let end_lane = first_lane.checked_add(lane_count)?;
+        self.writeback_ticks_filtered(repeat_index, |block| {
+            let block_first = usize::from(block.block_index)
+                * (C220_VECTOR_BLOCK_BYTES / usize::from(block.element_bytes));
+            block_first >= first_lane && block_first < end_lane
+        })
+    }
+
     fn writeback_ticks_matching(
         &self,
         repeat_index: usize,
         lane_group: Option<u8>,
     ) -> Option<usize> {
+        self.writeback_ticks_filtered(repeat_index, |block| {
+            let first_lane = usize::from(block.block_index)
+                * (C220_VECTOR_BLOCK_BYTES / usize::from(block.element_bytes));
+            lane_group.is_none_or(|group| first_lane / 64 == usize::from(group))
+        })
+    }
+
+    fn writeback_ticks_filtered(
+        &self,
+        repeat_index: usize,
+        include: impl Fn(&C220VectorWriteBlock) -> bool,
+    ) -> Option<usize> {
         let blocks = self
             .blocks
             .iter()
             .filter(|block| block.repeat_index == repeat_index)
-            .filter(|block| {
-                let first_lane = usize::from(block.block_index)
-                    * (C220_VECTOR_BLOCK_BYTES / usize::from(block.element_bytes));
-                lane_group.is_none_or(|group| first_lane / 64 == usize::from(group))
-            })
+            .filter(|block| include(block))
             .collect::<Vec<_>>();
         if blocks.is_empty() {
             return None;

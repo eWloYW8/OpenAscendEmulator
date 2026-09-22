@@ -66,6 +66,14 @@ pub struct C220ConversionIssueInputs<'a> {
     pub deq_scale: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct C220ConversionValueInputs<'a> {
+    pub issue: &'a C220ConversionIssue,
+    pub repeat_index: usize,
+    pub lane_group: u8,
+    pub lane_slice: Option<(usize, usize)>,
+}
+
 impl C220ConversionIssue {
     pub fn read_accesses_for_repeat(
         &self,
@@ -314,16 +322,15 @@ fn packed_destination_address(
         })
 }
 
-pub fn evaluate_c220_conversion_repeat(
-    issue: &C220ConversionIssue,
-    repeat_index: usize,
-    lane_group: u8,
+pub(crate) fn evaluate_c220_conversion_repeat(
+    inputs: C220ConversionValueInputs<'_>,
     source_bytes: &[u8],
     deq_bytes: &[u8],
     ub: &UbMemory,
 ) -> Result<(Vec<C220ConversionLaneOutcome>, Vec<C220VectorStore>), C220VectorError> {
-    if lane_group >= issue.instruction.lane_groups() {
-        return Err(C220VectorError::InvalidLaneGroup(lane_group));
+    let issue = inputs.issue;
+    if inputs.lane_group >= issue.instruction.lane_groups() {
+        return Err(C220VectorError::InvalidLaneGroup(inputs.lane_group));
     }
     if source_bytes.len() < issue.instruction.source_bytes_per_repeat() {
         return Err(C220VectorError::InvalidSourceTile {
@@ -343,7 +350,7 @@ pub fn evaluate_c220_conversion_repeat(
     }
     let mask = issue
         .iteration_masks
-        .get(repeat_index)
+        .get(inputs.repeat_index)
         .ok_or(C220VectorError::MissingMaskState)?;
     let lane_count = issue.instruction.lane_count();
     let mut lanes = Vec::with_capacity(lane_count);
@@ -353,8 +360,13 @@ pub fn evaluate_c220_conversion_repeat(
             source_bytes,
             lane_index,
         );
-        let active = lane_index / 64 == usize::from(lane_group)
-            && mask[lane_index / 64] & (1_u64 << (lane_index % 64)) != 0;
+        let in_uop = inputs.lane_slice.map_or_else(
+            || lane_index / 64 == usize::from(inputs.lane_group),
+            |(first_lane, lane_count)| {
+                lane_index >= first_lane && lane_index < first_lane + lane_count
+            },
+        );
+        let active = in_uop && mask[lane_index / 64] & (1_u64 << (lane_index % 64)) != 0;
         if active {
             let (result_bits, status) = convert_lane(issue, lane_index, source_bits, deq_bytes);
             lanes.push(C220ConversionLaneOutcome {
@@ -373,9 +385,17 @@ pub fn evaluate_c220_conversion_repeat(
         }
     }
     let stores = if issue.instruction.kind.destination_type() == C220ConversionType::S4 {
-        packed_stores(issue, repeat_index, lane_group, mask, &lanes, ub)?
+        packed_stores(
+            issue,
+            inputs.repeat_index,
+            inputs.lane_group,
+            inputs.lane_slice,
+            mask,
+            &lanes,
+            ub,
+        )?
     } else {
-        ordinary_stores(issue, repeat_index, &lanes, ub)?
+        ordinary_stores(issue, inputs.repeat_index, &lanes, ub)?
     };
     Ok((lanes, stores))
 }
@@ -422,12 +442,16 @@ fn packed_stores(
     issue: &C220ConversionIssue,
     repeat_index: usize,
     lane_group: u8,
+    lane_slice: Option<(usize, usize)>,
     mask: &[u64; 4],
     lanes: &[C220ConversionLaneOutcome],
     ub: &UbMemory,
 ) -> Result<Vec<C220VectorStore>, C220VectorError> {
-    let first_byte = usize::from(lane_group) * 32;
-    let last_byte = (first_byte + 32).min(issue.instruction.lane_count().div_ceil(2));
+    let (first_lane, lane_count) = lane_slice.unwrap_or((usize::from(lane_group) * 64, 64));
+    let first_byte = first_lane / 2;
+    let last_byte = (first_lane + lane_count)
+        .div_ceil(2)
+        .min(issue.instruction.lane_count().div_ceil(2));
     let mut stores = Vec::new();
     for byte_index in first_byte..last_byte {
         let first_lane = byte_index * 2;

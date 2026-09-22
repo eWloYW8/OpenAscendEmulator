@@ -5,17 +5,17 @@ use crate::memory::mapped::MappedMemory;
 use crate::memory::region::MemoryRegion;
 use crate::memory::sparse::{MemoryByteState, SparseMemory};
 use crate::memory::ub::UbMemory;
+use crate::sim::c220::core::functional::C220FunctionalCore;
 use crate::sim::c220::core::{C220Core, C220CoreInstruction, C220CoreStep, C220CoreTimingRules};
 use crate::sim::c220::fp16::C220Fp16Mode;
 use crate::sim::c220::timing::mte2::C220Mte2TimingRules;
 use crate::sim::c220::timing::mte3::C220Mte3TimingRules;
 use crate::sim::c220::vector::pipeline::C220VectorTimingRules;
-use crate::sim::machine::ScalarMachine;
-use crate::sim::mte_stepper::MteCoreStepper;
-use crate::sim::stepper::ScalarStepper;
+use crate::sim::common::scalar::ScalarMachine;
+use crate::sim::common::scalar::stepper::ScalarStepper;
 
 #[test]
-fn f16_arithmetic_captures_mode_and_commits_both_lane_groups() {
+fn f16_arithmetic_captures_mode_and_commits_one_native_uop() {
     for (opcode, first, second, expected, mode, execute_ticks) in [
         (0x9440_0000, 0xbc00, 0x3800, 0, C220Fp16Mode::Saturating, 7),
         (
@@ -128,7 +128,7 @@ fn f16_arithmetic_captures_mode_and_commits_both_lane_groups() {
             ub.write_states(offset + 0x200, &[MemoryByteState::Known(0xaa); 32])
                 .unwrap();
         }
-        let execution = MteCoreStepper::new(ScalarStepper::new(machine, 0x4000), ub);
+        let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
         let rate = NonZeroU64::new(32).unwrap();
         let mut core = C220Core::new(
             execution,
@@ -166,7 +166,7 @@ fn f16_arithmetic_captures_mode_and_commits_both_lane_groups() {
         let uops = C220CoreInstruction::VectorArithmetic(issue)
             .vector_uops()
             .unwrap();
-        assert_eq!(uops.len(), 2);
+        assert_eq!(uops.len(), 1);
         assert!(
             uops.iter()
                 .all(|uop| uop.stages.execute_ticks == execute_ticks)
@@ -174,13 +174,13 @@ fn f16_arithmetic_captures_mode_and_commits_both_lane_groups() {
         core.advance_to(100).unwrap();
         for address in [0x200, 0x280] {
             assert_eq!(
-                core.execution().core().ub().read_known(address, 2).unwrap(),
+                core.functional().ub().read_known(address, 2).unwrap(),
                 expected.to_le_bytes()
             );
         }
         let samples = core.vector_pipeline().last_read_samples();
-        assert_eq!(samples.len(), 2);
+        assert_eq!(samples.len(), 1);
         assert!(samples[0].lanes[0].fp16_status.is_some());
-        assert!(samples[1].lanes[64].fp16_status.is_some());
+        assert!(samples[0].lanes[64].fp16_status.is_some());
     }
 }

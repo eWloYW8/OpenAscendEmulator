@@ -2,7 +2,7 @@ use super::*;
 
 impl ScalarMachine {
     pub fn execute_word(&mut self, pc: u64, word: u32) -> Result<ScalarStep, ScalarMachineError> {
-        let hint = AicDecoderHint::from_word(self.architecture, word)
+        let hint = ScalarInstruction::from_word(self.architecture, word)
             .ok_or(ScalarMachineError::UnsupportedWord { pc, word })?;
         let (
             destination_register,
@@ -14,7 +14,7 @@ impl ScalarMachine {
             signed_overflow,
             spr2,
         ) = match hint {
-            AicDecoderHint::ScalarMoveX8Immediate {
+            ScalarInstruction::ScalarMoveX8Immediate {
                 destination_register,
                 encoded_immediate,
                 ..
@@ -28,7 +28,7 @@ impl ScalarMachine {
                 false,
                 self.spr2,
             ),
-            AicDecoderHint::ScalarKey0 {
+            ScalarInstruction::ScalarKey0 {
                 operation,
                 dtype_field,
                 destination_register,
@@ -138,7 +138,7 @@ impl ScalarMachine {
                     update_overflow_spr2(self.spr2, pc, signed_overflow),
                 )
             }
-            AicDecoderHint::ScalarKey2ShiftLeft {
+            ScalarInstruction::ScalarKey2ShiftLeft {
                 dtype_field,
                 destination_register,
                 count_register,
@@ -171,7 +171,7 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
-            AicDecoderHint::ScalarKey2ShiftRight {
+            ScalarInstruction::ScalarKey2ShiftRight {
                 dtype_field,
                 destination_register,
                 count_register,
@@ -209,7 +209,7 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
-            AicDecoderHint::ScalarKey2FindFirst {
+            ScalarInstruction::ScalarKey2FindFirst {
                 destination_register,
                 source_register,
                 find_set,
@@ -236,7 +236,7 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
-            AicDecoderHint::ScalarKey2MoveRegister {
+            ScalarInstruction::ScalarKey2MoveRegister {
                 destination_register,
                 source_register,
                 ..
@@ -258,32 +258,7 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
-            AicDecoderHint::C220ScalarConversion(hint) => {
-                let destination_register = hint.destination_register;
-                let source_register = hint.source_register;
-                let Some(&source_value) = self.xregs.get(usize::from(source_register)) else {
-                    return Err(ScalarMachineError::UnsupportedWord { pc, word });
-                };
-                if self.xregs.get(usize::from(destination_register)).is_none() {
-                    return Err(ScalarMachineError::UnsupportedWord { pc, word });
-                }
-                let spr3 = self
-                    .spr_value(3)
-                    .ok_or(ScalarMachineError::SprValueUnavailable { pc, spr: 3 })?;
-                let outcome =
-                    execute_scalar_conversion(hint.conversion, source_value, spr3, self.spr2, pc);
-                (
-                    destination_register,
-                    Some(source_register),
-                    Some(source_value),
-                    None,
-                    None,
-                    outcome.value,
-                    false,
-                    outcome.spr2,
-                )
-            }
-            AicDecoderHint::ScalarKey2Negate {
+            ScalarInstruction::ScalarKey2Negate {
                 dtype_field,
                 destination_register,
                 source_register,
@@ -310,7 +285,7 @@ impl ScalarMachine {
                     update_neg_overflow_spr2(self.architecture, self.spr2, pc, signed_overflow),
                 )
             }
-            AicDecoderHint::ScalarKey2Absolute {
+            ScalarInstruction::ScalarKey2Absolute {
                 dtype_field,
                 destination_register,
                 source_register,
@@ -339,7 +314,7 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
-            AicDecoderHint::ScalarKey2IntegerSqrt {
+            ScalarInstruction::ScalarKey2IntegerSqrt {
                 dtype_field,
                 destination_register,
                 source_register,
@@ -364,7 +339,7 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
-            AicDecoderHint::ScalarKey2BitwiseNot {
+            ScalarInstruction::ScalarKey2BitwiseNot {
                 dtype_field,
                 destination_register,
                 source_register,
@@ -389,7 +364,7 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
-            AicDecoderHint::ScalarKey2ZeroExtend {
+            ScalarInstruction::ScalarKey2ZeroExtend {
                 width,
                 destination_register,
                 source_register,
@@ -412,7 +387,7 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
-            AicDecoderHint::ScalarKey2SignExtend {
+            ScalarInstruction::ScalarKey2SignExtend {
                 width_bits,
                 destination_register,
                 source_register,
@@ -435,7 +410,7 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
-            AicDecoderHint::ScalarKey2Insert {
+            ScalarInstruction::ScalarKey2Insert {
                 destination_register,
                 source_register,
                 least_significant_bit,
@@ -463,7 +438,7 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
-            AicDecoderHint::ScalarKey2InsertImmediate {
+            ScalarInstruction::ScalarKey2InsertImmediate {
                 destination_register,
                 position,
                 immediate,
@@ -493,7 +468,7 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
-            AicDecoderHint::ScalarKey2BitSet {
+            ScalarInstruction::ScalarKey2BitSet {
                 destination_register,
                 source_register,
                 set_bit,
@@ -517,7 +492,7 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
-            AicDecoderHint::ScalarKey7 {
+            ScalarInstruction::ScalarKey7 {
                 operation,
                 destination_register,
                 encoded_immediate,
@@ -546,7 +521,7 @@ impl ScalarMachine {
                     self.spr2,
                 )
             }
-            AicDecoderHint::ScalarKey8 {
+            ScalarInstruction::ScalarKey8 {
                 source_register,
                 destination_register: Some(_),
                 ..

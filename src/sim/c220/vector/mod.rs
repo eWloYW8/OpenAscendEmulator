@@ -18,6 +18,7 @@ mod f16;
 mod fma;
 pub mod fused;
 pub mod gather;
+pub mod load_va;
 pub mod merge;
 mod movev;
 pub mod nchw;
@@ -32,7 +33,6 @@ pub mod shift;
 pub mod sort;
 pub mod special;
 mod special_tables;
-mod stepper;
 pub mod ternary;
 pub mod timing;
 pub mod transpose;
@@ -217,6 +217,8 @@ pub enum C220VectorError {
     MissingSelectionMask,
     #[error("C220 VA{register}[{index}] has not been initialized")]
     MissingVaEntry { register: u8, index: u8 },
+    #[error("C220 VA register {0} is out of range")]
+    InvalidVaRegister(u8),
     #[error("C220 vector repeat index {0} is out of range")]
     InvalidRepeatIndex(usize),
     #[error("C220 vector source tile has {actual} bytes, expected {expected}")]

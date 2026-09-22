@@ -8,7 +8,7 @@ impl ScalarMachine {
         bus: &mut B,
     ) -> Result<ScalarMemoryStep, ScalarMemoryExecutionError<B::Error>> {
         let Some(
-            hint @ AicDecoderHint::ScalarLoadStoreImmediate {
+            hint @ ScalarInstruction::ScalarLoadStoreImmediate {
                 operation,
                 width_bytes,
                 data_register,
@@ -17,7 +17,7 @@ impl ScalarMachine {
                 sign_extend,
                 ..
             },
-        ) = AicDecoderHint::from_word(self.architecture, word)
+        ) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
         };
@@ -87,12 +87,12 @@ impl ScalarMachine {
         word: u32,
         bus: &mut B,
     ) -> Result<ScalarIndexedLoadStep, ScalarMemoryExecutionError<B::Error>> {
-        let Some(AicDecoderHint::ScalarIndexedLoad {
+        let Some(ScalarInstruction::ScalarIndexedLoad {
             width_bytes,
             destination_register,
             base_register,
             offset_register,
-        }) = AicDecoderHint::from_word(self.architecture, word)
+        }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
         };
@@ -127,12 +127,12 @@ impl ScalarMachine {
         word: u32,
         bus: &mut B,
     ) -> Result<ScalarIndexedImmediateStoreStep, ScalarMemoryExecutionError<B::Error>> {
-        let Some(AicDecoderHint::ScalarIndexedImmediateStore {
+        let Some(ScalarInstruction::ScalarIndexedImmediateStore {
             width_bytes,
             base_register,
             offset_register,
             value,
-        }) = AicDecoderHint::from_word(self.architecture, word)
+        }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
         };
@@ -167,14 +167,14 @@ impl ScalarMachine {
         word: u32,
         bus: &mut B,
     ) -> Result<ScalarImmediateStoreStep, ScalarMemoryExecutionError<B::Error>> {
-        let Some(AicDecoderHint::ScalarStoreImmediate {
+        let Some(ScalarInstruction::ScalarStoreImmediate {
             width_bytes,
             base_register,
             signed_offset,
             post_index: false,
             value,
             ..
-        }) = AicDecoderHint::from_word(self.architecture, word)
+        }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
         };
@@ -206,7 +206,7 @@ impl ScalarMachine {
         word: u32,
         bus: &mut B,
     ) -> Result<ScalarPairLoadStep, ScalarMemoryExecutionError<B::Error>> {
-        let Some(AicDecoderHint::ScalarPairLoad {
+        let Some(ScalarInstruction::ScalarPairLoad {
             width_bytes,
             first_destination_register,
             second_destination_register,
@@ -214,7 +214,7 @@ impl ScalarMachine {
             signed_offset,
             sign_extend,
             ..
-        }) = AicDecoderHint::from_word(self.architecture, word)
+        }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
         };
@@ -269,14 +269,14 @@ impl ScalarMachine {
         word: u32,
         bus: &mut B,
     ) -> Result<ScalarPairStoreStep, ScalarMemoryExecutionError<B::Error>> {
-        let Some(AicDecoderHint::ScalarPairStore {
+        let Some(ScalarInstruction::ScalarPairStore {
             width_bytes,
             first_source_register,
             second_source_register,
             base_register,
             signed_offset,
             ..
-        }) = AicDecoderHint::from_word(self.architecture, word)
+        }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
         };

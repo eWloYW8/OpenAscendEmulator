@@ -1,8 +1,5 @@
 use thiserror::Error;
 
-use crate::architecture::Architecture;
-use crate::isa::decode::AicDecoderHint;
-
 pub const MAX_C310_MOV_ALIGN_COORDINATES: usize = 4096;
 
 #[cfg(test)]
@@ -24,11 +21,42 @@ pub struct C310MovAlignRegisterSelectors {
     pub stride: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct C310MovAlignInstruction {
+    pub word: u32,
+    pub direction_field: u8,
+    pub dtype_field: u8,
+    pub source_memory_class: u8,
+    pub destination_memory_class: u8,
+}
+
+impl C310MovAlignInstruction {
+    pub const fn from_word(word: u32) -> Option<Self> {
+        if word >> 29 != 3 || ((word >> 27) & 3) != 2 || ((word >> 24) & 7) != 4 {
+            return None;
+        }
+        let direction_field = ((word >> 22) & 3) as u8;
+        let (source_memory_class, destination_memory_class) = match direction_field {
+            0 => (10, 8),
+            1 => (8, 10),
+            2 => (10, 9),
+            _ => (9, 10),
+        };
+        Some(Self {
+            word,
+            direction_field,
+            dtype_field: (word & 3) as u8,
+            source_memory_class,
+            destination_memory_class,
+        })
+    }
+}
+
 impl C310MovAlignRegisterSelectors {
     pub fn from_hbm_to_ub_word(word: u32) -> Result<Self, C310MovAlignError> {
         if !matches!(
-            AicDecoderHint::from_word(Architecture::Dav3510, word),
-            Some(AicDecoderHint::C310MovAlignV2 {
+            C310MovAlignInstruction::from_word(word),
+            Some(C310MovAlignInstruction {
                 source_memory_class: 10,
                 destination_memory_class: 9,
                 dtype_field: 0 | 2,

@@ -6,9 +6,11 @@ use thiserror::Error;
 use crate::architecture::Architecture;
 use crate::isa::flow::{FlagInstruction, FlagOperation};
 use crate::memory::mapped::MappedMemory;
+use crate::sim::c220::core::functional::{
+    C220FunctionalCore, C220FunctionalError, C220MteAction, C220MteProgramStep,
+};
 use crate::sim::c220::mte::transfer::C220Mte2TransferPlan;
 use crate::sim::c220::mte::uop::{C220DmaUopError, C220DmaUopRequest, mte2_requests};
-use crate::sim::mte_stepper::{MteAction, MteCoreStepper, MteProgramStep, MteStepperError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220Mte2TimingRules {
@@ -38,11 +40,15 @@ impl C220Mte2Ticket {
 pub enum C220StallCause {
     InstructionRate,
     ScalarDependency,
+    Mte1IssueRate,
+    Mte1Dependency,
+    HardwareFlagDependency,
     Mte2IssueRate,
     Mte2Dependency,
     Mte3IssueRate,
     Mte3Dependency,
     VectorDependency,
+    CubeDependency,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,10 +60,10 @@ pub struct C220Stall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum C220TimedMte2Step {
+pub enum C220Mte2Step {
     Executed {
         tick: u64,
-        step: MteProgramStep,
+        step: C220MteProgramStep,
         ticket: Option<C220Mte2Ticket>,
     },
     Stalled(C220Stall),
@@ -76,12 +82,11 @@ pub enum C220TimingError {
     #[error(transparent)]
     Uop(#[from] C220DmaUopError),
     #[error(transparent)]
-    Execute(#[from] MteStepperError),
+    Execute(#[from] C220FunctionalError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct C220TimedMte2Core {
-    core: MteCoreStepper,
+pub struct C220Mte2Pipeline {
     rules: C220Mte2TimingRules,
     last_tick: Option<u64>,
     next_instruction_tick: u64,
@@ -91,13 +96,9 @@ pub struct C220TimedMte2Core {
     vector_flags: [Option<C220Mte2Ticket>; 2],
 }
 
-impl C220TimedMte2Core {
-    pub fn new(core: MteCoreStepper, rules: C220Mte2TimingRules) -> Result<Self, C220TimingError> {
-        if core.scalar().machine().architecture() != Architecture::Dav2201 {
-            return Err(C220TimingError::ArchitectureMismatch);
-        }
-        Ok(Self {
-            core,
+impl C220Mte2Pipeline {
+    pub const fn new(rules: C220Mte2TimingRules) -> Self {
+        Self {
             rules,
             last_tick: None,
             next_instruction_tick: 0,
@@ -105,20 +106,13 @@ impl C220TimedMte2Core {
             mte2_data_port_tick: 0,
             unsignaled: VecDeque::new(),
             vector_flags: [None; 2],
-        })
-    }
-
-    pub const fn core(&self) -> &MteCoreStepper {
-        &self.core
-    }
-
-    pub(crate) fn core_mut(&mut self) -> &mut MteCoreStepper {
-        &mut self.core
+        }
     }
 
     pub(crate) fn gate_other_at(
         &mut self,
         tick: u64,
+        pc: u64,
     ) -> Result<Option<C220Stall>, C220TimingError> {
         if let Some(previous) = self.last_tick
             && tick < previous
@@ -132,7 +126,7 @@ impl C220TimedMte2Core {
         if tick < self.next_instruction_tick {
             return Ok(Some(C220Stall {
                 tick,
-                pc: self.core.scalar().pc(),
+                pc,
                 resume_tick: self.next_instruction_tick,
                 cause: C220StallCause::InstructionRate,
             }));
@@ -167,9 +161,10 @@ impl C220TimedMte2Core {
     pub fn step_at(
         &mut self,
         tick: u64,
+        core: &mut C220FunctionalCore,
         word: u32,
         source: &MappedMemory,
-    ) -> Result<C220TimedMte2Step, C220TimingError> {
+    ) -> Result<C220Mte2Step, C220TimingError> {
         if let Some(previous) = self.last_tick
             && tick < previous
         {
@@ -179,9 +174,9 @@ impl C220TimedMte2Core {
             });
         }
         self.last_tick = Some(tick);
-        let pc = self.core.scalar().pc();
+        let pc = core.scalar().pc();
         if tick < self.next_instruction_tick {
-            return Ok(C220TimedMte2Step::Stalled(C220Stall {
+            return Ok(C220Mte2Step::Stalled(C220Stall {
                 tick,
                 pc,
                 resume_tick: self.next_instruction_tick,
@@ -197,13 +192,13 @@ impl C220TimedMte2Core {
             )
         });
         let wait_ready_tick = match route {
-            Some((4, 0, FlagOperation::Wait)) if self.core.flag0_set() => self
+            Some((4, 0, FlagOperation::Wait)) if core.flag0_set() => self
                 .unsignaled
                 .iter()
                 .map(|ticket| ticket.retire_tick)
                 .max(),
             Some((4, 1, FlagOperation::Wait)) => {
-                let flag_id = self.core.resolve_c220_vector_flag_id(pc, word)?;
+                let flag_id = core.resolve_c220_vector_flag_id(pc, word)?;
                 self.vector_flags[usize::from(flag_id)].map(|ticket| ticket.retire_tick)
             }
             _ => None,
@@ -211,7 +206,7 @@ impl C220TimedMte2Core {
         if let Some(resume_tick) = wait_ready_tick
             && tick < resume_tick
         {
-            return Ok(C220TimedMte2Step::Stalled(C220Stall {
+            return Ok(C220Mte2Step::Stalled(C220Stall {
                 tick,
                 pc,
                 resume_tick,
@@ -221,14 +216,14 @@ impl C220TimedMte2Core {
 
         let transfer = if is_mte2_transfer(word) {
             if tick < self.next_mte2_issue_tick {
-                return Ok(C220TimedMte2Step::Stalled(C220Stall {
+                return Ok(C220Mte2Step::Stalled(C220Stall {
                     tick,
                     pc,
                     resume_tick: self.next_mte2_issue_tick,
                     cause: C220StallCause::Mte2IssueRate,
                 }));
             }
-            Some(self.core.preview_c220_mte2_transfer(word)?)
+            Some(core.preview_c220_mte2_transfer(word)?)
         } else {
             None
         };
@@ -236,9 +231,9 @@ impl C220TimedMte2Core {
             .map(|plan| self.preview_ticket(tick, plan))
             .transpose()?;
         let next_instruction_tick = tick.checked_add(1).ok_or(C220TimingError::TimeOverflow)?;
-        let step = self.core.step_c220_mte_word(word, source, transfer)?;
+        let step = core.step_mte_word_with_plan(word, source, transfer)?;
         match &step.action {
-            MteAction::Issue {
+            C220MteAction::Issue {
                 source_address,
                 destination_address,
                 planned_bytes,
@@ -257,21 +252,21 @@ impl C220TimedMte2Core {
                     .ok_or(C220TimingError::TimeOverflow)?;
                 self.unsignaled.push_back(issued);
             }
-            MteAction::SetVectorFlag { flag_id, .. } => {
+            C220MteAction::SetVectorFlag { flag_id, .. } => {
                 let issued = self
                     .unsignaled
                     .pop_front()
                     .ok_or(C220TimingError::TicketMismatch)?;
                 self.vector_flags[usize::from(*flag_id)] = Some(issued);
             }
-            MteAction::WaitVectorFlag { flag_id, .. } => {
+            C220MteAction::WaitVectorFlag { flag_id, .. } => {
                 self.vector_flags[usize::from(*flag_id)] = None;
             }
-            MteAction::WaitFlag { .. } => self.unsignaled.clear(),
-            MteAction::SetFlag { .. } => {}
+            C220MteAction::WaitFlag { .. } => self.unsignaled.clear(),
+            C220MteAction::SetFlag { .. } => {}
         }
         self.next_instruction_tick = next_instruction_tick;
-        Ok(C220TimedMte2Step::Executed { tick, step, ticket })
+        Ok(C220Mte2Step::Executed { tick, step, ticket })
     }
 
     fn preview_ticket(
@@ -321,9 +316,6 @@ pub(crate) fn is_mte2_transfer(word: u32) -> bool {
 mod tests {
     use super::*;
     use crate::isa::c220::mte::{C220MovOutToUbDescriptor, CAPTURED_C220_MOV_OUT_TO_UB_X_WORD};
-    use crate::memory::ub::UbMemory;
-    use crate::sim::machine::ScalarMachine;
-    use crate::sim::stepper::ScalarStepper;
 
     fn transfer(burst_length: u16) -> C220Mte2TransferPlan {
         let descriptor = C220MovOutToUbDescriptor::decode(
@@ -342,17 +334,13 @@ mod tests {
 
     #[test]
     fn c220_timeline_separates_issue_service_and_retirement() {
-        let core = MteCoreStepper::new(
-            ScalarStepper::new(ScalarMachine::new(Architecture::Dav2201, [0; 32], 0), 0x100),
-            UbMemory::new(4096, 4096),
-        );
         let rules = C220Mte2TimingRules {
             issue_interval: NonZeroU64::new(2).unwrap(),
             startup_ticks: 3,
             bytes_per_tick: NonZeroU64::new(32).unwrap(),
             retire_ticks: 1,
         };
-        let mut timed = C220TimedMte2Core::new(core, rules).unwrap();
+        let mut timed = C220Mte2Pipeline::new(rules);
         let first = timed.preview_ticket(5, transfer(2)).unwrap();
         assert_eq!((first.data_ready_tick, first.retire_tick), (10, 11));
         assert_eq!(first.transfer.descriptor_segments().unwrap().len(), 2);
@@ -370,17 +358,13 @@ mod tests {
 
     #[test]
     fn split_requests_each_consume_a_service_quantum() {
-        let core = MteCoreStepper::new(
-            ScalarStepper::new(ScalarMachine::new(Architecture::Dav2201, [0; 32], 0), 0x100),
-            UbMemory::new(4096, 4096),
-        );
         let rules = C220Mte2TimingRules {
             issue_interval: NonZeroU64::new(1).unwrap(),
             startup_ticks: 0,
             bytes_per_tick: NonZeroU64::new(64).unwrap(),
             retire_ticks: 0,
         };
-        let timed = C220TimedMte2Core::new(core, rules).unwrap();
+        let timed = C220Mte2Pipeline::new(rules);
         let mut plan = transfer(1);
         plan.descriptor = C220MovOutToUbDescriptor::decode(
             CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,

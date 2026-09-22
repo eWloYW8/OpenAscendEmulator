@@ -1,4 +1,3 @@
-use super::*;
 use crate::architecture::Architecture;
 use crate::isa::c220::axpy::C220AxpyInstruction;
 use crate::isa::c220::conversion::C220ConversionInstruction;
@@ -16,8 +15,9 @@ use crate::isa::c220::vector::{
 use crate::isa::c220::vector_scalar::C220VectorScalarInstruction;
 use crate::isa::flow::FlagInstruction;
 use crate::memory::sparse::MemoryByteState;
+use crate::sim::c220::core::functional::state::C220OutputToken;
+use crate::sim::c220::core::functional::{C220FunctionalCore, C220FunctionalError};
 use crate::sim::c220::fp16::C220Fp16Mode;
-use crate::sim::c220::mte::state::C220OutputToken;
 use crate::sim::c220::vector::axpy::{C220AxpyIssue, C220AxpyIssueInputs, plan_c220_axpy_issue};
 use crate::sim::c220::vector::broadcast::{C220BroadcastIssue, plan_c220_broadcast_issue};
 use crate::sim::c220::vector::conversion::{
@@ -40,12 +40,11 @@ use crate::sim::c220::vector::ternary::{C220TernaryIssue, plan_c220_ternary_issu
 use crate::sim::c220::vector::transpose::{C220TransposeIssue, plan_c220_transpose_issue};
 use crate::sim::c220::vector::{
     C220_VECTOR_TILE_BYTES, C220Fp32Step, C220MovevStep, C220VectorAddresses,
-    C220VectorArithmeticIssue, C220VectorArithmeticModes, C220VectorControl, C220VectorStore,
-    decode_c220_fp32_control, decode_c220_movev_control, decode_c220_repeat_masks,
+    C220VectorArithmeticIssue, C220VectorArithmeticModes, C220VectorControl, C220VectorError,
+    C220VectorStore, decode_c220_fp32_control, decode_c220_movev_control, decode_c220_repeat_masks,
     decode_c220_vector_unary_control, execute_c220_fp32_to_ub, plan_c220_movev_to_ub,
     plan_c220_vector_arithmetic_issue, write_c220_movev_to_ub,
 };
-use crate::sim::mte_stepper::{MteCoreStepper, MteStepperError};
 
 struct ResolvedC220VectorArithmetic {
     pc: u64,
@@ -62,43 +61,44 @@ struct ResolvedC220UnaryVector {
     iteration_masks: Vec<[u64; 4]>,
 }
 
-impl MteCoreStepper {
+impl C220FunctionalCore {
     pub(crate) fn preview_c220_merge_word(
         &self,
         word: u32,
-    ) -> Result<C220MergeIssue, MteStepperError> {
+    ) -> Result<C220MergeIssue, C220FunctionalError> {
         let pc = self.scalar.pc();
         if self.scalar.is_halted() {
-            return Err(MteStepperError::ProgramEnded { pc });
+            return Err(C220FunctionalError::ProgramEnded { pc });
         }
         let machine = self.scalar.machine();
         if machine.architecture() != Architecture::Dav2201 {
-            return Err(MteStepperError::UnsupportedWord { pc, word });
+            return Err(C220FunctionalError::UnsupportedWord { pc, word });
         }
-        if self.c220.output_buffer_busy() {
-            return Err(MteStepperError::OutputDependencyOutstanding);
+        if self.state.output_buffer_busy() {
+            return Err(C220FunctionalError::OutputDependencyOutstanding);
         }
-        C220MergeInstruction::decode(word).ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+        C220MergeInstruction::decode(word)
+            .ok_or(C220FunctionalError::UnsupportedWord { pc, word })?;
         Ok(plan_c220_merge_issue(pc, word, machine.xregs(), &self.ub)?)
     }
 
     pub(crate) fn preview_c220_sort_word(
         &self,
         word: u32,
-    ) -> Result<C220SortIssue, MteStepperError> {
+    ) -> Result<C220SortIssue, C220FunctionalError> {
         let pc = self.scalar.pc();
         if self.scalar.is_halted() {
-            return Err(MteStepperError::ProgramEnded { pc });
+            return Err(C220FunctionalError::ProgramEnded { pc });
         }
         let machine = self.scalar.machine();
         if machine.architecture() != Architecture::Dav2201 {
-            return Err(MteStepperError::UnsupportedWord { pc, word });
+            return Err(C220FunctionalError::UnsupportedWord { pc, word });
         }
-        if self.c220.output_buffer_busy() {
-            return Err(MteStepperError::OutputDependencyOutstanding);
+        if self.state.output_buffer_busy() {
+            return Err(C220FunctionalError::OutputDependencyOutstanding);
         }
         let instruction = C220SortInstruction::decode(word)
-            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+            .ok_or(C220FunctionalError::UnsupportedWord { pc, word })?;
         let registers = machine.xregs();
         Ok(plan_c220_sort_issue(
             pc,
@@ -116,20 +116,20 @@ impl MteCoreStepper {
     pub(crate) fn preview_c220_fused_word(
         &self,
         word: u32,
-    ) -> Result<C220FusedIssue, MteStepperError> {
+    ) -> Result<C220FusedIssue, C220FunctionalError> {
         let pc = self.scalar.pc();
         if self.scalar.is_halted() {
-            return Err(MteStepperError::ProgramEnded { pc });
+            return Err(C220FunctionalError::ProgramEnded { pc });
         }
         let machine = self.scalar.machine();
         if machine.architecture() != Architecture::Dav2201 {
-            return Err(MteStepperError::UnsupportedWord { pc, word });
+            return Err(C220FunctionalError::UnsupportedWord { pc, word });
         }
-        if self.c220.output_buffer_busy() {
-            return Err(MteStepperError::OutputDependencyOutstanding);
+        if self.state.output_buffer_busy() {
+            return Err(C220FunctionalError::OutputDependencyOutstanding);
         }
         let instruction = C220FusedInstruction::decode(word)
-            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+            .ok_or(C220FunctionalError::UnsupportedWord { pc, word })?;
         let xregs = machine.xregs();
         let mask_control = machine
             .spr_value(3)
@@ -171,20 +171,20 @@ impl MteCoreStepper {
     pub(crate) fn preview_c220_conversion_word(
         &self,
         word: u32,
-    ) -> Result<C220ConversionIssue, MteStepperError> {
+    ) -> Result<C220ConversionIssue, C220FunctionalError> {
         let pc = self.scalar.pc();
         if self.scalar.is_halted() {
-            return Err(MteStepperError::ProgramEnded { pc });
+            return Err(C220FunctionalError::ProgramEnded { pc });
         }
         let machine = self.scalar.machine();
         if machine.architecture() != Architecture::Dav2201 {
-            return Err(MteStepperError::UnsupportedWord { pc, word });
+            return Err(C220FunctionalError::UnsupportedWord { pc, word });
         }
-        if self.c220.output_buffer_busy() {
-            return Err(MteStepperError::OutputDependencyOutstanding);
+        if self.state.output_buffer_busy() {
+            return Err(C220FunctionalError::OutputDependencyOutstanding);
         }
         let instruction = C220ConversionInstruction::decode(word)
-            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+            .ok_or(C220FunctionalError::UnsupportedWord { pc, word })?;
         let xregs = machine.xregs();
         let mask_control = machine
             .spr_value(3)
@@ -225,12 +225,13 @@ impl MteCoreStepper {
     pub(crate) fn preview_c220_special_unary_word(
         &self,
         word: u32,
-    ) -> Result<C220SpecialUnaryIssue, MteStepperError> {
-        let instruction =
-            C220SpecialUnaryInstruction::decode(word).ok_or(MteStepperError::UnsupportedWord {
+    ) -> Result<C220SpecialUnaryIssue, C220FunctionalError> {
+        let instruction = C220SpecialUnaryInstruction::decode(word).ok_or(
+            C220FunctionalError::UnsupportedWord {
                 pc: self.scalar.pc(),
                 word,
-            })?;
+            },
+        )?;
         let resolved = self.resolve_c220_unary_vector(
             word,
             instruction.destination_register,
@@ -253,9 +254,9 @@ impl MteCoreStepper {
     pub(crate) fn preview_c220_axpy_word(
         &self,
         word: u32,
-    ) -> Result<C220AxpyIssue, MteStepperError> {
+    ) -> Result<C220AxpyIssue, C220FunctionalError> {
         let instruction =
-            C220AxpyInstruction::decode(word).ok_or(MteStepperError::UnsupportedWord {
+            C220AxpyInstruction::decode(word).ok_or(C220FunctionalError::UnsupportedWord {
                 pc: self.scalar.pc(),
                 word,
             })?;
@@ -285,19 +286,19 @@ impl MteCoreStepper {
     pub(crate) fn preview_c220_gather_word(
         &self,
         word: u32,
-    ) -> Result<C220GatherIssue, MteStepperError> {
+    ) -> Result<C220GatherIssue, C220FunctionalError> {
         let pc = self.scalar.pc();
         if self.scalar.is_halted() {
-            return Err(MteStepperError::ProgramEnded { pc });
+            return Err(C220FunctionalError::ProgramEnded { pc });
         }
         if self.scalar.machine().architecture() != Architecture::Dav2201 {
-            return Err(MteStepperError::UnsupportedWord { pc, word });
+            return Err(C220FunctionalError::UnsupportedWord { pc, word });
         }
-        if self.c220.output_buffer_busy() {
-            return Err(MteStepperError::OutputDependencyOutstanding);
+        if self.state.output_buffer_busy() {
+            return Err(C220FunctionalError::OutputDependencyOutstanding);
         }
         let instruction = C220GatherInstruction::decode(word)
-            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+            .ok_or(C220FunctionalError::UnsupportedWord { pc, word })?;
         let machine = self.scalar.machine();
         let registers = machine.xregs();
         let control_value = registers[usize::from(instruction.control_register)];
@@ -331,19 +332,19 @@ impl MteCoreStepper {
     pub(crate) fn preview_c220_ternary_word(
         &self,
         word: u32,
-    ) -> Result<C220TernaryIssue, MteStepperError> {
+    ) -> Result<C220TernaryIssue, C220FunctionalError> {
         let pc = self.scalar.pc();
         if self.scalar.is_halted() {
-            return Err(MteStepperError::ProgramEnded { pc });
+            return Err(C220FunctionalError::ProgramEnded { pc });
         }
         if self.scalar.machine().architecture() != Architecture::Dav2201 {
-            return Err(MteStepperError::UnsupportedWord { pc, word });
+            return Err(C220FunctionalError::UnsupportedWord { pc, word });
         }
-        if self.c220.output_buffer_busy() {
-            return Err(MteStepperError::OutputDependencyOutstanding);
+        if self.state.output_buffer_busy() {
+            return Err(C220FunctionalError::OutputDependencyOutstanding);
         }
         let instruction = C220TernaryInstruction::decode(word)
-            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+            .ok_or(C220FunctionalError::UnsupportedWord { pc, word })?;
         let machine = self.scalar.machine();
         let registers = machine.xregs();
         let control =
@@ -380,9 +381,9 @@ impl MteCoreStepper {
     pub(crate) fn preview_c220_reduction_word(
         &self,
         word: u32,
-    ) -> Result<C220ReductionIssue, MteStepperError> {
+    ) -> Result<C220ReductionIssue, C220FunctionalError> {
         let instruction =
-            C220ReductionInstruction::decode(word).ok_or(MteStepperError::UnsupportedWord {
+            C220ReductionInstruction::decode(word).ok_or(C220FunctionalError::UnsupportedWord {
                 pc: self.scalar.pc(),
                 word,
             })?;
@@ -408,18 +409,18 @@ impl MteCoreStepper {
     pub(crate) fn preview_c220_transpose_word(
         &self,
         word: u32,
-    ) -> Result<C220TransposeIssue, MteStepperError> {
+    ) -> Result<C220TransposeIssue, C220FunctionalError> {
         let pc = self.scalar.pc();
         if self.scalar.is_halted() {
-            return Err(MteStepperError::ProgramEnded { pc });
+            return Err(C220FunctionalError::ProgramEnded { pc });
         }
         if self.scalar.machine().architecture() != Architecture::Dav2201 {
-            return Err(MteStepperError::UnsupportedWord { pc, word });
+            return Err(C220FunctionalError::UnsupportedWord { pc, word });
         }
         let instruction = C220TransposeInstruction::decode(word)
-            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
-        if self.c220.output_buffer_busy() {
-            return Err(MteStepperError::OutputDependencyOutstanding);
+            .ok_or(C220FunctionalError::UnsupportedWord { pc, word })?;
+        if self.state.output_buffer_busy() {
+            return Err(C220FunctionalError::OutputDependencyOutstanding);
         }
         let xregs = self.scalar.machine().xregs();
         Ok(plan_c220_transpose_issue(
@@ -434,18 +435,18 @@ impl MteCoreStepper {
     pub(crate) fn preview_c220_broadcast_word(
         &self,
         word: u32,
-    ) -> Result<C220BroadcastIssue, MteStepperError> {
+    ) -> Result<C220BroadcastIssue, C220FunctionalError> {
         let pc = self.scalar.pc();
         if self.scalar.is_halted() {
-            return Err(MteStepperError::ProgramEnded { pc });
+            return Err(C220FunctionalError::ProgramEnded { pc });
         }
         if self.scalar.machine().architecture() != Architecture::Dav2201 {
-            return Err(MteStepperError::UnsupportedWord { pc, word });
+            return Err(C220FunctionalError::UnsupportedWord { pc, word });
         }
         let instruction = C220BroadcastInstruction::decode(word)
-            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
-        if self.c220.output_buffer_busy() {
-            return Err(MteStepperError::OutputDependencyOutstanding);
+            .ok_or(C220FunctionalError::UnsupportedWord { pc, word })?;
+        if self.state.output_buffer_busy() {
+            return Err(C220FunctionalError::OutputDependencyOutstanding);
         }
         let xregs = self.scalar.machine().xregs();
         Ok(plan_c220_broadcast_issue(
@@ -458,7 +459,10 @@ impl MteCoreStepper {
         )?)
     }
 
-    pub fn step_c220_movev_word(&mut self, word: u32) -> Result<C220MovevStep, MteStepperError> {
+    pub fn step_c220_movev_word(
+        &mut self,
+        word: u32,
+    ) -> Result<C220MovevStep, C220FunctionalError> {
         let step = self.preview_c220_movev_word(word)?;
         write_c220_movev_to_ub(&step, &mut self.ub)?;
         self.commit_c220_vector_issue(None);
@@ -468,21 +472,21 @@ impl MteCoreStepper {
     pub(crate) fn preview_c220_movev_word(
         &self,
         word: u32,
-    ) -> Result<C220MovevStep, MteStepperError> {
+    ) -> Result<C220MovevStep, C220FunctionalError> {
         let pc = self.scalar.pc();
         if self.scalar.is_halted() {
-            return Err(MteStepperError::ProgramEnded { pc });
+            return Err(C220FunctionalError::ProgramEnded { pc });
         }
         if self.scalar.machine().architecture() != Architecture::Dav2201 {
-            return Err(MteStepperError::UnsupportedWord { pc, word });
+            return Err(C220FunctionalError::UnsupportedWord { pc, word });
         }
         let instruction = C220MovevInstruction::decode(word)
-            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+            .ok_or(C220FunctionalError::UnsupportedWord { pc, word })?;
         let element_bytes = instruction
             .supported_element_bytes()
-            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
-        if self.c220.output_buffer_busy() {
-            return Err(MteStepperError::OutputDependencyOutstanding);
+            .ok_or(C220FunctionalError::UnsupportedWord { pc, word })?;
+        if self.state.output_buffer_busy() {
+            return Err(C220FunctionalError::OutputDependencyOutstanding);
         }
         let machine = self.scalar.machine();
         let xregs = machine.xregs();
@@ -522,61 +526,64 @@ impl MteCoreStepper {
         &self,
         pc: u64,
         word: u32,
-    ) -> Result<u8, MteStepperError> {
+    ) -> Result<u8, C220FunctionalError> {
         let instruction = FlagInstruction::decode(Architecture::Dav2201, word)
             .filter(|instruction| {
                 instruction.source_pipe_code == 4 && instruction.trigger_pipe_code == 1
             })
-            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+            .ok_or(C220FunctionalError::UnsupportedWord { pc, word })?;
         let flag_id = instruction
             .resolve(pc, self.scalar.machine().xregs())
             .flag_id;
         u8::try_from(flag_id)
             .ok()
             .filter(|id| *id < 2)
-            .ok_or(MteStepperError::UnsupportedVectorFlagId { flag_id })
+            .ok_or(C220FunctionalError::UnsupportedVectorFlagId { flag_id })
     }
 
-    pub fn step_c220_vadd_word(&mut self, word: u32) -> Result<C220Fp32Step, MteStepperError> {
+    pub fn step_c220_vadd_word(&mut self, word: u32) -> Result<C220Fp32Step, C220FunctionalError> {
         self.step_c220_fp32_word(word, Some(C220VecArithmeticOperation::Add))
     }
 
-    pub fn step_c220_vsub_word(&mut self, word: u32) -> Result<C220Fp32Step, MteStepperError> {
+    pub fn step_c220_vsub_word(&mut self, word: u32) -> Result<C220Fp32Step, C220FunctionalError> {
         self.step_c220_fp32_word(word, Some(C220VecArithmeticOperation::Subtract))
     }
 
-    pub fn step_c220_vmul_word(&mut self, word: u32) -> Result<C220Fp32Step, MteStepperError> {
+    pub fn step_c220_vmul_word(&mut self, word: u32) -> Result<C220Fp32Step, C220FunctionalError> {
         self.step_c220_fp32_word(word, Some(C220VecArithmeticOperation::Multiply))
     }
 
-    pub fn step_c220_vdiv_word(&mut self, word: u32) -> Result<C220Fp32Step, MteStepperError> {
+    pub fn step_c220_vdiv_word(&mut self, word: u32) -> Result<C220Fp32Step, C220FunctionalError> {
         self.step_c220_fp32_word(word, Some(C220VecArithmeticOperation::Divide))
     }
 
-    pub fn step_c220_vmax_word(&mut self, word: u32) -> Result<C220Fp32Step, MteStepperError> {
+    pub fn step_c220_vmax_word(&mut self, word: u32) -> Result<C220Fp32Step, C220FunctionalError> {
         self.step_c220_fp32_word(word, Some(C220VecArithmeticOperation::Maximum))
     }
 
-    pub fn step_c220_vmin_word(&mut self, word: u32) -> Result<C220Fp32Step, MteStepperError> {
+    pub fn step_c220_vmin_word(&mut self, word: u32) -> Result<C220Fp32Step, C220FunctionalError> {
         self.step_c220_fp32_word(word, Some(C220VecArithmeticOperation::Minimum))
     }
 
-    pub fn step_c220_vabs_word(&mut self, word: u32) -> Result<C220Fp32Step, MteStepperError> {
+    pub fn step_c220_vabs_word(&mut self, word: u32) -> Result<C220Fp32Step, C220FunctionalError> {
         self.step_c220_fp32_word(word, Some(C220VecArithmeticOperation::Absolute))
     }
 
-    pub fn step_c220_vrelu_word(&mut self, word: u32) -> Result<C220Fp32Step, MteStepperError> {
+    pub fn step_c220_vrelu_word(&mut self, word: u32) -> Result<C220Fp32Step, C220FunctionalError> {
         self.step_c220_fp32_word(word, Some(C220VecArithmeticOperation::Rectify))
     }
 
-    pub fn step_c220_vector_word(&mut self, word: u32) -> Result<C220Fp32Step, MteStepperError> {
+    pub fn step_c220_vector_word(
+        &mut self,
+        word: u32,
+    ) -> Result<C220Fp32Step, C220FunctionalError> {
         self.step_c220_fp32_word(word, None)
     }
 
     pub(crate) fn preview_c220_vector_word(
         &self,
         word: u32,
-    ) -> Result<C220VectorArithmeticIssue, MteStepperError> {
+    ) -> Result<C220VectorArithmeticIssue, C220FunctionalError> {
         let resolved = self.resolve_c220_vector_arithmetic(word, None, true)?;
         let control_spr = self
             .scalar
@@ -598,12 +605,13 @@ impl MteCoreStepper {
     pub(crate) fn preview_c220_vector_scalar_word(
         &self,
         word: u32,
-    ) -> Result<C220VectorScalarIssue, MteStepperError> {
-        let instruction =
-            C220VectorScalarInstruction::decode(word).ok_or(MteStepperError::UnsupportedWord {
+    ) -> Result<C220VectorScalarIssue, C220FunctionalError> {
+        let instruction = C220VectorScalarInstruction::decode(word).ok_or(
+            C220FunctionalError::UnsupportedWord {
                 pc: self.scalar.pc(),
                 word,
-            })?;
+            },
+        )?;
         let resolved = self.resolve_c220_unary_vector(
             word,
             instruction.destination_register,
@@ -632,9 +640,9 @@ impl MteCoreStepper {
     pub(crate) fn preview_c220_shift_word(
         &self,
         word: u32,
-    ) -> Result<C220ShiftIssue, MteStepperError> {
+    ) -> Result<C220ShiftIssue, C220FunctionalError> {
         let instruction =
-            C220ShiftInstruction::decode(word).ok_or(MteStepperError::UnsupportedWord {
+            C220ShiftInstruction::decode(word).ok_or(C220FunctionalError::UnsupportedWord {
                 pc: self.scalar.pc(),
                 word,
             })?;
@@ -660,9 +668,9 @@ impl MteCoreStepper {
     pub(crate) fn preview_c220_copy_word(
         &self,
         word: u32,
-    ) -> Result<C220CopyIssue, MteStepperError> {
+    ) -> Result<C220CopyIssue, C220FunctionalError> {
         let instruction =
-            C220CopyInstruction::decode(word).ok_or(MteStepperError::UnsupportedWord {
+            C220CopyInstruction::decode(word).ok_or(C220FunctionalError::UnsupportedWord {
                 pc: self.scalar.pc(),
                 word,
             })?;
@@ -692,17 +700,17 @@ impl MteCoreStepper {
         control_register: u8,
         element_bytes: u8,
         supports_count_mask: bool,
-    ) -> Result<ResolvedC220UnaryVector, MteStepperError> {
+    ) -> Result<ResolvedC220UnaryVector, C220FunctionalError> {
         let pc = self.scalar.pc();
         if self.scalar.is_halted() {
-            return Err(MteStepperError::ProgramEnded { pc });
+            return Err(C220FunctionalError::ProgramEnded { pc });
         }
         let machine = self.scalar.machine();
         if machine.architecture() != Architecture::Dav2201 {
-            return Err(MteStepperError::UnsupportedWord { pc, word });
+            return Err(C220FunctionalError::UnsupportedWord { pc, word });
         }
-        if self.c220.output_buffer_busy() {
-            return Err(MteStepperError::OutputDependencyOutstanding);
+        if self.state.output_buffer_busy() {
+            return Err(C220FunctionalError::OutputDependencyOutstanding);
         }
         let xregs = machine.xregs();
         let mask_control = machine
@@ -741,15 +749,19 @@ impl MteCoreStepper {
 
     pub(crate) fn commit_c220_vector_issue(&mut self, destination_address: Option<u64>) {
         if let Some(source_address) = destination_address {
-            self.c220.unsignaled_output = Some(C220OutputToken { source_address });
+            self.state.unsignaled_output = Some(C220OutputToken { source_address });
         }
+        self.commit_c220_sequential_issue();
+    }
+
+    pub(crate) fn commit_c220_sequential_issue(&mut self) {
         self.scalar.advance_sequential();
     }
 
     pub(crate) fn commit_c220_vector_stores(
         &mut self,
         stores: &[C220VectorStore],
-    ) -> Result<(), MteStepperError> {
+    ) -> Result<(), C220FunctionalError> {
         let segments = stores
             .iter()
             .map(|store| {
@@ -771,7 +783,7 @@ impl MteCoreStepper {
         &mut self,
         word: u32,
         expected_operation: Option<C220VecArithmeticOperation>,
-    ) -> Result<C220Fp32Step, MteStepperError> {
+    ) -> Result<C220Fp32Step, C220FunctionalError> {
         let resolved = self.resolve_c220_vector_arithmetic(word, expected_operation, false)?;
         let step = execute_c220_fp32_to_ub(
             resolved.pc,
@@ -781,7 +793,7 @@ impl MteCoreStepper {
             &resolved.iteration_masks,
             &mut self.ub,
         )?;
-        self.c220.unsignaled_output = Some(C220OutputToken {
+        self.state.unsignaled_output = Some(C220OutputToken {
             source_address: step.destination_address,
         });
         self.scalar.advance_sequential();
@@ -793,16 +805,16 @@ impl MteCoreStepper {
         word: u32,
         expected_operation: Option<C220VecArithmeticOperation>,
         allow_non_fp32: bool,
-    ) -> Result<ResolvedC220VectorArithmetic, MteStepperError> {
+    ) -> Result<ResolvedC220VectorArithmetic, C220FunctionalError> {
         let pc = self.scalar.pc();
         if self.scalar.is_halted() {
-            return Err(MteStepperError::ProgramEnded { pc });
+            return Err(C220FunctionalError::ProgramEnded { pc });
         }
         if self.scalar.machine().architecture() != Architecture::Dav2201 {
-            return Err(MteStepperError::UnsupportedWord { pc, word });
+            return Err(C220FunctionalError::UnsupportedWord { pc, word });
         }
-        if self.c220.output_buffer_busy() {
-            return Err(MteStepperError::OutputDependencyOutstanding);
+        if self.state.output_buffer_busy() {
+            return Err(C220FunctionalError::OutputDependencyOutstanding);
         }
         let hint = C220VecArithmeticHint::from_word(word)
             .filter(|hint| {
@@ -814,7 +826,7 @@ impl MteCoreStepper {
                             || hint.has_bitwise_b16_value_path()))
             })
             .filter(|hint| expected_operation.is_none_or(|operation| hint.operation == operation))
-            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+            .ok_or(C220FunctionalError::UnsupportedWord { pc, word })?;
         let machine = self.scalar.machine();
         let xregs = machine.xregs();
         let control = xregs[usize::from(hint.control_register)];
@@ -834,7 +846,7 @@ impl MteCoreStepper {
         let modes = C220VectorArithmeticModes::from_control_spr(ctrl);
         let result_element_bytes = modes
             .result_element_bytes(hint)
-            .ok_or(MteStepperError::UnsupportedWord { pc, word })?;
+            .ok_or(C220FunctionalError::UnsupportedWord { pc, word })?;
         let mask_control = if modes.widen_s16 {
             ctrl & !(1 << 52)
         } else {

@@ -149,6 +149,7 @@ pub(crate) fn evaluate_c220_axpy_repeat(
     issue: &C220AxpyIssue,
     repeat_index: usize,
     lane_group: u8,
+    lane_slice: Option<(usize, usize)>,
     source_bytes: &[u8],
     destination_bytes: &[u8],
     ub: &UbMemory,
@@ -173,8 +174,13 @@ pub(crate) fn evaluate_c220_axpy_repeat(
     let mut lanes = Vec::with_capacity(lane_count);
     let mut stores = Vec::with_capacity(64);
     for lane_index in 0..lane_count {
-        let active = lane_index / 64 == usize::from(lane_group)
-            && mask[lane_index / 64] & (1_u64 << (lane_index % 64)) != 0;
+        let in_uop = lane_slice.map_or_else(
+            || lane_index / 64 == usize::from(lane_group),
+            |(first_lane, lane_count)| {
+                lane_index >= first_lane && lane_index < first_lane + lane_count
+            },
+        );
+        let active = in_uop && mask[lane_index / 64] & (1_u64 << (lane_index % 64)) != 0;
         if !active {
             lanes.push(C220AxpyLaneOutcome {
                 active: false,

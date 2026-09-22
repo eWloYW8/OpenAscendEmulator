@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220ReductionWidth {
     F16,
+    S16,
     F32,
 }
 
@@ -33,7 +34,7 @@ impl C220ExtremumOutput {
 impl C220ReductionWidth {
     pub const fn element_bytes(self) -> u8 {
         match self {
-            Self::F16 => 2,
+            Self::F16 | Self::S16 => 2,
             Self::F32 => 4,
         }
     }
@@ -102,6 +103,13 @@ impl C220ReductionInstruction {
                             output: C220ExtremumOutput::decode(word),
                         },
                     ),
+                    0x8380_0400 => (
+                        C220ReductionWidth::S16,
+                        C220ReductionKind::WholeExtremum {
+                            operation: C220ExtremumOperation::Maximum,
+                            output: C220ExtremumOutput::decode(word),
+                        },
+                    ),
                     0x8340_0480 => (
                         C220ReductionWidth::F16,
                         C220ReductionKind::WholeExtremum {
@@ -111,6 +119,13 @@ impl C220ReductionInstruction {
                     ),
                     0x83c0_0480 => (
                         C220ReductionWidth::F32,
+                        C220ReductionKind::WholeExtremum {
+                            operation: C220ExtremumOperation::Minimum,
+                            output: C220ExtremumOutput::decode(word),
+                        },
+                    ),
+                    0x8380_0480 => (
+                        C220ReductionWidth::S16,
                         C220ReductionKind::WholeExtremum {
                             operation: C220ExtremumOperation::Minimum,
                             output: C220ExtremumOutput::decode(word),

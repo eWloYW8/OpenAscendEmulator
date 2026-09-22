@@ -49,6 +49,7 @@ impl C220ReductionIssue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum C220ReductionValue {
     F16 { bits: u16, status: C220Fp16Status },
+    S16(u16),
     F32 { bits: u32, status: Fp32ValueStatus },
 }
 
@@ -65,6 +66,7 @@ impl C220ReductionValue {
                     underflow: false,
                 },
             },
+            C220ReductionWidth::S16 => Self::S16(0),
             C220ReductionWidth::F32 => Self::F32 {
                 bits: 0,
                 status: Fp32ValueStatus {
@@ -117,6 +119,7 @@ impl C220ReductionValue {
                     status: merge_fp32_status(first_status, second_status, result.status),
                 })
             }
+            (Self::S16(first), Self::S16(second)) => Some(Self::S16(first.wrapping_add(second))),
             _ => None,
         }
     }
@@ -168,6 +171,15 @@ impl C220ReductionValue {
                     status: merge_fp32_status(first_status, second_status, result.status),
                 })
             }
+            (Self::S16(first), Self::S16(second)) => {
+                let first_value = first as i16;
+                let second_value = second as i16;
+                let select_second = match operation {
+                    C220ExtremumOperation::Maximum => second_value >= first_value,
+                    C220ExtremumOperation::Minimum => second_value <= first_value,
+                };
+                Some(Self::S16(if select_second { second } else { first }))
+            }
             _ => None,
         }
     }
@@ -175,6 +187,7 @@ impl C220ReductionValue {
     pub(crate) const fn bits(self) -> u32 {
         match self {
             Self::F16 { bits, .. } => bits as u32,
+            Self::S16(bits) => bits as u32,
             Self::F32 { bits, .. } => bits,
         }
     }
@@ -182,13 +195,13 @@ impl C220ReductionValue {
     const fn fp16_status(self) -> Option<C220Fp16Status> {
         match self {
             Self::F16 { status, .. } => Some(status),
-            Self::F32 { .. } => None,
+            Self::S16(_) | Self::F32 { .. } => None,
         }
     }
 
     const fn fp32_status(self) -> Option<Fp32ValueStatus> {
         match self {
-            Self::F16 { .. } => None,
+            Self::F16 { .. } | Self::S16(_) => None,
             Self::F32 { status, .. } => Some(status),
         }
     }
@@ -578,6 +591,9 @@ fn decode_add_values(
                     bits: u16::from_le_bytes(bytes.try_into().expect("two-byte lane")),
                     status: C220Fp16Status::default(),
                 },
+                C220ReductionWidth::S16 => C220ReductionValue::S16(u16::from_le_bytes(
+                    bytes.try_into().expect("two-byte lane"),
+                )),
                 C220ReductionWidth::F32 => C220ReductionValue::F32 {
                     bits: u32::from_le_bytes(bytes.try_into().expect("four-byte lane")),
                     status: Fp32ValueStatus::default(),
@@ -596,6 +612,9 @@ fn decode_value(width: C220ReductionWidth, source_bytes: &[u8], lane: usize) -> 
             bits: u16::from_le_bytes(bytes.try_into().expect("two-byte lane")),
             status: C220Fp16Status::default(),
         },
+        C220ReductionWidth::S16 => {
+            C220ReductionValue::S16(u16::from_le_bytes(bytes.try_into().expect("two-byte lane")))
+        }
         C220ReductionWidth::F32 => C220ReductionValue::F32 {
             bits: u32::from_le_bytes(bytes.try_into().expect("four-byte lane")),
             status: Fp32ValueStatus::default(),

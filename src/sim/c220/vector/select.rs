@@ -309,14 +309,14 @@ mod tests {
     use crate::architecture::Architecture;
     use crate::memory::sparse::MemoryByteState;
     use crate::sim::c220::core::C220CoreInstruction;
+    use crate::sim::c220::core::functional::C220FunctionalCore;
     use crate::sim::c220::vector::compare::{
         plan_c220_compare_mask_issue, plan_c220_move_mask_issue,
     };
     use crate::sim::c220::vector::pipeline::{C220VectorPipeline, C220VectorTimingRules};
     use crate::sim::c220::vector::read::C220VectorReadIssue;
-    use crate::sim::machine::ScalarMachine;
-    use crate::sim::mte_stepper::MteCoreStepper;
-    use crate::sim::stepper::ScalarStepper;
+    use crate::sim::common::scalar::ScalarMachine;
+    use crate::sim::common::scalar::stepper::ScalarStepper;
 
     #[test]
     fn compare_mask_becomes_visible_to_dependent_select() {
@@ -405,7 +405,7 @@ mod tests {
             )
             .unwrap();
         let machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
-        let mut core = MteCoreStepper::new(ScalarStepper::new(machine, 0x2000), ub);
+        let mut core = C220FunctionalCore::new(ScalarStepper::new(machine, 0x2000), ub);
         pipeline.advance_to(300, &mut core).unwrap();
         assert_eq!(pipeline.compare_mask().bits(), [u64::MAX; 2]);
         assert_eq!(core.ub().read_known(0x100, 256).unwrap(), vec![0x11; 256]);

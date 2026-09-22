@@ -160,10 +160,16 @@ fn plan_ternary_reads(
     Ok(accesses)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct C220TernaryValueInputs<'a> {
+    pub issue: &'a C220TernaryIssue,
+    pub repeat_index: usize,
+    pub lane_group: u8,
+    pub lane_slice: Option<(usize, usize)>,
+}
+
 pub(crate) fn evaluate_c220_ternary_repeat(
-    issue: &C220TernaryIssue,
-    repeat_index: usize,
-    lane_group: u8,
+    inputs: C220TernaryValueInputs<'_>,
     source_0_bytes: &[u8],
     source_1_bytes: &[u8],
     destination_bytes: &[u8],
@@ -177,20 +183,26 @@ pub(crate) fn evaluate_c220_ternary_repeat(
             });
         }
     }
-    if lane_group >= issue.instruction.width.lane_groups() {
-        return Err(C220VectorError::InvalidLaneGroup(lane_group));
+    if inputs.lane_group >= inputs.issue.instruction.width.lane_groups() {
+        return Err(C220VectorError::InvalidLaneGroup(inputs.lane_group));
     }
-    let mask = issue
+    let mask = inputs
+        .issue
         .iteration_masks
-        .get(repeat_index)
+        .get(inputs.repeat_index)
         .ok_or(C220VectorError::MissingMaskState)?;
-    let lane_count = issue.instruction.width.lane_count();
-    let result_bytes = issue.instruction.width.destination_element_bytes();
+    let lane_count = inputs.issue.instruction.width.lane_count();
+    let result_bytes = inputs.issue.instruction.width.destination_element_bytes();
     let mut lanes = Vec::with_capacity(lane_count);
     let mut stores = Vec::with_capacity(64);
     for lane_index in 0..lane_count {
-        let active = lane_index / 64 == usize::from(lane_group)
-            && mask[lane_index / 64] & (1_u64 << (lane_index % 64)) != 0;
+        let in_uop = inputs.lane_slice.map_or_else(
+            || lane_index / 64 == usize::from(inputs.lane_group),
+            |(first_lane, lane_count)| {
+                lane_index >= first_lane && lane_index < first_lane + lane_count
+            },
+        );
+        let active = in_uop && mask[lane_index / 64] & (1_u64 << (lane_index % 64)) != 0;
         if !active {
             lanes.push(C220TernaryLaneOutcome {
                 active: false,
@@ -200,18 +212,18 @@ pub(crate) fn evaluate_c220_ternary_repeat(
             });
             continue;
         }
-        let (bits, fp16_status, fp32_status) = match issue.instruction.width {
+        let (bits, fp16_status, fp32_status) = match inputs.issue.instruction.width {
             C220TernaryWidth::F16 => {
                 let source_offset = lane_index * 2;
                 let source_0 = read_u16(source_0_bytes, source_offset);
                 let source_1 = read_u16(source_1_bytes, source_offset);
                 let destination = read_u16(destination_bytes, source_offset);
                 let (bits, status) = evaluate_f16(
-                    issue.instruction.operation,
+                    inputs.issue.instruction.operation,
                     source_0,
                     source_1,
                     destination,
-                    issue.fp16_mode,
+                    inputs.issue.fp16_mode,
                 );
                 (u32::from(bits), Some(status), None)
             }
@@ -220,8 +232,12 @@ pub(crate) fn evaluate_c220_ternary_repeat(
                 let source_0 = read_u32(source_0_bytes, source_offset);
                 let source_1 = read_u32(source_1_bytes, source_offset);
                 let destination = read_u32(destination_bytes, source_offset);
-                let (bits, status) =
-                    evaluate_f32(issue.instruction.operation, source_0, source_1, destination);
+                let (bits, status) = evaluate_f32(
+                    inputs.issue.instruction.operation,
+                    source_0,
+                    source_1,
+                    destination,
+                );
                 (bits, None, Some(status))
             }
             C220TernaryWidth::F16ToF32 => {
@@ -235,16 +251,16 @@ pub(crate) fn evaluate_c220_ternary_repeat(
             }
         };
         let address = vector_destination_address_for_width(
-            issue.control,
-            issue.addresses,
-            repeat_index,
+            inputs.issue.control,
+            inputs.issue.addresses,
+            inputs.repeat_index,
             lane_index,
             result_bytes,
         )?;
         ub.check_range(address, usize::from(result_bytes))?;
         let data = bits.to_le_bytes();
         stores.push(C220VectorStore {
-            repeat_index,
+            repeat_index: inputs.repeat_index,
             lane_index,
             address,
             bank: C220UbBank::from_address(address),
@@ -332,15 +348,15 @@ mod tests {
     use crate::memory::mapped::MappedMemory;
     use crate::memory::region::MemoryRegion;
     use crate::memory::sparse::{MemoryByteState, SparseMemory};
+    use crate::sim::c220::core::functional::C220FunctionalCore;
     use crate::sim::c220::core::{
         C220Core, C220CoreInstruction, C220CoreStep, C220CoreTimingRules,
     };
     use crate::sim::c220::timing::mte2::C220Mte2TimingRules;
     use crate::sim::c220::timing::mte3::C220Mte3TimingRules;
     use crate::sim::c220::vector::pipeline::C220VectorTimingRules;
-    use crate::sim::machine::ScalarMachine;
-    use crate::sim::mte_stepper::MteCoreStepper;
-    use crate::sim::stepper::ScalarStepper;
+    use crate::sim::common::scalar::ScalarMachine;
+    use crate::sim::common::scalar::stepper::ScalarStepper;
 
     use super::*;
 
@@ -370,7 +386,7 @@ mod tests {
                 .unwrap();
             }
         }
-        let execution = MteCoreStepper::new(ScalarStepper::new(machine, 0x4000), ub);
+        let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
         let rate = NonZeroU64::new(32).unwrap();
         let mut core = C220Core::new(
             execution,
@@ -407,12 +423,19 @@ mod tests {
         let uops = C220CoreInstruction::VectorTernary(issue)
             .vector_uops()
             .unwrap();
-        assert_eq!(uops.len(), 2);
+        assert_eq!(uops.len(), 1);
+        assert!(matches!(
+            uops[0].kind,
+            crate::sim::c220::vector::timing::C220VectorUopKind::LaneSlice {
+                first_lane: 0,
+                lane_count: 128
+            }
+        ));
         assert!(uops.iter().all(|uop| uop.stages.execute_ticks == 11));
         core.advance_to(100).unwrap();
         for address in [0x200, 0x280] {
             assert_eq!(
-                core.execution().core().ub().read_known(address, 2).unwrap(),
+                core.functional().ub().read_known(address, 2).unwrap(),
                 0x4900_u16.to_le_bytes()
             );
         }

@@ -1,5 +1,7 @@
 pub mod core;
+pub mod cube;
 pub mod fp16;
+pub mod memory;
 pub mod mte;
 pub mod scalar;
 pub(crate) mod scalar_address;

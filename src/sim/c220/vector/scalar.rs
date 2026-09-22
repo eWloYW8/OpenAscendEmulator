@@ -34,6 +34,7 @@ pub struct C220VectorScalarValueInputs {
     pub mask: [u64; 4],
     pub repeat_index: usize,
     pub lane_group: u8,
+    pub lane_slice: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,9 +119,13 @@ pub fn evaluate_c220_vector_scalar_repeat(
         .chunks_exact(usize::from(element_bytes))
         .enumerate()
     {
-        if lane_index / 64 != usize::from(inputs.lane_group)
-            || inputs.mask[lane_index / 64] & (1_u64 << (lane_index % 64)) == 0
-        {
+        let in_uop = inputs.lane_slice.map_or_else(
+            || lane_index / 64 == usize::from(inputs.lane_group),
+            |(first_lane, lane_count)| {
+                lane_index >= first_lane && lane_index < first_lane + lane_count
+            },
+        );
+        if !in_uop || inputs.mask[lane_index / 64] & (1_u64 << (lane_index % 64)) == 0 {
             values.push(C220VectorScalarLaneOutcome {
                 bits: 0,
                 fp16_status: None,

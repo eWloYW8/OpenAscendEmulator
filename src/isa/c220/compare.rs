@@ -20,6 +20,10 @@ impl C220CompareWidth {
         }
     }
 
+    pub const fn lane_count(self) -> usize {
+        256 / self.element_bytes() as usize
+    }
+
     pub const fn packed_bytes_per_repeat(self) -> usize {
         match self {
             Self::F16 => 16,

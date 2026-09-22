@@ -5,13 +5,13 @@ use crate::memory::mapped::MappedMemory;
 use crate::memory::region::MemoryRegion;
 use crate::memory::sparse::{MemoryByteState, SparseMemory};
 use crate::memory::ub::UbMemory;
+use crate::sim::c220::core::functional::C220FunctionalCore;
 use crate::sim::c220::core::{C220Core, C220CoreInstruction, C220CoreStep, C220CoreTimingRules};
 use crate::sim::c220::timing::mte2::C220Mte2TimingRules;
 use crate::sim::c220::timing::mte3::C220Mte3TimingRules;
 use crate::sim::c220::vector::pipeline::C220VectorTimingRules;
-use crate::sim::machine::ScalarMachine;
-use crate::sim::mte_stepper::MteCoreStepper;
-use crate::sim::stepper::ScalarStepper;
+use crate::sim::common::scalar::ScalarMachine;
+use crate::sim::common::scalar::stepper::ScalarStepper;
 
 #[test]
 fn widened_s16_binary_arithmetic_writes_one_s32_uop() {
@@ -49,7 +49,7 @@ fn widened_s16_binary_arithmetic_writes_one_s32_uop() {
             ub.write_states(address, &[MemoryByteState::Known(0xaa); 32])
                 .unwrap();
         }
-        let execution = MteCoreStepper::new(ScalarStepper::new(machine, 0x4000), ub);
+        let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
         let rate = NonZeroU64::new(32).unwrap();
         let mut core = C220Core::new(
             execution,
@@ -95,7 +95,7 @@ fn widened_s16_binary_arithmetic_writes_one_s32_uop() {
         core.advance_to(100).unwrap();
         for address in [0x200, 0x2fc] {
             assert_eq!(
-                core.execution().core().ub().read_known(address, 4).unwrap(),
+                core.functional().ub().read_known(address, 4).unwrap(),
                 expected.to_le_bytes()
             );
         }

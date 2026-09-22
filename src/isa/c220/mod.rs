@@ -1,10 +1,16 @@
 pub mod axpy;
 pub mod compare;
+pub mod control;
 pub mod conversion;
+pub mod cube;
 pub mod fused;
 pub mod gather;
+pub mod hflag;
+pub mod load_va;
 pub mod merge;
 pub mod mte;
+pub mod mte1;
+pub mod no_effect;
 pub mod reduce;
 pub mod scalar;
 pub mod select;

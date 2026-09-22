@@ -972,7 +972,7 @@ mod tests {
     use super::*;
     use crate::architecture::Architecture;
     use crate::memory::sparse::MemoryByteState;
-    use crate::sim::machine::ScalarMachine;
+    use crate::sim::common::scalar::ScalarMachine;
 
     #[test]
     fn captured_duplicate_store_and_load_preserve_overlapping_ub_bytes() {

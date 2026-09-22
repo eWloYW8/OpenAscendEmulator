@@ -1,11 +1,13 @@
-use crate::isa::flow::{BufferOperation, C310BufferStep, DcciStep, DsbStep, PipelineBarrierStep};
+use crate::isa::c310::buffer::{C310BufferOperation, C310BufferStep};
+use crate::isa::flow::{DcciStep, DsbStep, PipelineBarrierStep};
 use crate::sim::c310::buffer::{
     C310BufferAdmissionState, C310BufferCounterError, C310BufferDisposition, C310GetBufAdmission,
     C310GetBufDispatch, C310ReleaseAdmission,
 };
 use crate::sim::c310::predicate_buffer::{C310PushPbDisposition, C310PushPbStep};
+use crate::sim::c310::scalar::C310ScalarBus;
 use crate::sim::c310::vector_queue::{C310VfQueueDisposition, C310VfQueueStep};
-use crate::sim::machine::ScalarMemoryBus;
+use crate::sim::common::scalar::ScalarMemoryBus;
 use thiserror::Error;
 
 pub trait C310BufferPipeSink {
@@ -124,15 +126,17 @@ impl<B: ScalarMemoryBus, P: C310BufferPipeSink> ScalarMemoryBus for C310BufferAd
             .synchronize_barrier(step)
             .map_err(C310BufferBusError::Inner)
     }
+}
 
-    fn execute_c310_buffer(
+impl<B: C310ScalarBus, P: C310BufferPipeSink> C310ScalarBus for C310BufferAdmissionBus<B, P> {
+    fn execute_buffer(
         &mut self,
         step: C310BufferStep,
     ) -> Result<C310BufferDisposition, Self::Error> {
         let id = step.buffer_id;
         let pipe_code = step.instruction.pipe_code;
         let route = match step.instruction.operation {
-            BufferOperation::Get => match self.admission.admit_get(
+            C310BufferOperation::Get => match self.admission.admit_get(
                 id,
                 pipe_code,
                 step.instruction.mode_field,
@@ -148,35 +152,34 @@ impl<B: ScalarMemoryBus, P: C310BufferPipeSink> ScalarMemoryBus for C310BufferAd
                     C310BufferAdmissionRoute::QueuedGet(dispatch)
                 }
             },
-            BufferOperation::Release => match self
-                .admission
-                .admit_release(id, pipe_code, || self.pipes.try_enqueue(pipe_code, step))?
-            {
-                C310ReleaseAdmission::NoPipe => C310BufferAdmissionRoute::NoPipeRelease,
-                C310ReleaseAdmission::PipeStalled => return Ok(C310BufferDisposition::Stalled),
-                C310ReleaseAdmission::Queued => C310BufferAdmissionRoute::QueuedRelease,
-            },
+            C310BufferOperation::Release => {
+                match self
+                    .admission
+                    .admit_release(id, pipe_code, || self.pipes.try_enqueue(pipe_code, step))?
+                {
+                    C310ReleaseAdmission::NoPipe => C310BufferAdmissionRoute::NoPipeRelease,
+                    C310ReleaseAdmission::PipeStalled => return Ok(C310BufferDisposition::Stalled),
+                    C310ReleaseAdmission::Queued => C310BufferAdmissionRoute::QueuedRelease,
+                }
+            }
         };
         self.accepted
             .push(C310BufferAdmissionRecord { step, route });
         Ok(C310BufferDisposition::Accepted)
     }
 
-    fn execute_c310_push_pb(
+    fn execute_push_pb(
         &mut self,
         step: C310PushPbStep,
     ) -> Result<C310PushPbDisposition, Self::Error> {
         self.inner
-            .execute_c310_push_pb(step)
+            .execute_push_pb(step)
             .map_err(C310BufferBusError::Inner)
     }
 
-    fn enqueue_c310_vf(
-        &mut self,
-        step: C310VfQueueStep,
-    ) -> Result<C310VfQueueDisposition, Self::Error> {
+    fn enqueue_vf(&mut self, step: C310VfQueueStep) -> Result<C310VfQueueDisposition, Self::Error> {
         self.inner
-            .enqueue_c310_vf(step)
+            .enqueue_vf(step)
             .map_err(C310BufferBusError::Inner)
     }
 }
@@ -185,10 +188,10 @@ impl<B: ScalarMemoryBus, P: C310BufferPipeSink> ScalarMemoryBus for C310BufferAd
 mod tests {
     use super::*;
     use crate::architecture::Architecture;
-    use crate::memory::ub::UbMemory;
-    use crate::sim::machine::{ScalarInstructionError, ScalarInstructionStep, ScalarMachine};
-    use crate::sim::mte_stepper::MteCoreStepper;
-    use crate::sim::stepper::ScalarStepper;
+    use crate::sim::c310::scalar::{
+        C310ScalarExecutionError, C310ScalarInstructionStep, C310ScalarStepper,
+    };
+    use crate::sim::common::scalar::ScalarMachine;
     use std::collections::VecDeque;
     use std::convert::Infallible;
 
@@ -205,6 +208,8 @@ mod tests {
             unreachable!("test instructions do not write memory")
         }
     }
+
+    impl C310ScalarBus for UnusedMemory {}
 
     #[derive(Debug)]
     struct OneEntryPipe {
@@ -238,13 +243,10 @@ mod tests {
         )
     }
 
-    fn core() -> MteCoreStepper {
-        MteCoreStepper::new(
-            ScalarStepper::new(
-                ScalarMachine::from_pem_initial_state(Architecture::Dav3510),
-                0x1000,
-            ),
-            UbMemory::new(64, 64),
+    fn core() -> C310ScalarStepper {
+        C310ScalarStepper::new(
+            ScalarMachine::from_pem_initial_state(Architecture::Dav3510),
+            0x1000,
         )
     }
 
@@ -253,17 +255,17 @@ mod tests {
         let mut core = core();
         let mut bus = bus(4, false);
         let get = 0x4200_1000;
-        let first = core.step_scalar_word_with_ub(get, &mut bus).unwrap();
+        let first = core.step_word(get, &mut bus).unwrap();
         assert!(matches!(
             first.instruction,
-            ScalarInstructionStep::Buffer(_)
+            C310ScalarInstructionStep::Buffer(_)
         ));
-        assert_eq!(core.scalar().pc(), 0x1004);
+        assert_eq!(core.pc(), 0x1004);
         assert!(matches!(
-            core.step_scalar_word_with_ub(get, &mut bus),
-            Err(ScalarInstructionError::BufferStalled { pc: 0x1004, .. })
+            core.step_word(get, &mut bus),
+            Err(C310ScalarExecutionError::BufferStalled { pc: 0x1004, .. })
         ));
-        assert_eq!(core.scalar().pc(), 0x1004);
+        assert_eq!(core.pc(), 0x1004);
         assert_eq!(bus.accepted().len(), 1);
         assert_eq!(
             bus.admission()
@@ -276,9 +278,9 @@ mod tests {
         assert_eq!(bus.pipes().attempts, 2);
 
         bus.pipes_mut().entries.pop_front().unwrap();
-        let second = core.step_scalar_word_with_ub(get, &mut bus).unwrap();
+        let second = core.step_word(get, &mut bus).unwrap();
         assert_eq!(second.pc, 0x1004);
-        assert_eq!(core.scalar().pc(), 0x1008);
+        assert_eq!(core.pc(), 0x1008);
         assert_eq!(bus.accepted().len(), 2);
         assert!(matches!(
             bus.accepted()[1].route,
@@ -293,27 +295,23 @@ mod tests {
     fn ring_stall_precedes_pipe_attempt_and_preserves_pc() {
         let mut core = core();
         let mut bus = bus(2, false);
-        core.step_scalar_word_with_ub(0x4200_1000, &mut bus)
-            .unwrap();
+        core.step_word(0x4200_1000, &mut bus).unwrap();
         assert_eq!(bus.pipes().attempts, 1);
         assert!(matches!(
-            core.step_scalar_word_with_ub(0x4200_1000, &mut bus),
-            Err(ScalarInstructionError::BufferStalled { .. })
+            core.step_word(0x4200_1000, &mut bus),
+            Err(C310ScalarExecutionError::BufferStalled { .. })
         ));
         assert_eq!(bus.pipes().attempts, 1);
-        assert_eq!(core.scalar().pc(), 0x1004);
+        assert_eq!(core.pc(), 0x1004);
     }
 
     #[test]
     fn matching_release_enables_direct_get_without_pipe_capacity() {
         let mut core = core();
         let mut bus = bus(4, true);
-        core.step_scalar_word_with_ub(0x4220_1000, &mut bus)
-            .unwrap();
+        core.step_word(0x4220_1000, &mut bus).unwrap();
         assert_eq!(bus.pipes().entries.len(), 1);
-        let get = core
-            .step_scalar_word_with_ub(0x4200_1000, &mut bus)
-            .unwrap();
+        let get = core.step_word(0x4200_1000, &mut bus).unwrap();
         assert_eq!(get.pc, 0x1004);
         assert_eq!(bus.pipes().attempts, 1);
         assert_eq!(bus.accepted().len(), 2);
@@ -339,18 +337,17 @@ mod tests {
     fn zero_pipe_release_bypasses_sink_and_invalid_pipe_preserves_state() {
         let mut core = core();
         let mut bus = bus(4, false);
-        core.step_scalar_word_with_ub(0x4220_0000, &mut bus)
-            .unwrap();
+        core.step_word(0x4220_0000, &mut bus).unwrap();
         assert_eq!(
             bus.accepted()[0].route,
             C310BufferAdmissionRoute::NoPipeRelease
         );
         assert_eq!(bus.pipes().attempts, 0);
         assert!(matches!(
-            core.step_scalar_word_with_ub(0x4200_1800, &mut bus),
-            Err(ScalarInstructionError::BufferBackend(_))
+            core.step_word(0x4200_1800, &mut bus),
+            Err(C310ScalarExecutionError::BufferBackend(_))
         ));
-        assert_eq!(core.scalar().pc(), 0x1004);
+        assert_eq!(core.pc(), 0x1004);
         assert_eq!(bus.accepted().len(), 1);
         assert_eq!(bus.pipes().attempts, 0);
     }

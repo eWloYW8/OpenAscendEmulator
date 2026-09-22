@@ -1,4 +1,5 @@
 use crate::isa::c220::vector::C220MoveVaInstruction;
+use crate::sim::c220::vector::load_va::C220VaUpdate;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct C220VaRegisters {
@@ -21,5 +22,9 @@ impl C220VaRegisters {
             Some(((xregs[usize::from(instruction.source_0_register)] >> 5) & 0x1fff) as u16);
         destination[index + 1] =
             Some(((xregs[usize::from(instruction.source_1_register)] >> 5) & 0x1fff) as u16);
+    }
+
+    pub fn apply(&mut self, update: C220VaUpdate) {
+        self.entries[usize::from(update.destination_va)] = update.entries.map(Some);
     }
 }

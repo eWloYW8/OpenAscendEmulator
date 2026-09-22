@@ -76,6 +76,7 @@ pub(super) fn evaluate_c220_s32_repeat_from_bytes(
             C220VecArithmeticOperation::Multiply => first.wrapping_mul(second),
             C220VecArithmeticOperation::Maximum => (first as i32).max(second as i32) as u32,
             C220VecArithmeticOperation::Minimum => (first as i32).min(second as i32) as u32,
+            C220VecArithmeticOperation::Rectify => (first as i32).max(0) as u32,
             _ => unreachable!("S32 value path was checked"),
         };
         let address = vector_destination_address(

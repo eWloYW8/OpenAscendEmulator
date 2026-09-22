@@ -198,9 +198,10 @@ fn validate_image(image: &DeviceLoadImage<'_>) -> Result<u64, DeviceBinaryLoadEr
 mod tests {
     use super::*;
     use crate::memory::hbm::DEFAULT_HBM_BASE;
+    use crate::sim::c310::scalar::{C310ScalarBus, C310ScalarStepper};
     use crate::sim::c310::vector_queue::{C310VfQueueDisposition, C310VfQueueStep};
-    use crate::sim::machine::{ScalarMachine, ScalarMemoryBus};
-    use crate::sim::stepper::ScalarStepper;
+    use crate::sim::common::scalar::stepper::ScalarStepper;
+    use crate::sim::common::scalar::{ScalarMachine, ScalarMemoryBus};
     use std::io;
 
     struct NoMemoryBus;
@@ -231,8 +232,10 @@ mod tests {
         fn write(&mut self, _address: u64, _source: &[u8]) -> Result<(), Self::Error> {
             Err(io::Error::other("unexpected data write"))
         }
+    }
 
-        fn enqueue_c310_vf(
+    impl C310ScalarBus for VfQueueBus {
+        fn enqueue_vf(
             &mut self,
             step: C310VfQueueStep,
         ) -> Result<C310VfQueueDisposition, Self::Error> {
@@ -305,7 +308,7 @@ mod tests {
         let entry = kernel.entry_address();
         let mut machine = ScalarMachine::new(Architecture::Dav3510, [0; 32], 0);
         machine.set_xreg(13, 0x10d0_d900).unwrap();
-        let mut stepper = ScalarStepper::new(machine, entry);
+        let mut stepper = C310ScalarStepper::new(machine, entry);
         let mut bus = VfQueueBus { steps: Vec::new() };
         let first = stepper.step_loaded(&kernel, &mut memory, &mut bus).unwrap();
         assert_eq!(first.word, words[0]);

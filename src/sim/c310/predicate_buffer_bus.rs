@@ -1,11 +1,13 @@
-use crate::isa::flow::{C310BufferStep, DcciStep, DsbStep, PipelineBarrierStep};
+use crate::isa::c310::buffer::C310BufferStep;
+use crate::isa::flow::{DcciStep, DsbStep, PipelineBarrierStep};
 use crate::sim::c310::buffer::C310BufferDisposition;
 use crate::sim::c310::predicate_buffer::{
     C310PredicateBuffer, C310PredicateBufferError, C310PredicateBufferVfIssue,
     C310PredicateBufferWrite, C310PushPbDisposition, C310PushPbStep,
 };
+use crate::sim::c310::scalar::C310ScalarBus;
 use crate::sim::c310::vector_queue::{C310VfQueueDisposition, C310VfQueueStep};
-use crate::sim::machine::ScalarMemoryBus;
+use crate::sim::common::scalar::ScalarMemoryBus;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -140,17 +142,19 @@ impl<B: ScalarMemoryBus> ScalarMemoryBus for C310PredicateBufferBus<B> {
             .synchronize_barrier(step)
             .map_err(C310PredicateBufferBusError::Inner)
     }
+}
 
-    fn execute_c310_buffer(
+impl<B: C310ScalarBus> C310ScalarBus for C310PredicateBufferBus<B> {
+    fn execute_buffer(
         &mut self,
         step: C310BufferStep,
     ) -> Result<C310BufferDisposition, Self::Error> {
         self.inner
-            .execute_c310_buffer(step)
+            .execute_buffer(step)
             .map_err(C310PredicateBufferBusError::Inner)
     }
 
-    fn execute_c310_push_pb(
+    fn execute_push_pb(
         &mut self,
         step: C310PushPbStep,
     ) -> Result<C310PushPbDisposition, Self::Error> {
@@ -161,16 +165,13 @@ impl<B: ScalarMemoryBus> ScalarMemoryBus for C310PredicateBufferBus<B> {
         Ok(C310PushPbDisposition::Accepted)
     }
 
-    fn enqueue_c310_vf(
-        &mut self,
-        step: C310VfQueueStep,
-    ) -> Result<C310VfQueueDisposition, Self::Error> {
+    fn enqueue_vf(&mut self, step: C310VfQueueStep) -> Result<C310VfQueueDisposition, Self::Error> {
         if self.predicate_buffer.active_slot().is_none() {
             return Err(C310PredicateBufferError::NoActiveSlot.into());
         }
         let disposition = self
             .inner
-            .enqueue_c310_vf(step)
+            .enqueue_vf(step)
             .map_err(C310PredicateBufferBusError::Inner)?;
         if disposition == C310VfQueueDisposition::Accepted {
             let issue = C310PredicateBufferQueuedVfIssue {
@@ -189,8 +190,10 @@ mod tests {
     use super::*;
     use crate::architecture::Architecture;
     use crate::sim::c310::predicate::project_c310_pb_rvec_scalar_init;
-    use crate::sim::machine::{ScalarInstructionError, ScalarInstructionStep, ScalarMachine};
-    use crate::sim::stepper::ScalarStepper;
+    use crate::sim::c310::scalar::{
+        C310ScalarExecutionError, C310ScalarInstructionStep, C310ScalarStepper,
+    };
+    use crate::sim::common::scalar::ScalarMachine;
     use std::convert::Infallible;
 
     struct UnusedMemory;
@@ -207,6 +210,8 @@ mod tests {
         }
     }
 
+    impl C310ScalarBus for UnusedMemory {}
+
     struct VfQueueMemory {
         disposition: C310VfQueueDisposition,
         steps: Vec<C310VfQueueStep>,
@@ -222,8 +227,10 @@ mod tests {
         fn write(&mut self, _address: u64, _source: &[u8]) -> Result<(), Self::Error> {
             unreachable!("the test instruction does not access memory")
         }
+    }
 
-        fn enqueue_c310_vf(
+    impl C310ScalarBus for VfQueueMemory {
+        fn enqueue_vf(
             &mut self,
             step: C310VfQueueStep,
         ) -> Result<C310VfQueueDisposition, Self::Error> {
@@ -242,13 +249,13 @@ mod tests {
 
     #[test]
     fn scalar_push_commits_live_register_values_to_a_slot() {
-        let mut stepper = ScalarStepper::new(mul_machine(), 0x10d0_d6fc);
+        let mut stepper = C310ScalarStepper::new(mul_machine(), 0x10d0_d6fc);
         let mut bus =
             C310PredicateBufferBus::new(UnusedMemory, C310PredicateBuffer::with_default_slots());
         let result = stepper.step_word(0x4319_7108, &mut bus).unwrap();
         assert!(matches!(
             result.instruction,
-            ScalarInstructionStep::PushPb(_)
+            C310ScalarInstructionStep::PushPb(_)
         ));
         assert_eq!(stepper.pc(), 0x10d0_d700);
         assert_eq!(bus.writes().len(), 1);
@@ -265,14 +272,14 @@ mod tests {
 
     #[test]
     fn a_full_buffer_stalls_without_advancing_the_scalar_machine() {
-        let mut stepper = ScalarStepper::new(mul_machine(), 0x10d0_d6fc);
+        let mut stepper = C310ScalarStepper::new(mul_machine(), 0x10d0_d6fc);
         let mut bus =
             C310PredicateBufferBus::new(UnusedMemory, C310PredicateBuffer::new(1).unwrap());
         stepper.step_word(0x4319_7108, &mut bus).unwrap();
         let before = stepper.clone();
         assert!(matches!(
             stepper.step_word(0x4319_7108, &mut bus),
-            Err(ScalarInstructionError::PushPbStalled {
+            Err(C310ScalarExecutionError::PushPbStalled {
                 pc: 0x10d0_d700,
                 word: 0x4319_7108,
             })
@@ -299,7 +306,7 @@ mod tests {
             bytes: [0x5a; crate::isa::c310::layout::C310_PB_PUSH_BYTES],
         };
         assert_eq!(
-            bus.execute_c310_push_pb(push).unwrap(),
+            bus.execute_push_pb(push).unwrap(),
             C310PushPbDisposition::Accepted
         );
         let queue = C310VfQueueStep {
@@ -313,7 +320,7 @@ mod tests {
             vector_pc: 0x10d0_d900,
         };
         assert_eq!(
-            bus.enqueue_c310_vf(queue).unwrap(),
+            bus.enqueue_vf(queue).unwrap(),
             C310VfQueueDisposition::Accepted
         );
         assert_eq!(bus.inner().steps, [queue]);
@@ -369,7 +376,7 @@ mod tests {
                 .unwrap(),
                 vector_pc: 0x2000,
             };
-            assert_eq!(bus.enqueue_c310_vf(queue).unwrap(), disposition);
+            assert_eq!(bus.enqueue_vf(queue).unwrap(), disposition);
             assert_eq!(bus.predicate_buffer(), &before);
             assert!(bus.vf_issues().is_empty());
             assert!(bus.outstanding_vf_issues().is_empty());
@@ -394,7 +401,7 @@ mod tests {
             vector_pc: 0x2000,
         };
         assert!(matches!(
-            bus.enqueue_c310_vf(queue),
+            bus.enqueue_vf(queue),
             Err(C310PredicateBufferBusError::PredicateBuffer(
                 C310PredicateBufferError::NoActiveSlot
             ))

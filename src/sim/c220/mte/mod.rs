@@ -1,5 +1,4 @@
 pub(crate) mod decode;
-pub mod output;
-pub(crate) mod state;
+pub mod load2d;
 pub mod transfer;
 pub mod uop;

@@ -1,29 +1,6 @@
 use super::*;
 
 #[test]
-fn c220_scalar_conversion_updates_register_and_fp_status() {
-    let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
-    machine.set_xreg(8, 3.75_f32.to_bits().into()).unwrap();
-    let truncate = machine.execute_word(0x100, 0x0210_8583).unwrap();
-    assert_eq!(truncate.value, 3);
-    assert_eq!(truncate.source_value, Some(u64::from(3.75_f32.to_bits())));
-    assert_eq!(machine.spr2(), 0);
-
-    machine
-        .set_xreg(8, u64::from(2_147_483_648.0_f32.to_bits()))
-        .unwrap();
-    let overflow = machine.execute_word(0x104, 0x0210_8583).unwrap();
-    assert_eq!(overflow.value, i32::MAX as u64);
-    assert_eq!(overflow.prior_spr2, 0);
-    assert_eq!(overflow.spr2, 0x41_0020);
-
-    machine.set_xreg(8, (-3_i32) as u32 as u64).unwrap();
-    let to_float = machine.execute_word(0x108, 0x0210_8585).unwrap();
-    assert_eq!(to_float.value, u64::from((-3.0_f32).to_bits()));
-    assert_eq!(to_float.spr2, overflow.spr2);
-}
-
-#[test]
 fn captured_indexed_loads_scale_offset_and_preserve_machine_on_read_failure() {
     for (architecture, pc, word, destination, base, offset, base_value) in [
         (
@@ -1583,8 +1560,8 @@ fn insert_replaces_only_the_selected_destination_bit_field() {
         let overflow_word =
             (0x0202_7cc2 & !((3 << 22) | (0xf << 5) | 0x1f)) | (3 << 22) | (0xf << 5) | 0x1f;
         assert!(matches!(
-            AicDecoderHint::from_word(architecture, overflow_word),
-            Some(AicDecoderHint::ScalarKey2Insert {
+            ScalarInstruction::from_word(architecture, overflow_word),
+            Some(ScalarInstruction::ScalarKey2Insert {
                 least_significant_bit: 63,
                 width_bits: 32,
                 ..
@@ -1813,77 +1790,6 @@ fn flow_nop_preserves_registers_and_advances_pc_on_both_architectures() {
 }
 
 #[test]
-fn c220_scalar_words_supply_vector_fill_and_mask_values() {
-    for (fill_halfword, mask_halfword, expected_fill, expected_mask) in [
-        (0x074d_c2f6, 0x074f_5555, 0xc2f6_0000, 0x5555_5555),
-        (0x074d_c2f7, 0x074f_5554, 0xc2f7_0000, 0x5554_5555),
-    ] {
-        let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
-        let mut bus = TestBus::new(0);
-        for (pc, word) in [
-            (0x1131_2018, 0x0700_0001),
-            (0x1131_2024, 0x0200_0080),
-            (0x1131_202c, 0x8040_0000),
-            (0x1131_2030, 0x8040_0080),
-            (0x1131_2060, 0x0700_0000),
-            (0x1131_2314, 0x070c_0000),
-            (0x1131_2318, 0x070e_5555),
-            (0x1131_2330, fill_halfword),
-            (0x1131_2334, mask_halfword),
-            (0x1131_2340, 0x8040_0080),
-            (0x1131_265c, 0x8040_001c),
-        ] {
-            machine.execute_instruction(pc, word, &mut bus).unwrap();
-        }
-        assert_eq!(machine.xregs()[6], expected_fill);
-        assert_eq!(machine.xregs()[7], expected_mask);
-        assert_eq!(machine.spr_value(100), Some(expected_mask));
-        assert_eq!(machine.spr_value(101), Some(0));
-        assert_eq!(bus.accesses, 0);
-    }
-}
-
-#[test]
-fn c220_scalar_words_select_count_mask_mode() {
-    for (count_word, expected_count, expected_mask) in [
-        (0x070a_0020, 32, 0xffff_ffff),
-        (0x070a_001f, 31, 0x7fff_ffff),
-    ] {
-        let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
-        machine.set_xreg(17, 0x100_0000).unwrap();
-        let mut bus = TestBus::new(0);
-        for (pc, word) in [
-            (0x1131_2060, 0x0700_0000),
-            (0x1131_2264, 0x0704_0001),
-            (0x1131_22c0, 0x0204_2080),
-            (0x1131_22cc, 0x8040_0088),
-            (0x1131_22d4, 0x8040_0008),
-            (0x1131_2314, count_word),
-            (0x1131_2604, 0x8040_0080),
-            (0x1131_2618, 0x0222_3880),
-            (0x1131_261c, 0x0263_8b01),
-            (0x1131_2620, 0x0207_1900),
-            (0x1131_2624, 0x8040_0014),
-        ] {
-            machine.execute_instruction(pc, word, &mut bus).unwrap();
-        }
-        assert_eq!(machine.spr_value(3), Some(1 << 56));
-        assert_eq!(machine.spr_value(100), Some(expected_count));
-        assert_eq!(machine.spr_value(101), Some(0));
-        assert_eq!(
-            crate::sim::c220::vector::decode_c220_fp32_mask(
-                machine.spr_value(3).unwrap(),
-                machine.spr_value(100).unwrap(),
-                machine.spr_value(101).unwrap(),
-            )
-            .unwrap(),
-            [expected_mask, 0, 0, 0]
-        );
-        assert_eq!(bus.accesses, 0);
-    }
-}
-
-#[test]
 fn spr_two_reads_follow_the_live_overflow_register() {
     for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
         let mut machine = ScalarMachine::new(architecture, [0; 32], 0x1234);
@@ -1914,70 +1820,6 @@ fn spr_two_reads_follow_the_live_overflow_register() {
             0x55
         );
     }
-}
-
-#[test]
-fn c310_observed_movemask_updates_the_selected_live_spr() {
-    let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav3510);
-    machine.set_xreg(0, 0).unwrap();
-    machine.set_xreg(13, 0x5555_5555).unwrap();
-    let mut bus = TestBus::new(0);
-
-    let ScalarInstructionStep::C310Movemask(first) = machine
-        .execute_instruction(0x10d0d130, 0x15c0_0033, &mut bus)
-        .unwrap()
-    else {
-        panic!("expected MOVEMASK step")
-    };
-    assert_eq!(first.hint.source_x_register, 0);
-    assert_eq!(first.hint.destination_spr, 153);
-    assert_eq!(first.prior_value, u64::MAX);
-    assert_eq!(first.value, 0);
-    assert_eq!(machine.spr_value(152), Some(u64::MAX));
-    assert_eq!(machine.spr_value(153), Some(0));
-
-    let ScalarInstructionStep::C310Movemask(second) = machine
-        .execute_instruction(0x10d0d55c, 0x15cd_0013, &mut bus)
-        .unwrap()
-    else {
-        panic!("expected MOVEMASK step")
-    };
-    assert_eq!(second.hint.source_x_register, 13);
-    assert_eq!(second.hint.destination_spr, 152);
-    assert_eq!(second.prior_value, u64::MAX);
-    assert_eq!(second.value, 0x5555_5555);
-    assert_eq!(machine.spr_value(152), Some(0x5555_5555));
-    assert_eq!(machine.spr_value(153), Some(0));
-    assert_eq!(bus.accesses, 0);
-
-    let before = machine.clone();
-    assert!(matches!(
-        machine.execute_c310_movemask_word(0x10d0d560, 0x15ce_0012),
-        Err(ScalarMachineError::UnsupportedWord { .. })
-    ));
-    assert_eq!(machine, before);
-}
-
-#[test]
-fn c310_movemask_requires_a_known_prior_mask_and_the_right_architecture() {
-    let mut c310 = ScalarMachine::new(Architecture::Dav3510, [0; 32], 0);
-    let before = c310.clone();
-    assert_eq!(
-        c310.execute_c310_movemask_word(0x10d0d130, 0x15c0_0033),
-        Err(ScalarMachineError::SprValueUnavailable {
-            pc: 0x10d0d130,
-            spr: 153,
-        })
-    );
-    assert_eq!(c310, before);
-
-    let mut c220 = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
-    let before = c220.clone();
-    assert!(matches!(
-        c220.execute_c310_movemask_word(0x10d0d130, 0x15c0_0033),
-        Err(ScalarMachineError::UnsupportedWord { .. })
-    ));
-    assert_eq!(c220, before);
 }
 
 #[test]

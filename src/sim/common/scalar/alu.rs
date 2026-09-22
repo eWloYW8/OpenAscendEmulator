@@ -1,5 +1,5 @@
 use crate::architecture::Architecture;
-use crate::isa::decode::{AicDecoderHint, ScalarKey8Operation};
+use crate::isa::scalar::{ScalarInstruction, ScalarKey8Operation};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,12 +19,12 @@ pub enum ScalarIntegerError {
 }
 
 pub fn evaluate_scalar_integer_immediate(
-    hint: AicDecoderHint,
+    hint: ScalarInstruction,
     source_value: u64,
     runtime_isa_pc: u64,
     prior_spr2: u64,
 ) -> Result<ScalarIntegerOutcome, ScalarIntegerError> {
-    let AicDecoderHint::ScalarKey8 {
+    let ScalarInstruction::ScalarKey8 {
         operation,
         destination_register: Some(destination_register),
         encoded_immediate,
@@ -98,8 +98,8 @@ mod tests {
     use super::*;
     use crate::architecture::Architecture;
 
-    fn hint(word: u32) -> AicDecoderHint {
-        AicDecoderHint::from_word(Architecture::Dav3510, word).unwrap()
+    fn hint(word: u32) -> ScalarInstruction {
+        ScalarInstruction::from_word(Architecture::Dav3510, word).unwrap()
     }
 
     #[test]
@@ -152,7 +152,7 @@ mod tests {
         );
         assert_eq!(
             evaluate_scalar_integer_immediate(
-                AicDecoderHint::ScalarKey8 {
+                ScalarInstruction::ScalarKey8 {
                     operation: ScalarKey8Operation::AddImmediate,
                     destination_register: Some(1),
                     source_register: 1,

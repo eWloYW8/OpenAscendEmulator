@@ -194,7 +194,7 @@ mod tests {
     use super::*;
     use crate::architecture::Architecture;
     use crate::memory::region::MemoryRegion;
-    use crate::sim::machine::ScalarMachine;
+    use crate::sim::common::scalar::ScalarMachine;
 
     fn sub_memory() -> SparseMemory {
         let regions = vec![

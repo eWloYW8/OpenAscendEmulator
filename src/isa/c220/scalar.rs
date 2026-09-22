@@ -32,11 +32,9 @@ impl C220ScalarConversionHint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::architecture::Architecture;
-    use crate::isa::decode::AicDecoderHint;
 
     #[test]
-    fn scalar_conversion_words_decode_only_on_c220() {
+    fn scalar_conversion_words_decode() {
         let truncate = C220ScalarConversionHint::from_word(0x0210_8583).unwrap();
         assert_eq!(truncate.conversion, C220ScalarConversion::F32ToS32Truncate);
         assert_eq!(
@@ -48,14 +46,6 @@ mod tests {
                 .unwrap()
                 .conversion,
             C220ScalarConversion::S32ToF32
-        );
-        assert_eq!(
-            AicDecoderHint::from_word(Architecture::Dav2201, 0x0210_8583),
-            Some(AicDecoderHint::C220ScalarConversion(truncate))
-        );
-        assert_eq!(
-            AicDecoderHint::from_word(Architecture::Dav3510, 0x0210_8583),
-            None
         );
         assert!(C220ScalarConversionHint::from_word(0x0210_8589).is_none());
     }

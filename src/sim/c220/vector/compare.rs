@@ -16,6 +16,10 @@ pub struct C220CompareMask {
 }
 
 impl C220CompareMask {
+    pub const fn from_bits(bits: [u64; 2]) -> Self {
+        Self { bits }
+    }
+
     pub const fn bits(self) -> [u64; 2] {
         self.bits
     }
@@ -125,31 +129,34 @@ pub struct C220CompareMaskIssue {
 
 impl C220CompareMaskIssue {
     pub fn uop_count(&self) -> usize {
-        self.iteration_masks.len() * self.instruction.width.groups_per_repeat()
+        self.iteration_masks.len()
     }
 
     pub fn split_uop(&self, uop_index: usize) -> Result<(usize, u8), C220VectorError> {
-        split_uop(
-            self.instruction.width,
-            self.iteration_masks.len(),
-            uop_index,
-        )
+        if uop_index >= self.iteration_masks.len() {
+            return Err(C220VectorError::InvalidRepeatIndex(uop_index));
+        }
+        Ok((uop_index, 0))
     }
 
     pub fn read_accesses_for_uop(
         &self,
         uop_index: usize,
     ) -> Result<Vec<C220VectorReadAccess>, C220VectorError> {
-        let (repeat_index, group) = self.split_uop(uop_index)?;
-        plan_c220_vector_read_accesses(
-            self.control,
-            self.addresses,
-            repeat_index,
-            &self.iteration_masks[repeat_index],
-            2,
-            self.instruction.width.element_bytes(),
-            Some(group),
-        )
+        let (repeat_index, _) = self.split_uop(uop_index)?;
+        let mut accesses = Vec::new();
+        for group in 0..self.instruction.width.groups_per_repeat() {
+            accesses.extend(plan_c220_vector_read_accesses(
+                self.control,
+                self.addresses,
+                repeat_index,
+                &self.iteration_masks[repeat_index],
+                2,
+                self.instruction.width.element_bytes(),
+                Some(group as u8),
+            )?);
+        }
+        Ok(accesses)
     }
 }
 
@@ -195,7 +202,8 @@ pub fn plan_c220_compare_mask_issue(
 
 pub fn evaluate_c220_compare_mask_uop(
     issue: &C220CompareMaskIssue,
-    uop_index: usize,
+    repeat_index: usize,
+    lane_slice: Option<(usize, usize)>,
     source_0_bytes: &[u8],
     source_1_bytes: &[u8],
 ) -> Result<Vec<(bool, bool)>, C220VectorError> {
@@ -207,11 +215,14 @@ pub fn evaluate_c220_compare_mask_uop(
             });
         }
     }
-    let (repeat_index, group) = issue.split_uop(uop_index)?;
+    issue.split_uop(repeat_index)?;
     let element_bytes = usize::from(issue.instruction.width.element_bytes());
-    let first_lane = usize::from(group) * 64;
+    let (first_lane, lane_count) = lane_slice.unwrap_or((0, issue.instruction.width.lane_count()));
+    if first_lane + lane_count > issue.instruction.width.lane_count() {
+        return Err(C220VectorError::InvalidLaneGroup((first_lane / 64) as u8));
+    }
     let mask = issue.iteration_masks[repeat_index];
-    Ok((first_lane..first_lane + 64)
+    Ok((first_lane..first_lane + lane_count)
         .map(|lane| {
             let active = mask[lane / 64] & (1_u64 << (lane % 64)) != 0;
             let offset = lane * element_bytes;
@@ -244,53 +255,44 @@ pub struct C220PackedCompareValueInputs {
     pub control: C220VectorControl,
     pub addresses: C220VectorAddresses,
     pub scalar_bits: Option<u32>,
-    pub uop_index: usize,
+    pub repeat_index: usize,
 }
 
 impl C220PackedCompareIssue {
     pub fn uop_count(&self) -> usize {
-        usize::from(self.control.encoded_repeat_count) * self.instruction.width.groups_per_repeat()
+        usize::from(self.control.encoded_repeat_count)
     }
 
     pub fn split_uop(&self, uop_index: usize) -> Result<(usize, u8), C220VectorError> {
-        split_uop(
-            self.instruction.width,
-            usize::from(self.control.encoded_repeat_count),
-            uop_index,
-        )
+        if uop_index >= self.uop_count() {
+            return Err(C220VectorError::InvalidRepeatIndex(uop_index));
+        }
+        Ok((uop_index, 0))
     }
 
     pub fn read_accesses_for_uop(
         &self,
         uop_index: usize,
     ) -> Result<Vec<C220VectorReadAccess>, C220VectorError> {
-        let (repeat_index, group) = self.split_uop(uop_index)?;
-        plan_c220_vector_read_accesses(
-            self.control,
-            self.addresses,
-            repeat_index,
-            &[u64::MAX; 4],
-            if self.instruction.operand.is_vector() {
-                2
-            } else {
-                1
-            },
-            self.instruction.width.element_bytes(),
-            Some(group),
-        )
+        let (repeat_index, _) = self.split_uop(uop_index)?;
+        let mut accesses = Vec::new();
+        for group in 0..self.instruction.width.groups_per_repeat() {
+            accesses.extend(plan_c220_vector_read_accesses(
+                self.control,
+                self.addresses,
+                repeat_index,
+                &[u64::MAX; 4],
+                if self.instruction.operand.is_vector() {
+                    2
+                } else {
+                    1
+                },
+                self.instruction.width.element_bytes(),
+                Some(group as u8),
+            )?);
+        }
+        Ok(accesses)
     }
-}
-
-fn split_uop(
-    width: C220CompareWidth,
-    repeat_count: usize,
-    uop_index: usize,
-) -> Result<(usize, u8), C220VectorError> {
-    if uop_index >= repeat_count * width.groups_per_repeat() {
-        return Err(C220VectorError::InvalidRepeatIndex(uop_index));
-    }
-    let groups = width.groups_per_repeat();
-    Ok((uop_index / groups, (uop_index % groups) as u8))
 }
 
 pub fn plan_c220_packed_compare_issue(
@@ -349,7 +351,7 @@ pub fn plan_c220_packed_compare_issue(
                 control,
                 addresses,
                 scalar_bits,
-                uop_index,
+                repeat_index: uop_index,
             },
             &[0; C220_VECTOR_TILE_BYTES],
             &[0; C220_VECTOR_TILE_BYTES],
@@ -379,68 +381,60 @@ pub fn evaluate_c220_packed_compare_uop(
             expected: C220_VECTOR_TILE_BYTES,
         });
     }
-    let (repeat_index, group) = split_uop(
-        inputs.instruction.width,
-        usize::from(inputs.control.encoded_repeat_count),
-        inputs.uop_index,
-    )?;
+    if inputs.repeat_index >= usize::from(inputs.control.encoded_repeat_count) {
+        return Err(C220VectorError::InvalidRepeatIndex(inputs.repeat_index));
+    }
+    let repeat_index = inputs.repeat_index;
     let element_bytes = usize::from(inputs.instruction.width.element_bytes());
-    let lanes_per_block = 32 / element_bytes;
-    let blocks_per_group = 64 / lanes_per_block;
-    let packed_block_bytes = lanes_per_block / 8;
-    let mut outcomes = Vec::with_capacity(64);
-    let mut stores = Vec::with_capacity(8);
-    for block_in_group in 0..blocks_per_group {
-        let block_index = usize::from(group) * blocks_per_group + block_in_group;
-        for byte_index in 0..packed_block_bytes {
-            let mut packed = 0_u8;
-            for bit_index in 0..8 {
-                let lane = block_index * lanes_per_block + byte_index * 8 + bit_index;
-                let offset = lane * element_bytes;
-                let scalar = inputs.scalar_bits.map(u32::to_le_bytes);
-                let second = scalar
-                    .as_ref()
-                    .map_or(&source_1_bytes[offset..], |bytes| bytes.as_slice());
-                let result = evaluate_compare(
-                    inputs.instruction.width,
-                    inputs.instruction.condition,
-                    &source_0_bytes[offset..],
-                    second,
-                );
-                packed |= u8::from(result) << bit_index;
-                outcomes.push(u32::from(result));
-            }
-            let repeat_offset = (repeat_index as u64)
-                .checked_mul(inputs.instruction.width.packed_bytes_per_repeat() as u64)
-                .ok_or(C220VectorError::AddressOverflow {
-                    base: inputs.addresses.destination,
-                    lane: block_index * lanes_per_block + byte_index * 8,
-                })?;
-            let repeat_base = inputs
-                .addresses
-                .destination
-                .checked_add(repeat_offset)
-                .ok_or(C220VectorError::AddressOverflow {
-                    base: inputs.addresses.destination,
-                    lane: block_index * lanes_per_block + byte_index * 8,
-                })?;
-            let packed_offset =
-                usize::from(group) * 8 + block_in_group * packed_block_bytes + byte_index;
-            let address = repeat_base.checked_add(packed_offset as u64).ok_or(
-                C220VectorError::AddressOverflow {
-                    base: inputs.addresses.destination,
-                    lane: block_index * lanes_per_block + byte_index * 8,
-                },
-            )?;
-            stores.push(C220VectorStore {
-                repeat_index: inputs.uop_index,
-                lane_index: (address - (repeat_base & !31)) as usize,
-                address,
-                bank: C220UbBank::from_address(address),
-                width_bytes: 1,
-                data: super::store_data([packed]),
-            });
+    let lane_count = inputs.instruction.width.lane_count();
+    let mut outcomes = Vec::with_capacity(lane_count);
+    let mut stores = Vec::with_capacity(lane_count / 8);
+    let repeat_offset = (repeat_index as u64)
+        .checked_mul(inputs.instruction.width.packed_bytes_per_repeat() as u64)
+        .ok_or(C220VectorError::AddressOverflow {
+            base: inputs.addresses.destination,
+            lane: 0,
+        })?;
+    let repeat_base = inputs
+        .addresses
+        .destination
+        .checked_add(repeat_offset)
+        .ok_or(C220VectorError::AddressOverflow {
+            base: inputs.addresses.destination,
+            lane: 0,
+        })?;
+    for packed_offset in 0..lane_count / 8 {
+        let mut packed = 0_u8;
+        for bit_index in 0..8 {
+            let lane = packed_offset * 8 + bit_index;
+            let offset = lane * element_bytes;
+            let scalar = inputs.scalar_bits.map(u32::to_le_bytes);
+            let second = scalar
+                .as_ref()
+                .map_or(&source_1_bytes[offset..], |bytes| bytes.as_slice());
+            let result = evaluate_compare(
+                inputs.instruction.width,
+                inputs.instruction.condition,
+                &source_0_bytes[offset..],
+                second,
+            );
+            packed |= u8::from(result) << bit_index;
+            outcomes.push(u32::from(result));
         }
+        let address = repeat_base.checked_add(packed_offset as u64).ok_or(
+            C220VectorError::AddressOverflow {
+                base: inputs.addresses.destination,
+                lane: packed_offset * 8,
+            },
+        )?;
+        stores.push(C220VectorStore {
+            repeat_index,
+            lane_index: packed_offset,
+            address,
+            bank: C220UbBank::from_address(address),
+            width_bytes: 1,
+            data: super::store_data([packed]),
+        });
     }
     Ok((outcomes, stores))
 }
@@ -512,11 +506,11 @@ mod tests {
     use crate::architecture::Architecture;
     use crate::memory::sparse::MemoryByteState;
     use crate::sim::c220::core::C220CoreInstruction;
+    use crate::sim::c220::core::functional::C220FunctionalCore;
     use crate::sim::c220::vector::pipeline::{C220VectorPipeline, C220VectorTimingRules};
     use crate::sim::c220::vector::read::C220VectorReadIssue;
-    use crate::sim::machine::ScalarMachine;
-    use crate::sim::mte_stepper::MteCoreStepper;
-    use crate::sim::stepper::ScalarStepper;
+    use crate::sim::common::scalar::ScalarMachine;
+    use crate::sim::common::scalar::stepper::ScalarStepper;
 
     #[test]
     fn packed_compare_writes_dense_results_for_supported_operands() {
@@ -527,10 +521,10 @@ mod tests {
             (2_u64 << 56) | (8 << 40) | (8 << 32) | (0xab << 24) | (1 << 16) | (1 << 8) | 0x12;
         let scalar_control = (2_u64 << 56) | (8 << 40) | (8 << 32) | (1 << 16) | 0x12;
         for (word, bytes_per_repeat, uops, operand, control) in [
-            (0x9800_110d, 16_usize, 4_usize, 0x800, vector_control),
+            (0x9800_110d, 16_usize, 2_usize, 0x800, vector_control),
             (0x9800_110e, 8_usize, 2_usize, 0x800, vector_control),
             (0x9800_110f, 8_usize, 2_usize, 0x800, vector_control),
-            (0x9a00_110e, 16_usize, 4_usize, 0, scalar_control),
+            (0x9a00_110e, 16_usize, 2_usize, 0, scalar_control),
             (0x9a00_110f, 8_usize, 2_usize, 0, scalar_control),
             (0x9900_110e, 8_usize, 2_usize, 0x800, scalar_control),
         ] {
@@ -573,7 +567,7 @@ mod tests {
                 )
                 .unwrap();
             let machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
-            let mut core = MteCoreStepper::new(ScalarStepper::new(machine, 0x2000), ub);
+            let mut core = C220FunctionalCore::new(ScalarStepper::new(machine, 0x2000), ub);
             pipeline.advance_to(200, &mut core).unwrap();
             assert_eq!(
                 core.ub().read_known(0x100, bytes_per_repeat * 2).unwrap(),
