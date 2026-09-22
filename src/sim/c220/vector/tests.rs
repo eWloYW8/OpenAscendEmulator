@@ -1,12 +1,18 @@
+use super::mask::C220_COUNT_MASK_CONTROL;
 use super::*;
-use crate::isa::c220::vector::C220MovemaskHint;
+use crate::isa::c220::vector::C220MovevControl;
+use crate::isa::c220::vector::{
+    C220MovemaskHint, C220VecArithmeticHint, C220VecArithmeticOperation,
+};
+use crate::memory::sparse::MemoryByteState;
+use crate::memory::ub::{UbMemory, UbMemoryError};
 
 fn movev_control() -> C220MovevControl {
-    decode_c220_movev_control(C220_CAPTURED_MOVEV_CONTROL).unwrap()
+    C220MovevControl::decode(C220_CAPTURED_MOVEV_CONTROL)
 }
 
 fn fp32_control() -> C220VectorControl {
-    decode_c220_fp32_control(C220_CAPTURED_VADD_CONTROL).unwrap()
+    C220VectorControl::decode_binary(C220_CAPTURED_VADD_CONTROL)
 }
 
 fn addresses(source_0: u64, source_1: u64, destination: u64) -> C220VectorAddresses {
@@ -24,7 +30,7 @@ fn vector_controls_decode_block_and_repeat_strides() {
     assert_eq!(fp32_control().source_0_block_stride, 1);
     assert_eq!(fp32_control().destination_repeat_stride, 8);
     assert_eq!(
-        decode_c220_movev_control((2_u64 << 56) | (3 << 52) | (5 << 32) | (9 << 16) | 7).unwrap(),
+        C220MovevControl::decode((2_u64 << 56) | (3 << 52) | (5 << 32) | (9 << 16) | 7),
         C220MovevControl {
             encoded_repeat_count: 2,
             destination_block_stride: 7,
@@ -32,10 +38,9 @@ fn vector_controls_decode_block_and_repeat_strides() {
         }
     );
     assert_eq!(
-        decode_c220_fp32_control(
+        C220VectorControl::decode_binary(
             (2_u64 << 56) | (6 << 40) | (5 << 32) | (4 << 24) | (3 << 16) | (2 << 8) | 1
-        )
-        .unwrap(),
+        ),
         C220VectorControl {
             encoded_repeat_count: 2,
             destination_block_stride: 1,
@@ -47,15 +52,11 @@ fn vector_controls_decode_block_and_repeat_strides() {
         }
     );
     assert_eq!(
-        decode_c220_movev_control(0x0200_0008_0001_0001)
-            .unwrap()
-            .encoded_repeat_count,
+        C220MovevControl::decode(0x0200_0008_0001_0001).encoded_repeat_count,
         2
     );
     assert_eq!(
-        decode_c220_fp32_control(0x0200_0808_0801_0101)
-            .unwrap()
-            .encoded_repeat_count,
+        C220VectorControl::decode_binary(0x0200_0808_0801_0101).encoded_repeat_count,
         2
     );
 }
@@ -72,7 +73,7 @@ fn vabs_uses_one_source_and_preserves_masked_destination_lanes() {
     assert_eq!(hint.control_register, 5);
     assert!(hint.has_fp32_value_path());
 
-    let wide = decode_c220_vector_unary_control(
+    let wide = C220VectorControl::decode_unary(
         (2_u64 << 56) | (1 << 52) | (9 << 40) | (7 << 32) | (3 << 16) | 2,
     );
     assert_eq!(wide.destination_block_stride, 2);
@@ -82,7 +83,7 @@ fn vabs_uses_one_source_and_preserves_masked_destination_lanes() {
     assert_eq!(wide.encoded_repeat_count, 2);
 
     let control =
-        decode_c220_vector_unary_control((1_u64 << 56) | (8 << 40) | (8 << 32) | (1 << 16) | 1);
+        C220VectorControl::decode_unary((1_u64 << 56) | (8 << 40) | (8 << 32) | (1 << 16) | 1);
     let addresses = addresses(0, u64::MAX, 0x200);
     let mask = [0b111, 0, 0, 0];
     let mut ub = UbMemory::new(1024, 256);
@@ -203,9 +204,7 @@ fn multiply_word_selects_fp32_lane_path() {
     assert!(hint.has_fp32_value_path());
     let first = [2.0_f32.to_bits(), 0];
     let second = [3.0_f32.to_bits(), f32::INFINITY.to_bits()];
-    let lanes = hint
-        .evaluate_fp32_lanes(&first, &second, &[3, 0, 0, 0])
-        .unwrap();
+    let lanes = evaluate_c220_fp32_lanes(hint, &first, &second, &[3, 0, 0, 0]).unwrap();
     assert_eq!(lanes[0].bits, 6.0_f32.to_bits());
     assert_eq!(lanes[1].bits, 0x7fff_ffff);
     assert_eq!(
@@ -223,8 +222,13 @@ fn divide_word_uses_its_own_dtype_selector_and_two_sources() {
     assert!(hint.has_fp32_value_path());
     assert_eq!(hint.source_1_register, Some(12));
     assert_eq!(
-        hint.evaluate_fp32_lanes(&[3.0_f32.to_bits()], &[2.0_f32.to_bits()], &[1, 0, 0, 0],)
-            .unwrap()[0]
+        evaluate_c220_fp32_lanes(
+            hint,
+            &[3.0_f32.to_bits()],
+            &[2.0_f32.to_bits()],
+            &[1, 0, 0, 0],
+        )
+        .unwrap()[0]
             .bits,
         1.5_f32.to_bits()
     );
@@ -265,8 +269,8 @@ fn maximum_and_minimum_select_their_own_opcode_family() {
         f32::NEG_INFINITY.to_bits(),
     ];
     let mask = [0b111, 0, 0, 0];
-    let max_lanes = maximum.evaluate_fp32_lanes(&first, &second, &mask).unwrap();
-    let min_lanes = minimum.evaluate_fp32_lanes(&first, &second, &mask).unwrap();
+    let max_lanes = evaluate_c220_fp32_lanes(maximum, &first, &second, &mask).unwrap();
+    let min_lanes = evaluate_c220_fp32_lanes(minimum, &first, &second, &mask).unwrap();
     assert_eq!(
         max_lanes.iter().map(|lane| lane.bits).collect::<Vec<_>>(),
         [0, 0x7fff_ffff, f32::INFINITY.to_bits()]
@@ -298,14 +302,10 @@ fn captured_fp32_words_reach_the_masked_value_stage() {
     let sub = C220VecArithmeticHint::from_word(0x85dc_b619).unwrap();
     let add_relu = C220VecArithmeticHint::from_word(0x94c0_0000).unwrap();
     let sub_relu = C220VecArithmeticHint::from_word(0x94c0_0001).unwrap();
-    let added = add.evaluate_fp32_lanes(&first, &second, &mask).unwrap();
-    let subtracted = sub.evaluate_fp32_lanes(&first, &second, &mask).unwrap();
-    let added_rectified = add_relu
-        .evaluate_fp32_lanes(&first, &second, &mask)
-        .unwrap();
-    let subtracted_rectified = sub_relu
-        .evaluate_fp32_lanes(&first, &second, &mask)
-        .unwrap();
+    let added = evaluate_c220_fp32_lanes(add, &first, &second, &mask).unwrap();
+    let subtracted = evaluate_c220_fp32_lanes(sub, &first, &second, &mask).unwrap();
+    let added_rectified = evaluate_c220_fp32_lanes(add_relu, &first, &second, &mask).unwrap();
+    let subtracted_rectified = evaluate_c220_fp32_lanes(sub_relu, &first, &second, &mask).unwrap();
     assert_eq!(added[0].bits, 4.0_f32.to_bits());
     assert_eq!(subtracted[0].bits, (-2.0_f32).to_bits());
     assert_eq!(added_rectified[0].bits, 4.0_f32.to_bits());
@@ -573,7 +573,7 @@ fn single_repeat_block_strides_change_vector_addresses() {
 #[test]
 fn count_mask_spans_repeats_and_applies_only_the_final_tail() {
     let raw = (2_u64 << 56) | (8 << 32) | 1;
-    let control = decode_c220_movev_control(raw).unwrap();
+    let control = C220MovevControl::decode(raw);
     let masks = decode_c220_repeat_masks(C220_COUNT_MASK_CONTROL, 65, 0, 64, 2).unwrap();
     assert_eq!(masks, vec![[u64::MAX, 0, 0, 0], [1, 0, 0, 0]]);
 
@@ -593,7 +593,7 @@ fn count_mask_spans_repeats_and_applies_only_the_final_tail() {
 
 #[test]
 fn fp32_repeats_read_previous_repeat_writes_on_aliasing_ub() {
-    let control = decode_c220_fp32_control((2_u64 << 56) | (1 << 16) | (1 << 8) | 1).unwrap();
+    let control = C220VectorControl::decode_binary((2_u64 << 56) | (1 << 16) | (1 << 8) | 1);
     let mut ub = UbMemory::new(512, 256);
     let ones = 1.0_f32.to_le_bytes().repeat(64);
     let twos = 2.0_f32.to_le_bytes().repeat(64);
@@ -632,7 +632,7 @@ fn fp32_repeats_read_previous_repeat_writes_on_aliasing_ub() {
 #[test]
 fn fp32_repeat_strides_advance_each_operand_independently() {
     let raw = (2_u64 << 56) | (16 << 40) | (8 << 32) | (8 << 24) | (1 << 16) | (1 << 8) | 1;
-    let control = decode_c220_fp32_control(raw).unwrap();
+    let control = C220VectorControl::decode_binary(raw);
     let masks = decode_c220_repeat_masks(C220_COUNT_MASK_CONTROL, 65, 0, 64, 2).unwrap();
     let mut ub = UbMemory::new(2048, 256);
     for (address, value) in [(0, 1.0_f32), (0x100, 3.0), (0x400, 2.0), (0x600, 4.0)] {

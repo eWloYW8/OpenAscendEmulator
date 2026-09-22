@@ -1730,7 +1730,7 @@ fn scalar_immediate_store_rejects_unsupported_forms_and_backend_errors_atomicall
 }
 
 #[test]
-fn pem_initial_spr_values_keep_config_dependent_slots_unknown() {
+fn pem_initial_spr_values_match_architecture_reset_state() {
     let mut c220 = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
     assert_eq!(c220.spr_value(1), Some(0));
     assert_eq!(c220.spr_value(95), Some(0));
@@ -1741,8 +1741,8 @@ fn pem_initial_spr_values_keep_config_dependent_slots_unknown() {
     assert_eq!(c220.spr_value(111), Some(0));
     assert_eq!(c220.spr_value(174), Some(63));
     assert_eq!(c220.spr_value(181), Some(u64::MAX));
-    assert_eq!(c220.spr_value(107), None);
-    assert_eq!(c220.spr_value(108), None);
+    assert_eq!(c220.spr_value(107), Some(0));
+    assert_eq!(c220.spr_value(108), Some(0));
     assert_eq!(c220.spr_value(187), None);
     assert_eq!(
         c220.execute_spr_read_word(0x1131212c, 0x028f_f880)

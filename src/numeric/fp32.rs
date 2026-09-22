@@ -39,6 +39,22 @@ pub struct Fp32ValueStatus {
     pub invalid: bool,
 }
 
+impl Fp32ValueStatus {
+    pub const fn merge(self, other: Self) -> Self {
+        Self {
+            overflow: self.overflow || other.overflow,
+            underflow: self.underflow || other.underflow,
+            nan_operand: self.nan_operand || other.nan_operand,
+            infinity_operand: self.infinity_operand || other.infinity_operand,
+            opposite_infinities: self.opposite_infinities || other.opposite_infinities,
+            zero_times_infinity: self.zero_times_infinity || other.zero_times_infinity,
+            division_by_zero: self.division_by_zero || other.division_by_zero,
+            indeterminate_division: self.indeterminate_division || other.indeterminate_division,
+            invalid: self.invalid || other.invalid,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fp32ValueOutcome {
     pub bits: u32,

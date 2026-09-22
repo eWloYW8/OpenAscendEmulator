@@ -1,6 +1,8 @@
 use crate::isa::c220::cube::{C220CubeInstruction, C220MmadParameters};
 use crate::sim::c220::cube::timing::C220CubeTicket;
-use crate::sim::c220::cube::uop::{C220CubeL0cAccess, C220CubeL0cRequest, C220CubeUop};
+use crate::sim::c220::cube::uop::{
+    C220CubeL0cAccess, C220CubeL0cRequest, C220CubeUnitFlagMode, C220CubeUop,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220CubeV0UopPlanner {
@@ -192,6 +194,7 @@ impl Iterator for C220CubeV0UopPlanner {
                     * u64::from(request_bytes),
                 bytes: request_bytes,
                 access: C220CubeL0cAccess::Read,
+                unit_flags: C220CubeUnitFlagMode::Disabled,
             });
         let bubble_start = self
             .uop_count

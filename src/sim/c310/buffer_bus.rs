@@ -1,12 +1,14 @@
 use crate::isa::c310::buffer::{C310BufferOperation, C310BufferStep};
+use crate::isa::c310::dispatch::C310PushPbStep;
+use crate::isa::c310::dispatch::C310VfQueueStep;
 use crate::isa::flow::{DcciStep, DsbStep, PipelineBarrierStep};
 use crate::sim::c310::buffer::{
     C310BufferAdmissionState, C310BufferCounterError, C310BufferDisposition, C310GetBufAdmission,
     C310GetBufDispatch, C310ReleaseAdmission,
 };
-use crate::sim::c310::predicate_buffer::{C310PushPbDisposition, C310PushPbStep};
+use crate::sim::c310::predicate_buffer::C310PushPbDisposition;
 use crate::sim::c310::scalar::C310ScalarBus;
-use crate::sim::c310::vector_queue::{C310VfQueueDisposition, C310VfQueueStep};
+use crate::sim::c310::vector_queue::C310VfQueueDisposition;
 use crate::sim::common::scalar::ScalarMemoryBus;
 use thiserror::Error;
 

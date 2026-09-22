@@ -1,0 +1,270 @@
+use std::collections::VecDeque;
+
+use super::{C220L0WritePort, C220MteOutputFragment, C220MteOutputPlan};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220MteL1OutputDestination {
+    Bt,
+    L0a(C220L0WritePort),
+    L0b(C220L0WritePort),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct C220MteL1OutputCredits {
+    pub l0a: [bool; 3],
+    pub l0b: [bool; 3],
+}
+
+impl C220MteL1OutputCredits {
+    fn permits(self, destination: C220MteL1OutputDestination) -> bool {
+        match destination {
+            C220MteL1OutputDestination::Bt => true,
+            C220MteL1OutputDestination::L0a(port) => self.l0a[port as usize],
+            C220MteL1OutputDestination::L0b(port) => self.l0b[port as usize],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220MteL1OutputTransfer<T> {
+    pub destination: C220MteL1OutputDestination,
+    pub fragment: C220MteOutputFragment,
+    pub payload: T,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct C220MteL1OutputQueues {
+    pub acknowledged: usize,
+    pub output_fragments: usize,
+    pub awaiting_retirement: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct C220MteL1OutputCycle<T> {
+    pub tick: u64,
+    pub sent: Option<C220MteL1OutputTransfer<T>>,
+    pub blocked: Option<C220MteL1OutputDestination>,
+    /// Local BT completion. L0 destinations retire through their write interface.
+    pub retired: Option<C220MteL1OutputTransfer<T>>,
+    pub queues: C220MteL1OutputQueues,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum C220MteL1OutputError {
+    #[error("L1 output time reversed from {previous} to {requested}")]
+    TimeReversed { previous: u64, requested: u64 },
+    #[error("L1 output expected cycle {expected}, got {requested}")]
+    InvalidCycle { expected: u64, requested: u64 },
+    #[error("L1 output time overflowed")]
+    TimeOverflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Acknowledgment<T> {
+    ready_tick: u64,
+    destination: C220MteL1OutputDestination,
+    fragments: C220MteOutputPlan,
+    expanded: bool,
+    payload: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Retirement<T> {
+    ready_tick: u64,
+    transfer: C220MteL1OutputTransfer<T>,
+}
+
+/// One shared L1 output interface, not one lane per destination. Completing
+/// responses enter a FIFO with one tick of visibility delay. Each cycle can
+/// forward only one fragment; a blocked target holds up all later responses.
+/// The payload preserves the caller's logical request without imposing a
+/// particular instruction representation on the interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct C220MteL1Output<T> {
+    acknowledged: VecDeque<Acknowledgment<T>>,
+    retiring: VecDeque<Retirement<T>>,
+    observed_tick: Option<u64>,
+    next_tick: Option<u64>,
+}
+
+impl<T> Default for C220MteL1Output<T> {
+    fn default() -> Self {
+        Self {
+            acknowledged: VecDeque::new(),
+            retiring: VecDeque::new(),
+            observed_tick: None,
+            next_tick: None,
+        }
+    }
+}
+
+impl<T: Copy> C220MteL1Output<T> {
+    pub fn is_idle(&self) -> bool {
+        self.acknowledged.is_empty() && self.retiring.is_empty()
+    }
+
+    pub fn queue_state(&self) -> C220MteL1OutputQueues {
+        C220MteL1OutputQueues {
+            acknowledged: self.acknowledged.len(),
+            output_fragments: self.acknowledged.front().map_or(0, |head| {
+                if head.expanded {
+                    head.fragments.len()
+                } else {
+                    0
+                }
+            }),
+            awaiting_retirement: self.retiring.len(),
+        }
+    }
+
+    /// Accept only completing logical responses. Non-completing physical reads
+    /// are discarded by the request owner. Receive may precede or follow step
+    /// in the same cycle; neither ordering permits same-cycle output.
+    pub fn receive(
+        &mut self,
+        tick: u64,
+        destination: C220MteL1OutputDestination,
+        fragments: C220MteOutputPlan,
+        payload: T,
+    ) -> Result<(), C220MteL1OutputError> {
+        self.validate_receive(tick)?;
+        if self.is_idle() {
+            self.next_tick = Some(self.next_tick.unwrap_or(tick).max(tick));
+        }
+        self.acknowledged.push_back(Acknowledgment {
+            ready_tick: tick + 1,
+            destination,
+            fragments,
+            expanded: false,
+            payload,
+        });
+        self.observed_tick = Some(tick);
+        Ok(())
+    }
+
+    pub(in crate::sim::c220::mte) fn validate_receive(
+        &self,
+        tick: u64,
+    ) -> Result<(), C220MteL1OutputError> {
+        self.check_time(tick)?;
+        tick.checked_add(1)
+            .ok_or(C220MteL1OutputError::TimeOverflow)?;
+        Ok(())
+    }
+
+    /// Validate before a composing unit mutates its other queues.
+    pub(in crate::sim::c220::mte) fn validate_step(
+        &self,
+        tick: u64,
+        credits: C220MteL1OutputCredits,
+    ) -> Result<(), C220MteL1OutputError> {
+        self.check_time(tick)?;
+        if let Some(expected) = self.next_tick
+            && tick < expected
+        {
+            return Err(C220MteL1OutputError::InvalidCycle {
+                expected,
+                requested: tick,
+            });
+        }
+        tick.checked_add(1)
+            .ok_or(C220MteL1OutputError::TimeOverflow)?;
+        if let Some(head) = self.ready_head(tick)
+            && head.destination == C220MteL1OutputDestination::Bt
+            && credits.permits(head.destination)
+            && head
+                .fragments
+                .front()
+                .is_some_and(|fragment| fragment.last_in_uop)
+        {
+            tick.checked_add(5)
+                .ok_or(C220MteL1OutputError::TimeOverflow)?;
+        }
+        Ok(())
+    }
+
+    /// Credits refer to the actual downstream input queues. The caller must
+    /// enqueue a returned L0 fragment into the selected target and port.
+    /// Empty active output plans remain pending instead of inventing retirement.
+    pub fn step(
+        &mut self,
+        tick: u64,
+        credits: C220MteL1OutputCredits,
+    ) -> Result<C220MteL1OutputCycle<T>, C220MteL1OutputError> {
+        self.validate_step(tick, credits)?;
+        let retired = self
+            .retiring
+            .pop_front_if(|entry| entry.ready_tick <= tick)
+            .map(|entry| entry.transfer);
+        let mut sent = None;
+        let mut blocked = None;
+        if let Some(head) = self
+            .acknowledged
+            .front_mut()
+            .filter(|head| head.ready_tick <= tick)
+        {
+            head.expanded = true;
+            if head.fragments.front().is_some() {
+                if credits.permits(head.destination) {
+                    let fragment = head.fragments.next().expect("nonempty output");
+                    let transfer = C220MteL1OutputTransfer {
+                        destination: head.destination,
+                        fragment,
+                        payload: head.payload,
+                    };
+                    sent = Some(transfer);
+                    if fragment.last_in_uop {
+                        if head.destination == C220MteL1OutputDestination::Bt {
+                            self.retiring.push_back(Retirement {
+                                ready_tick: tick + 5,
+                                transfer,
+                            });
+                        }
+                        self.acknowledged.pop_front();
+                    }
+                } else {
+                    blocked = Some(head.destination);
+                }
+            }
+        }
+        self.observed_tick = Some(tick);
+        self.next_tick = Some(tick + 1);
+        Ok(C220MteL1OutputCycle {
+            tick,
+            sent,
+            blocked,
+            retired,
+            queues: self.queue_state(),
+        })
+    }
+
+    fn ready_head(&self, tick: u64) -> Option<&Acknowledgment<T>> {
+        self.acknowledged
+            .front()
+            .filter(|head| head.ready_tick <= tick)
+    }
+
+    fn check_time(&self, tick: u64) -> Result<(), C220MteL1OutputError> {
+        if let Some(previous) = self.observed_tick
+            && tick < previous
+        {
+            return Err(C220MteL1OutputError::TimeReversed {
+                previous,
+                requested: tick,
+            });
+        }
+        if !self.is_idle()
+            && let Some(expected) = self.next_tick
+            && tick > expected
+        {
+            return Err(C220MteL1OutputError::InvalidCycle {
+                expected,
+                requested: tick,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests;

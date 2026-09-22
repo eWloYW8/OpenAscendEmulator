@@ -1,17 +1,13 @@
 use super::*;
-
+use crate::sim::c220::vector::C220VectorInstruction;
 
 use crate::architecture::Architecture;
 use crate::memory::mapped::MappedMemory;
-use crate::sim::c220::core::functional::C220FunctionalCore;
-use crate::sim::c220::timing::mte2::{
-    C220Mte2TimingRules, C220Stall, C220StallCause,
-};
-use crate::sim::c220::timing::mte3::C220Mte3TimingRules;
-use crate::sim::c220::vector::pipeline::{
-    C220VectorPipelineError,
-    C220VectorTimingRules,
-};
+use crate::sim::c220::mte::mte2::C220Mte2TimingRules;
+use crate::sim::c220::mte::mte3::C220Mte3TimingRules;
+use crate::sim::c220::schedule::{C220Stall, C220StallCause};
+use crate::sim::c220::state::C220State;
+use crate::sim::c220::vector::pipeline::{C220VectorPipelineError, C220VectorTimingRules};
 use crate::sim::c220::vector::timing::C220VectorUopKind;
 use std::num::NonZeroU64;
 
@@ -19,13 +15,13 @@ use crate::isa::c220::mte::CAPTURED_C220_MOV_UB_TO_OUT_WORD;
 use crate::memory::region::MemoryRegion;
 use crate::memory::sparse::{MemoryByteState, SparseMemory};
 use crate::memory::ub::UbMemory;
-use crate::sim::c220::fp16::C220Fp16Mode;
+use crate::sim::c220::numeric::fp16::C220Fp16Mode;
 use crate::sim::c220::vector::{
     C220_CAPTURED_MOVEV_CONTROL, C220_CAPTURED_MOVEV_WORD, C220_CAPTURED_VADD_CONTROL,
     C220_CAPTURED_VADD_WORD,
 };
 use crate::sim::common::scalar::ScalarMachine;
-use crate::sim::common::scalar::stepper::ScalarStepper;
+use crate::sim::common::scalar::ScalarStepper;
 
 const C220_VECTOR_TO_MTE3_SET_FLAG_WORD: u32 = 0x40a2_06b8;
 const C220_VECTOR_TO_MTE3_WAIT_FLAG_WORD: u32 = 0x40c2_06b4;
@@ -58,7 +54,7 @@ fn reduction_state_waits_for_both_repeats() {
     machine.set_spr_value(3, 0).unwrap();
     machine.set_spr_value(100, u64::MAX).unwrap();
     machine.set_spr_value(101, 0).unwrap();
-    let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+    let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
     let rate = NonZeroU64::new(32).unwrap();
     let mut core = C220Core::new(
         execution,
@@ -87,7 +83,7 @@ fn reduction_state_waits_for_both_repeats() {
     assert!(matches!(
         core.step_word_at(0, 0x83c6_2392).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorReduction(_),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Reduction(_)),
             ..
         }
     ));
@@ -109,24 +105,24 @@ fn reduction_state_waits_for_both_repeats() {
         }
     ));
     assert_eq!(
-        core.functional().scalar().machine().spr_value(87),
+        core.state().scalar().machine().spr_value(87),
         Some(192.0_f32.to_bits().into())
     );
     let max_tick = stall.resume_tick + 1;
     assert!(matches!(
         core.step_word_at(max_tick, 0x83c6_2410).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorReduction(_),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Reduction(_)),
             ..
         }
     ));
     core.advance_to(max_tick + 64).unwrap();
     assert_eq!(
-        core.functional().scalar().machine().spr_value(63),
+        core.state().scalar().machine().spr_value(63),
         Some(u64::from(2.0_f32.to_bits()) | (127_u64 << 32))
     );
     assert_eq!(
-        core.functional().ub().read_known(0x820, 8).unwrap(),
+        core.state().ub().read_known(0x820, 8).unwrap(),
         [2.0_f32.to_le_bytes(), 63_u32.to_le_bytes()].concat()
     );
 }
@@ -138,8 +134,7 @@ fn moveva_updates_only_its_selected_pair_and_retires_as_vector_work() {
     let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
     machine.set_xreg(6, 0x120).unwrap();
     machine.set_xreg(7, 0x160).unwrap();
-    let execution =
-        C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), UbMemory::new(512, 256));
+    let execution = C220State::new(ScalarStepper::new(machine, 0x4000), UbMemory::new(512, 256));
     let rate = NonZeroU64::new(32).unwrap();
     let mut core = C220Core::new(
         execution,
@@ -166,20 +161,25 @@ fn moveva_updates_only_its_selected_pair_and_retires_as_vector_work() {
     )
     .unwrap();
     let C220CoreStep::Executed {
-        instruction: first @ C220CoreInstruction::VectorMoveAddress { .. },
+        instruction: first @ C220CoreInstruction::Vector(C220VectorInstruction::MoveAddress { .. }),
         ..
     } = core.step_word_at(0, 0x8000_6380).unwrap()
     else {
         panic!("MOVEVA should issue");
     };
-    assert_eq!(first.vector_uops().unwrap()[0].stages.execute_ticks, 1);
+    assert_eq!(
+        first.as_vector().unwrap().uops().unwrap()[0]
+            .stages
+            .execute_ticks,
+        1
+    );
     assert_eq!(core.va_registers().entry(0, 0), Some(9));
     assert_eq!(core.va_registers().entry(0, 1), Some(11));
     assert_eq!(core.va_registers().entry(0, 2), None);
     assert!(matches!(
         core.step_word_at(1, 0x8000_6390).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorMoveAddress { .. },
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::MoveAddress { .. }),
             ..
         }
     ));
@@ -203,7 +203,7 @@ fn loadva_commits_at_execute_and_high_half_observes_the_ldvad_hazard() {
         .map(MemoryByteState::Known)
         .collect::<Vec<_>>();
     ub.write_states(0x100, &source).unwrap();
-    let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+    let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
     let rate = NonZeroU64::new(32).unwrap();
     let mut core = C220Core::new(
         execution,
@@ -233,7 +233,7 @@ fn loadva_commits_at_execute_and_high_half_observes_the_ldvad_hazard() {
     assert!(matches!(
         core.step_word_at(0, 0x8080_1000).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorLoadAddress(_),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::LoadAddress(_)),
             ..
         }
     ));
@@ -244,7 +244,7 @@ fn loadva_commits_at_execute_and_high_half_observes_the_ldvad_hazard() {
     assert!(matches!(
         core.step_word_at(stall.resume_tick, 0x8082_1002).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorLoadAddress(_),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::LoadAddress(_)),
             ..
         }
     ));
@@ -255,12 +255,12 @@ fn loadva_commits_at_execute_and_high_half_observes_the_ldvad_hazard() {
         core.step_word_at(stall.resume_tick + 1, 0x8040_000c)
             .unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorMovemask(_),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Movemask(_)),
             ..
         }
     ));
     assert_eq!(
-        core.functional().scalar().machine().spr_value(100),
+        core.state().scalar().machine().spr_value(100),
         Some(0x1234_5678)
     );
     core.advance_to(stall.resume_tick + 16).unwrap();
@@ -297,7 +297,7 @@ fn nchw_uses_va_rows_and_two_timed_uops_for_each_element_width() {
             )
             .unwrap();
         }
-        let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+        let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
         let rate = NonZeroU64::new(32).unwrap();
         let mut core = C220Core::new(
             execution,
@@ -330,12 +330,12 @@ fn nchw_uses_va_rows_and_two_timed_uops_for_each_element_width() {
                 for pair in 0..4_u64 {
                     let row = half * 8 + pair * 2;
                     let source_0 = base_address - 32 + row * 32;
-                    core.functional
+                    core.state
                         .scalar_mut()
                         .machine_mut()
                         .set_xreg(6, source_0)
                         .unwrap();
-                    core.functional
+                    core.state
                         .scalar_mut()
                         .machine_mut()
                         .set_xreg(7, source_0 + 32)
@@ -353,14 +353,16 @@ fn nchw_uses_va_rows_and_two_timed_uops_for_each_element_width() {
             | u32::from(destination_high)
             | (u32::from(source_high) << 1);
         let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorNchw(issue),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Nchw(issue)),
             ..
         } = core.step_word_at(tick, word).unwrap()
         else {
             panic!("VNCHWCONV should issue");
         };
-        let uops = C220CoreInstruction::VectorNchw(issue)
-            .vector_uops()
+        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Nchw(issue))
+            .as_vector()
+            .unwrap()
+            .uops()
             .unwrap();
         assert_eq!(uops.len(), 2);
         assert!(uops.iter().all(|uop| uop.stages.execute_ticks == 1));
@@ -387,11 +389,11 @@ fn nchw_uses_va_rows_and_two_timed_uops_for_each_element_width() {
                     (row * 16 * width + column * width) as u64
                 };
                 assert_eq!(
-                    core.functional()
+                    core.state()
                         .ub()
                         .read_known(0x600 + destination_offset, width)
                         .unwrap(),
-                    core.functional()
+                    core.state()
                         .ub()
                         .read_known(0x200 + source_offset, width)
                         .unwrap()
@@ -427,7 +429,7 @@ fn transpose_reads_full_matrix_before_two_half_tile_writebacks() {
                 .unwrap();
             }
         }
-        let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+        let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
         let rate = NonZeroU64::new(32).unwrap();
         let mut core = C220Core::new(
             execution,
@@ -454,14 +456,16 @@ fn transpose_reads_full_matrix_before_two_half_tile_writebacks() {
         )
         .unwrap();
         let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorTranspose(issue),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Transpose(issue)),
             ..
         } = core.step_word_at(0, word).unwrap()
         else {
             panic!("transpose should issue");
         };
-        let uops = C220CoreInstruction::VectorTranspose(issue)
-            .vector_uops()
+        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Transpose(issue))
+            .as_vector()
+            .unwrap()
+            .uops()
             .unwrap();
         assert_eq!(uops.len(), 2);
         assert!(
@@ -486,7 +490,7 @@ fn transpose_reads_full_matrix_before_two_half_tile_writebacks() {
                 let destination = 0x400 + (row * 16 + column) as u64 * 2;
                 let expected = (column * 16 + row) as u16;
                 assert_eq!(
-                    core.functional().ub().read_known(destination, 2).unwrap(),
+                    core.state().ub().read_known(destination, 2).unwrap(),
                     expected.to_le_bytes()
                 );
             }
@@ -527,7 +531,7 @@ fn broadcast_issues_one_full_tile_uop_per_repeat() {
                     .unwrap();
             }
         }
-        let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+        let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
         let rate = NonZeroU64::new(32).unwrap();
         let mut core = C220Core::new(
             execution,
@@ -554,14 +558,16 @@ fn broadcast_issues_one_full_tile_uop_per_repeat() {
         )
         .unwrap();
         let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorBroadcast(issue),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Broadcast(issue)),
             ..
         } = core.step_word_at(0, word).unwrap()
         else {
             panic!("broadcast should issue");
         };
-        let uops = C220CoreInstruction::VectorBroadcast(issue)
-            .vector_uops()
+        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Broadcast(issue))
+            .as_vector()
+            .unwrap()
+            .uops()
             .unwrap();
         assert_eq!(uops.len(), 2);
         assert!(
@@ -569,11 +575,11 @@ fn broadcast_issues_one_full_tile_uop_per_repeat() {
                 .all(|uop| uop.lane_group.is_none() && uop.stages.execute_ticks == 2)
         );
         assert_eq!(
-            core.functional().ub().read_known(0x200, width).unwrap(),
+            core.state().ub().read_known(0x200, width).unwrap(),
             vec![0xaa; width]
         );
         core.advance_to(100).unwrap();
-        let ub = core.functional().ub();
+        let ub = core.state().ub();
         for repeat in 0..2 {
             for block in 0..8 {
                 let address = 0x200_u64 + 32 * (276 * repeat + 2 * block);
@@ -688,7 +694,7 @@ fn vector_scalar_s32_and_f32_capture_scalar_and_delay_writeback() {
             .unwrap();
         ub.write_states(0x100, &[MemoryByteState::Known(0xaa); 32])
             .unwrap();
-        let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+        let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
         let rate = NonZeroU64::new(32).unwrap();
         let mut core = C220Core::new(
             execution,
@@ -715,7 +721,7 @@ fn vector_scalar_s32_and_f32_capture_scalar_and_delay_writeback() {
         )
         .unwrap();
         let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorScalar(issue),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Scalar(issue)),
             ..
         } = core.step_word_at(0, word).unwrap()
         else {
@@ -724,38 +730,34 @@ fn vector_scalar_s32_and_f32_capture_scalar_and_delay_writeback() {
         assert_eq!(issue.scalar.bits, scalar_bits);
         assert_eq!(issue.scalar.integer_saturating, saturating);
         if saturating {
-            core.functional
+            core.state
                 .scalar_mut()
                 .machine_mut()
                 .set_spr_value(3, 1 << 56)
                 .unwrap();
         }
         assert_eq!(
-            C220CoreInstruction::VectorScalar(issue)
-                .vector_uops()
+            C220CoreInstruction::Vector(C220VectorInstruction::Scalar(issue))
+                .as_vector()
+                .unwrap()
+                .uops()
                 .unwrap()[0]
                 .stages
                 .execute_ticks,
             execute_ticks
         );
-        assert_eq!(
-            core.functional().ub().read_known(0x100, 4).unwrap(),
-            [0xaa; 4]
-        );
-        core.functional
+        assert_eq!(core.state().ub().read_known(0x100, 4).unwrap(), [0xaa; 4]);
+        core.state
             .scalar_mut()
             .machine_mut()
             .set_xreg(6, 0x8000_0000)
             .unwrap();
         core.advance_to(100).unwrap();
         assert_eq!(
-            core.functional().ub().read_known(0x100, 4).unwrap(),
+            core.state().ub().read_known(0x100, 4).unwrap(),
             result_bits.to_le_bytes()
         );
-        assert_eq!(
-            core.functional().ub().read_known(0x104, 4).unwrap(),
-            [0xaa; 4]
-        );
+        assert_eq!(core.state().ub().read_known(0x104, 4).unwrap(), [0xaa; 4]);
         assert!(
             core.vector_pipeline().last_read_samples()[0]
                 .read1_grants
@@ -845,7 +847,7 @@ fn vector_scalar_16_bit_forms_use_native_uop_widths_and_preserve_inactive_tail()
             .unwrap();
         ub.write_states(0x200, &[MemoryByteState::Known(0xaa); 256])
             .unwrap();
-        let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+        let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
         let rate = NonZeroU64::new(32).unwrap();
         let mut core = C220Core::new(
             execution,
@@ -872,7 +874,7 @@ fn vector_scalar_16_bit_forms_use_native_uop_widths_and_preserve_inactive_tail()
         )
         .unwrap();
         let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorScalar(issue),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Scalar(issue)),
             ..
         } = core.step_word_at(0, word).unwrap()
         else {
@@ -884,14 +886,14 @@ fn vector_scalar_16_bit_forms_use_native_uop_widths_and_preserve_inactive_tail()
         );
         assert_eq!(issue.scalar.integer_saturating, sat);
         if sat {
-            core.functional
+            core.state
                 .scalar_mut()
                 .machine_mut()
                 .set_spr_value(3, 1 << 56)
                 .unwrap();
         }
         if source_bits == 0x7c00 {
-            core.functional
+            core.state
                 .scalar_mut()
                 .machine_mut()
                 .set_spr_value(3, control_spr ^ (1 << 48))
@@ -899,28 +901,27 @@ fn vector_scalar_16_bit_forms_use_native_uop_widths_and_preserve_inactive_tail()
         }
         let expected_uops = usize::from(
             issue.instruction.operation
-                == crate::isa::c220::vector_scalar::C220VectorScalarOperation::Multiply
+                == crate::isa::c220::vector::scalar::C220VectorScalarOperation::Multiply
                 && issue.instruction.dtype
-                    == crate::isa::c220::vector_scalar::C220VectorScalarType::S16,
+                    == crate::isa::c220::vector::scalar::C220VectorScalarType::S16,
         ) + 1;
-        let uops = C220CoreInstruction::VectorScalar(issue)
-            .vector_uops()
+        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Scalar(issue))
+            .as_vector()
+            .unwrap()
+            .uops()
             .unwrap();
         assert_eq!(uops.len(), expected_uops);
         assert_eq!(uops[0].stages.execute_ticks, execute_ticks);
         core.advance_to(200).unwrap();
         assert_eq!(
-            core.functional().ub().read_known(0x200, 2).unwrap(),
+            core.state().ub().read_known(0x200, 2).unwrap(),
             expected.to_le_bytes()
         );
         assert_eq!(
-            core.functional().ub().read_known(0x280, 2).unwrap(),
+            core.state().ub().read_known(0x280, 2).unwrap(),
             expected.to_le_bytes()
         );
-        assert_eq!(
-            core.functional().ub().read_known(0x282, 2).unwrap(),
-            [0xaa; 2]
-        );
+        assert_eq!(core.state().ub().read_known(0x282, 2).unwrap(), [0xaa; 2]);
         assert_eq!(core.vector_pipeline().pending_uops(), 0);
         assert_eq!(
             core.vector_pipeline().last_read_samples()[0].lanes[0]
@@ -973,7 +974,7 @@ fn vector_s32_binary_operations_use_delayed_reads_and_captured_saturation() {
             .unwrap();
         ub.write_states(0x200, &[MemoryByteState::Known(0xaa); 32])
             .unwrap();
-        let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+        let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
         let rate = NonZeroU64::new(32).unwrap();
         let mut core = C220Core::new(
             execution,
@@ -1000,7 +1001,7 @@ fn vector_s32_binary_operations_use_delayed_reads_and_captured_saturation() {
         )
         .unwrap();
         let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorArithmetic(issue),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue)),
             ..
         } = core.step_word_at(0, word).unwrap()
         else {
@@ -1009,25 +1010,24 @@ fn vector_s32_binary_operations_use_delayed_reads_and_captured_saturation() {
         assert_eq!(issue.modes.integer_saturating, saturating);
         assert!(issue.hint.has_s32_value_path());
         assert_eq!(
-            C220CoreInstruction::VectorArithmetic(issue)
-                .vector_uops()
+            C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue))
+                .as_vector()
+                .unwrap()
+                .uops()
                 .unwrap()[0]
                 .stages
                 .execute_ticks,
             execute_ticks
         );
-        assert_eq!(
-            core.functional().ub().read_known(0x200, 4).unwrap(),
-            [0xaa; 4]
-        );
-        core.functional
+        assert_eq!(core.state().ub().read_known(0x200, 4).unwrap(), [0xaa; 4]);
+        core.state
             .scalar_mut()
             .machine_mut()
             .set_spr_value(3, control_spr ^ (1 << 53))
             .unwrap();
         core.advance_to(100).unwrap();
         assert_eq!(
-            core.functional().ub().read_known(0x200, 4).unwrap(),
+            core.state().ub().read_known(0x200, 4).unwrap(),
             expected.to_le_bytes()
         );
         assert!(
@@ -1085,7 +1085,7 @@ fn vector_s16_binary_operations_use_native_uop_widths() {
             ub.write_states(offset + 0x200, &[MemoryByteState::Known(0xaa); 32])
                 .unwrap();
         }
-        let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+        let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
         let rate = NonZeroU64::new(32).unwrap();
         let mut core = C220Core::new(
             execution,
@@ -1112,7 +1112,7 @@ fn vector_s16_binary_operations_use_native_uop_widths() {
         )
         .unwrap();
         let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorArithmetic(issue),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue)),
             ..
         } = core.step_word_at(0, word).unwrap()
         else {
@@ -1122,8 +1122,10 @@ fn vector_s16_binary_operations_use_native_uop_widths() {
         assert_eq!(issue.modes.integer_saturating, saturating);
         assert_eq!(issue.modes.widen_s16, widen_bit);
         let operation = issue.hint.operation;
-        let uops = C220CoreInstruction::VectorArithmetic(issue)
-            .vector_uops()
+        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue))
+            .as_vector()
+            .unwrap()
+            .uops()
             .unwrap();
         let expected_uops = usize::from(
             operation == crate::isa::c220::vector::C220VecArithmeticOperation::Multiply,
@@ -1133,7 +1135,7 @@ fn vector_s16_binary_operations_use_native_uop_widths() {
             uops.iter()
                 .all(|uop| uop.stages.execute_ticks == execute_ticks)
         );
-        core.functional
+        core.state
             .scalar_mut()
             .machine_mut()
             .set_spr_value(3, control_spr ^ (1 << 53))
@@ -1141,7 +1143,7 @@ fn vector_s16_binary_operations_use_native_uop_widths() {
         core.advance_to(100).unwrap();
         for address in [0x200, 0x280] {
             assert_eq!(
-                core.functional().ub().read_known(address, 2).unwrap(),
+                core.state().ub().read_known(address, 2).unwrap(),
                 expected.to_le_bytes()
             );
         }
@@ -1167,8 +1169,7 @@ fn scalar_conversion_retires_after_two_ticks_and_blocks_dependent_conversion() {
     let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
     machine.set_xreg(8, u64::from(4.75_f32.to_bits())).unwrap();
     machine.set_xreg(11, u64::from(6.5_f32.to_bits())).unwrap();
-    let execution =
-        C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), UbMemory::new(512, 256));
+    let execution = C220State::new(ScalarStepper::new(machine, 0x4000), UbMemory::new(512, 256));
     let rate = NonZeroU64::new(32).unwrap();
     let mut core = C220Core::new(
         execution,
@@ -1215,7 +1216,7 @@ fn scalar_conversion_retires_after_two_ticks_and_blocks_dependent_conversion() {
     };
     assert_eq!(stall.cause, C220StallCause::ScalarDependency);
     assert_eq!(stall.resume_tick, 12);
-    assert_eq!(core.functional().scalar().pc(), 0x4004);
+    assert_eq!(core.state().scalar().pc(), 0x4004);
 
     let C220CoreStep::Stalled(move_stall) = core.step_word_at(11, 0x0202_8800).unwrap() else {
         panic!("scalar register read should wait");
@@ -1236,7 +1237,7 @@ fn scalar_conversion_retires_after_two_ticks_and_blocks_dependent_conversion() {
         C220CoreStep::Executed { .. }
     ));
     assert_eq!(core.scalar_timing().pending_xreg_retirement(8), None);
-    assert_eq!(core.functional().scalar().machine().xregs()[1], 4);
+    assert_eq!(core.state().scalar().machine().xregs()[1], 4);
     assert!(matches!(
         core.step_word_at(13, 0x0210_8583).unwrap(),
         C220CoreStep::Executed { .. }
@@ -1262,7 +1263,7 @@ fn vabs_uses_modeled_five_tick_execution_stage() {
         source[..4].copy_from_slice(&(-1.0_f32).to_le_bytes());
         ub.write_states(0, &source.map(MemoryByteState::Known))
             .unwrap();
-        let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+        let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
         let rate = NonZeroU64::new(32).unwrap();
         C220Core::new(
             execution,
@@ -1291,15 +1292,17 @@ fn vabs_uses_modeled_five_tick_execution_stage() {
     };
     let mut timed = make_core();
     let C220CoreStep::Executed {
-        instruction: C220CoreInstruction::VectorArithmetic(issue),
+        instruction: C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue)),
         ..
     } = timed.step_word_at(0, word).unwrap()
     else {
         panic!("VABS should issue to the vector pipeline");
     };
     assert_eq!(
-        C220CoreInstruction::VectorArithmetic(issue)
-            .vector_uops()
+        C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue))
+            .as_vector()
+            .unwrap()
+            .uops()
             .unwrap()[0]
             .stages
             .execute_ticks,
@@ -1308,7 +1311,7 @@ fn vabs_uses_modeled_five_tick_execution_stage() {
     let visible = timed.vector_pipeline().pending_visibility_tick().unwrap();
     timed.advance_to(visible).unwrap();
     assert_eq!(
-        timed.functional().ub().read_known(0x100, 4).unwrap(),
+        timed.state().ub().read_known(0x100, 4).unwrap(),
         1.0_f32.to_le_bytes()
     );
     assert!(
@@ -1337,7 +1340,7 @@ fn vnot_b16_reads_one_source_and_preserves_inactive_ub_lanes() {
         .unwrap();
     ub.write_states(0x100, &[MemoryByteState::Known(0xaa); 32])
         .unwrap();
-    let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+    let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
     let rate = NonZeroU64::new(32).unwrap();
     let mut core = C220Core::new(
         execution,
@@ -1364,7 +1367,7 @@ fn vnot_b16_reads_one_source_and_preserves_inactive_ub_lanes() {
     )
     .unwrap();
     let C220CoreStep::Executed {
-        instruction: C220CoreInstruction::VectorArithmetic(issue),
+        instruction: C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue)),
         ..
     } = core.step_word_at(0, word).unwrap()
     else {
@@ -1372,12 +1375,14 @@ fn vnot_b16_reads_one_source_and_preserves_inactive_ub_lanes() {
     };
     assert_eq!(issue.hint.source_1_register, None);
     assert_eq!(issue.result_element_bytes, 2);
-    let uops = C220CoreInstruction::VectorArithmetic(issue)
-        .vector_uops()
+    let uops = C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue))
+        .as_vector()
+        .unwrap()
+        .uops()
         .unwrap();
     assert_eq!(uops[0].stages.execute_ticks, 1);
     core.advance_to(100).unwrap();
-    let ub = core.functional().ub();
+    let ub = core.state().ub();
     assert_eq!(ub.read_known(0x100, 2).unwrap(), 0xff0f_u16.to_le_bytes());
     assert_eq!(ub.read_known(0x102, 2).unwrap(), [0xaa; 2]);
     assert!(
@@ -1418,7 +1423,7 @@ fn vector_shifts_capture_scalar_and_follow_masked_pipeline() {
             .unwrap();
         ub.write_states(0x100, &[MemoryByteState::Known(0xaa); 32])
             .unwrap();
-        let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+        let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
         let rate = NonZeroU64::new(32).unwrap();
         let mut core = C220Core::new(
             execution,
@@ -1445,7 +1450,7 @@ fn vector_shifts_capture_scalar_and_follow_masked_pipeline() {
         )
         .unwrap();
         let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorShift(issue),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Shift(issue)),
             ..
         } = core.step_word_at(0, word).unwrap()
         else {
@@ -1453,19 +1458,21 @@ fn vector_shifts_capture_scalar_and_follow_masked_pipeline() {
         };
         assert_eq!(issue.shift, shift as u32);
         assert_eq!(
-            C220CoreInstruction::VectorShift(issue)
-                .vector_uops()
+            C220CoreInstruction::Vector(C220VectorInstruction::Shift(issue))
+                .as_vector()
+                .unwrap()
+                .uops()
                 .unwrap()[0]
                 .stages
                 .execute_ticks,
             6
         );
         assert_eq!(
-            core.functional().ub().read_known(0x100, width).unwrap(),
+            core.state().ub().read_known(0x100, width).unwrap(),
             vec![0xaa; width]
         );
         core.advance_to(100).unwrap();
-        let ub = core.functional().ub();
+        let ub = core.state().ub();
         assert_eq!(
             ub.read_known(0x100, width).unwrap(),
             expected.to_le_bytes()[..width]
@@ -1509,7 +1516,7 @@ fn vector_copy_uses_both_lane_groups_and_preserves_masked_destinations() {
             .unwrap();
         ub.write_states(0x200, &[MemoryByteState::Known(0xaa); 256])
             .unwrap();
-        let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+        let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
         let rate = NonZeroU64::new(32).unwrap();
         let mut core = C220Core::new(
             execution,
@@ -1536,7 +1543,7 @@ fn vector_copy_uses_both_lane_groups_and_preserves_masked_destinations() {
         )
         .unwrap();
         let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorCopy(issue),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Copy(issue)),
             ..
         } = core.step_word_at(0, word).unwrap()
         else {
@@ -1544,22 +1551,21 @@ fn vector_copy_uses_both_lane_groups_and_preserves_masked_destinations() {
         };
         assert_eq!(issue.control.source_0_block_stride, 1);
         assert_eq!(
-            C220CoreInstruction::VectorCopy(issue)
-                .vector_uops()
+            C220CoreInstruction::Vector(C220VectorInstruction::Copy(issue))
+                .as_vector()
+                .unwrap()
+                .uops()
                 .unwrap()[0]
                 .stages
                 .execute_ticks,
             1
         );
         assert_eq!(
-            core.functional()
-                .ub()
-                .read_known(0x200, element_bytes)
-                .unwrap(),
+            core.state().ub().read_known(0x200, element_bytes).unwrap(),
             vec![0xaa; element_bytes]
         );
         core.advance_to(100).unwrap();
-        let ub = core.functional().ub();
+        let ub = core.state().ub();
         assert_eq!(
             ub.read_known(0x200, element_bytes).unwrap(),
             source[..element_bytes]
@@ -1600,7 +1606,7 @@ fn vector_read_samples_ub_after_issue_without_an_implicit_raw_wait() {
         .collect::<Vec<_>>();
     ub.write_states(0, &ones).unwrap();
     ub.write_states(0x200, &ones).unwrap();
-    let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+    let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
     let rate = NonZeroU64::new(32).unwrap();
     let mut core = C220Core::new(
         execution,
@@ -1632,7 +1638,7 @@ fn vector_read_samples_ub_after_issue_without_an_implicit_raw_wait() {
     ));
     let movev_visible = core.vector_pipeline().pending_visibility_tick().unwrap();
     assert!(movev_visible < 21);
-    core.functional
+    core.state
         .scalar_mut()
         .machine_mut()
         .set_xreg(16, 0x400)
@@ -1640,15 +1646,15 @@ fn vector_read_samples_ub_after_issue_without_an_implicit_raw_wait() {
     assert!(matches!(
         core.step_word_at(1, C220_CAPTURED_VADD_WORD).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorArithmetic(_),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(_)),
             ..
         }
     ));
     assert!(core.vector_pipeline().last_read_samples().is_empty());
-    assert!(core.functional().ub().read_known(0x400, 4).is_err());
+    assert!(core.state().ub().read_known(0x400, 4).is_err());
     core.advance_to(30).unwrap();
     assert_eq!(
-        core.functional().ub().read_known(0, 4).unwrap(),
+        core.state().ub().read_known(0, 4).unwrap(),
         0x4000_0000_u32.to_le_bytes()
     );
     let sample = &core.vector_pipeline().last_read_samples()[0];
@@ -1666,11 +1672,11 @@ fn vector_read_samples_ub_after_issue_without_an_implicit_raw_wait() {
     assert_eq!(&sample.source_0_bytes[..4], &0x4000_0000_u32.to_le_bytes());
     assert_eq!(&sample.source_1_bytes[..4], &0x3f80_0000_u32.to_le_bytes());
     assert_eq!(sample.lanes[0].bits, 0x4040_0000);
-    assert!(core.functional().ub().read_known(0x400, 4).is_err());
+    assert!(core.state().ub().read_known(0x400, 4).is_err());
     let arithmetic_visible = core.vector_pipeline().pending_visibility_tick().unwrap();
     core.advance_to(arithmetic_visible).unwrap();
     assert_eq!(
-        core.functional().ub().read_known(0x400, 4).unwrap(),
+        core.state().ub().read_known(0x400, 4).unwrap(),
         0x4040_0000_u32.to_le_bytes()
     );
 }
@@ -1686,8 +1692,7 @@ fn halfword_movev_uses_one_native_128_lane_uop() {
     machine.set_spr_value(3, 1 << 56).unwrap();
     machine.set_spr_value(100, 65).unwrap();
     machine.set_spr_value(101, 0).unwrap();
-    let execution =
-        C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), UbMemory::new(256, 256));
+    let execution = C220State::new(ScalarStepper::new(machine, 0x4000), UbMemory::new(256, 256));
     let rate = NonZeroU64::new(32).unwrap();
     let mut core = C220Core::new(
         execution,
@@ -1716,13 +1721,17 @@ fn halfword_movev_uses_one_native_128_lane_uop() {
     let halfword_word = (C220_CAPTURED_MOVEV_WORD & !(7 << 22)) | (1 << 22);
     let step = core.step_word_at(0, halfword_word).unwrap();
     let C220CoreStep::Executed {
-        instruction: C220CoreInstruction::VectorMove(step),
+        instruction: C220CoreInstruction::Vector(C220VectorInstruction::Move(step)),
         ..
     } = step
     else {
         panic!("expected MOVEV");
     };
-    let uops = C220CoreInstruction::VectorMove(step).vector_uops().unwrap();
+    let uops = C220CoreInstruction::Vector(C220VectorInstruction::Move(step))
+        .as_vector()
+        .unwrap()
+        .uops()
+        .unwrap();
     assert_eq!(uops.len(), 1);
     assert!(matches!(
         uops[0].kind,
@@ -1732,18 +1741,18 @@ fn halfword_movev_uses_one_native_128_lane_uop() {
         }
     ));
     assert_eq!(core.vector_pipeline().pending_ub_responses(), 1);
-    assert!(core.functional().ub().read_known(0, 2).is_err());
+    assert!(core.state().ub().read_known(0, 2).is_err());
     let final_visibility = core.vector_pipeline().pending_visibility_tick().unwrap();
     core.advance_to(final_visibility - 1).unwrap();
-    assert!(core.functional().ub().read_known(0, 2).is_err());
-    assert!(core.functional().ub().read_known(128, 2).is_err());
+    assert!(core.state().ub().read_known(0, 2).is_err());
+    assert!(core.state().ub().read_known(128, 2).is_err());
     core.advance_to(final_visibility).unwrap();
     assert_eq!(
-        core.functional().ub().read_known(0, 2).unwrap(),
+        core.state().ub().read_known(0, 2).unwrap(),
         0x3c00_u16.to_le_bytes()
     );
     assert_eq!(
-        core.functional().ub().read_known(128, 2).unwrap(),
+        core.state().ub().read_known(128, 2).unwrap(),
         0x3c00_u16.to_le_bytes()
     );
 }
@@ -1759,8 +1768,7 @@ fn vector_issue_failure_keeps_execution_state_uncommitted() {
     machine.set_spr_value(3, 1 << 56).unwrap();
     machine.set_spr_value(100, 1).unwrap();
     machine.set_spr_value(101, 0).unwrap();
-    let execution =
-        C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), UbMemory::new(256, 256));
+    let execution = C220State::new(ScalarStepper::new(machine, 0x4000), UbMemory::new(256, 256));
     let before = execution.clone();
     let rate = NonZeroU64::new(32).unwrap();
     let mut core = C220Core::new(
@@ -1789,11 +1797,13 @@ fn vector_issue_failure_keeps_execution_state_uncommitted() {
     .unwrap();
     assert!(matches!(
         core.step_word_at(1, C220_CAPTURED_MOVEV_WORD),
-        Err(C220CoreError::VectorPipeline(
-            C220VectorPipelineError::TimeOverflow
+        Err(C220CoreError::VectorRuntime(
+            crate::sim::c220::vector::C220VectorRuntimeError::Issue(
+                C220VectorPipelineError::TimeOverflow
+            )
         ))
     ));
-    assert_eq!(core.functional(), &before);
+    assert_eq!(core.state(), &before);
     assert_eq!(core.vector_pipeline().pending_uops(), 0);
 }
 
@@ -1812,8 +1822,7 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
     machine.set_spr_value(3, 1 << 56).unwrap();
     machine.set_spr_value(100, 32).unwrap();
     machine.set_spr_value(101, 0).unwrap();
-    let execution =
-        C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), UbMemory::new(512, 256));
+    let execution = C220State::new(ScalarStepper::new(machine, 0x4000), UbMemory::new(512, 256));
     let rate = NonZeroU64::new(32).unwrap();
     let mut core = C220Core::new(
         execution,
@@ -1840,23 +1849,23 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
     )
     .unwrap();
     core.step_word_at(0, C220_CAPTURED_MOVEV_WORD).unwrap();
-    core.functional
+    core.state
         .scalar_mut()
         .machine_mut()
         .set_xreg(16, 0x80)
         .unwrap();
     core.step_word_at(2, C220_CAPTURED_MOVEV_WORD).unwrap();
-    let machine = core.functional.scalar_mut().machine_mut();
+    let machine = core.state.scalar_mut().machine_mut();
     machine.set_xreg(16, 0x100).unwrap();
     core.step_word_at(4, C220_CAPTURED_MOVEV_WORD).unwrap();
     let read_ready_tick = core.vector_pipeline().pending_visibility_tick().unwrap();
-    core.functional
+    core.state
         .scalar_mut()
         .machine_mut()
         .set_xreg(16, 0x180)
         .unwrap();
     core.step_word_at(6, C220_CAPTURED_MOVEV_WORD).unwrap();
-    let machine = core.functional.scalar_mut().machine_mut();
+    let machine = core.state.scalar_mut().machine_mut();
     machine.set_xreg(8, C220_CAPTURED_VADD_CONTROL).unwrap();
     machine.set_xreg(13, 0).unwrap();
     machine.set_xreg(14, 0x80).unwrap();
@@ -1865,11 +1874,11 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
     let last_release = movev_visible - 3;
     core.advance_to(last_release).unwrap();
     assert_eq!(core.last_vector_releases().len(), 4);
-    assert!(core.functional().ub().read_known(0x180, 4).is_err());
+    assert!(core.state().ub().read_known(0x180, 4).is_err());
     core.advance_to(read_ready_tick).unwrap();
     core.step_word_at(read_ready_tick, C220_CAPTURED_VADD_WORD)
         .unwrap();
-    core.functional
+    core.state
         .scalar_mut()
         .machine_mut()
         .set_xreg(14, 0)
@@ -1877,7 +1886,7 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
     let set_tick = read_ready_tick + 1;
     core.step_word_at(set_tick, C220_VECTOR_TO_MTE3_SET_FLAG_WORD)
         .unwrap();
-    core.functional
+    core.state
         .scalar_mut()
         .machine_mut()
         .set_xreg(13, 0)
@@ -1894,7 +1903,7 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
     ));
     core.step_word_at(vector_visible, C220_VECTOR_TO_MTE3_WAIT_FLAG_WORD)
         .unwrap();
-    let machine = core.functional.scalar_mut().machine_mut();
+    let machine = core.state.scalar_mut().machine_mut();
     machine.set_xreg(14, 0x180).unwrap();
     machine.set_xreg(10, 0x2000).unwrap();
     machine.set_xreg(3, 0x40010).unwrap();
@@ -1918,14 +1927,14 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
     assert_eq!(ticket.retire_tick, issue_tick + 7);
     assert_eq!(ticket.uop_count, 1);
     assert!(core.memory().read_known_at(0x2000, 128).is_err());
-    core.functional
+    core.state
         .scalar_mut()
         .machine_mut()
         .set_xreg(10, 0)
         .unwrap();
     core.step_word_at(issue_tick + 1, C220_MTE3_TO_VECTOR_SET_FLAG_WORD)
         .unwrap();
-    core.functional
+    core.state
         .scalar_mut()
         .machine_mut()
         .set_xreg(19, 0)
@@ -2002,7 +2011,7 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
         .set_xreg(3, 2 | (2_u64 << 16) | (2_u64 << 32) | (2_u64 << 48))
         .unwrap();
     machine.set_xreg(4, 1 | (0xf << 8)).unwrap();
-    let execution = C220FunctionalCore::new(ScalarStepper::new(machine, 0x4000), ub);
+    let execution = C220State::new(ScalarStepper::new(machine, 0x4000), ub);
     let rate = NonZeroU64::new(32).unwrap();
     let mut core = C220Core::new(
         execution,
@@ -2032,7 +2041,7 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     assert!(matches!(
         core.step_word_at(0, word).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorMerge(_),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Merge(_)),
             ..
         }
     ));
@@ -2040,7 +2049,7 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     let retirement = core.vmsu_pipeline().pending_drain_tick().unwrap();
     assert!(retirement > visibility);
     core.advance_to(visibility).unwrap();
-    let output = core.functional().ub().read_known(0x100, 64).unwrap();
+    let output = core.state().ub().read_known(0x100, 64).unwrap();
     let payloads = output
         .chunks_exact(8)
         .map(|record| u32::from_le_bytes(record[4..8].try_into().unwrap()))
@@ -2049,11 +2058,11 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     assert!(matches!(
         core.step_word_at(visibility, 0x8040_0000).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorMovemask(_),
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Movemask(_)),
             ..
         }
     ));
     core.advance_to(retirement).unwrap();
     assert!(!core.vmsu_pipeline().is_active());
-    assert_eq!(core.functional().scalar().machine().spr_value(17), Some(0));
+    assert_eq!(core.state().scalar().machine().spr_value(17), Some(0));
 }

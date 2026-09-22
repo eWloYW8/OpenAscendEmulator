@@ -1,8 +1,6 @@
 use std::fmt;
 use std::str::FromStr;
 
-pub mod c220;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Architecture {
     Dav2201,

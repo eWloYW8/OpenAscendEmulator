@@ -197,10 +197,11 @@ fn validate_image(image: &DeviceLoadImage<'_>) -> Result<u64, DeviceBinaryLoadEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::isa::c310::dispatch::C310VfQueueStep;
     use crate::memory::hbm::DEFAULT_HBM_BASE;
     use crate::sim::c310::scalar::{C310ScalarBus, C310ScalarStepper};
-    use crate::sim::c310::vector_queue::{C310VfQueueDisposition, C310VfQueueStep};
-    use crate::sim::common::scalar::stepper::ScalarStepper;
+    use crate::sim::c310::vector_queue::C310VfQueueDisposition;
+    use crate::sim::common::scalar::ScalarStepper;
     use crate::sim::common::scalar::{ScalarMachine, ScalarMemoryBus};
     use std::io;
 

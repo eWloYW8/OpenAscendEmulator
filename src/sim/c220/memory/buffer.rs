@@ -50,7 +50,11 @@ impl C220LocalBuffer {
         len: usize,
     ) -> Result<Vec<MemoryByteState>, C220LocalBufferError> {
         self.check_range(address, len)?;
-        self.read_with(len, |offset| address + offset as u64)
+        self.read_with(
+            len,
+            |offset| address + offset as u64,
+            MemoryByteState::Unknown,
+        )
     }
 
     pub fn read_states_wrapped(
@@ -61,9 +65,31 @@ impl C220LocalBuffer {
         if self.capacity == 0 {
             return Err(C220LocalBufferError::ZeroCapacity);
         }
-        self.read_with(len, |offset| {
-            address.wrapping_add(offset as u64) % self.capacity
-        })
+        self.read_with(
+            len,
+            |offset| address.wrapping_add(offset as u64) % self.capacity,
+            MemoryByteState::Unknown,
+        )
+    }
+
+    /// Reads without capacity wrapping. Untouched bytes are zero; explicitly
+    /// unknown bytes remain errors.
+    pub fn read_initialized_linear(
+        &self,
+        address: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, C220LocalBufferError> {
+        if len != 0 {
+            address
+                .checked_add((len - 1) as u64)
+                .ok_or(C220LocalBufferError::RangeOverflow)?;
+        }
+        let states = self.read_with(
+            len,
+            |offset| address + offset as u64,
+            MemoryByteState::Known(0),
+        )?;
+        collect_known(states, |offset| address + offset as u64)
     }
 
     pub fn read_known(&self, address: u64, len: usize) -> Result<Vec<u8>, C220LocalBufferError> {
@@ -138,18 +164,14 @@ impl C220LocalBuffer {
         &self,
         len: usize,
         address: impl Fn(usize) -> u64,
+        default: MemoryByteState,
     ) -> Result<Vec<MemoryByteState>, C220LocalBufferError> {
         let mut result = Vec::new();
         result
             .try_reserve_exact(len)
             .map_err(|_| C220LocalBufferError::HostAllocationFailed { requested: len })?;
         for offset in 0..len {
-            result.push(
-                self.bytes
-                    .get(&address(offset))
-                    .copied()
-                    .unwrap_or(MemoryByteState::Unknown),
-            );
+            result.push(self.bytes.get(&address(offset)).copied().unwrap_or(default));
         }
         Ok(result)
     }

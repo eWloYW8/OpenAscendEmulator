@@ -1,3 +1,6 @@
 pub mod c220;
 pub mod c310;
-pub(crate) mod common;
+pub mod common;
+
+#[cfg(test)]
+mod transfer_tests;

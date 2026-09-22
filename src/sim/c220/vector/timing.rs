@@ -1,22 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-use crate::architecture::c220::C220UbBank;
-use crate::isa::c220::conversion::C220ConversionKind;
-use crate::isa::c220::fused::C220FusedInstruction;
-use crate::isa::c220::gather::C220GatherKind;
-use crate::isa::c220::reduce::{
+use crate::isa::c220::vector::conversion::C220ConversionKind;
+use crate::isa::c220::vector::fused::C220FusedInstruction;
+use crate::isa::c220::vector::gather::C220GatherKind;
+use crate::isa::c220::vector::reduce::{
     C220ExtremumOperation, C220ReductionInstruction, C220ReductionKind, C220ReductionWidth,
 };
-use crate::isa::c220::special::{C220SpecialUnaryInstruction, C220SpecialUnaryOperation};
-use crate::isa::c220::ternary::C220TernaryInstruction;
+use crate::isa::c220::vector::scalar::{
+    C220VectorScalarInstruction, C220VectorScalarOperation, C220VectorScalarType,
+};
+use crate::isa::c220::vector::special::{C220SpecialUnaryInstruction, C220SpecialUnaryOperation};
+use crate::isa::c220::vector::ternary::C220TernaryInstruction;
 use crate::isa::c220::vector::{
     C220MovevInstruction, C220VecArithmeticHint, C220VecArithmeticOperation,
 };
-use crate::isa::c220::vector_scalar::{
-    C220VectorScalarInstruction, C220VectorScalarOperation, C220VectorScalarType,
-};
-use crate::sim::c220::ub_arbiter::{C220UbCycle, C220UbRequest};
+use crate::sim::c220::memory::C220UbBank;
+use crate::sim::c220::memory::{C220UbCycle, C220UbRequest};
 use crate::sim::c220::vector::{C220_VECTOR_BLOCK_BYTES, C220_VECTOR_BLOCK_COUNT, C220VectorStore};
 
 const PARTIAL_WRITE_OCCUPANCY_TICKS: usize = 6;

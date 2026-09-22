@@ -1,6 +1,16 @@
+pub(super) mod runtime;
+pub use runtime::C220CubeRuntimeError;
+mod accumulator;
+pub use accumulator::C220CubeAccumulatorSource;
+mod control;
 mod execute;
 mod fsm_v0;
 mod fsm_v1;
+mod layout;
+mod mmad;
+mod numeric;
+#[cfg(test)]
+mod tests;
 pub mod timing;
 mod uop;
 
@@ -8,17 +18,20 @@ use crate::isa::c220::cube::{C220CubeInstruction, C220CubeRegisterValues, C220Mm
 
 pub use timing::{
     C220CubeConfig, C220CubeFsmVersion, C220CubePipeline, C220CubeTicket, C220CubeTimingError,
+    C220CubeV1FrameOrder,
 };
 
-pub(crate) use execute::update_cube_status_spr2;
-pub use execute::{
-    C220CubeControl, C220CubeExecutionError, C220CubeExecutionOutcome, C220CubeFpStatus,
-    C220F32MmadMode, C220PreparedCubeExecution,
+pub use control::{
+    C220CubeExecutionControl, C220CubeIssueDelay, C220CubeTimingControl, C220F32MmadMode,
 };
+pub(crate) use execute::update_cube_status_spr2;
+pub use execute::{C220CubeExecutionError, C220CubeExecutionOutcome, C220PreparedCubeExecution};
 pub use fsm_v0::C220CubeV0UopPlanner;
 pub use fsm_v1::C220CubeV1UopPlanner;
+pub use numeric::C220CubeFpStatus;
 pub use uop::{
-    C220CubeL0cAccess, C220CubeL0cRequest, C220CubeTileIndices, C220CubeUop, C220CubeUopRelease,
+    C220CubeL0cAccess, C220CubeL0cRequest, C220CubeTileIndices, C220CubeUnitFlagMode, C220CubeUop,
+    C220CubeUopRelease,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,42 +60,9 @@ impl Iterator for C220CubeUopPlanner {
 
 impl ExactSizeIterator for C220CubeUopPlanner {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct C220CubeTimeline {
-    ticket: C220CubeTicket,
-    uops: C220CubeUopPlanner,
-}
-
-impl C220CubeTimeline {
-    fn new(issue: C220CubeIssue) -> Self {
-        Self {
-            ticket: issue.ticket,
-            uops: issue.uops(),
-        }
-    }
-}
-
-impl Iterator for C220CubeTimeline {
-    type Item = C220CubeUopRelease;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let uop = self.uops.next()?;
-        let issue_tick = self
-            .ticket
-            .uop_issue_tick(uop.id)
-            .expect("planner only emits scheduled Cube uops");
-        Some(C220CubeUopRelease { uop, issue_tick })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.uops.size_hint()
-    }
-}
-
-impl ExactSizeIterator for C220CubeTimeline {}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CubeIssue {
+    pub instruction_id: u64,
     pub pc: u64,
     pub word: u32,
     pub instruction: C220CubeInstruction,
@@ -105,9 +85,5 @@ impl C220CubeIssue {
                 self.parameters,
             )),
         }
-    }
-
-    pub fn timeline(self) -> C220CubeTimeline {
-        C220CubeTimeline::new(self)
     }
 }

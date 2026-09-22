@@ -1,11 +1,11 @@
 pub mod core;
 pub mod cube;
-pub mod fp16;
+pub mod device;
 pub mod memory;
 pub mod mte;
+pub mod numeric;
 pub mod scalar;
-pub(crate) mod scalar_address;
-pub mod timing;
-pub mod ub_arbiter;
-pub mod va;
+pub mod schedule;
+pub mod state;
+pub mod sync;
 pub mod vector;

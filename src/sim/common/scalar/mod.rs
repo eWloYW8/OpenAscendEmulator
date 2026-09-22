@@ -10,16 +10,18 @@ use crate::isa::scalar::{
     ScalarLoadStoreOperation, ScalarStoreImmediateValue,
 };
 use crate::sim::common::scalar::alu::{
-    ScalarIntegerError, evaluate_scalar_integer_immediate, update_neg_overflow_spr2,
-    update_overflow_spr2,
+    evaluate_scalar_integer_immediate, update_neg_overflow_spr2, update_overflow_spr2,
 };
 use thiserror::Error;
 
-pub(crate) mod alu;
-pub(crate) mod bus;
+mod alu;
+mod bus;
 mod integer;
 mod memory;
-pub(crate) mod stepper;
+mod stepper;
+
+pub use alu::ScalarIntegerError;
+pub use stepper::{ScalarProgramStep, ScalarStepper, ScalarStepperError};
 
 pub const SCALAR_X_REGISTER_COUNT: usize = 32;
 const SCALAR_SPR_SNAPSHOT_CAPACITY: usize = 243;
@@ -389,8 +391,6 @@ impl ScalarMachine {
                 }
                 sprs[55] = Some(15360);
                 sprs[58] = Some(0x10000);
-                sprs[107] = None;
-                sprs[108] = None;
             }
             Architecture::Dav3510 => {
                 for (index, slot) in sprs[164..228].iter_mut().enumerate() {
@@ -916,5 +916,4 @@ fn evaluate_integer_compare(
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;

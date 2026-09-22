@@ -44,8 +44,8 @@ impl From<C220CubeL0cRequest> for C220L0cFragmentRequest {
             address: request.address,
             bytes: u32::from(request.bytes),
             access: request.access,
-            check_unit_flags: false,
-            update_unit_flags: false,
+            check_unit_flags: request.unit_flags.checks(),
+            update_unit_flags: request.unit_flags.updates(),
         }
     }
 }

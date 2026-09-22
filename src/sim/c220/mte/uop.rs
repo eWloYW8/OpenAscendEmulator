@@ -3,7 +3,8 @@ use thiserror::Error;
 use crate::isa::c220::mte::{
     C220DmaMovDescriptor, C220DmaMovError, C220MovOutToUbDescriptor, C220MovOutToUbError,
 };
-use crate::sim::c220::mte::transfer::{C220Mte2TransferPlan, C220Mte3TransferPlan};
+use crate::sim::c220::mte::mte2::C220Mte2TransferPlan;
+use crate::sim::c220::mte::mte3::C220Mte3TransferPlan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220DmaUopMode {

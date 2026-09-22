@@ -1,10 +1,13 @@
+mod execute;
 use crate::architecture::Architecture;
 use crate::isa::c220::scalar::{C220ScalarConversion, C220ScalarConversionHint};
 use crate::isa::c220::vector::C220MovemaskHint;
 use crate::numeric::conversion::{F32ToS32Status, f32_to_s32_truncate, s32_to_f32_bits};
 use crate::sim::common::scalar::{ScalarMachine, ScalarMachineError, ScalarStep};
 
+pub(crate) mod address;
 pub(crate) mod bus;
+pub mod timing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220MovemaskStep {

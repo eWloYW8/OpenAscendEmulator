@@ -1,12 +1,14 @@
 use crate::isa::c310::buffer::C310BufferStep;
+use crate::isa::c310::dispatch::C310PushPbStep;
+use crate::isa::c310::dispatch::C310VfQueueStep;
 use crate::isa::flow::{DcciStep, DsbStep, PipelineBarrierStep};
 use crate::sim::c310::buffer::C310BufferDisposition;
 use crate::sim::c310::predicate_buffer::{
     C310PredicateBuffer, C310PredicateBufferError, C310PredicateBufferVfIssue,
-    C310PredicateBufferWrite, C310PushPbDisposition, C310PushPbStep,
+    C310PredicateBufferWrite, C310PushPbDisposition,
 };
 use crate::sim::c310::scalar::C310ScalarBus;
-use crate::sim::c310::vector_queue::{C310VfQueueDisposition, C310VfQueueStep};
+use crate::sim::c310::vector_queue::C310VfQueueDisposition;
 use crate::sim::common::scalar::ScalarMemoryBus;
 use thiserror::Error;
 
@@ -297,7 +299,7 @@ mod tests {
         let mut bus = C310PredicateBufferBus::new(inner, C310PredicateBuffer::new(3).unwrap());
         let push = C310PushPbStep {
             pc: 0x10d0_d6fc,
-            instruction: crate::sim::c310::predicate_buffer::C310PushPbInstruction::decode(
+            instruction: crate::isa::c310::dispatch::C310PushPbInstruction::decode(
                 Architecture::Dav3510,
                 0x4319_7108,
             )
@@ -311,7 +313,7 @@ mod tests {
         );
         let queue = C310VfQueueStep {
             pc: 0x10d0_d718,
-            instruction: crate::sim::c310::vector_queue::C310VfQueueInstruction::decode(
+            instruction: crate::isa::c310::dispatch::C310VfQueueInstruction::decode(
                 Architecture::Dav3510,
                 0x1542_0000,
                 0x15e0_0125,
@@ -356,7 +358,7 @@ mod tests {
                 steps: Vec::new(),
             };
             let mut buffer = C310PredicateBuffer::new(2).unwrap();
-            let instruction = crate::sim::c310::predicate_buffer::C310PushPbInstruction::decode(
+            let instruction = crate::isa::c310::dispatch::C310PushPbInstruction::decode(
                 Architecture::Dav3510,
                 0x4319_7108,
             )
@@ -368,7 +370,7 @@ mod tests {
             let mut bus = C310PredicateBufferBus::new(inner, buffer);
             let queue = C310VfQueueStep {
                 pc: 0x1010,
-                instruction: crate::sim::c310::vector_queue::C310VfQueueInstruction::decode(
+                instruction: crate::isa::c310::dispatch::C310VfQueueInstruction::decode(
                     Architecture::Dav3510,
                     0x1542_0000,
                     0x15e0_0125,
@@ -392,7 +394,7 @@ mod tests {
         let mut bus = C310PredicateBufferBus::new(inner, C310PredicateBuffer::new(2).unwrap());
         let queue = C310VfQueueStep {
             pc: 0x1010,
-            instruction: crate::sim::c310::vector_queue::C310VfQueueInstruction::decode(
+            instruction: crate::isa::c310::dispatch::C310VfQueueInstruction::decode(
                 Architecture::Dav3510,
                 0x1542_0000,
                 0x15e0_0125,

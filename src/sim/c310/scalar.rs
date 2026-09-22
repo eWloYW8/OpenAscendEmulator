@@ -3,17 +3,15 @@ use thiserror::Error;
 use crate::architecture::Architecture;
 use crate::image::loader::{DeviceKernelFetchError, LoadedDeviceKernel};
 use crate::isa::c310::buffer::{C310BufferInstruction, C310BufferStep};
+use crate::isa::c310::dispatch::{C310PushPbInstruction, C310PushPbStep};
+use crate::isa::c310::dispatch::{C310VfQueueInstruction, C310VfQueueStep};
 use crate::isa::c310::vector::C310ObservedMovemaskHint;
 use crate::memory::hbm_pv_memory::HbmPvMemory;
 use crate::memory::mapped::MappedMemory;
 use crate::sim::c310::buffer::C310BufferDisposition;
-use crate::sim::c310::predicate_buffer::{
-    C310PushPbDisposition, C310PushPbInstruction, C310PushPbStep,
-};
+use crate::sim::c310::predicate_buffer::C310PushPbDisposition;
 use crate::sim::c310::vector::C310ObservedMovemaskStep;
-use crate::sim::c310::vector_queue::{
-    C310VfQueueDisposition, C310VfQueueInstruction, C310VfQueueStep,
-};
+use crate::sim::c310::vector_queue::C310VfQueueDisposition;
 use crate::sim::common::scalar::{
     ScalarFlowStep, ScalarInstructionError, ScalarInstructionStep, ScalarMachine,
     ScalarMachineError, ScalarMemoryBus,

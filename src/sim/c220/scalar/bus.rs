@@ -3,7 +3,7 @@ use thiserror::Error;
 use crate::isa::flow::{DcciStep, DsbStep, PipelineBarrierStep};
 use crate::memory::sparse::MemoryByteState;
 use crate::memory::ub::{UbMemory, UbMemoryError};
-use crate::sim::c220::scalar_address::{
+use crate::sim::c220::scalar::address::{
     C220_UB_BYTES, C220ScalarRoute, classify_c220_scalar_address,
 };
 use crate::sim::common::scalar::ScalarMemoryBus;

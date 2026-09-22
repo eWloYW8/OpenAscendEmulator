@@ -429,8 +429,8 @@ mod tests {
     use crate::architecture::Architecture;
     use crate::image::loader::{DeviceKernelFetchError, DeviceKernelLoadError, load_named_kernel};
     use crate::memory::hbm_pv_memory::HbmPvMemory;
-    use crate::sim::common::scalar::stepper::{ScalarStepper, ScalarStepperError};
     use crate::sim::common::scalar::{ScalarInstructionStep, ScalarMachine, ScalarMemoryBus};
+    use crate::sim::common::scalar::{ScalarStepper, ScalarStepperError};
 
     struct RejectMemoryBus;
 

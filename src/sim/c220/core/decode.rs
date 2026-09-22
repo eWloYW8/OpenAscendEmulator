@@ -1,0 +1,62 @@
+use crate::architecture::Architecture;
+use crate::isa::c220::cube::C220CubeInstruction;
+use crate::isa::c220::hflag::C220HardwareFlagInstruction;
+use crate::isa::c220::mte::C220DmaMovDescriptor;
+use crate::isa::c220::mte::load2d::C220Load2dInstruction;
+use crate::isa::flow::FlagInstruction;
+use crate::sim::c220::mte::mte2::is_mte2_transfer;
+use crate::sim::c220::vector::dispatch::is_vector_word;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum C220DispatchKind {
+    Mte1,
+    Mte2,
+    HardwareFlag(C220HardwareFlagInstruction),
+    Cube(C220CubeInstruction),
+    Vector,
+    Mte3,
+    Scalar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct C220DecodedWord {
+    pub(super) kind: C220DispatchKind,
+    pub(super) flow_flag: Option<FlagInstruction>,
+}
+
+impl C220DecodedWord {
+    pub(super) fn decode(word: u32) -> Self {
+        let flow_flag = FlagInstruction::decode(Architecture::Dav2201, word);
+        let kind = if C220Load2dInstruction::decode(word)
+            .is_some_and(|instruction| instruction.is_mte1())
+            || flow_flag.is_some_and(|instruction| {
+                instruction.source_pipe_code == 3 && instruction.trigger_pipe_code == 2
+            }) {
+            C220DispatchKind::Mte1
+        } else if is_mte2_transfer(word)
+            || flow_flag.is_some_and(|instruction| {
+                instruction.source_pipe_code == 4 && matches!(instruction.trigger_pipe_code, 0 | 1)
+            })
+        {
+            C220DispatchKind::Mte2
+        } else if let Some(instruction) = C220HardwareFlagInstruction::decode(word) {
+            C220DispatchKind::HardwareFlag(instruction)
+        } else if let Some(instruction) = C220CubeInstruction::decode(word) {
+            C220DispatchKind::Cube(instruction)
+        } else if is_vector_word(word) {
+            C220DispatchKind::Vector
+        } else if C220DmaMovDescriptor::is_word(word)
+            || flow_flag.is_some_and(|instruction| {
+                matches!(
+                    (instruction.source_pipe_code, instruction.trigger_pipe_code),
+                    (1, 5) | (1, 4) | (5, 1)
+                )
+            })
+        {
+            C220DispatchKind::Mte3
+        } else {
+            C220DispatchKind::Scalar
+        };
+        Self { kind, flow_flag }
+    }
+}

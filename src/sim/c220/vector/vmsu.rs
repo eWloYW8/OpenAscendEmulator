@@ -4,10 +4,10 @@ use thiserror::Error;
 
 use crate::memory::sparse::MemoryByteState;
 use crate::memory::ub::{UbMemory, UbMemoryError};
-use crate::sim::c220::core::functional::C220FunctionalCore;
-use crate::sim::c220::ub_arbiter::{C220UbCycle, C220UbRequest, C220UbRequestError};
+use crate::sim::c220::memory::{C220UbCycle, C220UbRequest, C220UbRequestError};
+use crate::sim::c220::state::C220State;
 use crate::sim::c220::vector::C220VectorError;
-use crate::sim::c220::vector::merge::{
+use crate::sim::c220::vector::ops::merge::{
     C220MergeIssue, C220MergeRecord, C220MergeRepeatData, load_c220_merge_repeat,
     merge_record_precedes,
 };
@@ -78,7 +78,7 @@ pub enum C220VmsuError {
     TimeReversed { previous: u64, requested: u64 },
     #[error("C220 VMSU timeline computation overflowed")]
     TimeOverflow,
-    #[error("C220 VMSU merge order diverged from the functional result")]
+    #[error("C220 VMSU merge order diverged from the state result")]
     MergeOrderMismatch,
     #[error("C220 VMSU made no timing progress")]
     NonprogressingSchedule,
@@ -241,11 +241,7 @@ impl C220VmsuPipeline {
         Ok(Some(visibility))
     }
 
-    pub fn advance_to(
-        &mut self,
-        tick: u64,
-        core: &mut C220FunctionalCore,
-    ) -> Result<(), C220VmsuError> {
+    pub fn advance_to(&mut self, tick: u64, core: &mut C220State) -> Result<(), C220VmsuError> {
         if let Some(previous) = self.observed_tick
             && tick < previous
         {

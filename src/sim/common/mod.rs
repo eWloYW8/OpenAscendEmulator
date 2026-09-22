@@ -1,1 +1,1 @@
-pub(crate) mod scalar;
+pub mod scalar;

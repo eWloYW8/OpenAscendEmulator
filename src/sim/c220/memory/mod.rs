@@ -1,12 +1,19 @@
 mod buffer;
 mod l0c;
+pub mod l1;
+mod ub_arbiter;
 
-use crate::architecture::c220::C220Device;
+use crate::memory::pv_memory::PvMemory;
+use crate::sim::c220::device::C220Device;
 
 pub use buffer::{C220LocalBuffer, C220LocalBufferError};
 pub use l0c::{
     C220_L0C_FRAGMENT_BYTES, C220L0c, C220L0cError, C220L0cFragmentRequest, C220L0cMaster,
     C220L0cScoreboard, C220L0cUnitFlagBlock, C220L0cWriteArbiter,
+};
+pub use ub_arbiter::{
+    C220UbBank, C220UbBlock, C220UbCycle, C220UbDecision, C220UbPort, C220UbRequest,
+    C220UbRequestError,
 };
 
 pub const C220_L0C_UNIT_FLAG_READ_LATENCY: u32 = 12;
@@ -45,6 +52,7 @@ pub struct C220LocalMemory {
     l0b: C220LocalBuffer,
     l0c: C220L0c,
     l1: C220LocalBuffer,
+    bt: PvMemory,
 }
 
 impl C220LocalMemory {
@@ -54,6 +62,7 @@ impl C220LocalMemory {
             l0b: C220LocalBuffer::new(config.l0b_bytes),
             l0c: C220L0c::new(config.l0c_bytes, config.l0c_unit_flag_read_latency)?,
             l1: C220LocalBuffer::new(config.l1_bytes),
+            bt: PvMemory::new(0, usize::MAX),
         })
     }
 
@@ -87,5 +96,13 @@ impl C220LocalMemory {
 
     pub fn l1_mut(&mut self) -> &mut C220LocalBuffer {
         &mut self.l1
+    }
+
+    pub const fn bt(&self) -> &PvMemory {
+        &self.bt
+    }
+
+    pub fn bt_mut(&mut self) -> &mut PvMemory {
+        &mut self.bt
     }
 }

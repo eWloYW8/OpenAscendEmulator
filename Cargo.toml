@@ -7,3 +7,6 @@ description = "An evidence-driven, open implementation of the Ascend operator si
 
 [dependencies]
 thiserror = "2.0"
+
+[lints.rust]
+unreachable_pub = "warn"

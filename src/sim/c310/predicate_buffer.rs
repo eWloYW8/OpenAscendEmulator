@@ -1,4 +1,4 @@
-use crate::architecture::Architecture;
+use crate::isa::c310::dispatch::C310PushPbStep;
 use crate::isa::c310::layout::{C310_PB_DEFAULT_SLOTS, C310_PB_PUSH_BYTES, C310_PB_SLOT_BYTES};
 use thiserror::Error;
 
@@ -7,59 +7,6 @@ pub enum C310PushPbDisposition {
     Accepted,
     Stalled,
     Unsupported,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C310PushPbInstruction {
-    pub word: u32,
-    pub source_registers: [u8; 4],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C310PushPbStep {
-    pub pc: u64,
-    pub instruction: C310PushPbInstruction,
-    pub source_values: [u64; 4],
-    pub bytes: [u8; C310_PB_PUSH_BYTES],
-}
-
-impl C310PushPbInstruction {
-    pub const fn decode(architecture: Architecture, word: u32) -> Option<Self> {
-        if !matches!(architecture, Architecture::Dav3510)
-            || !matches!(word, 0x4314_b108 | 0x4338_2108 | 0x4319_7108)
-        {
-            return None;
-        }
-        Some(Self {
-            word,
-            source_registers: [
-                ((word >> 17) & 0x1f) as u8,
-                ((word >> 12) & 0x1f) as u8,
-                ((word >> 7) & 0x1f) as u8,
-                ((word >> 2) & 0x1f) as u8,
-            ],
-        })
-    }
-
-    pub fn from_source_values(self, pc: u64, source_values: [u64; 4]) -> C310PushPbStep {
-        let mut bytes = [0; C310_PB_PUSH_BYTES];
-        for (chunk, value) in bytes.chunks_exact_mut(8).zip(source_values) {
-            chunk.copy_from_slice(&value.to_le_bytes());
-        }
-        C310PushPbStep {
-            pc,
-            instruction: self,
-            source_values,
-            bytes,
-        }
-    }
-
-    pub fn resolve(self, pc: u64, xregs: &[u64; 32]) -> C310PushPbStep {
-        self.from_source_values(
-            pc,
-            self.source_registers.map(|index| xregs[usize::from(index)]),
-        )
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -214,6 +161,8 @@ impl C310PredicateBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::architecture::Architecture;
+    use crate::isa::c310::dispatch::C310PushPbInstruction;
 
     fn step(word: u32, xregs: &[u64; 32]) -> C310PushPbStep {
         C310PushPbInstruction::decode(Architecture::Dav3510, word)

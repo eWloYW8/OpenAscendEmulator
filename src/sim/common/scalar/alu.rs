@@ -3,7 +3,7 @@ use crate::isa::scalar::{ScalarInstruction, ScalarKey8Operation};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScalarIntegerOutcome {
+pub(super) struct ScalarIntegerOutcome {
     pub destination_register: u8,
     pub value: u64,
     pub signed_overflow: bool,
@@ -18,7 +18,7 @@ pub enum ScalarIntegerError {
     ImmediateOutOfRange(u16),
 }
 
-pub fn evaluate_scalar_integer_immediate(
+pub(super) fn evaluate_scalar_integer_immediate(
     hint: ScalarInstruction,
     source_value: u64,
     runtime_isa_pc: u64,
