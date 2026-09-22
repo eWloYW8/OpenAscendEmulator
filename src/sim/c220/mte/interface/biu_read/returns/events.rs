@@ -1,0 +1,129 @@
+use super::{C220BiuReadOutput, C220BiuReadReturns, C220BiuReturnError, C220BiuRobBeat, Tag};
+use crate::sim::c220::mte::interface::biu_read::C220BiuSubcore;
+use crate::sim::common::event::{EventDispatcher, EventError, EventId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220BiuReturnCallback {
+    Probe,
+    Ingress(usize),
+    Select,
+    Read,
+    Egress(C220BiuSubcore),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum C220BiuReturnEvent {
+    Readiness,
+    Ingress { port: usize, tag: Option<Tag> },
+    Selected([Option<Tag>; 3]),
+    Read(Vec<C220BiuRobBeat>),
+    Egress(Option<C220BiuReadOutput>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220BiuReturnEvents {
+    ingress: [EventId; 2],
+    selection: EventId,
+    read: EventId,
+    egress: [EventId; 3],
+}
+
+impl C220BiuReturnEvents {
+    pub fn register<T: Copy>(
+        events: &mut EventDispatcher<T>,
+        clock: EventId,
+        tag: impl Fn(C220BiuReturnCallback) -> T,
+    ) -> Self {
+        let probe = events.add_process(tag(C220BiuReturnCallback::Probe), false);
+        events.subscribe(clock, probe);
+        let ingress = std::array::from_fn(|port| {
+            let event = events.add_event();
+            let process = events.add_process(tag(C220BiuReturnCallback::Ingress(port)), false);
+            events.subscribe(event, process);
+            event
+        });
+        let selection = events.add_event();
+        let process = events.add_process(tag(C220BiuReturnCallback::Select), false);
+        events.subscribe(selection, process);
+        let read = events.add_event();
+        let process = events.add_process(tag(C220BiuReturnCallback::Read), false);
+        events.subscribe(read, process);
+        let egress = C220BiuSubcore::ALL.map(|core| {
+            let event = events.add_event();
+            let process = events.add_process(tag(C220BiuReturnCallback::Egress(core)), false);
+            events.subscribe(event, process);
+            event
+        });
+        Self {
+            ingress,
+            selection,
+            read,
+            egress,
+        }
+    }
+
+    pub fn handle<T: Copy>(
+        &self,
+        callback: C220BiuReturnCallback,
+        events: &mut EventDispatcher<T>,
+        returns: &mut C220BiuReadReturns,
+    ) -> Result<C220BiuReturnEvent, C220BiuReturnError> {
+        let tick = events.tick();
+        match callback {
+            C220BiuReturnCallback::Probe => {
+                for (port, queue) in returns.ingress.iter().enumerate() {
+                    if queue.front().is_some_and(|head| head.ready_tick <= tick) {
+                        events.notify_at(self.ingress[port], tick);
+                    }
+                }
+                if returns
+                    .order
+                    .iter()
+                    .flatten()
+                    .any(|queue| queue.front().is_some_and(|head| head.ready_tick <= tick))
+                {
+                    events.notify_at(self.selection, tick);
+                }
+                for (core, queue) in returns.egress.iter().enumerate() {
+                    if queue.front().is_some_and(|head| head.ready_tick <= tick) {
+                        events.notify_at(self.egress[core], tick);
+                    }
+                }
+                Ok(C220BiuReturnEvent::Readiness)
+            }
+            C220BiuReturnCallback::Ingress(port) => Ok(C220BiuReturnEvent::Ingress {
+                port,
+                tag: returns.ingress(tick, port)?,
+            }),
+            C220BiuReturnCallback::Select => {
+                let selected = returns.select(tick)?;
+                if selected.iter().any(Option::is_some) {
+                    self.schedule_read(events)?;
+                }
+                Ok(C220BiuReturnEvent::Selected(selected))
+            }
+            C220BiuReturnCallback::Read => {
+                let read = returns.read(tick)?;
+                if returns.has_active_tags() {
+                    self.schedule_read(events)?;
+                }
+                Ok(C220BiuReturnEvent::Read(read))
+            }
+            C220BiuReturnCallback::Egress(core) => {
+                returns.egress(tick, core).map(C220BiuReturnEvent::Egress)
+            }
+        }
+    }
+
+    fn schedule_read<T: Copy>(
+        &self,
+        events: &mut EventDispatcher<T>,
+    ) -> Result<(), C220BiuReturnError> {
+        events
+            .notify_after(self.read, 1)
+            .map_err(|error| match error {
+                EventError::TimeOverflow => C220BiuReturnError::TimeOverflow,
+                _ => unreachable!("scheduling a future event cannot reverse time"),
+            })
+    }
+}

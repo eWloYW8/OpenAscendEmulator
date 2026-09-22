@@ -1,7 +1,6 @@
 use crate::isa::c220::mte::C220MovOutToUbError;
 use crate::memory::ub::UbMemoryError;
 use crate::sim::c220::mte::C220TransferError;
-use crate::sim::c220::mte::mte2::MAX_PENDING_MTE2_TRANSFERS;
 use crate::sim::c220::vector::C220VectorError;
 use thiserror::Error;
 
@@ -13,22 +12,6 @@ pub enum C220ExecutionError {
     UnsupportedWord { pc: u64, word: u32 },
     #[error("SPR {index} is unavailable for MTE word at PC {pc:#x}")]
     MissingSpr { pc: u64, index: u16 },
-    #[error("MTE2 pending count exceeds {MAX_PENDING_MTE2_TRANSFERS}")]
-    PendingLimit,
-    #[error("MTE2-to-Scalar flag 0 has no pending transfer")]
-    SetWithoutTransfer,
-    #[error("MTE2-to-Scalar flag 0 is already set")]
-    FlagAlreadySet,
-    #[error("MTE2-to-Scalar flag 0 was not set before wait")]
-    WaitWithoutFlag,
-    #[error("MTE2-to-Vector flag {flag_id} has no unassigned transfer")]
-    VectorSetWithoutTransfer { flag_id: u8 },
-    #[error("MTE2-to-Vector flag {flag_id} is already set")]
-    VectorFlagAlreadySet { flag_id: u8 },
-    #[error("MTE2-to-Vector flag {flag_id} was not set before wait")]
-    VectorWaitWithoutFlag { flag_id: u8 },
-    #[error("MTE2-to-Vector flag ID {flag_id} is outside the modeled 0..1 range")]
-    UnsupportedVectorFlagId { flag_id: u32 },
     #[error("MTE2 transfer byte count overflows usize")]
     TransferSizeOverflow,
     #[error("pipeline barrier at PC {pc:#x} has outstanding modeled work")]

@@ -1,4 +1,18 @@
+use super::dma::{
+    C220DmaEventOutcome, C220DmaEvents, C220DmaFrontend, C220DmaFrontendError, C220DmaGenerated,
+    C220DmaIssue,
+};
+use super::interface::biu_read::returns::{
+    C220BiuReadBeat, C220BiuReadOutput, C220BiuReadReturns, C220BiuReturnCallback,
+    C220BiuReturnError, C220BiuReturnEvent, C220BiuReturnEvents,
+};
+use super::interface::biu_read::{
+    C220BiuReadCallback, C220BiuReadConfig, C220BiuReadError, C220BiuReadEvent, C220BiuReadEvents,
+    C220BiuReadFrontend, C220BiuReadInput, C220BiuReadRequest, C220BiuSubcore,
+};
 use super::mte1::{C220Mte1Command, C220Mte1Generator, C220Mte1Issue};
+use super::mte2::C220Mte2TransferPlan;
+use super::uop::{C220DmaUopError, mte2_uops};
 use crate::isa::c220::mte::set2d::{C220Set2dDestination, C220Set2dFill};
 use crate::sim::c220::mte::set2d::{
     C220Set2dBandwidths, C220Set2dEventOutcome, C220Set2dEvents, C220Set2dFrontend,
@@ -42,6 +56,9 @@ enum Callback {
     Generator(C220Mte1ReadKind, C220MteGeneratorCallback),
     Set2d(C220MteGeneratorCallback),
     Set2dL1(C220MteGeneratorCallback),
+    Dma(C220MteGeneratorCallback),
+    BiuRead(C220BiuReadCallback),
+    BiuReturn(C220BiuReturnCallback),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,10 +71,29 @@ pub enum C220MtePipelineEvent {
     Generator(C220Mte1ReadKind, C220Mte1ReadEventOutcome),
     Set2d(C220Set2dEventOutcome),
     Set2dL1(C220Set2dEventOutcome),
+    Dma(C220DmaEventOutcome),
+    BiuRead(C220BiuReadEvent),
+    BiuReturn(C220BiuReturnEvent),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220MtePipelineError {
+    #[error(transparent)]
+    BiuReturn(#[from] C220BiuReturnError),
+    #[error(transparent)]
+    BiuRead(#[from] C220BiuReadError),
+    #[error("BIU read frontend is not connected")]
+    BiuDisconnected,
+    #[error("BIU request has not been consumed by its transport")]
+    BiuRequestUndelivered,
+    #[error("DMA instruction {0} still has pending BIU requests")]
+    BiuPending(u64),
+    #[error("MTE2 DMA requires a connected request/response consumer")]
+    DmaDisconnected,
+    #[error(transparent)]
+    Dma(#[from] C220DmaFrontendError),
+    #[error(transparent)]
+    DmaUop(#[from] C220DmaUopError),
     #[error("SET_2D to L1 belongs to the MTE2 command lane")]
     WrongCommandLane,
     #[error("the L1 fill generator cannot accept an L0 fill")]
@@ -82,6 +118,12 @@ pub enum C220MtePipelineError {
     L0(#[from] C220L0WriteError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mte2Generator {
+    Dma,
+    L1Fill,
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -99,6 +141,9 @@ pub struct C220MtePipeline {
     generator_events: [C220Mte1ReadEvents; 2],
     set2d_events: C220Set2dEvents,
     set2d_l1_events: C220Set2dEvents,
+    dma_events: C220DmaEvents,
+    biu_events: C220BiuReadEvents,
+    biu_return_events: C220BiuReturnEvents,
     memory: C220L1Transport,
     interface: C220MteL1Interface<C220Mte1ReadUop>,
     write_interface: C220MteL1WriteInterface,
@@ -106,6 +151,15 @@ pub struct C220MtePipeline {
     generators: [C220Mte1ReadFrontend; 2],
     set2d: C220Set2dFrontend,
     set2d_l1: C220Set2dFrontend,
+    dma: C220DmaFrontend,
+    dma_connected: bool,
+    dma_output: Option<C220DmaGenerated>,
+    biu_read: Option<C220BiuReadFrontend>,
+    biu_returns: Option<C220BiuReadReturns>,
+    biu_subcore: C220BiuSubcore,
+    biu_output: Option<C220BiuReadRequest>,
+    dma_hardware_sync_blocked: bool,
+    selected_mte2_generator: Option<Mte2Generator>,
     l1_prefetch_blocked: bool,
     selected_generator: Option<C220Mte1Generator>,
     completions: Vec<u64>,
@@ -131,6 +185,10 @@ impl C220MtePipeline {
         });
         let set2d_events = C220Set2dEvents::register(&mut events, clock, Callback::Set2d);
         let set2d_l1_events = C220Set2dEvents::register(&mut events, clock, Callback::Set2dL1);
+        let dma_events = C220DmaEvents::register(&mut events, clock, Callback::Dma);
+        let biu_events = C220BiuReadEvents::register(&mut events, clock, Callback::BiuRead);
+        let biu_return_events =
+            C220BiuReturnEvents::register(&mut events, clock, Callback::BiuReturn);
         Self {
             events,
             clock,
@@ -141,6 +199,9 @@ impl C220MtePipeline {
             generator_events,
             set2d_events,
             set2d_l1_events,
+            dma_events,
+            biu_events,
+            biu_return_events,
             memory: C220L1Transport::new(config.l1),
             interface: C220MteL1Interface::default(),
             write_interface: C220MteL1WriteInterface::default(),
@@ -151,6 +212,15 @@ impl C220MtePipeline {
             selected_generator: None,
             set2d: C220Set2dFrontend::new(config.set2d_bandwidths),
             set2d_l1: C220Set2dFrontend::new(config.set2d_bandwidths),
+            dma: C220DmaFrontend::default(),
+            dma_connected: false,
+            dma_output: None,
+            biu_read: None,
+            biu_returns: None,
+            biu_subcore: C220BiuSubcore::Vector0,
+            biu_output: None,
+            dma_hardware_sync_blocked: false,
+            selected_mte2_generator: None,
             l1_prefetch_blocked: false,
             completions: Vec::new(),
             l1_fill_completions: Vec::new(),
@@ -184,6 +254,17 @@ impl C220MtePipeline {
         self.generators.iter().all(C220Mte1ReadFrontend::is_idle)
             && self.set2d.is_idle()
             && self.set2d_l1.is_idle()
+            && self.dma.is_idle()
+            && self.dma_output.is_none()
+            && self.biu_output.is_none()
+            && self
+                .biu_read
+                .as_ref()
+                .is_none_or(C220BiuReadFrontend::is_idle)
+            && self
+                .biu_returns
+                .as_ref()
+                .is_none_or(C220BiuReadReturns::is_idle)
             && self.write_interface.is_idle()
             && self.interface.is_idle()
             && self.memory.is_idle()
@@ -211,11 +292,156 @@ impl C220MtePipeline {
         self.l1_prefetch_blocked = blocked;
     }
 
-    /// Admission to this generator only; the MTE2 command owner must first
-    /// resolve its lane-level dependencies and generator switching rules.
+    /// Enables explicit DMA requests. The caller must consume every request
+    /// and report destination completion; this boundary is not a BIU model.
+    pub fn connect_mte2_dma(&mut self) -> Result<(), C220MtePipelineError> {
+        if !self.is_idle() {
+            return Err(C220MtePipelineError::CommandBusy);
+        }
+        self.dma_connected = true;
+        self.biu_read = None;
+        self.biu_returns = None;
+        Ok(())
+    }
+
+    /// Connects BIU read admission and return reordering. The consumer supplies
+    /// memory response beats and accepts write-adapter outputs for destination service.
+    pub fn connect_mte2_biu(
+        &mut self,
+        config: C220BiuReadConfig,
+        subcore: C220BiuSubcore,
+    ) -> Result<(), C220MtePipelineError> {
+        if !self.is_idle() {
+            return Err(C220MtePipelineError::CommandBusy);
+        }
+        let returns = C220BiuReadReturns::new(config.outstanding, config.group_vector_returns)?;
+        self.biu_read = Some(C220BiuReadFrontend::new(config));
+        self.biu_returns = Some(returns);
+        self.biu_subcore = subcore;
+        self.dma_connected = true;
+        Ok(())
+    }
+
+    pub fn biu_read(&self) -> Option<&C220BiuReadFrontend> {
+        self.biu_read.as_ref()
+    }
+
+    pub fn take_biu_read_request(&mut self) -> Option<C220BiuReadRequest> {
+        self.biu_output.take()
+    }
+
+    pub fn biu_read_returns(&self) -> Option<&C220BiuReadReturns> {
+        self.biu_returns.as_ref()
+    }
+
+    pub fn receive_biu_read(
+        &mut self,
+        heads: [Option<C220BiuReadBeat>; 2],
+    ) -> Result<[bool; 2], C220MtePipelineError> {
+        if heads.iter().flatten().any(|beat| {
+            self.biu_output
+                .is_some_and(|request| request.tag == beat.tag)
+        }) {
+            return Err(C220MtePipelineError::BiuRequestUndelivered);
+        }
+        Ok(self
+            .biu_returns
+            .as_mut()
+            .ok_or(C220MtePipelineError::BiuDisconnected)?
+            .receive(self.events.tick(), heads)?)
+    }
+
+    pub fn take_biu_read_output(
+        &mut self,
+        core: C220BiuSubcore,
+    ) -> Result<Option<C220BiuReadOutput>, C220MtePipelineError> {
+        Ok(self
+            .biu_returns
+            .as_mut()
+            .ok_or(C220MtePipelineError::BiuDisconnected)?
+            .take_output(self.events.tick(), core)?)
+    }
+
+    pub fn check_dma_completion(&self, instruction_id: u64) -> Result<(), C220MtePipelineError> {
+        if self
+            .biu_read
+            .as_ref()
+            .is_some_and(|frontend| frontend.contains_instruction(instruction_id))
+            || self
+                .biu_returns
+                .as_ref()
+                .is_some_and(|returns| returns.contains_instruction(instruction_id))
+        {
+            return Err(C220MtePipelineError::BiuPending(instruction_id));
+        }
+        Ok(())
+    }
+
+    pub fn mte2_dma_connected(&self) -> bool {
+        self.dma_connected
+    }
+    pub fn dma_generator(&self) -> &C220DmaFrontend {
+        &self.dma
+    }
+    pub fn dma_output(&self) -> Option<C220DmaGenerated> {
+        self.dma_output
+    }
+    pub fn take_dma_output(&mut self) -> Option<C220DmaGenerated> {
+        self.dma_output.take()
+    }
+    pub fn set_dma_hardware_sync_blocked(&mut self, blocked: bool) {
+        self.dma_hardware_sync_blocked = blocked;
+    }
+
+    fn mte2_generator_idle(&self) -> bool {
+        self.selected_mte2_generator
+            .is_none_or(|generator| match generator {
+                Mte2Generator::Dma => self.dma.is_idle(),
+                Mte2Generator::L1Fill => self.set2d_l1.is_idle(),
+            })
+    }
+
+    pub fn can_issue_mte2_dma(&self) -> bool {
+        self.dma_connected
+            && self.dma.can_issue()
+            && (self.selected_mte2_generator == Some(Mte2Generator::Dma)
+                || self.mte2_generator_idle())
+    }
+
+    pub fn issue_mte2_dma(
+        &mut self,
+        instruction_id: u64,
+        transfer: C220Mte2TransferPlan,
+    ) -> Result<C220DmaIssue, C220MtePipelineError> {
+        if !self.dma_connected {
+            return Err(C220MtePipelineError::DmaDisconnected);
+        }
+        let requests = mte2_uops(transfer)?;
+        if transfer.descriptor.is_disabled() {
+            return Ok(C220DmaIssue {
+                tick: self.events.tick(),
+                instruction_id,
+                completion_ready: true,
+            });
+        }
+        if !self.can_issue_mte2_dma() {
+            return Err(C220MtePipelineError::CommandBusy);
+        }
+        let issue =
+            self.dma_events
+                .issue(&mut self.events, &mut self.dma, instruction_id, requests)?;
+        self.selected_mte2_generator = Some(Mte2Generator::Dma);
+        Ok(issue)
+    }
+
+    /// Resolves generator admission and switching. The command owner still
+    /// owns ordered retirement and lane-level dependencies.
     pub fn can_issue_l1_fill(&self, fill: C220Set2dFill) -> bool {
         fill.instruction.destination == C220Set2dDestination::L1
-            && (fill.descriptor.is_disabled() || self.set2d_l1.can_issue())
+            && (fill.descriptor.is_disabled()
+                || (self.set2d_l1.can_issue()
+                    && (self.selected_mte2_generator == Some(Mte2Generator::L1Fill)
+                        || self.mte2_generator_idle())))
     }
 
     pub fn issue_l1_fill(
@@ -234,12 +460,17 @@ impl C220MtePipeline {
                 completion_ready: true,
             });
         }
-        Ok(self.set2d_l1_events.issue(
+        if !self.can_issue_l1_fill(fill) {
+            return Err(C220MtePipelineError::CommandBusy);
+        }
+        let issue = self.set2d_l1_events.issue(
             &mut self.events,
             &mut self.set2d_l1,
             instruction_id,
             fill,
-        )?)
+        )?;
+        self.selected_mte2_generator = Some(Mte2Generator::L1Fill);
+        Ok(issue)
     }
     pub fn memory(&self) -> &C220L1Transport {
         &self.memory
@@ -323,6 +554,81 @@ impl C220MtePipeline {
         self.events.notify_at(self.clock, tick);
         while let Some(invocation) = self.events.next_callback() {
             match invocation.callback {
+                Callback::Dma(phase) => {
+                    let output_ready = self
+                        .biu_read
+                        .as_ref()
+                        .map_or(self.dma_output.is_none(), |frontend| {
+                            frontend.can_push(self.biu_subcore)
+                        });
+                    let outcome = self.dma_events.handle(
+                        phase,
+                        &mut self.events,
+                        &mut self.dma,
+                        self.dma_hardware_sync_blocked,
+                        output_ready,
+                    )?;
+                    if let C220DmaEventOutcome::Sent(send) = outcome
+                        && let Some(sent) = send.sent
+                    {
+                        if let Some(frontend) = &mut self.biu_read {
+                            assert!(self.biu_events.push(
+                                &mut self.events,
+                                frontend,
+                                C220BiuReadInput {
+                                    subcore: self.biu_subcore,
+                                    prefetch: false,
+                                    generated: sent,
+                                }
+                            )?);
+                        } else {
+                            self.dma_output = Some(sent);
+                        }
+                    }
+                    if outcome != C220DmaEventOutcome::Readiness {
+                        self.trace.push(C220MtePipelineEvent::Dma(outcome));
+                    }
+                }
+                Callback::BiuRead(phase) => {
+                    if let Some(frontend) = &mut self.biu_read {
+                        let outcome = self.biu_events.handle(
+                            phase,
+                            &mut self.events,
+                            frontend,
+                            self.biu_output.is_none(),
+                        )?;
+                        if let C220BiuReadEvent::Send(send) = outcome
+                            && let Some(request) = send.sent
+                        {
+                            self.biu_returns
+                                .as_mut()
+                                .expect("connected return path")
+                                .track(tick, request)?;
+                            self.biu_output = Some(request);
+                        }
+                        if outcome != C220BiuReadEvent::Readiness {
+                            self.trace.push(C220MtePipelineEvent::BiuRead(outcome));
+                        }
+                    }
+                }
+                Callback::BiuReturn(phase) => {
+                    if let Some(returns) = &mut self.biu_returns {
+                        let outcome =
+                            self.biu_return_events
+                                .handle(phase, &mut self.events, returns)?;
+                        if let C220BiuReturnEvent::Egress(Some(output)) = &outcome {
+                            let released = self
+                                .biu_read
+                                .as_mut()
+                                .expect("connected request path")
+                                .release_tag(tick, output.request.tag)?;
+                            assert_eq!(released, output.request);
+                        }
+                        if outcome != C220BiuReturnEvent::Readiness {
+                            self.trace.push(C220MtePipelineEvent::BiuReturn(outcome));
+                        }
+                    }
+                }
                 Callback::Set2dL1(phase) => {
                     let outcome = self.set2d_l1_events.handle(
                         phase,

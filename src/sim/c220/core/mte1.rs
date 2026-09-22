@@ -74,7 +74,7 @@ impl C220Core {
             match flag.instruction.operation {
                 FlagOperation::Set => self.mte1.set_event(flag.flag_id),
                 FlagOperation::Wait => {
-                    if !self.mte1.wait_event(flag.flag_id)? {
+                    if !self.mte1.wait_event(flag.flag_id) {
                         return Ok(C220CoreStep::Stalled(C220Stall {
                             tick,
                             pc,

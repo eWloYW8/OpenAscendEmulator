@@ -32,13 +32,28 @@ impl VectorEngine {
         }
     }
 
-    pub(in crate::sim::c220) fn advance_to(
+    pub(in crate::sim::c220) fn begin_advance(&mut self) {
+        self.releases.clear();
+        self.pipeline.begin_advance();
+    }
+
+    pub(in crate::sim::c220) fn next_event_tick(&self) -> Option<u64> {
+        self.pipeline
+            .next_event_tick()
+            .into_iter()
+            .chain(self.vmsu.next_event_tick())
+            .min()
+    }
+
+    pub(in crate::sim::c220) fn advance_event(
         &mut self,
         tick: u64,
         state: &mut C220State,
     ) -> Result<(), C220VectorRuntimeError> {
-        self.releases = self.pipeline.advance_to(tick, state)?;
-        for &update in self.pipeline.last_va_updates() {
+        let va_updates = self.pipeline.last_va_updates().len();
+        self.releases
+            .extend(self.pipeline.advance_event(tick, state)?);
+        for &update in &self.pipeline.last_va_updates()[va_updates..] {
             self.va.apply(update);
         }
         self.vmsu.advance_to(tick, state)?;

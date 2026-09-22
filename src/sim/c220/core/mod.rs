@@ -18,11 +18,13 @@ use crate::sim::c220::vector::timing::C220VectorUopRelease;
 use crate::sim::c220::vector::va::C220VaRegisters;
 use crate::sim::c220::vector::vmsu::C220VmsuPipeline;
 
+mod advance;
 mod cube;
 mod decode;
 mod dispatch;
 mod hflag;
 mod mte1;
+mod mte2;
 mod mte3;
 
 use crate::sim::c220::cube::runtime::CubeEngine;
@@ -178,6 +180,7 @@ impl C220Core {
         config: C220MtePipelineConfig,
     ) -> Result<(), C220CoreError> {
         if self.mte1.pending_commands().next().is_some()
+            || self.mte2.is_busy()
             || self.mte_pipeline.as_ref().is_some_and(|p| !p.is_idle())
         {
             return Err(C220CoreError::MtePipelineBusy);
@@ -249,14 +252,12 @@ impl C220Core {
     pub fn advance_to(&mut self, tick: u64) -> Result<Option<C220Stall>, C220CoreError> {
         let gate = self.clock.observe(tick, self.state.scalar().pc())?;
         self.scalar_timing.advance_to(tick);
-        self.advance_matrix_to(tick)?;
+        self.advance_engines_to(tick)?;
         self.hardware_flags.advance_to(tick)?;
         self.local_memory
             .l0c_mut()
             .scoreboard_mut()
             .advance_to(tick);
-        self.vector.advance_to(tick, &mut self.state)?;
-        self.mte3.commit_ready_at(tick, &mut self.memory)?;
         Ok(gate)
     }
 
@@ -342,6 +343,9 @@ impl C220Core {
             self.mte1
                 .next_event_tick()
                 .map(|tick| (tick, C220StallCause::Mte1Dependency)),
+            self.mte2
+                .next_event_tick()
+                .map(|tick| (tick, C220StallCause::Mte2Dependency)),
             self.mte_pipeline
                 .as_ref()
                 .and_then(C220MtePipeline::next_event_tick)

@@ -49,8 +49,14 @@ impl C220Core {
                 }));
             }
         }
-        let (ticket, requests, transfer) = if C220DmaMovDescriptor::is_word(word) {
-            if tick < self.mte3.timing.next_issue_tick() {
+        let (ticket, transfer) = if C220DmaMovDescriptor::is_word(word) {
+            let plan = decode_mte3_transfer(
+                self.state.scalar.machine(),
+                pc,
+                word,
+                self.state.isa_instance_index,
+            )?;
+            if !plan.descriptor.is_disabled() && tick < self.mte3.timing.next_issue_tick() {
                 return Ok(C220CoreStep::Stalled(C220Stall {
                     tick,
                     pc,
@@ -58,19 +64,13 @@ impl C220Core {
                     cause: C220StallCause::Mte3IssueRate,
                 }));
             }
-            let plan = decode_mte3_transfer(
-                self.state.scalar.machine(),
-                pc,
-                word,
-                self.state.isa_instance_index,
-            )?;
-            let (ticket, requests) = self.mte3.timing.preview_issue(tick, plan)?;
+            let ticket = self.mte3.timing.preview_issue(tick, plan)?;
             if self.mte3.has_pending() {
                 return Err(C220Mte3TimingError::TicketMismatch.into());
             }
-            (Some(ticket), requests, Some(plan))
+            (Some(ticket), Some(plan))
         } else {
-            (None, Vec::new(), None)
+            (None, None)
         };
         let (step, prepared) =
             self.state
@@ -90,11 +90,7 @@ impl C220Core {
             }
             _ => {}
         }
-        let instruction = C220CoreInstruction::Mte3 {
-            step,
-            requests,
-            ticket,
-        };
+        let instruction = C220CoreInstruction::Mte3 { step, ticket };
         Ok(C220CoreStep::Executed { tick, instruction })
     }
 }

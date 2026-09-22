@@ -39,8 +39,11 @@ impl C220DecodedWord {
             }) {
             C220DispatchKind::Mte1
         } else if is_mte2_transfer(word)
+            || C220Set2dInstruction::decode(word)
+                .is_some_and(|instruction| instruction.destination == C220Set2dDestination::L1)
             || flow_flag.is_some_and(|instruction| {
-                instruction.source_pipe_code == 4 && matches!(instruction.trigger_pipe_code, 0 | 1)
+                instruction.source_pipe_code == 4
+                    && matches!(instruction.trigger_pipe_code, 0 | 1 | 3)
             })
         {
             C220DispatchKind::Mte2

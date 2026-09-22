@@ -340,6 +340,25 @@ impl C220VectorPipeline {
         tick: u64,
         core: &mut C220State,
     ) -> Result<Vec<C220VectorUopRelease>, C220VectorAdvanceError> {
+        self.begin_advance();
+        self.advance_event(tick, core)
+    }
+
+    pub(crate) fn begin_advance(&mut self) {
+        self.last_read_samples.clear();
+        self.last_ub_cycles.clear();
+        self.last_va_updates.clear();
+    }
+
+    pub(crate) fn next_event_tick(&self) -> Option<u64> {
+        (!self.pending.is_empty()).then_some(self.next_service_tick)
+    }
+
+    pub(crate) fn advance_event(
+        &mut self,
+        tick: u64,
+        core: &mut C220State,
+    ) -> Result<Vec<C220VectorUopRelease>, C220VectorAdvanceError> {
         if let Some(previous) = self.observed_tick
             && tick < previous
         {
@@ -349,9 +368,6 @@ impl C220VectorPipeline {
             }
             .into());
         }
-        self.last_read_samples.clear();
-        self.last_ub_cycles.clear();
-        self.last_va_updates.clear();
         let mut releases = Vec::new();
         while self.next_service_tick <= tick {
             if self.pending.is_empty() {

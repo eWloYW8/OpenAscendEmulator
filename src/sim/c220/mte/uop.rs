@@ -15,6 +15,23 @@ pub enum C220DmaUopMode {
 }
 
 impl C220DmaUopMode {
+    pub(super) fn split_bytes(self, address: u64, remaining: u32) -> u32 {
+        if !address.is_multiple_of(128) {
+            remaining.min(128 - (address % 128) as u32)
+        } else if self == Self::Wide512 && address.is_multiple_of(512) && remaining >= 512 {
+            512
+        } else if matches!(self, Self::Wide512 | Self::Wide256)
+            && address.is_multiple_of(256)
+            && remaining >= 256
+        {
+            256
+        } else if self == Self::Unbounded {
+            remaining
+        } else {
+            remaining.min(128)
+        }
+    }
+
     pub const fn from_mode_word(value: u64) -> Self {
         if value & 1 == 0 {
             return Self::Wide512;
@@ -56,13 +73,11 @@ pub enum C220DmaUopError {
     PlanSizeMismatch,
     #[error("DMA uop byte count exceeds u32")]
     SizeOverflow,
-    #[error("DMA uop address calculation overflowed")]
-    AddressOverflow,
     #[error("cannot reserve {requested} DMA uop records")]
     AllocationFailed { requested: usize },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DmaRequestGeometry {
     source_base: u64,
     destination_base: u64,
@@ -77,6 +92,10 @@ struct DmaRequestGeometry {
 pub fn mte2_requests(
     transfer: C220Mte2TransferPlan,
 ) -> Result<Vec<C220DmaUopRequest>, C220DmaUopError> {
+    mte2_uops(transfer)?.collect_records()
+}
+
+pub fn mte2_uops(transfer: C220Mte2TransferPlan) -> Result<C220DmaUops, C220DmaUopError> {
     let descriptor = checked_descriptor(transfer)?;
     let route = if descriptor.source_gap == 0 && descriptor.destination_gap == 0 {
         Some(C220DmaUopRoute::ContiguousBatch)
@@ -98,17 +117,25 @@ pub fn mte2_requests(
     }
     if let Some(route) = route {
         let bytes = u32::try_from(transfer.bytes).map_err(|_| C220DmaUopError::SizeOverflow)?;
-        return Ok(vec![C220DmaUopRequest {
+        return split_requests(
+            DmaRequestGeometry {
+                source_base: transfer.source_address,
+                destination_base: transfer.destination_address,
+                burst_count: 1,
+                burst_bytes: u64::from(bytes),
+                source_stride: 0,
+                destination_stride: 0,
+                split_on_destination: false,
+                split_enabled: false,
+            },
             route,
-            burst_index: 0,
-            source_address: transfer.source_address,
-            destination_address: transfer.destination_address,
-            bytes,
-            last_in_burst: true,
-        }]);
+            C220DmaUopMode::from_mode_word(transfer.dma_mode_word),
+        );
     }
-    ordinary_mte2_requests(
+    split_mte2_requests(
         transfer,
+        descriptor,
+        C220DmaUopRoute::Ordinary,
         C220DmaUopMode::from_mode_word(transfer.dma_mode_word),
     )
 }
@@ -128,12 +155,7 @@ fn checked_descriptor(
     if transfer.bytes != expected_bytes {
         return Err(C220DmaUopError::PlanSizeMismatch);
     }
-    for (base, gap) in [
-        (transfer.source_address, descriptor.source_gap),
-        (transfer.destination_address, descriptor.destination_gap),
-    ] {
-        check_address_extent(base, descriptor.burst_count, descriptor.burst_length, gap)?;
-    }
+    let _ = descriptor.segment_iter(transfer.source_address, transfer.destination_address)?;
     Ok(descriptor)
 }
 
@@ -142,7 +164,7 @@ pub fn ordinary_mte2_requests(
     mode: C220DmaUopMode,
 ) -> Result<Vec<C220DmaUopRequest>, C220DmaUopError> {
     let descriptor = checked_descriptor(transfer)?;
-    split_mte2_requests(transfer, descriptor, C220DmaUopRoute::Ordinary, mode)
+    split_mte2_requests(transfer, descriptor, C220DmaUopRoute::Ordinary, mode)?.collect_records()
 }
 
 fn split_mte2_requests(
@@ -150,7 +172,7 @@ fn split_mte2_requests(
     descriptor: C220MovOutToUbDescriptor,
     route: C220DmaUopRoute,
     mode: C220DmaUopMode,
-) -> Result<Vec<C220DmaUopRequest>, C220DmaUopError> {
+) -> Result<C220DmaUops, C220DmaUopError> {
     let batch = route == C220DmaUopRoute::ContiguousBatch;
     split_requests(
         DmaRequestGeometry {
@@ -158,7 +180,7 @@ fn split_mte2_requests(
             destination_base: transfer.destination_address,
             burst_count: if batch { 1 } else { descriptor.burst_count },
             burst_bytes: if batch {
-                transfer.bytes as u64
+                u64::from(transfer.bytes as u32)
             } else {
                 u64::from(descriptor.burst_length) * 32
             },
@@ -178,6 +200,10 @@ fn split_mte2_requests(
 pub fn mte3_requests(
     transfer: C220Mte3TransferPlan,
 ) -> Result<Vec<C220DmaUopRequest>, C220DmaUopError> {
+    mte3_uops(transfer)?.collect_records()
+}
+
+pub fn mte3_uops(transfer: C220Mte3TransferPlan) -> Result<C220DmaUops, C220DmaUopError> {
     let descriptor =
         C220DmaMovDescriptor::decode(transfer.descriptor.instruction_word, transfer.descriptor.xm)?;
     if descriptor != transfer.descriptor {
@@ -188,12 +214,7 @@ pub fn mte3_requests(
     if transfer.bytes != expected_bytes {
         return Err(C220DmaUopError::PlanSizeMismatch);
     }
-    for (base, gap) in [
-        (transfer.source_address, descriptor.source_gap),
-        (transfer.destination_address, descriptor.destination_gap),
-    ] {
-        check_address_extent(base, descriptor.burst_count, descriptor.burst_length, gap)?;
-    }
+    let _ = descriptor.segment_iter(transfer.source_address, transfer.destination_address)?;
     let batch = descriptor.source_gap == 0 && descriptor.destination_gap == 0;
     let gather = !batch
         && transfer.source_address.is_multiple_of(32)
@@ -209,7 +230,7 @@ pub fn mte3_requests(
             destination_base: transfer.destination_address,
             burst_count: if flatten { 1 } else { descriptor.burst_count },
             burst_bytes: if flatten {
-                transfer.bytes as u64
+                u64::from(transfer.bytes as u32)
             } else {
                 u64::from(descriptor.burst_length) * 32
             },
@@ -232,95 +253,103 @@ pub fn mte3_requests(
     )
 }
 
-fn check_address_extent(
-    base: u64,
-    burst_count: u16,
-    burst_length: u16,
-    gap: u16,
-) -> Result<(), C220DmaUopError> {
-    let stride = (u64::from(burst_length) + u64::from(gap)) * 32;
-    let extent = (u64::from(burst_count) - 1)
-        .checked_mul(stride)
-        .and_then(|offset| offset.checked_add(u64::from(burst_length) * 32))
-        .ok_or(C220DmaUopError::AddressOverflow)?;
-    base.checked_add(extent)
-        .ok_or(C220DmaUopError::AddressOverflow)?;
-    Ok(())
-}
-
 fn split_requests(
     geometry: DmaRequestGeometry,
     route: C220DmaUopRoute,
     mode: C220DmaUopMode,
-) -> Result<Vec<C220DmaUopRequest>, C220DmaUopError> {
-    let requested = usize::from(geometry.burst_count)
-        * usize::try_from(geometry.burst_bytes / 32).map_err(|_| C220DmaUopError::SizeOverflow)?
-        * 2;
-    let mut requests = Vec::new();
-    requests
-        .try_reserve_exact(requested)
-        .map_err(|_| C220DmaUopError::AllocationFailed { requested })?;
-    for burst_index in 0..geometry.burst_count {
-        let source_start = geometry
-            .source_base
-            .checked_add(u64::from(burst_index) * geometry.source_stride)
-            .ok_or(C220DmaUopError::AddressOverflow)?;
-        let destination_start = geometry
-            .destination_base
-            .checked_add(u64::from(burst_index) * geometry.destination_stride)
-            .ok_or(C220DmaUopError::AddressOverflow)?;
-        let mut offset = 0;
-        while offset < geometry.burst_bytes {
-            let source_address = source_start
-                .checked_add(offset)
-                .ok_or(C220DmaUopError::AddressOverflow)?;
-            let destination_address = destination_start
-                .checked_add(offset)
-                .ok_or(C220DmaUopError::AddressOverflow)?;
-            let aligned_address = if geometry.split_on_destination {
-                destination_address
-            } else {
-                source_address
-            };
-            let remaining = geometry.burst_bytes - offset;
-            let bytes = if !geometry.split_enabled {
-                remaining
-            } else if !aligned_address.is_multiple_of(128) {
-                remaining.min(128 - aligned_address % 128)
-            } else if mode == C220DmaUopMode::Wide512
-                && aligned_address.is_multiple_of(512)
-                && remaining >= 512
-            {
-                512
-            } else if matches!(mode, C220DmaUopMode::Wide512 | C220DmaUopMode::Wide256)
-                && aligned_address.is_multiple_of(256)
-                && remaining >= 256
-            {
-                256
-            } else if mode == C220DmaUopMode::Unbounded {
-                remaining
-            } else {
-                remaining.min(128)
-            };
-            source_address
-                .checked_add(bytes)
-                .ok_or(C220DmaUopError::AddressOverflow)?;
-            destination_address
-                .checked_add(bytes)
-                .ok_or(C220DmaUopError::AddressOverflow)?;
-            offset += bytes;
-            requests.push(C220DmaUopRequest {
-                route,
-                burst_index,
-                source_address,
-                destination_address,
-                bytes: bytes as u32,
-                last_in_burst: offset == geometry.burst_bytes,
-            });
-        }
+) -> Result<C220DmaUops, C220DmaUopError> {
+    if geometry.burst_bytes > u64::from(u32::MAX) {
+        return Err(C220DmaUopError::SizeOverflow);
     }
-    Ok(requests)
+    Ok(C220DmaUops {
+        geometry,
+        route,
+        mode,
+        burst_index: 0,
+        offset: 0,
+    })
 }
+
+/// Lazy physical requests. Burst source offsets use a 32-bit accumulator;
+/// destination offsets and both base addresses remain 64-bit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct C220DmaUops {
+    geometry: DmaRequestGeometry,
+    route: C220DmaUopRoute,
+    mode: C220DmaUopMode,
+    burst_index: u16,
+    offset: u64,
+}
+
+impl C220DmaUops {
+    pub(super) fn out_of_order(&self) -> bool {
+        self.geometry.split_enabled
+    }
+
+    pub(super) fn mode(&self) -> C220DmaUopMode {
+        self.mode
+    }
+
+    pub fn collect_records(self) -> Result<Vec<C220DmaUopRequest>, C220DmaUopError> {
+        let mut records = Vec::new();
+        for request in self {
+            if records.len() == records.capacity() {
+                records
+                    .try_reserve(1)
+                    .map_err(|_| C220DmaUopError::AllocationFailed {
+                        requested: records.len() + 1,
+                    })?;
+            }
+            records.push(request);
+        }
+        Ok(records)
+    }
+}
+
+impl Iterator for C220DmaUops {
+    type Item = C220DmaUopRequest;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let geometry = self.geometry;
+        if self.burst_index >= geometry.burst_count || geometry.burst_bytes == 0 {
+            return None;
+        }
+        let burst_index = self.burst_index;
+        let source_address = geometry.source_base
+            + u64::from(u32::from(burst_index).wrapping_mul(geometry.source_stride as u32))
+            + self.offset;
+        let destination_address = geometry.destination_base
+            + u64::from(burst_index) * geometry.destination_stride
+            + self.offset;
+        let aligned_address = if geometry.split_on_destination {
+            destination_address
+        } else {
+            source_address
+        };
+        let remaining = geometry.burst_bytes - self.offset;
+        let bytes = if !geometry.split_enabled {
+            remaining
+        } else {
+            u64::from(self.mode.split_bytes(aligned_address, remaining as u32))
+        };
+        self.offset += bytes;
+        let last_in_burst = self.offset == geometry.burst_bytes;
+        if last_in_burst {
+            self.burst_index += 1;
+            self.offset = 0;
+        }
+        Some(C220DmaUopRequest {
+            route: self.route,
+            burst_index,
+            source_address,
+            destination_address,
+            bytes: bytes as u32,
+            last_in_burst,
+        })
+    }
+}
+
+impl std::iter::FusedIterator for C220DmaUops {}
 
 #[cfg(test)]
 mod tests {
@@ -350,6 +379,43 @@ mod tests {
             destination_address,
             bytes: usize::from(descriptor.burst_count) * usize::from(descriptor.burst_length) * 32,
             dma_mode_word: 0,
+        }
+    }
+
+    #[test]
+    fn full_descriptor_range_streams_wrapped_offsets_and_disabled_commands() {
+        let xm = (1_u64 << 48) | (0xffff << 32) | 0xffff_fff0;
+        let plan = transfer(xm, 1);
+        let requests = mte2_uops(plan).unwrap();
+        assert_eq!(requests.clone().count(), 4095);
+        let last = requests.last().unwrap();
+        let segment = plan
+            .descriptor_segments()
+            .unwrap()
+            .nth(4094 * 65535)
+            .unwrap();
+        assert_eq!(last.source_address, segment.source_hbm);
+        assert_eq!(last.destination_address, segment.destination_local);
+        assert_eq!(last.bytes, 65535 * 32);
+        assert!(last.last_in_burst);
+        assert!(last.destination_address > u64::from(u32::MAX));
+
+        let mut batch = transfer(0xffff_fff0, 0x1000);
+        batch.dma_mode_word = 7;
+        assert!(batch.bytes > u32::MAX as usize);
+        let mut requests = mte2_uops(batch).unwrap();
+        let request = requests.next().unwrap();
+        assert_eq!(request.bytes, batch.bytes as u32);
+        assert!(request.last_in_burst);
+        assert_eq!(requests.next(), None);
+
+        for xm in [0, 0x10, 0x10000] {
+            let mut input = transfer(xm, u64::MAX);
+            input.destination_address = u64::MAX;
+            assert_eq!(mte2_uops(input).unwrap().next(), None);
+            let mut output = output_transfer(xm, u64::MAX);
+            output.source_address = u64::MAX;
+            assert_eq!(mte3_uops(output).unwrap().next(), None);
         }
     }
 

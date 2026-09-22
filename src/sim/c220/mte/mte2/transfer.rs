@@ -14,10 +14,10 @@ pub fn copy_c220_mov_out_to_ub(
     source_address: u64,
     destination_address: u64,
 ) -> Result<UbTransferResult, C220TransferError> {
-    let segments = descriptor.segments(source_address, destination_address)?;
+    let segments = descriptor.segment_iter(source_address, destination_address)?;
     Ok(ub.copy_segments(
         source,
-        segments.into_iter().map(|segment| {
+        segments.map(|segment| {
             (
                 segment.source_hbm,
                 segment.destination_local,
@@ -37,13 +37,16 @@ pub struct C220Mte2TransferPlan {
 }
 
 impl C220Mte2TransferPlan {
-    pub fn descriptor_segments(self) -> Result<Vec<C220MovOutToUbSegment>, C220MovOutToUbError> {
+    pub fn descriptor_segments(
+        self,
+    ) -> Result<impl ExactSizeIterator<Item = C220MovOutToUbSegment> + Clone, C220MovOutToUbError>
+    {
         self.descriptor
-            .segments(self.source_address, self.destination_address)
+            .segment_iter(self.source_address, self.destination_address)
     }
 }
 
-pub(super) fn decode_mte2_transfer(
+pub(crate) fn decode_mte2_transfer(
     machine: &ScalarMachine,
     pc: u64,
     word: u32,
@@ -60,7 +63,7 @@ pub(super) fn decode_mte2_transfer(
     let descriptor =
         C220MovOutToUbDescriptor::decode(word, xregs[usize::from(selectors.descriptor_register)])?;
     let bytes = descriptor
-        .segments(source_address, destination_address)?
+        .segment_iter(source_address, destination_address)?
         .len()
         .checked_mul(32)
         .ok_or(C220ExecutionError::TransferSizeOverflow)?;

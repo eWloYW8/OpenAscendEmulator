@@ -1,3 +1,4 @@
+pub mod dma;
 mod error;
 mod generator;
 pub use generator::C220MteGeneratorCallback;

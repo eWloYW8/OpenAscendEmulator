@@ -3,7 +3,6 @@ use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
 use crate::architecture::Architecture;
 use crate::isa::c220::scalar::C220ScalarConversionHint;
 use crate::isa::flow::{FlagOperation, PipelineBarrierScope, PipelineBarrierStep};
-use crate::sim::c220::mte::mte2::C220Mte2Step;
 use crate::sim::c220::scalar::timing::C220ScalarTimingTicket;
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 use crate::sim::c220::state::C220ExecutionError;
@@ -63,22 +62,7 @@ impl C220Core {
                 });
             }
             C220DispatchKind::Mte1 => return self.step_mte1_at(tick, pc, word),
-            C220DispatchKind::Mte2 => {
-                return match self.mte2.step_at(
-                    tick,
-                    &mut self.state.scalar,
-                    &mut self.state.ub,
-                    word,
-                    &self.memory,
-                    self.state.isa_instance_index,
-                )? {
-                    C220Mte2Step::Stalled(stall) => Ok(C220CoreStep::Stalled(stall)),
-                    result @ C220Mte2Step::Executed { .. } => Ok(C220CoreStep::Executed {
-                        tick,
-                        instruction: C220CoreInstruction::Mte2(result),
-                    }),
-                };
-            }
+            C220DispatchKind::Mte2 => return self.step_mte2_at(tick, pc, word),
             C220DispatchKind::HardwareFlag(instruction) => {
                 return self.step_hardware_flag_at(tick, pc, instruction);
             }

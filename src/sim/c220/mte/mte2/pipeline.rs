@@ -1,324 +1,368 @@
-use super::transfer::decode_mte2_transfer;
-use super::{C220Mte2State, C220MteAction, C220MteProgramStep};
-use crate::sim::c220::schedule::{C220Stall, C220StallCause};
-use std::collections::VecDeque;
-use std::num::NonZeroU64;
+use std::collections::{BTreeMap, VecDeque};
 
-use thiserror::Error;
-
-use crate::architecture::Architecture;
-use crate::isa::flow::{FlagInstruction, FlagOperation};
+use super::timing::C220Mte2DmaTiming;
+use super::{
+    C220Mte2Command, C220Mte2CommandState, C220Mte2Completion, C220Mte2EventState, C220Mte2Issue,
+    C220Mte2IssueTiming, C220Mte2Outcome, C220Mte2Result, C220Mte2TimingError, C220Mte2TimingRules,
+    C220Mte2TransferPlan, copy_c220_mov_out_to_ub,
+};
+use crate::isa::c220::mte::set2d::C220Set2dFill;
 use crate::memory::mapped::MappedMemory;
 use crate::memory::ub::UbMemory;
-use crate::sim::c220::mte::mte2::C220Mte2TransferPlan;
-use crate::sim::c220::mte::uop::{C220DmaUopError, C220DmaUopRequest, mte2_requests};
-use crate::sim::c220::state::C220ExecutionError;
-use crate::sim::common::scalar::ScalarStepper;
+use crate::sim::c220::memory::{C220LocalBufferError, C220LocalMemory};
+use crate::sim::c220::mte::set2d::execute_c220_set2d;
+use crate::sim::c220::mte::{C220MtePipeline, C220MtePipelineError, C220TransferError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220Mte2TimingRules {
-    pub issue_interval: NonZeroU64,
-    pub startup_ticks: u64,
-    pub bytes_per_tick: NonZeroU64,
-    pub retire_ticks: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220Mte2Ticket {
-    pub issue_tick: u64,
-    pub data_ready_tick: u64,
-    pub retire_tick: u64,
-    pub transfer: C220Mte2TransferPlan,
-    pub uop_count: usize,
-    pub modeled_service_ticks: u64,
-}
-
-impl C220Mte2Ticket {
-    pub fn requests(self) -> Result<Vec<C220DmaUopRequest>, C220DmaUopError> {
-        mte2_requests(self.transfer)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum C220Mte2Step {
-    Executed {
-        tick: u64,
-        step: C220MteProgramStep,
-        ticket: Option<C220Mte2Ticket>,
-    },
-    Stalled(C220Stall),
-}
-
-#[derive(Debug, Error)]
-pub enum C220Mte2TimingError {
-    #[error("MTE2 timing computation overflowed")]
+#[derive(Debug, thiserror::Error)]
+pub enum C220Mte2RuntimeError {
+    #[error(
+        "DMA completion for command {instruction_id} precedes its request tail or does not match an active transfer"
+    )]
+    InvalidDmaCompletion { instruction_id: u64 },
+    #[error("MTE2 command generator is busy")]
+    Busy,
+    #[error(
+        "switching from an outstanding aggregate DMA to L1 fill requires a physical DMA generator model"
+    )]
+    UnmodeledDmaGeneratorSwitch,
+    #[error("MTE2 time reversed from {previous} to {requested}")]
+    TimeReversed { previous: u64, requested: u64 },
+    #[error("MTE2 command cannot retire beyond the maximum tick")]
     TimeOverflow,
-    #[error("MTE2 transfer count and timing tickets diverged")]
-    TicketMismatch,
     #[error(transparent)]
-    Uop(#[from] C220DmaUopError),
+    Timing(#[from] C220Mte2TimingError),
     #[error(transparent)]
-    Execute(#[from] C220ExecutionError),
+    Pipeline(#[from] C220MtePipelineError),
+    #[error(transparent)]
+    Transfer(#[from] C220TransferError),
+    #[error(transparent)]
+    LocalMemory(#[from] C220LocalBufferError),
 }
 
+/// MTE2 command ownership and ordered functional retirement. The physical L1
+/// path is core-owned; this lane only consumes its completion notifications.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220Mte2Pipeline {
-    state: C220Mte2State,
-    rules: C220Mte2TimingRules,
-    next_mte2_issue_tick: u64,
-    mte2_data_port_tick: u64,
-    unsignaled: VecDeque<C220Mte2Ticket>,
-    vector_flags: [Option<C220Mte2Ticket>; 2],
+    dma: C220Mte2DmaTiming,
+    pending: VecDeque<C220Mte2CommandState>,
+    events: BTreeMap<(u8, u32), VecDeque<Option<u64>>>,
+    outcomes: Vec<C220Mte2Outcome>,
+    now: u64,
+    advanced: Option<u64>,
 }
 
 impl C220Mte2Pipeline {
     pub fn new(rules: C220Mte2TimingRules) -> Self {
         Self {
-            state: C220Mte2State::default(),
-            rules,
-            next_mte2_issue_tick: 0,
-            mte2_data_port_tick: 0,
-            unsignaled: VecDeque::new(),
-            vector_flags: [None; 2],
+            dma: C220Mte2DmaTiming::new(rules),
+            pending: VecDeque::new(),
+            events: BTreeMap::new(),
+            outcomes: Vec::new(),
+            now: 0,
+            advanced: None,
         }
     }
 
-    pub fn pending_transfer_count(&self) -> usize {
-        self.state.pending_count()
-    }
-
-    pub const fn scalar_flag_set(&self) -> bool {
-        self.state.scalar_flag_set()
-    }
-
-    pub const fn vector_flags_set(&self) -> [bool; 2] {
-        self.state.vector_flags_set()
+    pub fn pending_commands(&self) -> impl Iterator<Item = C220Mte2CommandState> + '_ {
+        self.pending.iter().copied()
     }
 
     pub fn is_busy(&self) -> bool {
-        self.state.is_busy()
+        !self.pending.is_empty()
+    }
+
+    pub fn last_outcomes(&self) -> &[C220Mte2Outcome] {
+        &self.outcomes
+    }
+
+    pub fn pending_events(&self) -> impl Iterator<Item = C220Mte2EventState> + '_ {
+        self.events
+            .iter()
+            .flat_map(move |(&(destination_pipe, event_id), tokens)| {
+                tokens.iter().map(move |&dependency| C220Mte2EventState {
+                    destination_pipe,
+                    event_id,
+                    dependency,
+                    ready: !dependency
+                        .is_some_and(|id| self.pending.iter().any(|p| p.instruction_id <= id)),
+                })
+            })
     }
 
     pub const fn rules(&self) -> C220Mte2TimingRules {
-        self.rules
+        self.dma.rules
     }
 
     pub const fn next_mte2_issue_tick(&self) -> u64 {
-        self.next_mte2_issue_tick
+        self.dma.next_issue_tick
     }
 
-    pub fn outstanding(&self) -> impl Iterator<Item = C220Mte2Ticket> + '_ {
-        self.unsignaled
-            .iter()
-            .copied()
-            .chain(self.vector_flags.iter().filter_map(|ticket| *ticket))
+    pub fn next_event_tick(&self) -> Option<u64> {
+        let head = self.pending.front()?;
+        let next = self.now.saturating_add(1);
+        Some(match head.completion {
+            C220Mte2Completion::Estimated { retire_tick } => next.max(retire_tick),
+            C220Mte2Completion::Observed { tick } => next.max(tick.saturating_add(1)),
+            C220Mte2Completion::AwaitingDestination | C220Mte2Completion::AwaitingDma { .. } => {
+                next
+            }
+        })
     }
 
-    pub(crate) fn step_at(
+    pub(crate) fn can_issue_l1_fill(
+        &self,
+        pipeline: &C220MtePipeline,
+        fill: C220Set2dFill,
+    ) -> Result<bool, C220Mte2RuntimeError> {
+        if !fill.descriptor.is_disabled()
+            && self.pending.iter().any(|p| {
+                matches!(p.command, C220Mte2Command::MovOutToUb(_))
+                    && matches!(p.completion, C220Mte2Completion::Estimated { .. })
+            })
+        {
+            return Err(C220Mte2RuntimeError::UnmodeledDmaGeneratorSwitch);
+        }
+        Ok(pipeline.can_issue_l1_fill(fill))
+    }
+
+    pub(crate) fn issue_l1_fill(
+        &mut self,
+        pipeline: &mut C220MtePipeline,
+        instruction_id: u64,
+        pc: u64,
+        fill: C220Set2dFill,
+    ) -> Result<C220Mte2Issue, C220Mte2RuntimeError> {
+        if !self.can_issue_l1_fill(pipeline, fill)? {
+            return Err(C220Mte2RuntimeError::Busy);
+        }
+        self.now
+            .checked_add(1)
+            .ok_or(C220Mte2RuntimeError::TimeOverflow)?;
+        let timing = pipeline.issue_l1_fill(instruction_id, fill)?;
+        let command = C220Mte2Command::Set2d(fill);
+        self.pending.push_back(C220Mte2CommandState {
+            instruction_id,
+            pc,
+            issue_tick: timing.tick,
+            command,
+            completion: if timing.completion_ready {
+                C220Mte2Completion::Observed { tick: timing.tick }
+            } else {
+                C220Mte2Completion::AwaitingDestination
+            },
+        });
+        Ok(C220Mte2Issue {
+            instruction_id,
+            pc,
+            command,
+            timing: C220Mte2IssueTiming::L1(timing),
+        })
+    }
+
+    pub(crate) fn issue_dma(
+        &mut self,
+        pipeline: Option<&mut C220MtePipeline>,
+        instruction_id: u64,
+        pc: u64,
+        transfer: C220Mte2TransferPlan,
+    ) -> Result<C220Mte2Issue, C220Mte2RuntimeError> {
+        if transfer.descriptor.is_disabled() {
+            let _ = super::super::uop::mte2_uops(transfer).map_err(C220Mte2TimingError::from)?;
+            self.now
+                .checked_add(1)
+                .ok_or(C220Mte2RuntimeError::TimeOverflow)?;
+            let command = C220Mte2Command::MovOutToUb(transfer);
+            self.pending.push_back(C220Mte2CommandState {
+                instruction_id,
+                pc,
+                issue_tick: self.now,
+                command,
+                completion: C220Mte2Completion::Observed { tick: self.now },
+            });
+            return Ok(C220Mte2Issue {
+                instruction_id,
+                pc,
+                command,
+                timing: C220Mte2IssueTiming::Disabled,
+            });
+        }
+        if let Some(pipeline) = pipeline.filter(|p| p.mte2_dma_connected()) {
+            self.now
+                .checked_add(1)
+                .ok_or(C220Mte2RuntimeError::TimeOverflow)?;
+            let timing = pipeline.issue_mte2_dma(instruction_id, transfer)?;
+            let command = C220Mte2Command::MovOutToUb(transfer);
+            self.pending.push_back(C220Mte2CommandState {
+                instruction_id,
+                pc,
+                issue_tick: self.now,
+                command,
+                completion: if timing.completion_ready {
+                    C220Mte2Completion::Observed { tick: self.now }
+                } else {
+                    C220Mte2Completion::AwaitingDma {
+                        tail_delivered: false,
+                    }
+                },
+            });
+            return Ok(C220Mte2Issue {
+                instruction_id,
+                pc,
+                command,
+                timing: C220Mte2IssueTiming::Dma(timing),
+            });
+        }
+        if self.now < self.dma.next_issue_tick {
+            return Err(C220Mte2RuntimeError::Busy);
+        }
+        let ticket = self.dma.preview_ticket(self.now, transfer)?;
+        let command = C220Mte2Command::MovOutToUb(transfer);
+        self.dma.accept(ticket);
+        self.pending.push_back(C220Mte2CommandState {
+            instruction_id,
+            pc,
+            issue_tick: self.now,
+            command,
+            completion: C220Mte2Completion::Estimated {
+                retire_tick: ticket.retire_tick,
+            },
+        });
+        Ok(C220Mte2Issue {
+            instruction_id,
+            pc,
+            command,
+            timing: C220Mte2IssueTiming::AggregateDma(ticket),
+        })
+    }
+
+    /// Every SET refers to the latest preceding command, including repeated
+    /// SETs for different consumers. SET never removes a command from retirement.
+    pub(crate) fn set_event(&mut self, destination: u8, event_id: u32) {
+        let dependency = self.pending.back().map(|p| p.instruction_id);
+        self.events
+            .entry((destination, event_id))
+            .or_default()
+            .push_back(dependency);
+    }
+
+    pub(crate) fn wait_event(&mut self, destination: u8, event_id: u32) -> bool {
+        let key = (destination, event_id);
+        let Some(tokens) = self.events.get_mut(&key) else {
+            return false;
+        };
+        let Some(target) = tokens.front() else {
+            return false;
+        };
+        if target.is_some_and(|id| self.pending.iter().any(|p| p.instruction_id <= id)) {
+            return false;
+        }
+        tokens.pop_front();
+        if tokens.is_empty() {
+            self.events.remove(&key);
+        }
+        true
+    }
+
+    pub(crate) fn begin_advance(&mut self) {
+        self.outcomes.clear();
+    }
+
+    pub(crate) fn observe_dma_tail(&mut self, instruction_id: u64) {
+        let command = self
+            .pending
+            .iter_mut()
+            .find(|p| p.instruction_id == instruction_id)
+            .expect("DMA request belongs to a pending command");
+        let C220Mte2Completion::AwaitingDma { tail_delivered } = &mut command.completion else {
+            unreachable!("DMA request belongs to an active physical transfer");
+        };
+        *tail_delivered = true;
+    }
+
+    pub(crate) fn complete_dma(&mut self, instruction_id: u64) -> Result<(), C220Mte2RuntimeError> {
+        let command = self
+            .pending
+            .iter_mut()
+            .find(|p| {
+                p.instruction_id == instruction_id
+                    && matches!(
+                        p.completion,
+                        C220Mte2Completion::AwaitingDma {
+                            tail_delivered: true
+                        }
+                    )
+            })
+            .ok_or(C220Mte2RuntimeError::InvalidDmaCompletion { instruction_id })?;
+        self.now
+            .checked_add(1)
+            .ok_or(C220Mte2RuntimeError::TimeOverflow)?;
+        command.completion = C220Mte2Completion::Observed { tick: self.now };
+        Ok(())
+    }
+
+    pub(crate) fn commit_ready_at(
         &mut self,
         tick: u64,
-        scalar: &mut ScalarStepper,
+        local: &mut C220LocalMemory,
         ub: &mut UbMemory,
-        word: u32,
         source: &MappedMemory,
-        isa_instance_index: u32,
-    ) -> Result<C220Mte2Step, C220Mte2TimingError> {
-        let pc = scalar.pc();
-
-        let route = FlagInstruction::decode(Architecture::Dav2201, word).map(|instruction| {
-            (
-                instruction.source_pipe_code,
-                instruction.trigger_pipe_code,
-                instruction.operation,
-            )
-        });
-        let wait_ready_tick = match route {
-            Some((4, 0, FlagOperation::Wait)) if self.state.scalar_flag_set() => self
-                .unsignaled
-                .iter()
-                .map(|ticket| ticket.retire_tick)
-                .max(),
-            Some((4, 1, FlagOperation::Wait)) => {
-                let flag_id = C220Mte2State::resolve_vector_flag_id(scalar.machine(), pc, word)?;
-                self.vector_flags[usize::from(flag_id)].map(|ticket| ticket.retire_tick)
+    ) -> Result<(), C220Mte2RuntimeError> {
+        if tick < self.now {
+            return Err(C220Mte2RuntimeError::TimeReversed {
+                previous: self.now,
+                requested: tick,
+            });
+        }
+        if self.advanced == Some(tick) {
+            return Ok(());
+        }
+        if let Some(&command) = self.pending.front()
+            && command.issue_tick < tick
+            && match command.completion {
+                C220Mte2Completion::AwaitingDestination
+                | C220Mte2Completion::AwaitingDma { .. } => false,
+                C220Mte2Completion::Observed { tick: done } => done < tick,
+                C220Mte2Completion::Estimated { retire_tick } => retire_tick <= tick,
             }
-            _ => None,
-        };
-        if let Some(resume_tick) = wait_ready_tick
-            && tick < resume_tick
         {
-            return Ok(C220Mte2Step::Stalled(C220Stall {
-                tick,
-                pc,
-                resume_tick,
-                cause: C220StallCause::Mte2Dependency,
-            }));
-        }
-
-        let transfer = if is_mte2_transfer(word) {
-            if tick < self.next_mte2_issue_tick {
-                return Ok(C220Mte2Step::Stalled(C220Stall {
-                    tick,
-                    pc,
-                    resume_tick: self.next_mte2_issue_tick,
-                    cause: C220StallCause::Mte2IssueRate,
-                }));
-            }
-            Some(decode_mte2_transfer(
-                scalar.machine(),
-                pc,
-                word,
-                isa_instance_index,
-            )?)
-        } else {
-            None
-        };
-        let ticket = transfer
-            .map(|plan| self.preview_ticket(tick, plan))
-            .transpose()?;
-        let step = self.state.step_word(scalar, ub, word, source, transfer)?;
-        match &step.action {
-            C220MteAction::Issue {
-                source_address,
-                destination_address,
-                planned_bytes,
-                ..
-            } => {
-                let issued = ticket.ok_or(C220Mte2TimingError::TicketMismatch)?;
-                if issued.transfer.bytes != *planned_bytes
-                    || issued.transfer.source_address != *source_address
-                    || issued.transfer.destination_address != *destination_address
-                {
-                    return Err(C220Mte2TimingError::TicketMismatch);
+            let result = match command.command {
+                C220Mte2Command::Set2d(fill) => {
+                    C220Mte2Result::Set2d(execute_c220_set2d(local, fill)?)
                 }
-                self.mte2_data_port_tick = issued.data_ready_tick;
-                self.next_mte2_issue_tick = tick
-                    .checked_add(self.rules.issue_interval.get())
-                    .ok_or(C220Mte2TimingError::TimeOverflow)?;
-                self.unsignaled.push_back(issued);
-            }
-            C220MteAction::SetVectorFlag { flag_id, .. } => {
-                let issued = self
-                    .unsignaled
-                    .pop_front()
-                    .ok_or(C220Mte2TimingError::TicketMismatch)?;
-                self.vector_flags[usize::from(*flag_id)] = Some(issued);
-            }
-            C220MteAction::WaitVectorFlag { flag_id, .. } => {
-                self.vector_flags[usize::from(*flag_id)] = None;
-            }
-            C220MteAction::WaitFlag { .. } => self.unsignaled.clear(),
-            C220MteAction::SetFlag { .. } => {}
+                C220Mte2Command::MovOutToUb(plan) => {
+                    C220Mte2Result::MovOutToUb(copy_c220_mov_out_to_ub(
+                        ub,
+                        source,
+                        plan.descriptor,
+                        plan.source_address,
+                        plan.destination_address,
+                    )?)
+                }
+            };
+            self.pending.pop_front();
+            self.outcomes.push(C220Mte2Outcome {
+                command,
+                retire_tick: tick,
+                result,
+            });
         }
-        Ok(C220Mte2Step::Executed { tick, step, ticket })
+        self.now = tick;
+        self.advanced = Some(tick);
+        Ok(())
     }
 
-    fn preview_ticket(
-        &self,
-        issue_tick: u64,
-        transfer: C220Mte2TransferPlan,
-    ) -> Result<C220Mte2Ticket, C220Mte2TimingError> {
-        let requests = mte2_requests(transfer)?;
-        let uop_count = requests.len();
-        let rate = self.rules.bytes_per_tick.get();
-        let modeled_service_ticks = requests.iter().try_fold(0_u64, |total, request| {
-            let bytes = u64::from(request.bytes);
-            let ticks = bytes / rate + u64::from(bytes % rate != 0);
-            total
-                .checked_add(ticks)
-                .ok_or(C220Mte2TimingError::TimeOverflow)
-        })?;
-        let start = issue_tick
-            .checked_add(self.rules.startup_ticks)
-            .ok_or(C220Mte2TimingError::TimeOverflow)?
-            .max(self.mte2_data_port_tick);
-        let data_ready_tick = start
-            .checked_add(modeled_service_ticks)
-            .ok_or(C220Mte2TimingError::TimeOverflow)?;
-        let retire_tick = data_ready_tick
-            .checked_add(self.rules.retire_ticks)
-            .ok_or(C220Mte2TimingError::TimeOverflow)?;
-        issue_tick
-            .checked_add(self.rules.issue_interval.get())
-            .ok_or(C220Mte2TimingError::TimeOverflow)?;
-        Ok(C220Mte2Ticket {
-            issue_tick,
-            data_ready_tick,
-            retire_tick,
-            transfer,
-            uop_count,
-            modeled_service_ticks,
-        })
+    pub(crate) fn observe_l1_completions(&mut self, tick: u64, ids: &[u64]) {
+        for id in ids {
+            let command = self
+                .pending
+                .iter_mut()
+                .find(|p| p.instruction_id == *id)
+                .expect("L1 completion owns a pending MTE2 command");
+            command.completion = C220Mte2Completion::Observed { tick };
+        }
     }
 }
 
 pub(crate) fn is_mte2_transfer(word: u32) -> bool {
     crate::isa::c220::mte::C220MovOutToUbDescriptor::is_word(word)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::isa::c220::mte::{C220MovOutToUbDescriptor, CAPTURED_C220_MOV_OUT_TO_UB_X_WORD};
-
-    fn transfer(burst_length: u16) -> C220Mte2TransferPlan {
-        let descriptor = C220MovOutToUbDescriptor::decode(
-            CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,
-            (u64::from(burst_length) << 16) | (1 << 4),
-        )
-        .unwrap();
-        C220Mte2TransferPlan {
-            descriptor,
-            source_address: 0x1000,
-            destination_address: 0x200,
-            bytes: usize::from(burst_length) * 32,
-            dma_mode_word: 0,
-        }
-    }
-
-    #[test]
-    fn c220_timeline_separates_issue_service_and_retirement() {
-        let rules = C220Mte2TimingRules {
-            issue_interval: NonZeroU64::new(2).unwrap(),
-            startup_ticks: 3,
-            bytes_per_tick: NonZeroU64::new(32).unwrap(),
-            retire_ticks: 1,
-        };
-        let mut timed = C220Mte2Pipeline::new(rules);
-        let first = timed.preview_ticket(5, transfer(2)).unwrap();
-        assert_eq!((first.data_ready_tick, first.retire_tick), (10, 11));
-        assert_eq!(first.transfer.descriptor_segments().unwrap().len(), 2);
-        assert_eq!(first.uop_count, 1);
-        assert_eq!(first.modeled_service_ticks, 2);
-        assert_eq!(first.requests().unwrap()[0].bytes, 64);
-        timed.mte2_data_port_tick = first.data_ready_tick;
-        let second = timed.preview_ticket(7, transfer(4)).unwrap();
-        assert_eq!((second.data_ready_tick, second.retire_tick), (14, 15));
-        assert!(matches!(
-            timed.preview_ticket(u64::MAX, transfer(1)),
-            Err(C220Mte2TimingError::TimeOverflow)
-        ));
-    }
-
-    #[test]
-    fn split_requests_each_consume_a_service_quantum() {
-        let rules = C220Mte2TimingRules {
-            issue_interval: NonZeroU64::new(1).unwrap(),
-            startup_ticks: 0,
-            bytes_per_tick: NonZeroU64::new(64).unwrap(),
-            retire_ticks: 0,
-        };
-        let timed = C220Mte2Pipeline::new(rules);
-        let mut plan = transfer(1);
-        plan.descriptor = C220MovOutToUbDescriptor::decode(
-            CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,
-            (1_u64 << 32) | (1 << 16) | (2 << 4),
-        )
-        .unwrap();
-        plan.bytes = 64;
-        let ticket = timed.preview_ticket(5, plan).unwrap();
-        assert_eq!(ticket.uop_count, 2);
-        assert_eq!(ticket.modeled_service_ticks, 2);
-        assert_eq!(ticket.data_ready_tick, 7);
-    }
 }

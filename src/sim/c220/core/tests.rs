@@ -1808,6 +1808,108 @@ fn vector_issue_failure_keeps_execution_state_uncommitted() {
 }
 
 #[test]
+fn disabled_dma_retires_without_memory_access_or_bandwidth_delay() {
+    use crate::isa::c220::mte::{C220MovInstruction, CAPTURED_C220_MOV_OUT_TO_UB_X_WORD};
+    use crate::sim::c220::mte::mte2::{C220Mte2IssueTiming, C220Mte2Result};
+
+    for xm in [0, 0x10, 0x10000] {
+        let memory = MappedMemory::bind(
+            SparseMemory::new(vec![MemoryRegion::unknown(32)], 32, 32),
+            &[0x2000],
+        )
+        .unwrap();
+        let machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+        let state = C220State::new(ScalarStepper::new(machine, 0x4000), UbMemory::new(32, 32));
+        let interval = NonZeroU64::new(u64::MAX).unwrap();
+        let mut core = C220Core::new(
+            state,
+            memory,
+            C220CoreTimingRules {
+                mte2: C220Mte2TimingRules {
+                    issue_interval: interval,
+                    startup_ticks: u64::MAX,
+                    bytes_per_tick: interval,
+                    retire_ticks: u64::MAX,
+                },
+                mte3: C220Mte3TimingRules {
+                    issue_interval: interval,
+                    startup_ticks: u64::MAX,
+                    bytes_per_tick: interval,
+                    retire_ticks: u64::MAX,
+                },
+                vector: C220VectorTimingRules {
+                    dispatch_ticks: 0,
+                    uop_issue_interval: NonZeroU64::new(1).unwrap(),
+                    ub_response_ticks: 1,
+                },
+            },
+        )
+        .unwrap();
+        for (tick, word) in [
+            CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,
+            CAPTURED_C220_MOV_UB_TO_OUT_WORD,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let operands = C220MovInstruction::decode(word).unwrap();
+            let machine = core.state.scalar_mut().machine_mut();
+            machine
+                .set_xreg(operands.source_register, u64::MAX)
+                .unwrap();
+            machine
+                .set_xreg(operands.destination_register, u64::MAX)
+                .unwrap();
+            machine.set_xreg(operands.descriptor_register, xm).unwrap();
+            let C220CoreStep::Executed { instruction, .. } =
+                core.step_word_at(tick as u64, word).unwrap()
+            else {
+                panic!("disabled command should issue without a data dependency");
+            };
+            match instruction {
+                C220CoreInstruction::Mte2(issue) => {
+                    assert_eq!(issue.timing, C220Mte2IssueTiming::Disabled)
+                }
+                C220CoreInstruction::Mte3 {
+                    ticket: Some(ticket),
+                    ..
+                } => {
+                    assert_eq!(ticket.requests().unwrap().next(), None);
+                    assert_eq!(ticket.uop_count, 0);
+                    assert_eq!(ticket.modeled_service_ticks, 0);
+                    assert_eq!(ticket.retire_tick, 2);
+                }
+                _ => panic!("expected a DMA command"),
+            }
+        }
+        let outcomes = core.mte2_pipeline().last_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0].result, C220Mte2Result::MovOutToUb(result) if result.bytes == 0 && result.segment_count == 0)
+        );
+        assert_eq!(core.mte2_pipeline().next_mte2_issue_tick(), 0);
+        assert_eq!(core.mte3.timing.next_issue_tick(), 0);
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(10, 0)
+            .unwrap();
+        core.step_word_at(2, C220_MTE3_TO_VECTOR_SET_FLAG_WORD)
+            .unwrap();
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(19, 0)
+            .unwrap();
+        core.step_word_at(3, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
+            .unwrap();
+        assert_eq!(core.pending_output_ready_tick(), None);
+        assert!(core.memory().read_known_at(0x2000, 32).is_err());
+        assert!(core.state().ub().read_known(0, 32).is_err());
+    }
+}
+
+#[test]
 fn mte3_completion_wait_uses_the_scheduled_request_service() {
     let regions = vec![
         MemoryRegion::unknown(128),

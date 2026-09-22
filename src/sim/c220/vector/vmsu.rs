@@ -241,6 +241,26 @@ impl C220VmsuPipeline {
         Ok(Some(visibility))
     }
 
+    pub(crate) fn next_event_tick(&self) -> Option<u64> {
+        let active = self.active.as_ref()?;
+        let tick = if let Some(schedule) = &active.schedule {
+            schedule
+                .writes
+                .get(active.committed_writes)
+                .map_or(schedule.trace.completion_tick, |write| {
+                    write.trace.done_tick.min(schedule.trace.completion_tick)
+                })
+        } else {
+            active.retirement_tick?
+        };
+        Some(
+            tick.max(
+                self.observed_tick
+                    .map_or(0, |previous| previous.saturating_add(1)),
+            ),
+        )
+    }
+
     pub fn advance_to(&mut self, tick: u64, core: &mut C220State) -> Result<(), C220VmsuError> {
         if let Some(previous) = self.observed_tick
             && tick < previous

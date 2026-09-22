@@ -123,14 +123,16 @@ impl C220Mte3State {
                 }
             }
             None if C220DmaMovDescriptor::is_word(word) => {
-                self.ready_output
-                    .ok_or(C220ExecutionError::OutputNotReady)?;
+                let plan = transfer.ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
+                if !plan.descriptor.is_disabled() {
+                    self.ready_output
+                        .ok_or(C220ExecutionError::OutputNotReady)?;
+                }
                 if self.copied_output.is_some()
                     || self.mte3_completion_flags.iter().any(Option::is_some)
                 {
                     return Err(C220ExecutionError::OutputDependencyOutstanding);
                 }
-                let plan = transfer.ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
                 let prepared = prepare_c220_mov_ub_to_hbm(
                     ub,
                     plan.descriptor,

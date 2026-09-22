@@ -32,19 +32,22 @@ Execution units do not import the core, and ISA decoders do not import the simul
 MTE2 owns its pending transfers and flags inside its pipeline; inspect these via
 `core.mte2_pipeline()`. MTE state transitions use explicit register and memory
 arguments instead of extending the whole-core state. Cross-unit barriers are
-coordinated by the core. MTE3 reuses the transfer plan used for timing admission.
+coordinated by the core. `core/advance.rs` advances MTE, Cube, Vector/VMSU and
+output commits in event-time order, retaining diagnostics across a bulk advance.
+MTE3 reuses the transfer plan used for timing admission.
 
 Cube separates MMAD traversal (`mmad.rs`), tiled memory addressing (`layout.rs`),
 pure numerical operations (`numeric/`), and deferred output commits (`execute.rs`).
 All supported MMAD formats share the traversal and output bookkeeping; their
 slice widths, rounding, saturation, and nonfinite rules remain format-specific.
-MTE1, MTE2, and MTE3 each own their transfers, execution state and timing under
+MTE1, MTE2, and MTE3 own their commands and execution state under
 `mte/{mte1,mte2,mte3}/`. Module entry points expose the unit API; timing,
 transfer and state implementations stay private. MTE1 instruction families
 have explicit `bias` and `load2d` APIs without duplicate unit-root exports.
-`mte/interface/` owns shared L1 read arbitration, output scheduling and
-L0 write interfaces. Only common DMA request expansion and transfer errors
-remain at the MTE level. Cube numerical helpers are private; execution results
+`mte/interface/` owns shared L1 read/write arbitration, output scheduling and
+L0 write interfaces. The core-owned `C220MtePipeline` composes their physical
+events in `mte/pipeline.rs`; it is not privately owned by a command lane.
+Cube numerical helpers are private; execution results
 and timing state remain inspectable.
 
 `mte/mte1/{bias,load2d}/` own data movement and lazy physical request expansion.
@@ -69,7 +72,10 @@ Generated entries retain instruction identity, uop index, eligibility tick and
 route; send results distinguish readiness, synchronization and output-credit
 stalls. Empty commands signal completion without output traffic. Generation
 completion permits command admission but does not imply output retirement.
-SET_2D integrated core dispatch and automatic gate resolution remain incomplete.
+Core dispatch routes L0 fills through MTE1 and L1 fills through MTE2. Register
+operands and the pattern are captured on admission; functional writes occur at
+ordered retirement after destination completion. Automatic gate resolution is
+still incomplete.
 
 `C220MteL1WriteInterface` provides the shared four-port MTE write path to L1.
 It owns bounded, latency-bearing input queues, round-robin selection, unique
@@ -102,26 +108,79 @@ Frontend idleness means generation is finished, not that submitted requests
 have retired. The shared interface and destination write interfaces must also
 drain. Cross-engine callback order remains explicit at the composition boundary;
 complete callback-order equivalence is not established.
-The integrated core still uses the aggregate timing lane; the L1 read and
-L0 write components are not yet coordinated in core dispatch.
+The integrated core coordinates LOAD2D, BT and SET_2D through the shared physical
+MTE pipeline. Configure its geometry and bandwidths with `configure_mte_pipeline`;
+inspect queues and the latest physical events with `mte_pipeline()`.
 LOAD2D captures register operands on issue but reads L1 and commits L0 at
 ordered command retirement. Issue events contain the plan, not a premature
 transfer result. `core.last_mte1_outcomes()` reports the transfers completed
 during the latest advance, including instruction identity, retirement tick,
 and known/unknown byte counts. Non-triggered MTE1 HSETs are queued per memory
 and attached to the next matching transfer, with duplicate event IDs suppressed
-while queued. Attached flags become visible after command retirement, not at
+while queued. Attached flags are attempted at ordered command retirement, not at
 transport readiness. Flag admission checks visible counters, independently of
 pending sets; delivery saturates at the counter limit. Counter snapshots expose
 visible and pending tokens, and discarded deliveries have a cumulative count.
 Triggered flag operations stall when a token or counter capacity is unavailable.
-Attached HSET capacity stalls currently return an explicit error; automatic
-retirement backpressure recovery and response-driven command retirement remain
-to be integrated. Triggered flags do not yet gate on generation-engine idleness.
-Each attached HSET is attempted independently. A blocked or failed command keeps
-its timing slot and produces no retirement outcome; successful transfers release
+Attached HSET capacity stalls retain the command and retry on later clocks while
+other engines continue, so triggered waits and Cube consumers can free capacity.
+Triggered MTE1 flags gate on the last selected generation engine becoming idle.
+Each attached HSET is attempted independently; accepted flags can become visible
+while another attached flag still blocks retirement, and are not sent again on
+retry. A blocked or failed command keeps its timing slot and produces no retirement
+outcome; successful transfers release
 their slot only after committing memory. `core.pending_mte1_commands()` exposes
 instruction identity, earliest retirement attempt, remaining sets and flag stalls.
+Command state and retirement outcomes retain the number of flag-stalled clocks.
+The MTE1 default limit is 31 outstanding commands, not the capacity of a physical
+generator or destination queue.
+
+MTE2 shares one ordered retirement queue for L1 fills and HBM-to-UB transfers.
+Ordinary SET/WAIT events track command retirement and never perform data copies.
+Repeated SETs retain independent tokens, keyed by destination pipe and event ID.
+`pending_commands()`, `pending_events()` and `last_outcomes()` expose dependencies,
+completion sources and results. L1 completion is observed from write responses.
+HBM-to-UB defaults to caller-supplied aggregate timing, explicitly marked
+`AggregateDma`/`Estimated`; that path cannot switch to L1 fill while a DMA is
+outstanding. After configuring the shared MTE pipeline, `connect_mte2_dma()`
+selects explicit request generation instead. This uses a one-tick instruction
+queue and a four-entry generated queue with three-tick latency. Generation
+and sending have separate callbacks; synchronization and output credit stalls
+preserve the offered request. The selected generation engine must drain before
+switching between DMA and L1 fill, independently of destination completion.
+
+The explicit DMA connection currently needs a transport consumer. Its single
+handoff slot provides backpressure; it is not a hardware BIU queue. Inspect
+`dma_generator()` and `dma_output()` through `core.mte_pipeline()`, drain requests
+with `take_mte2_dma_request()`, and report whole-command destination completion
+with `complete_mte2_dma_at()`. Completion before tail delivery, duplicate completion
+and unknown command IDs are rejected. Request delivery never commits UB writes;
+functional copies and dependent SET/WAIT events remain tied to ordered retirement.
+`connect_mte2_biu(config, subcore)` additionally routes generated requests through
+the BIU read frontend: three four-entry input queues, three-tick input latency,
+weighted arbitration, address/mode-dependent splitting, and a finite tag pool.
+Tag reservation survives transport backpressure. Queue occupancy, arbitration
+decisions, stalls and outstanding requests are inspectable. Request splitting is
+lazy even for large unaligned transfers. `take_mte2_biu_request()` is an explicit
+consumer boundary, not a model of the downstream BIU transport queue.
+Supply up to two response-channel heads with `receive_mte2_biu_at()`; unaccepted
+heads stay with the transport for retry. Ordinary read returns now pass through
+two ROB ports, transaction-ID ordering, ingress delay, in-order/out-of-order tag
+arbitration, Cube/Vector read scheduling and bounded write-adapter queues. Tags
+are recycled internally only after successful egress. The final-completion marker
+follows the last completing request, including when the issued tail returns early.
+Inspect `biu_read_returns()` and consume `take_mte2_biu_output()` for destination
+service. Whole-command destination completion remains separate and is rejected
+while BIU requests or adapter outputs remain pending. Native HBM service latency,
+destination write service, prefetch task switching and automatic synchronization
+gates are still missing; this is not an end-to-end calibrated DMA model.
+Ordinary DMA descriptors cover the full encoded burst range without an artificial
+segment-count limit. Functional segments and physical requests expand lazily;
+explicit collection remains available for inspection. Source burst offsets wrap
+at 32 bits while destination offsets remain 64-bit. Zero burst count or length
+disables memory traffic and aggregate bandwidth charges while retaining command
+retirement and completion events. MTE3's general command queue and physical
+HBM/UB response path remain incomplete.
 
 Vector has explicit boundaries between instruction preparation, operations,
 operand reads, and scheduling:

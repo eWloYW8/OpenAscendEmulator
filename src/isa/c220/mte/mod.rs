@@ -3,7 +3,7 @@ mod burst;
 pub mod load2d;
 pub mod set2d;
 
-use burst::{BurstLayout, BurstSizeError};
+use burst::BurstLayout;
 
 use thiserror::Error;
 
@@ -22,7 +22,6 @@ mod test_words {
 #[cfg(test)]
 pub use test_words::*;
 pub const C220_MOV_UB_TO_OUT_UNIT_BYTES: u64 = 32;
-pub const MAX_C220_DMAMOV_SEGMENTS: u64 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220MovDirection {
@@ -103,10 +102,8 @@ pub enum C220MovOutToUbError {
     UnsupportedWord { word: u32 },
     #[error("unsupported C220 MOV_OUT_TO_UB XM descriptor {xm:#x}")]
     UnsupportedXm { xm: u64 },
-    #[error("C220 MOV_OUT_TO_UB burst count or length is zero")]
-    EmptyDescriptor,
-    #[error("C220 MOV_OUT_TO_UB requests {requested} segments, limit {limit}")]
-    TooManySegments { requested: u64, limit: u64 },
+    #[error("cannot allocate C220 MOV_OUT_TO_UB segment records")]
+    AllocationFailed,
     #[error("C220 MOV_OUT_TO_UB descriptor fields disagree with XM")]
     InconsistentDescriptor,
     #[error("C220 MOV_OUT_TO_UB source or destination address overflows")]
@@ -133,7 +130,7 @@ impl C220MovOutToUbDescriptor {
         if xm & 0xf != 0 {
             return Err(C220MovOutToUbError::UnsupportedXm { xm });
         }
-        let layout = BurstLayout::decode(xm).map_err(C220MovOutToUbError::from)?;
+        let layout = BurstLayout::decode(xm);
         Ok(Self {
             instruction_word,
             xm,
@@ -149,6 +146,25 @@ impl C220MovOutToUbDescriptor {
         source_hbm: u64,
         destination_local: u64,
     ) -> Result<Vec<C220MovOutToUbSegment>, C220MovOutToUbError> {
+        let segments = self.segment_iter(source_hbm, destination_local)?;
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(segments.len())
+            .map_err(|_| C220MovOutToUbError::AllocationFailed)?;
+        records.extend(segments);
+        Ok(records)
+    }
+
+    pub const fn is_disabled(self) -> bool {
+        self.burst_count == 0 || self.burst_length == 0
+    }
+
+    pub fn segment_iter(
+        self,
+        source_hbm: u64,
+        destination_local: u64,
+    ) -> Result<impl ExactSizeIterator<Item = C220MovOutToUbSegment> + Clone, C220MovOutToUbError>
+    {
         let decoded = Self::decode(self.instruction_word, self.xm)?;
         if decoded.burst_count != self.burst_count
             || decoded.burst_length != self.burst_length
@@ -163,19 +179,16 @@ impl C220MovOutToUbDescriptor {
             source_gap: self.source_gap,
             destination_gap: self.destination_gap,
         };
-        layout
+        Ok(layout
             .segments(source_hbm, destination_local)
-            .map(|segment| {
-                let segment = segment.ok_or(C220MovOutToUbError::AddressOverflow)?;
-                Ok(C220MovOutToUbSegment {
-                    burst_index: segment.burst_index,
-                    unit_index: segment.unit_index,
-                    source_hbm: segment.source,
-                    destination_local: segment.destination,
-                    bytes: segment.bytes,
-                })
-            })
-            .collect()
+            .ok_or(C220MovOutToUbError::AddressOverflow)?
+            .map(|segment| C220MovOutToUbSegment {
+                burst_index: segment.burst_index,
+                unit_index: segment.unit_index,
+                source_hbm: segment.source,
+                destination_local: segment.destination,
+                bytes: segment.bytes,
+            }))
     }
 }
 
@@ -185,10 +198,8 @@ pub enum C220DmaMovError {
     UnsupportedWord { word: u32 },
     #[error("unsupported C220 MOV_UB_TO_OUT low mode bits {mode:#x}")]
     UnsupportedMode { mode: u8 },
-    #[error("C220 MOV_UB_TO_OUT burst count or length is zero")]
-    EmptyDescriptor,
-    #[error("C220 MOV_UB_TO_OUT requests {requested} segments, limit {limit}")]
-    TooManySegments { requested: u64, limit: u64 },
+    #[error("cannot allocate C220 MOV_UB_TO_OUT segment records")]
+    AllocationFailed,
     #[error("C220 MOV_UB_TO_OUT descriptor fields disagree with XM")]
     InconsistentDescriptor,
     #[error("C220 MOV_UB_TO_OUT source or destination address overflows")]
@@ -216,7 +227,7 @@ impl C220DmaMovDescriptor {
         if mode != 0 {
             return Err(C220DmaMovError::UnsupportedMode { mode });
         }
-        let layout = BurstLayout::decode(xm).map_err(C220DmaMovError::from)?;
+        let layout = BurstLayout::decode(xm);
         Ok(Self {
             instruction_word,
             xm,
@@ -232,6 +243,24 @@ impl C220DmaMovDescriptor {
         source_local: u64,
         destination_hbm: u64,
     ) -> Result<Vec<C220DmaMovSegment>, C220DmaMovError> {
+        let segments = self.segment_iter(source_local, destination_hbm)?;
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(segments.len())
+            .map_err(|_| C220DmaMovError::AllocationFailed)?;
+        records.extend(segments);
+        Ok(records)
+    }
+
+    pub const fn is_disabled(self) -> bool {
+        self.burst_count == 0 || self.burst_length == 0
+    }
+
+    pub fn segment_iter(
+        self,
+        source_local: u64,
+        destination_hbm: u64,
+    ) -> Result<impl ExactSizeIterator<Item = C220DmaMovSegment> + Clone, C220DmaMovError> {
         let decoded = Self::decode(self.instruction_word, self.xm)?;
         if self.burst_count != decoded.burst_count
             || self.burst_length != decoded.burst_length
@@ -246,19 +275,16 @@ impl C220DmaMovDescriptor {
             source_gap: self.source_gap,
             destination_gap: self.destination_gap,
         };
-        layout
+        Ok(layout
             .segments(source_local, destination_hbm)
-            .map(|segment| {
-                let segment = segment.ok_or(C220DmaMovError::AddressOverflow)?;
-                Ok(C220DmaMovSegment {
-                    burst_index: segment.burst_index,
-                    unit_index: segment.unit_index,
-                    source_local: segment.source,
-                    destination_hbm: segment.destination,
-                    bytes: segment.bytes,
-                })
-            })
-            .collect()
+            .ok_or(C220DmaMovError::AddressOverflow)?
+            .map(|segment| C220DmaMovSegment {
+                burst_index: segment.burst_index,
+                unit_index: segment.unit_index,
+                source_local: segment.source,
+                destination_hbm: segment.destination,
+                bytes: segment.bytes,
+            }))
     }
 }
 
@@ -298,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_modes_and_invalid_sizes_fail_closed() {
+    fn descriptor_modes_empty_commands_and_full_size_range() {
         let word = CAPTURED_C220_MOV_UB_TO_OUT_WORD;
         assert!(matches!(
             C220DmaMovDescriptor::decode(word ^ 1, 0x40010),
@@ -308,14 +334,20 @@ mod tests {
             C220DmaMovDescriptor::decode(word, 0x40011),
             Err(C220DmaMovError::UnsupportedMode { .. })
         ));
+        for xm in [0, 0x10, 0x10000] {
+            let disabled = C220DmaMovDescriptor::decode(word, xm).unwrap();
+            assert!(disabled.is_disabled());
+            assert_eq!(disabled.segment_iter(u64::MAX, u64::MAX).unwrap().len(), 0);
+        }
+        let large = C220DmaMovDescriptor::decode(word, 0xffff_fff0).unwrap();
+        let mut segments = large.segment_iter(0, 0).unwrap();
+        let units = 4095 * 65535;
+        assert_eq!(segments.len(), units);
         assert_eq!(
-            C220DmaMovDescriptor::decode(word, 0),
-            Err(C220DmaMovError::EmptyDescriptor)
+            segments.nth(units - 1).unwrap().source_local,
+            u64::from(4094_u32.wrapping_mul(65535 * 32)) + 65534 * 32
         );
-        assert!(matches!(
-            C220DmaMovDescriptor::decode(word, 0xffff_0ff0),
-            Err(C220DmaMovError::TooManySegments { .. })
-        ));
+        assert_eq!(segments.len(), 0);
         let descriptor = C220DmaMovDescriptor::decode(word, 0x40010).unwrap();
         assert_eq!(
             descriptor.segments(u64::MAX - 16, 0x1000),
@@ -461,27 +493,5 @@ mod tests {
             .segments(0, 0),
             Err(C220DmaMovError::UnsupportedMode { mode: 1 })
         );
-    }
-}
-
-impl From<BurstSizeError> for C220MovOutToUbError {
-    fn from(error: BurstSizeError) -> Self {
-        match error {
-            BurstSizeError::Empty => Self::EmptyDescriptor,
-            BurstSizeError::TooMany { requested, limit } => {
-                Self::TooManySegments { requested, limit }
-            }
-        }
-    }
-}
-
-impl From<BurstSizeError> for C220DmaMovError {
-    fn from(error: BurstSizeError) -> Self {
-        match error {
-            BurstSizeError::Empty => Self::EmptyDescriptor,
-            BurstSizeError::TooMany { requested, limit } => {
-                Self::TooManySegments { requested, limit }
-            }
-        }
     }
 }

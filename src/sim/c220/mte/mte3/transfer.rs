@@ -40,20 +40,23 @@ pub fn prepare_c220_mov_ub_to_hbm(
     source_address: u64,
     destination_address: u64,
 ) -> Result<C220PreparedOutput, C220TransferError> {
-    let segments = descriptor.segments(source_address, destination_address)?;
+    let segments = descriptor.segment_iter(source_address, destination_address)?;
+    let segment_count = segments.len();
     let bytes = segments
         .len()
         .checked_mul(32)
         .ok_or(UbMemoryError::ResultSizeOverflow)?;
     let mut writes = Vec::new();
-    writes
-        .try_reserve_exact(segments.len())
-        .map_err(|_| UbMemoryError::HostAllocationFailed {
-            requested: segments.len(),
-        })?;
     let mut known_bytes = 0;
-    for segment in &segments {
+    for segment in segments {
         let states = ub.read_states(segment.source_local, segment.bytes as usize)?;
+        if writes.len() == writes.capacity() {
+            writes
+                .try_reserve(1)
+                .map_err(|_| UbMemoryError::HostAllocationFailed {
+                    requested: writes.len() + 1,
+                })?;
+        }
         known_bytes += states
             .iter()
             .filter(|state| matches!(state, MemoryByteState::Known(_)))
@@ -63,7 +66,7 @@ pub fn prepare_c220_mov_ub_to_hbm(
     Ok(C220PreparedOutput {
         writes,
         result: UbTransferResult {
-            segment_count: segments.len(),
+            segment_count,
             bytes,
             known_bytes,
             unknown_bytes: bytes - known_bytes,

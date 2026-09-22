@@ -50,42 +50,6 @@ impl C220Core {
         self.state.commit_c220_sequential_issue();
         Ok(C220CoreInstruction::Cube(issue))
     }
-
-    pub(super) fn advance_matrix_to(&mut self, tick: u64) -> Result<(), C220CoreError> {
-        self.cube.begin_advance();
-        self.mte1.begin_advance();
-        loop {
-            let event_tick = self
-                .cube
-                .pipeline
-                .next_event_tick()
-                .into_iter()
-                .chain(self.mte1.next_event_tick())
-                .chain(self.mte_pipeline.as_ref().and_then(|p| p.next_event_tick()))
-                .min()
-                .map_or(tick, |next| next.min(tick));
-            self.mte1.commit_ready_at(
-                event_tick,
-                &mut self.local_memory,
-                &mut self.hardware_flags,
-            )?;
-            if let Some(pipeline) = &mut self.mte_pipeline {
-                pipeline.advance(event_tick)?;
-                self.mte1
-                    .observe_completions(event_tick, pipeline.mte1_completions());
-            }
-            self.cube.advance_event(
-                event_tick,
-                &mut self.local_memory,
-                &mut self.hardware_flags,
-                self.state.scalar_mut().machine_mut(),
-            )?;
-            if event_tick == tick {
-                break;
-            }
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -409,6 +373,285 @@ mod tests {
     }
 
     #[test]
+    fn mte1_retirement_backpressure_allows_flag_consumers_to_run() {
+        use crate::isa::c220::hflag::{C220HardwareFlagInstruction, C220MatrixMemory};
+        use crate::sim::c220::sync::C220HardwareFlagTimingError;
+
+        for triggered_wait in [true, false] {
+            let mut core = matrix_core();
+            core.advance_to(64).unwrap();
+            let flag = (2 << 29) | (15 << 21) | (1 << 15) | (3 << 10) | (2 << 7);
+            let step = C220HardwareFlagInstruction::decode(flag)
+                .unwrap()
+                .resolve(
+                    core.state.scalar().pc(),
+                    core.state.scalar().machine().xregs(),
+                )
+                .unwrap();
+            for _ in 0..crate::sim::c220::sync::C220_HARDWARE_FLAG_ALMOST_FULL {
+                core.hardware_flags.schedule_set(step, 64).unwrap();
+            }
+            let machine = core.state.scalar_mut().machine_mut();
+            machine.set_xreg(10, 0).unwrap();
+            machine.set_xreg(11, 1 | (1 << 16)).unwrap();
+            machine.set_spr_value(15, 0x4000).unwrap();
+            core.step_word_at(65, flag).unwrap();
+            let fill = (3 << 29) | (1 << 22) | (10 << 17) | (11 << 7);
+            assert!(matches!(
+                core.step_word_at(66, fill).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+            let before = core.local_memory.l0a().read_known(0, 512).unwrap();
+            core.advance_to(100).unwrap();
+            let pending = core.pending_mte1_commands().next().unwrap();
+            assert!(pending.completion_tick.is_some());
+            assert!(matches!(
+                pending.hardware_flag_stall,
+                Some(C220HardwareFlagTimingError::AlmostFull { count: 32, .. })
+            ));
+            assert!(core.last_mte1_outcomes().is_empty());
+            assert_eq!(core.local_memory.l0a().read_known(0, 512).unwrap(), before);
+            let pc = core.state.scalar().pc();
+            assert!(matches!(
+                core.step_word_at(101, 0x40e0_1800).unwrap(),
+                C220CoreStep::Stalled(_)
+            ));
+            assert_eq!(core.state.scalar().pc(), pc);
+
+            let wait = flag | (1 << 5) | (u32::from(triggered_wait) << 19);
+            assert!(matches!(
+                core.step_word_at(102, wait).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+            if !triggered_wait {
+                let cube = (7 << 29) | (3 << 22) | (1 << 12) | (2 << 7) | (3 << 2);
+                assert!(matches!(
+                    core.step_word_at(103, cube).unwrap(),
+                    C220CoreStep::Executed { .. }
+                ));
+            }
+            core.advance_to(200).unwrap();
+            assert!(core.pending_mte1_commands().next().is_none());
+            assert_eq!(core.last_mte1_outcomes().len(), 1);
+            assert!(core.last_mte1_outcomes()[0].retire_tick > 102);
+            assert_eq!(
+                core.local_memory.l0a().read_known(0, 512).unwrap(),
+                0x4000_u16.to_le_bytes().repeat(256)
+            );
+            assert_eq!(core.hardware_flags.count(2, C220MatrixMemory::L0a, 0), 32);
+            assert_eq!(core.hardware_flags.pending_cube_wait_count(), 0);
+            if !triggered_wait {
+                assert_eq!(core.last_cube_outcomes().len(), 1);
+                assert_eq!(
+                    core.local_memory.l0c().buffer().read_known(0, 4).unwrap(),
+                    48.0_f32.to_le_bytes()
+                );
+            }
+            assert!(matches!(
+                core.step_word_at(201, 0x40e0_1800).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn l1_fill_retires_captured_pattern_before_mte1_flags_release_load2d() {
+        use crate::sim::c220::mte::mte2::{C220Mte2Completion, C220Mte2IssueTiming};
+        let mut core = matrix_core();
+        core.advance_to(64).unwrap();
+        let pattern = 0x4000_4000_u64;
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(1, 2048).unwrap();
+        machine.set_xreg(3, 2 | (16 << 16) | (16 << 32)).unwrap();
+        machine.set_spr_value(15, pattern).unwrap();
+        let word = (3 << 29) | (1 << 22) | (1 << 17) | (3 << 7) | 6;
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Mte2(issue),
+            ..
+        } = core.step_word_at(65, word).unwrap()
+        else {
+            panic!("L1 fill issue")
+        };
+        assert!(matches!(issue.timing, C220Mte2IssueTiming::L1(_)));
+        let set = (2 << 29) | (5 << 21) | (4 << 10) | (3 << 7) | 3;
+        let wait = (set & !(15 << 21)) | (6 << 21);
+        for (tick, word) in [(66, set), (67, set), (68, set & !(7 << 7))] {
+            assert!(matches!(
+                core.step_word_at(tick, word).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+        }
+        let pc = core.state.scalar().pc();
+        assert!(matches!(
+            core.step_word_at(69, wait).unwrap(),
+            C220CoreStep::Stalled(_)
+        ));
+        assert_eq!(core.state.scalar().pc(), pc);
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_spr_value(15, 0)
+            .unwrap();
+        let mut completed = None;
+        let mut retired = None;
+        for tick in 70..180 {
+            core.advance_to(tick).unwrap();
+            if let Some(command) = core
+                .mte2
+                .pending_commands()
+                .find(|p| p.instruction_id == issue.instruction_id)
+                && let C220Mte2Completion::Observed { tick: done } = command.completion
+            {
+                completed = Some(done);
+                assert!(core.local_memory.l1().read_known(2048, 512).is_err());
+            }
+            if let Some(outcome) = core
+                .mte2
+                .last_outcomes()
+                .iter()
+                .find(|o| o.command.instruction_id == issue.instruction_id)
+            {
+                retired = Some(outcome.retire_tick);
+                break;
+            }
+        }
+        let retired = retired.expect("L1 command retirement");
+        assert_eq!(retired, completed.unwrap() + 1);
+        let expected = (pattern as u32).to_le_bytes().repeat(128);
+        for address in [2048, 3072] {
+            assert_eq!(
+                core.local_memory.l1().read_known(address, 512).unwrap(),
+                expected
+            );
+        }
+        assert!(core.local_memory.l1().read_known(2560, 512).is_err());
+        for (offset, word) in [(1, wait), (2, wait), (3, wait & !(7 << 7))] {
+            assert!(matches!(
+                core.step_word_at(retired + offset, word).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+        }
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(1, 8192).unwrap();
+        machine.set_xreg(2, 2048).unwrap();
+        machine.set_xreg(3, (2 << 16) | (2 << 24)).unwrap();
+        let load = (3 << 29) | (1 << 17) | (2 << 12) | (3 << 7) | 8;
+        assert!(matches!(
+            core.step_word_at(retired + 4, load).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Mte1 { .. },
+                ..
+            }
+        ));
+        core.advance_to(retired + 80).unwrap();
+        assert_eq!(
+            core.local_memory.l0a().read_known(8192, 1024).unwrap(),
+            expected.repeat(2)
+        );
+        assert!(core.mte_pipeline().unwrap().is_idle());
+        assert!(!core.mte2.is_busy());
+    }
+
+    #[test]
+    fn dma_functional_retirement_does_not_require_wait() {
+        use crate::isa::c220::mte::{C220MovInstruction, CAPTURED_C220_MOV_OUT_TO_UB_X_WORD};
+        use crate::memory::region::MemoryRegion;
+        let mut core = matrix_core();
+        core.advance_to(64).unwrap();
+        // Bind a source after initialization; the transfer reads it at retirement.
+        core.memory = MappedMemory::bind(
+            SparseMemory::new(vec![MemoryRegion::unknown(32)], 64, 64),
+            &[0x1000],
+        )
+        .unwrap();
+        core.memory.write_known_at(0x1000, &[7; 32]).unwrap();
+        let word = CAPTURED_C220_MOV_OUT_TO_UB_X_WORD;
+        let decoded = C220MovInstruction::decode(word).unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        machine
+            .set_xreg(decoded.destination_register, 0x100)
+            .unwrap();
+        machine.set_xreg(decoded.source_register, 0x1000).unwrap();
+        machine
+            .set_xreg(decoded.descriptor_register, (1 << 4) | (1 << 16))
+            .unwrap();
+        assert!(matches!(
+            core.step_word_at(65, word).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Mte2(_),
+                ..
+            }
+        ));
+        assert!(core.state.ub().read_known(0x100, 32).is_err());
+        core.advance_to(97).unwrap();
+        assert_eq!(core.state.ub().read_known(0x100, 32).unwrap(), vec![7; 32]);
+        assert_eq!(core.mte2.last_outcomes().len(), 1);
+        assert!(!core.mte2.is_busy());
+        assert!(matches!(
+            core.step_word_at(98, 0x40e0_1800).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+
+        // A late DMA overwrite must not become visible to earlier vector reads
+        // when the caller advances across both operations in one jump.
+        core.memory = MappedMemory::bind(
+            SparseMemory::new(vec![MemoryRegion::unknown(256)], 512, 512),
+            &[0x1000],
+        )
+        .unwrap();
+        core.memory
+            .write_known_at(0x1000, &2.0_f32.to_le_bytes().repeat(64))
+            .unwrap();
+        core.state
+            .ub_mut()
+            .write_states(
+                0x100,
+                &1.0_f32
+                    .to_le_bytes()
+                    .repeat(64)
+                    .into_iter()
+                    .map(crate::memory::sparse::MemoryByteState::Known)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(2, 0x100).unwrap();
+        machine.set_xreg(3, 0x800).unwrap();
+        machine
+            .set_xreg(4, (1 << 56) | 1 | (1 << 16) | (1 << 32) | (8 << 40))
+            .unwrap();
+        machine.set_spr_value(3, 0).unwrap();
+        machine.set_spr_value(100, u64::MAX).unwrap();
+        machine.set_spr_value(101, 0).unwrap();
+        assert!(matches!(
+            core.step_word_at(100, 0x83c6_2392).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        let machine = core.state.scalar_mut().machine_mut();
+        machine
+            .set_xreg(decoded.destination_register, 0x100)
+            .unwrap();
+        machine.set_xreg(decoded.source_register, 0x1000).unwrap();
+        machine
+            .set_xreg(decoded.descriptor_register, (1 << 4) | (8 << 16))
+            .unwrap();
+        assert!(matches!(
+            core.step_word_at(101, word).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        core.advance_to(400).unwrap();
+        assert_eq!(
+            core.state.scalar().machine().spr_value(87),
+            Some(u64::from(64.0_f32.to_bits()))
+        );
+        assert_eq!(
+            core.state.ub().read_known(0x100, 256).unwrap(),
+            2.0_f32.to_le_bytes().repeat(64)
+        );
+        assert!(!core.last_vector_releases().is_empty());
+    }
+
+    #[test]
     fn matrix_advance_is_independent_of_observation_granularity() {
         let mut bulk = matrix_core();
         let mut incremental = matrix_core();
@@ -511,10 +754,8 @@ mod tests {
         .capture(&registers, 0);
         for core in [&mut bulk, &mut incremental] {
             core.advance_to(80).unwrap();
-            core.mte_pipeline
-                .as_mut()
-                .unwrap()
-                .issue_l1_fill(100, fill)
+            core.mte2
+                .issue_l1_fill(core.mte_pipeline.as_mut().unwrap(), 100, 0, fill)
                 .unwrap();
             assert!(core.pending_mte1_commands().next().is_none());
             assert_eq!(

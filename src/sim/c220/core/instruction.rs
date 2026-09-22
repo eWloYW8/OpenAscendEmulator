@@ -2,10 +2,9 @@ use crate::isa::c220::hflag::C220HardwareFlagStep;
 use crate::isa::flow::FlagStep;
 use crate::sim::c220::cube::C220CubeIssue;
 use crate::sim::c220::mte::mte1::{C220Mte1Command, C220Mte1Issue};
-use crate::sim::c220::mte::mte2::C220Mte2Step;
+use crate::sim::c220::mte::mte2::C220Mte2Issue;
 use crate::sim::c220::mte::mte3::C220Mte3Ticket;
 use crate::sim::c220::mte::mte3::C220OutputStep;
-use crate::sim::c220::mte::uop::C220DmaUopRequest;
 use crate::sim::c220::scalar::timing::C220ScalarTimingTicket;
 use crate::sim::c220::vector::C220VectorInstruction;
 use crate::sim::common::scalar::ScalarProgramStep;
@@ -29,13 +28,13 @@ pub enum C220CoreInstruction {
         step: C220HardwareFlagStep,
         token_ready_tick: Option<u64>,
     },
-    Mte2(C220Mte2Step),
+    Mte2(C220Mte2Issue),
+    Mte2Flag(FlagStep),
     Cube(C220CubeIssue),
     Vector(C220VectorInstruction),
     VectorToScalarFlag(FlagStep),
     Mte3 {
         step: C220OutputStep,
-        requests: Vec<C220DmaUopRequest>,
         ticket: Option<C220Mte3Ticket>,
     },
 }
