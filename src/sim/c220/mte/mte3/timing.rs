@@ -33,8 +33,8 @@ impl C220Mte3Ticket {
 pub enum C220Mte3TimingError {
     #[error("MTE3 timing computation overflowed")]
     TimeOverflow,
-    #[error("MTE3 completion state does not match its transfer ticket")]
-    TicketMismatch,
+    #[error("MTE3 outstanding command queue is full")]
+    QueueFull,
     #[error(transparent)]
     Uop(#[from] C220DmaUopError),
 }
@@ -43,8 +43,7 @@ pub struct C220TimedMte3Lane {
     rules: C220Mte3TimingRules,
     next_issue_tick: u64,
     data_port_tick: u64,
-    unsignaled: Option<C220Mte3Ticket>,
-    completion_flags: [Option<C220Mte3Ticket>; 4],
+    latest_retirement_tick: Option<u64>,
 }
 
 impl C220TimedMte3Lane {
@@ -53,8 +52,7 @@ impl C220TimedMte3Lane {
             rules,
             next_issue_tick: 0,
             data_port_tick: 0,
-            unsignaled: None,
-            completion_flags: [None; 4],
+            latest_retirement_tick: None,
         }
     }
 
@@ -62,18 +60,8 @@ impl C220TimedMte3Lane {
         self.next_issue_tick
     }
 
-    pub fn latest_retirement_tick(&self) -> Option<u64> {
-        self.unsignaled
-            .iter()
-            .chain(self.completion_flags.iter().flatten())
-            .map(|ticket| ticket.retire_tick)
-            .max()
-    }
-
-    pub fn completion_ready_tick(&self, flag_id: u8) -> Option<u64> {
-        self.completion_flags
-            .get(usize::from(flag_id))
-            .and_then(|ticket| ticket.map(|ticket| ticket.retire_tick))
+    pub const fn latest_retirement_tick(&self) -> Option<u64> {
+        self.latest_retirement_tick
     }
 
     pub fn preview_issue(
@@ -83,12 +71,13 @@ impl C220TimedMte3Lane {
     ) -> Result<C220Mte3Ticket, C220Mte3TimingError> {
         let mut requests = mte3_uops(transfer)?;
         if transfer.descriptor.is_disabled() {
-            let retire_tick = tick
+            let data_ready_tick = tick
                 .checked_add(1)
                 .ok_or(C220Mte3TimingError::TimeOverflow)?;
+            let retire_tick = self.ordered_retirement_tick(data_ready_tick)?;
             return Ok(C220Mte3Ticket {
                 issue_tick: tick,
-                data_ready_tick: retire_tick,
+                data_ready_tick,
                 retire_tick,
                 transfer,
                 uop_count: 0,
@@ -114,6 +103,7 @@ impl C220TimedMte3Lane {
         let retire_tick = data_ready_tick
             .checked_add(self.rules.retire_ticks)
             .ok_or(C220Mte3TimingError::TimeOverflow)?;
+        let retire_tick = self.ordered_retirement_tick(retire_tick)?;
         tick.checked_add(self.rules.issue_interval.get())
             .ok_or(C220Mte3TimingError::TimeOverflow)?;
         Ok(C220Mte3Ticket {
@@ -126,10 +116,18 @@ impl C220TimedMte3Lane {
         })
     }
 
-    pub fn issue(&mut self, ticket: C220Mte3Ticket) -> Result<(), C220Mte3TimingError> {
-        if self.unsignaled.is_some() {
-            return Err(C220Mte3TimingError::TicketMismatch);
+    fn ordered_retirement_tick(&self, ready: u64) -> Result<u64, C220Mte3TimingError> {
+        match self.latest_retirement_tick {
+            Some(previous) => Ok(ready.max(
+                previous
+                    .checked_add(1)
+                    .ok_or(C220Mte3TimingError::TimeOverflow)?,
+            )),
+            None => Ok(ready),
         }
+    }
+
+    pub fn issue(&mut self, ticket: C220Mte3Ticket) -> Result<(), C220Mte3TimingError> {
         if !ticket.transfer.descriptor.is_disabled() {
             let next_issue_tick = ticket
                 .issue_tick
@@ -138,31 +136,11 @@ impl C220TimedMte3Lane {
             self.data_port_tick = ticket.data_ready_tick;
             self.next_issue_tick = next_issue_tick;
         }
-        self.unsignaled = Some(ticket);
-        Ok(())
-    }
-
-    pub fn set_completion_flag(&mut self, flag_id: u8) -> Result<(), C220Mte3TimingError> {
-        let slot = self
-            .completion_flags
-            .get_mut(usize::from(flag_id))
-            .ok_or(C220Mte3TimingError::TicketMismatch)?;
-        if slot.is_some() {
-            return Err(C220Mte3TimingError::TicketMismatch);
-        }
-        *slot = Some(
-            self.unsignaled
-                .take()
-                .ok_or(C220Mte3TimingError::TicketMismatch)?,
+        self.latest_retirement_tick = Some(
+            self.latest_retirement_tick
+                .unwrap_or(0)
+                .max(ticket.retire_tick),
         );
-        Ok(())
-    }
-
-    pub fn wait_completion_flag(&mut self, flag_id: u8) -> Result<(), C220Mte3TimingError> {
-        self.completion_flags
-            .get_mut(usize::from(flag_id))
-            .and_then(Option::take)
-            .ok_or(C220Mte3TimingError::TicketMismatch)?;
         Ok(())
     }
 }

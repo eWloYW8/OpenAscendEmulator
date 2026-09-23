@@ -11,6 +11,7 @@ pub enum C220StallCause {
     Mte2IssueRate,
     Mte2Dependency,
     Mte3IssueRate,
+    Mte3QueueFull,
     Mte3Dependency,
     VectorDependency,
     CubeDependency,

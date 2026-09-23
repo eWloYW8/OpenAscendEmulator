@@ -48,6 +48,10 @@ pub enum C220CoreError {
     #[error(transparent)]
     Mte3Timing(#[from] C220Mte3TimingError),
     #[error(transparent)]
+    Mte3Runtime(#[from] crate::sim::c220::mte::mte3::C220Mte3RuntimeError),
+    #[error(transparent)]
+    Mte3Transfer(#[from] crate::sim::c220::mte::C220TransferError),
+    #[error(transparent)]
     CubeTiming(#[from] C220CubeTimingError),
     #[error(transparent)]
     LocalMemory(#[from] C220L0cError),
@@ -59,10 +63,6 @@ pub enum C220CoreError {
     NonprogressingStall,
     #[error("tick counter overflowed")]
     TimeOverflow,
-    #[error("C220 vector-to-scalar flag {flag_id} is already pending")]
-    VectorScalarFlagAlreadySet { flag_id: u32 },
-    #[error("C220 vector-to-scalar flag {flag_id} was not set before wait")]
-    VectorScalarWaitWithoutFlag { flag_id: u32 },
     #[error("C220 Cube execution requires initialized SPR3 control state")]
     MissingCubeControlSpr,
     #[error("C220 SET_2D requires initialized SPR15 fill pattern")]

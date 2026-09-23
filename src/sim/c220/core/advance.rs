@@ -5,6 +5,7 @@ impl C220Core {
         self.cube.begin_advance();
         self.mte1.begin_advance();
         self.mte2.begin_advance();
+        self.mte3.begin_advance();
         self.vector.begin_advance();
         loop {
             let event_tick = self
@@ -15,7 +16,7 @@ impl C220Core {
                 .chain(self.mte1.next_event_tick())
                 .chain(self.mte2.next_event_tick())
                 .chain(self.vector.next_event_tick())
-                .chain(self.mte3.pending_ready_tick())
+                .chain(self.mte3.pending_retirement_tick())
                 .chain(self.mte_pipeline.as_ref().and_then(|p| p.next_event_tick()))
                 .min()
                 .map_or(tick, |next| next.min(tick));
@@ -50,7 +51,14 @@ impl C220Core {
             if let Some(pipeline) = &mut self.mte_pipeline {
                 pipeline.advance_ub_service(self.vector.ub_cycles_at(event_tick))?;
             }
-            self.mte3.commit_ready_at(event_tick, &mut self.memory)?;
+            self.mte3
+                .commit_ready_at(event_tick, self.state.ub(), &mut self.memory)?;
+            if self.mte3.physical
+                && let Some(pipeline) = &mut self.mte_pipeline
+            {
+                self.mte3
+                    .commit_dma_at(event_tick, pipeline, self.state.ub(), &mut self.memory)?;
+            }
             if event_tick == tick {
                 break;
             }

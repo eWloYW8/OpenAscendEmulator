@@ -181,6 +181,7 @@ impl C220Core {
     ) -> Result<(), C220CoreError> {
         if self.mte1.pending_commands().next().is_some()
             || self.mte2.is_busy()
+            || !self.mte3.dma_commands.is_empty()
             || self.mte_pipeline.as_ref().is_some_and(|p| !p.is_idle())
         {
             return Err(C220CoreError::MtePipelineBusy);
@@ -245,8 +246,18 @@ impl C220Core {
         &mut self.local_memory
     }
 
-    pub fn pending_output_ready_tick(&self) -> Option<u64> {
-        self.mte3.pending_ready_tick()
+    pub fn pending_output_retirement_tick(&self) -> Option<u64> {
+        self.mte3.pending_retirement_tick()
+    }
+
+    pub fn last_mte3_outcomes(&self) -> &[crate::sim::c220::mte::mte3::C220Mte3Outcome] {
+        &self.mte3.outcomes
+    }
+
+    pub fn pending_mte3_commands(
+        &self,
+    ) -> impl Iterator<Item = crate::sim::c220::mte::mte3::C220Mte3CommandState> + '_ {
+        self.mte3.pending_commands()
     }
 
     pub fn advance_to(&mut self, tick: u64) -> Result<Option<C220Stall>, C220CoreError> {

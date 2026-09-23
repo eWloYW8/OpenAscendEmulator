@@ -17,6 +17,11 @@ use super::interface::ub_write::{
 };
 use super::mte1::{C220Mte1Command, C220Mte1Generator, C220Mte1Issue};
 use super::mte2::C220Mte2TransferPlan;
+use super::mte3::C220Mte3TransferPlan;
+use super::mte3::frontend::{
+    C220Mte3Callback, C220Mte3Events, C220Mte3Frontend, C220Mte3FrontendError,
+    C220Mte3FrontendEvent, C220Mte3Record,
+};
 use super::uop::{C220DmaUopError, mte2_uops};
 use crate::isa::c220::mte::set2d::{C220Set2dDestination, C220Set2dFill};
 use crate::sim::c220::memory::ub_service::{
@@ -65,6 +70,7 @@ enum Callback {
     Set2d(C220MteGeneratorCallback),
     Set2dL1(C220MteGeneratorCallback),
     Dma(C220MteGeneratorCallback),
+    Mte3(C220Mte3Callback),
     BiuRead(C220BiuReadCallback),
     BiuReturn(C220BiuReturnCallback),
     UbWrite(usize, C220UbWriteCallback),
@@ -81,6 +87,7 @@ pub enum C220MtePipelineEvent {
     Set2d(C220Set2dEventOutcome),
     Set2dL1(C220Set2dEventOutcome),
     Dma(C220DmaEventOutcome),
+    Mte3(C220Mte3FrontendEvent),
     BiuRead(C220BiuReadEvent),
     BiuReturn(C220BiuReturnEvent),
     UbWrite(C220BiuSubcore, C220UbWriteEvent),
@@ -91,6 +98,8 @@ pub enum C220MtePipelineEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220MtePipelineError {
+    #[error(transparent)]
+    Mte3(#[from] C220Mte3FrontendError),
     #[error(transparent)]
     UbService(#[from] C220UbServiceError),
     #[error(transparent)]
@@ -162,6 +171,8 @@ pub struct C220MtePipeline {
     set2d_events: C220Set2dEvents,
     set2d_l1_events: C220Set2dEvents,
     dma_events: C220DmaEvents,
+    mte3_events: C220Mte3Events,
+    mte3: C220Mte3Frontend,
     biu_events: C220BiuReadEvents,
     biu_return_events: C220BiuReturnEvents,
     ub_write_events: [C220UbWriteEvents; 2],
@@ -211,6 +222,7 @@ impl C220MtePipeline {
         let set2d_events = C220Set2dEvents::register(&mut events, clock, Callback::Set2d);
         let set2d_l1_events = C220Set2dEvents::register(&mut events, clock, Callback::Set2dL1);
         let dma_events = C220DmaEvents::register(&mut events, clock, Callback::Dma);
+        let mte3_events = C220Mte3Events::register(&mut events, clock, Callback::Mte3);
         let biu_events = C220BiuReadEvents::register(&mut events, clock, Callback::BiuRead);
         let biu_return_events =
             C220BiuReturnEvents::register(&mut events, clock, Callback::BiuReturn);
@@ -228,6 +240,8 @@ impl C220MtePipeline {
             set2d_events,
             set2d_l1_events,
             dma_events,
+            mte3_events,
+            mte3: C220Mte3Frontend::default(),
             biu_events,
             biu_return_events,
             ub_write_events,
@@ -288,6 +302,7 @@ impl C220MtePipeline {
             && self.set2d.is_idle()
             && self.set2d_l1.is_idle()
             && self.dma.is_idle()
+            && self.mte3.is_idle()
             && self.dma_output.is_none()
             && self.biu_output.is_none()
             && self.ub_write.iter().all(C220UbWriteInterface::is_idle)
@@ -427,6 +442,48 @@ impl C220MtePipeline {
     }
     pub fn dma_generator(&self) -> &C220DmaFrontend {
         &self.dma
+    }
+
+    pub fn mte3_frontend(&self) -> &C220Mte3Frontend {
+        &self.mte3
+    }
+
+    pub fn issue_mte3_dma(
+        &mut self,
+        instruction_id: u64,
+        transfer: C220Mte3TransferPlan,
+    ) -> Result<C220Mte3Record, C220MtePipelineError> {
+        Ok(self
+            .mte3_events
+            .issue(&mut self.events, &mut self.mte3, instruction_id, transfer)?)
+    }
+
+    pub fn take_mte3_dma_output(&mut self) -> Option<C220DmaGenerated> {
+        self.mte3.take_output()
+    }
+
+    pub fn acknowledge_mte3_dma(
+        &mut self,
+        instruction_id: u64,
+        uop_index: u64,
+    ) -> Result<(), C220MtePipelineError> {
+        Ok(self.mte3.acknowledge(instruction_id, uop_index)?)
+    }
+
+    pub fn set_mte3_hardware_sync_blocked(&mut self, blocked: bool) {
+        self.mte3.set_hardware_sync_blocked(blocked);
+    }
+
+    pub fn mte3_retirement_candidate(&self) -> Option<C220Mte3Record> {
+        self.mte3.retirement_candidate(self.events.tick())
+    }
+
+    /// Release the record only after the owner successfully commits its functional effects.
+    pub fn retire_mte3(
+        &mut self,
+        instruction_id: u64,
+    ) -> Result<C220Mte3Record, C220MtePipelineError> {
+        Ok(self.mte3.retire(self.events.tick(), instruction_id)?)
     }
     pub fn dma_output(&self) -> Option<C220DmaGenerated> {
         self.dma_output
@@ -600,6 +657,14 @@ impl C220MtePipeline {
         self.events.notify_at(self.clock, tick);
         while let Some(invocation) = self.events.next_callback() {
             match invocation.callback {
+                Callback::Mte3(phase) => {
+                    if let Some(outcome) =
+                        self.mte3_events
+                            .handle(phase, &mut self.events, &mut self.mte3)?
+                    {
+                        self.trace.push(C220MtePipelineEvent::Mte3(outcome));
+                    }
+                }
                 Callback::Dma(phase) => {
                     let output_ready = self
                         .biu_read

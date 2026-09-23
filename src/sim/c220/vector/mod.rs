@@ -16,7 +16,7 @@ pub mod va;
 pub mod vmsu;
 
 pub use instruction::C220VectorInstruction;
-pub use runtime::C220VectorRuntimeError;
+pub use runtime::{C220VectorFence, C220VectorRuntimeError};
 
 use crate::isa::c220::vector::C220VectorControl;
 pub use access::{

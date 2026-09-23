@@ -41,6 +41,7 @@ pub enum C220VmsuError {
 
 #[derive(Debug, Clone)]
 struct ActiveVmsu {
+    generation: u64,
     trace: C220VmsuTrace,
     repeat: Option<RepeatMachine>,
     functional_due: Option<u64>,
@@ -49,6 +50,7 @@ struct ActiveVmsu {
 
 #[derive(Debug, Clone)]
 pub struct C220VmsuPipeline {
+    next_generation: u64,
     rules: C220VectorTimingRules,
     observed_tick: Option<u64>,
     active: Option<ActiveVmsu>,
@@ -58,6 +60,7 @@ pub struct C220VmsuPipeline {
 impl C220VmsuPipeline {
     pub const fn new(rules: C220VectorTimingRules) -> Self {
         Self {
+            next_generation: 0,
             rules,
             observed_tick: None,
             active: None,
@@ -67,6 +70,17 @@ impl C220VmsuPipeline {
 
     pub const fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    pub(crate) fn instruction_fence(&self) -> Option<u64> {
+        self.active.as_ref().map(|active| active.generation)
+    }
+
+    pub(crate) fn fence_retirement_tick(&self, generation: u64) -> Option<u64> {
+        self.active
+            .as_ref()
+            .filter(|active| active.generation == generation)?;
+        self.pending_drain_tick()
     }
 
     pub fn trace(&self) -> Option<&C220VmsuTrace> {
@@ -124,7 +138,12 @@ impl C220VmsuPipeline {
             result: None,
             retirement_tick: None,
         };
+        let generation = self.next_generation;
+        self.next_generation = generation
+            .checked_add(1)
+            .ok_or(C220VmsuError::TimeOverflow)?;
         self.active = Some(ActiveVmsu {
+            generation,
             trace,
             repeat: Some(repeat),
             functional_due: None,

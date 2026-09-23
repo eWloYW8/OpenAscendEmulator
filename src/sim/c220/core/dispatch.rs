@@ -95,33 +95,24 @@ impl C220Core {
                     .resolve(pc, self.state.scalar().machine().xregs());
                 match flag.instruction.operation {
                     FlagOperation::Set => {
-                        if self.vector.scalar_flags.contains_key(&flag.flag_id) {
-                            return Err(C220CoreError::VectorScalarFlagAlreadySet {
-                                flag_id: flag.flag_id,
-                            });
-                        }
-                        let ready_tick = self.vector.pending_drain_tick().unwrap_or(tick);
-                        self.vector.scalar_flags.insert(flag.flag_id, ready_tick);
+                        self.vector.signal_scalar(flag.flag_id);
                     }
                     FlagOperation::Wait => {
-                        let ready_tick =
-                            self.vector.scalar_flags.get(&flag.flag_id).copied().ok_or(
-                                C220CoreError::VectorScalarWaitWithoutFlag {
-                                    flag_id: flag.flag_id,
-                                },
-                            )?;
-                        if tick < ready_tick {
+                        let ready_tick = self.vector.scalar_event_ready_tick(flag.flag_id, tick);
+                        if ready_tick.is_none_or(|ready| tick < ready) {
                             return Ok(C220CoreStep::Stalled(C220Stall {
                                 tick,
                                 pc,
-                                resume_tick: ready_tick,
+                                resume_tick: ready_tick.unwrap_or(
+                                    tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+                                ),
                                 cause: C220StallCause::VectorDependency,
                             }));
                         }
-                        self.vector.scalar_flags.remove(&flag.flag_id);
+                        self.vector.consume_scalar_event(flag.flag_id);
                     }
                 }
-                self.state.commit_c220_vector_issue(None);
+                self.state.commit_c220_sequential_issue();
                 C220CoreInstruction::VectorToScalarFlag(flag)
             }
             _ if matches!(

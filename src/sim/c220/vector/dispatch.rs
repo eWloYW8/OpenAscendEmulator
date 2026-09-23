@@ -101,7 +101,7 @@ impl VectorEngine {
                 self.issue_at(tick, &instruction)?;
                 self.va
                     .write_pair(decoded, state.scalar().machine().xregs());
-                state.commit_c220_vector_issue(None);
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220LoadVaInstruction::decode(word).is_some() => {
@@ -122,7 +122,7 @@ impl VectorEngine {
                 let step = plan_c220_load_va_issue(pc, word, source_address, state.ub())?;
                 let instruction = C220VectorInstruction::LoadAddress(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(None);
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220MovemaskHint::from_word(word).is_some() => {
@@ -133,7 +133,7 @@ impl VectorEngine {
                 )?;
                 let instruction = C220VectorInstruction::Movemask(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(None);
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220VectorControlInstruction::decode(word).is_some() => {
@@ -144,7 +144,7 @@ impl VectorEngine {
                     instruction: decoded,
                 };
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(None);
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220NoEffectVectorInstruction::decode(word).is_some() => {
@@ -173,14 +173,14 @@ impl VectorEngine {
                     lane_groups: decoded.lane_groups(),
                 };
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(None);
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220MovevInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_movev_word(word)?;
                 let instruction = C220VectorInstruction::Move(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(None);
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220NchwInstruction::decode(word).is_some() => {
@@ -198,10 +198,9 @@ impl VectorEngine {
                 let control =
                     state.scalar().machine().xregs()[usize::from(decoded.control_register)];
                 let step = plan_c220_nchw_issue(pc, word, control, &self.va, state.ub())?;
-                let destination = step.rows.first().map(|rows| rows.destination[0]);
                 let instruction = C220VectorInstruction::Nchw(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(destination);
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220MoveMaskInstruction::decode(word).is_some() => {
@@ -223,12 +222,9 @@ impl VectorEngine {
                     state.scalar().machine().xregs(),
                     state.ub(),
                 )?;
-                let destination =
-                    matches!(step.instruction.direction, C220MoveMaskDirection::ToMemory)
-                        .then_some(step.address);
                 let instruction = C220VectorInstruction::MoveMask(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(destination);
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220CompareMaskInstruction::decode(word).is_some() => {
@@ -263,7 +259,7 @@ impl VectorEngine {
                 )?;
                 let instruction = C220VectorInstruction::CompareMask(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(None);
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220SelectInstruction::decode(word).is_some() => {
@@ -303,10 +299,9 @@ impl VectorEngine {
                     registers,
                     state.ub(),
                 )?;
-                let destination = step.addresses.destination;
                 let instruction = C220VectorInstruction::Select(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(Some(destination));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220PackedCompareInstruction::decode(word).is_some() => {
@@ -315,29 +310,23 @@ impl VectorEngine {
                 let control = registers[usize::from(decoded.control_register)];
                 let step =
                     plan_c220_packed_compare_issue(pc, word, control, registers, state.ub())?;
-                let destination = step.addresses.destination;
                 let instruction = C220VectorInstruction::PackedCompare(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(Some(destination));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220ReductionInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_reduction_word(word)?;
-                let produces_output =
-                    !step.instruction.writes_accumulator() && !step.iteration_masks.is_empty();
-                let destination = step.addresses.destination;
                 let instruction = C220VectorInstruction::Reduction(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(produces_output.then_some(destination));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220SortInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_sort_word(word)?;
-                let destination = step.addresses.destination;
-                let produces_output = step.repeat_count != 0;
                 let instruction = C220VectorInstruction::Sort(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(produces_output.then_some(destination));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220MergeInstruction::decode(word).is_some() => {
@@ -352,113 +341,96 @@ impl VectorEngine {
                     }));
                 }
                 let step = state.preview_c220_merge_word(word)?;
-                let destination = step
-                    .repeats
-                    .first()
-                    .map(|repeat| repeat.destination_address);
                 if step.repeat_count() == 0 {
                     state.scalar_mut().machine_mut().set_spr_value(17, 0)?;
                 } else {
                     self.vmsu.issue_at(tick, step.clone(), state.ub())?;
                 }
-                state.commit_c220_vector_issue(destination);
+                state.commit_c220_sequential_issue();
                 C220VectorInstruction::Merge(step)
             }
             _ if C220TernaryInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_ternary_word(word)?;
-                let destination = step.addresses.destination;
                 let instruction = C220VectorInstruction::Ternary(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(Some(destination));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220AxpyInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_axpy_word(word)?;
-                let destination = step.addresses.destination;
                 let instruction = C220VectorInstruction::Axpy(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(Some(destination));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220SpecialUnaryInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_special_unary_word(word)?;
-                let destination = step.addresses.destination;
                 let instruction = C220VectorInstruction::SpecialUnary(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(Some(destination));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220FusedInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_fused_word(word)?;
-                let destination = step.addresses.destination;
                 let instruction = C220VectorInstruction::Fused(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(Some(destination));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220ConversionInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_conversion_word(word)?;
-                let destination = step.addresses.destination;
                 let instruction = C220VectorInstruction::Conversion(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(Some(destination));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220GatherInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_gather_word(word)?;
-                let destination = step.destination_address;
                 let instruction = C220VectorInstruction::Gather(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(Some(destination));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220VecArithmeticHint::from_word(word).is_some() => {
                 let step = state.preview_c220_vector_word(word)?;
-                let destination_address = step.addresses.destination;
                 let instruction = C220VectorInstruction::Arithmetic(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(Some(destination_address));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220VectorScalarInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_vector_scalar_word(word)?;
-                let destination_address = step.addresses.destination;
                 let instruction = C220VectorInstruction::Scalar(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(Some(destination_address));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220ShiftInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_shift_word(word)?;
-                let destination_address = step.addresses.destination;
                 let instruction = C220VectorInstruction::Shift(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(Some(destination_address));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220CopyInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_copy_word(word)?;
-                let destination_address = step.addresses.destination;
                 let instruction = C220VectorInstruction::Copy(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(Some(destination_address));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220BroadcastInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_broadcast_word(word)?;
-                let destination_address = step.destination_address;
-                let has_repeats = step.control.repeat_count != 0;
                 let instruction = C220VectorInstruction::Broadcast(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(has_repeats.then_some(destination_address));
+                state.commit_c220_sequential_issue();
                 instruction
             }
             _ if C220TransposeInstruction::decode(word).is_some() => {
                 let step = state.preview_c220_transpose_word(word)?;
-                let destination_address = step.destination_address;
                 let instruction = C220VectorInstruction::Transpose(step);
                 self.issue_at(tick, &instruction)?;
-                state.commit_c220_vector_issue(Some(destination_address));
+                state.commit_c220_sequential_issue();
                 instruction
             }
 

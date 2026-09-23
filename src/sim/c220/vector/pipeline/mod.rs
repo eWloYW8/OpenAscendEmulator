@@ -327,6 +327,20 @@ impl C220VectorPipeline {
             .max()
     }
 
+    pub(crate) fn instruction_fence(&self) -> Option<u64> {
+        self.pending.back().map(|entry| entry.instruction_group)
+    }
+
+    pub(crate) fn fence_retirement_tick(&self, group: u64) -> Option<u64> {
+        self.pending
+            .iter()
+            .zip(self.predicted_ticks())
+            .filter(|(entry, _)| entry.instruction_group <= group)
+            .map(|(_, timing)| timing.retirement)
+            .filter(|&tick| self.observed_tick.is_none_or(|observed| observed < tick))
+            .max()
+    }
+
     pub fn pending_drain_tick(&self) -> Option<u64> {
         self.predicted_ticks()
             .into_iter()

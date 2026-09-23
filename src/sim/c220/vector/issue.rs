@@ -601,13 +601,6 @@ impl C220State {
         })
     }
 
-    pub(crate) fn commit_c220_vector_issue(&mut self, destination_address: Option<u64>) {
-        if let Some(source_address) = destination_address {
-            self.output.publish_vector_output(source_address);
-        }
-        self.commit_c220_sequential_issue();
-    }
-
     pub(crate) fn commit_c220_vector_stores(
         &mut self,
         stores: &[C220VectorStore],

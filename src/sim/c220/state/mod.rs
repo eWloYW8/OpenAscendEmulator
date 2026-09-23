@@ -42,15 +42,9 @@ impl C220State {
         &mut self.ub
     }
 
-    pub const fn output_flags_set(&self) -> [bool; 4] {
-        self.output.output_flags_set()
-    }
-
-    pub const fn reuse_flags_set(&self) -> [bool; 2] {
-        self.output.reuse_flags_set()
-    }
-
-    pub const fn completion_flags_set(&self) -> [bool; 4] {
-        self.output.completion_flags_set()
+    pub fn pending_output_events(
+        &self,
+    ) -> impl Iterator<Item = crate::sim::c220::mte::mte3::C220OutputEvent> + '_ {
+        self.output.pending_events()
     }
 }

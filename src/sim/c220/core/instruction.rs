@@ -37,6 +37,10 @@ pub enum C220CoreInstruction {
         step: C220OutputStep,
         ticket: Option<C220Mte3Ticket>,
     },
+    Mte3Dma {
+        step: C220OutputStep,
+        record: crate::sim::c220::mte::mte3::frontend::C220Mte3Record,
+    },
 }
 
 impl C220CoreInstruction {
