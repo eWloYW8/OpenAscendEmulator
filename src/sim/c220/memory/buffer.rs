@@ -86,6 +86,21 @@ impl C220LocalBuffer {
         )
     }
 
+    /// Read functional values at linear addresses. Untouched bytes are zero;
+    /// bytes explicitly written as unknown retain their unknown state.
+    pub fn read_initialized_states_linear(
+        &self,
+        address: u64,
+        len: usize,
+    ) -> Result<Vec<MemoryByteState>, C220LocalBufferError> {
+        Self::check_linear_range(address, len)?;
+        self.read_with(
+            len,
+            |offset| address + offset as u64,
+            MemoryByteState::Known(0),
+        )
+    }
+
     /// Reads without capacity wrapping. Untouched bytes are zero; explicitly
     /// unknown bytes remain errors.
     pub fn read_initialized_linear(
@@ -93,12 +108,7 @@ impl C220LocalBuffer {
         address: u64,
         len: usize,
     ) -> Result<Vec<u8>, C220LocalBufferError> {
-        Self::check_linear_range(address, len)?;
-        let states = self.read_with(
-            len,
-            |offset| address + offset as u64,
-            MemoryByteState::Known(0),
-        )?;
+        let states = self.read_initialized_states_linear(address, len)?;
         collect_known(states, |offset| address + offset as u64)
     }
 

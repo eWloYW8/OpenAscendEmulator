@@ -2,6 +2,7 @@ pub mod bias;
 mod command;
 pub mod frontend;
 pub mod load2d;
+pub mod sparse;
 pub use command::{C220Mte1Command, C220Mte1Generator, C220Mte1Issue};
 
 pub(in crate::sim::c220) mod runtime;

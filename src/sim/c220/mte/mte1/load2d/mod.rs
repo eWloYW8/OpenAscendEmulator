@@ -1,11 +1,11 @@
+mod transpose;
 mod uop;
+pub use transpose::prepare_c220_load2d_transpose;
 pub use uop::{C220Load2dReadUop, C220Load2dRequestPlan};
 
 use thiserror::Error;
 
-use crate::isa::c220::mte::load2d::{
-    C220Load2dDestination, C220Load2dElementFormat, C220Load2dError, C220Load2dTransfer,
-};
+use crate::isa::c220::mte::load2d::{C220Load2dDestination, C220Load2dError, C220Load2dTransfer};
 use crate::memory::sparse::MemoryByteState;
 use crate::sim::c220::memory::{C220LocalBufferError, C220LocalMemory};
 
@@ -80,9 +80,9 @@ pub fn prepare_c220_load2d(
     for segment in transfer.segments() {
         let mut states = memory
             .l1()
-            .read_states_linear(segment.source_address, segment.bytes as usize)?;
+            .read_initialized_states_linear(segment.source_address, segment.bytes as usize)?;
         if transfer.instruction.transpose {
-            states = transpose_block(states, transfer.instruction.element_format);
+            states = transpose_halfwords(states);
         }
         known_bytes += states
             .iter()
@@ -103,53 +103,13 @@ pub fn prepare_c220_load2d(
     })
 }
 
-fn transpose_block(
-    states: Vec<MemoryByteState>,
-    element_format: C220Load2dElementFormat,
-) -> Vec<MemoryByteState> {
-    match element_format {
-        C220Load2dElementFormat::B4 => transpose_b4(states),
-        C220Load2dElementFormat::B8 => transpose_bytes(states, 1),
-        C220Load2dElementFormat::B16 => transpose_bytes(states, 2),
-        C220Load2dElementFormat::B32 => transpose_bytes(states, 4),
-    }
-}
-
-fn transpose_bytes(states: Vec<MemoryByteState>, element_bytes: usize) -> Vec<MemoryByteState> {
-    let element_count = states.len() / element_bytes;
-    let destination_row_length = element_count / 16;
+fn transpose_halfwords(states: Vec<MemoryByteState>) -> Vec<MemoryByteState> {
     let mut transposed = vec![MemoryByteState::Unknown; states.len()];
-    for source_index in 0..element_count {
-        let destination_index = source_index / 16 + (source_index % 16) * destination_row_length;
-        let source_offset = source_index * element_bytes;
-        let destination_offset = destination_index * element_bytes;
-        transposed[destination_offset..destination_offset + element_bytes]
-            .copy_from_slice(&states[source_offset..source_offset + element_bytes]);
+    for (source_index, halfword) in states.chunks_exact(2).enumerate() {
+        let destination_offset = (source_index / 16 + (source_index % 16) * 16) * 2;
+        transposed[destination_offset..destination_offset + 2].copy_from_slice(halfword);
     }
     transposed
-}
-
-fn transpose_b4(states: Vec<MemoryByteState>) -> Vec<MemoryByteState> {
-    let nibble_count = states.len() * 2;
-    let destination_row_length = nibble_count / 16;
-    let mut transposed = vec![None; nibble_count];
-    for source_index in 0..nibble_count {
-        let source = states[source_index / 2];
-        let nibble = match source {
-            MemoryByteState::Known(byte) if source_index & 1 == 0 => Some(byte & 0xf),
-            MemoryByteState::Known(byte) => Some(byte >> 4),
-            MemoryByteState::Unknown => None,
-        };
-        let destination_index = source_index / 16 + (source_index % 16) * destination_row_length;
-        transposed[destination_index] = nibble;
-    }
-    transposed
-        .chunks_exact(2)
-        .map(|pair| match (pair[0], pair[1]) {
-            (Some(low), Some(high)) => MemoryByteState::Known(low | (high << 4)),
-            _ => MemoryByteState::Unknown,
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -161,7 +121,8 @@ mod tests {
     #[test]
     fn load2d_preserves_linear_addresses_and_unknown_bytes() {
         for destination in 0..=1 {
-            for transpose in [false, true] {
+            for format_bits in [0, 8, 4, 6, 12, 14] {
+                let transpose = format_bits & 4 != 0;
                 let mut memory = C220LocalMemory::new(C220LocalMemoryConfig {
                     l1_bytes: 768,
                     l0a_bytes: 768,
@@ -170,14 +131,17 @@ mod tests {
                 })
                 .unwrap();
                 memory.l1_mut().write_known(0, &[99; 512]).unwrap();
-                let mut source = vec![MemoryByteState::Known(7); 512];
-                source[300] = MemoryByteState::Unknown;
+                let mut source = (0..=u8::MAX)
+                    .map(MemoryByteState::Known)
+                    .collect::<Vec<_>>();
+                source[200] = MemoryByteState::Unknown;
                 memory.l1_mut().write_states_linear(512, &source).unwrap();
+                source.resize(512, MemoryByteState::Known(0));
                 let mut registers = [0; 32];
                 registers[0] = 512;
                 registers[2] = 512;
                 registers[3] = (1 << 16) | (1 << 24);
-                let word = 0x6000_2180 | destination | (u32::from(transpose) << 2);
+                let word = 0x6000_2180 | destination | format_bits;
                 let transfer = C220Load2dInstruction::decode(word)
                     .unwrap()
                     .capture(&registers)
@@ -191,17 +155,28 @@ mod tests {
                 } else {
                     memory.l0b()
                 };
-                let expected = if transpose {
-                    transpose_block(source, C220Load2dElementFormat::B8)
-                } else {
-                    source
-                };
+                let mut expected = vec![MemoryByteState::Known(0); 512];
+                for (index, state) in source.into_iter().enumerate() {
+                    let destination_index = if transpose {
+                        let row = index / 32;
+                        let column = (index % 32) / 2;
+                        column * 32 + row * 2 + index % 2
+                    } else {
+                        index
+                    };
+                    expected[destination_index] = state;
+                }
                 assert_eq!(target.read_states_linear(512, 512).unwrap(), expected);
                 assert_eq!(
                     target.read_states(0, 512).unwrap(),
                     vec![MemoryByteState::Unknown; 512]
                 );
                 assert_eq!(target.tracked_bytes(), 512);
+                assert_eq!(memory.l1().tracked_bytes(), 768);
+                assert_eq!(
+                    memory.l1().read_states_linear(768, 256).unwrap(),
+                    vec![MemoryByteState::Unknown; 256]
+                );
             }
         }
     }

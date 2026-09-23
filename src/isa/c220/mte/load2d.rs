@@ -139,10 +139,7 @@ impl C220Load2dDescriptor {
         address_mode: C220Load2dAddressMode,
     ) -> Result<Self, C220Load2dError> {
         let repeat_count = ((raw >> 16) & 0xff) as u8;
-        if repeat_count == 0 {
-            return Err(C220Load2dError::EmptyTransfer);
-        }
-        if raw >> 60 != 0 {
+        if repeat_count != 0 && raw >> 60 != 0 {
             return Err(C220Load2dError::UnsupportedDescriptorHighBits {
                 bits: (raw >> 60) as u8,
             });
@@ -241,8 +238,6 @@ pub enum C220Load2dError {
     },
     #[error("LOAD_2D instruction bit 6 is unsupported")]
     UnsupportedInstructionBit6,
-    #[error("LOAD_2D repeat count is zero")]
-    EmptyTransfer,
     #[error("LOAD_2D descriptor high bits 60:63 are unsupported: {bits:#x}")]
     UnsupportedDescriptorHighBits { bits: u8 },
 }

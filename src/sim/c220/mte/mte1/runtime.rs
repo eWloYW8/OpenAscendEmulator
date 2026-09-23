@@ -1,5 +1,6 @@
 use super::bias::{C220BtTransferError, C220BtTransferResult, prepare_c220_mov_l1_to_bt};
 use super::frontend::C220Mte1ReadTransfer;
+use super::load2d::prepare_c220_load2d_transpose;
 use super::load2d::{C220Load2dTransferError, C220Load2dTransferResult, prepare_c220_load2d};
 use super::{C220Mte1Command, C220Mte1Issue};
 use crate::isa::c220::hflag::C220MatrixMemory;
@@ -38,6 +39,7 @@ pub enum C220Mte1RuntimeError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1TransferResult {
     Load2d(C220Load2dTransferResult),
+    Load2dTranspose(C220Load2dTransferResult),
     Bt(C220BtTransferResult),
     Set2d(C220Set2dResult),
 }
@@ -110,6 +112,17 @@ impl Mte1Engine {
                 }
             },
             C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(_)) => C220MatrixMemory::BiasTable,
+            C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dTranspose(transfer)) => {
+                match transfer.instruction.destination {
+                    C220Load2dDestination::L0a => C220MatrixMemory::L0a,
+                    C220Load2dDestination::L0b => C220MatrixMemory::L0b,
+                    destination => {
+                        return Err(
+                            C220Load2dTransferError::UnsupportedDestination(destination).into()
+                        );
+                    }
+                }
+            }
             C220Mte1Command::Read(C220Mte1ReadTransfer::Load2d(transfer)) => match transfer
                 .instruction
                 .destination
@@ -252,6 +265,12 @@ impl Mte1Engine {
                     C220Mte1TransferResult::Bt(
                         prepare_c220_mov_l1_to_bt(memory, transfer)?.commit(memory)?,
                     )
+                }
+                C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dTranspose(transfer)) => {
+                    let prepared = prepare_c220_load2d_transpose(memory, transfer)?;
+                    let result = prepared.result;
+                    prepared.commit(memory)?;
+                    C220Mte1TransferResult::Load2dTranspose(result)
                 }
             };
             let outcome = C220Mte1Outcome {
@@ -439,5 +458,43 @@ mod tests {
         flags.advance_to(completed + 5).unwrap();
         assert_eq!(flags.count(2, C220MatrixMemory::L0a, 0), 32);
         assert_eq!(flags.count(2, C220MatrixMemory::L0a, 1), 1);
+
+        registers[0] = u64::MAX;
+        registers[2] = u64::MAX;
+        registers[3] = !(0xff << 16);
+        let empty = C220Load2dInstruction::decode(0x6000_2180)
+            .unwrap()
+            .capture(&registers)
+            .unwrap();
+        let before = memory.clone();
+        let issue = engine
+            .issue(
+                &mut pipeline,
+                3,
+                8,
+                C220Mte1Command::Read(C220Mte1ReadTransfer::Load2d(empty)),
+                &mut flags,
+            )
+            .unwrap();
+        assert!(issue.completion_ready);
+        assert_eq!(issue.uop_count, 0);
+        engine.set_event(9);
+        assert!(!engine.wait_event(9));
+        advance(
+            &mut engine,
+            &mut pipeline,
+            completed + 5,
+            &mut memory,
+            &mut flags,
+        )
+        .unwrap();
+        assert!(engine.wait_event(9));
+        let outcome = engine.outcomes.last().unwrap();
+        assert_eq!(outcome.instruction_id, 3);
+        assert!(
+            matches!(outcome.result, C220Mte1TransferResult::Load2d(result) if result.bytes == 0 && result.segment_count == 0)
+        );
+        assert_eq!(memory, before);
+        assert!(engine.pending_commands().next().is_none());
     }
 }

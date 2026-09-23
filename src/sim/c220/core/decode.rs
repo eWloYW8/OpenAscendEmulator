@@ -4,6 +4,7 @@ use crate::isa::c220::hflag::C220HardwareFlagInstruction;
 use crate::isa::c220::mte::C220DmaMovDescriptor;
 use crate::isa::c220::mte::bias::C220MovL1ToBtInstruction;
 use crate::isa::c220::mte::load2d::C220Load2dInstruction;
+use crate::isa::c220::mte::load2d_transpose::C220Load2dTransposeInstruction;
 use crate::isa::c220::mte::set2d::{C220Set2dDestination, C220Set2dInstruction};
 use crate::isa::flow::FlagInstruction;
 use crate::sim::c220::mte::mte2::is_mte2_transfer;
@@ -31,6 +32,7 @@ impl C220DecodedWord {
         let flow_flag = FlagInstruction::decode(Architecture::Dav2201, word);
         let kind = if C220Load2dInstruction::decode(word)
             .is_some_and(|instruction| instruction.is_mte1())
+            || C220Load2dTransposeInstruction::decode(word).is_some()
             || C220MovL1ToBtInstruction::decode(word).is_some()
             || C220Set2dInstruction::decode(word)
                 .is_some_and(|instruction| instruction.destination != C220Set2dDestination::L1)

@@ -5,6 +5,7 @@ use super::bias::{C220BtReadUop, C220BtRequestPlan};
 use super::load2d::{C220Load2dReadUop, C220Load2dRequestPlan};
 use crate::isa::c220::mte::bias::C220BtTransfer;
 use crate::isa::c220::mte::load2d::{C220Load2dDestination, C220Load2dError, C220Load2dTransfer};
+use crate::isa::c220::mte::load2d_transpose::C220Load2dTransposeTransfer;
 use crate::sim::c220::memory::l1::C220L1Access;
 use crate::sim::c220::mte::interface::{
     C220L0WritePort, C220MteL1Error, C220MteL1Interface, C220MteL1OutputDestination,
@@ -45,6 +46,7 @@ pub struct C220Mte1ReadBandwidths {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1ReadTransfer {
     Load2d(C220Load2dTransfer),
+    Load2dTranspose(C220Load2dTransposeTransfer),
     Bt(C220BtTransfer),
 }
 
@@ -52,13 +54,14 @@ impl C220Mte1ReadTransfer {
     pub const fn is_empty(self) -> bool {
         match self {
             Self::Load2d(transfer) => transfer.descriptor.repeat_count == 0,
+            Self::Load2dTranspose(transfer) => transfer.repeat_count() == 0,
             Self::Bt(transfer) => transfer.descriptor.is_empty(),
         }
     }
 
     pub const fn kind(self) -> C220Mte1ReadKind {
         match self {
-            Self::Load2d(_) => C220Mte1ReadKind::Load2d,
+            Self::Load2d(_) | Self::Load2dTranspose(_) => C220Mte1ReadKind::Load2d,
             Self::Bt(_) => C220Mte1ReadKind::Bt,
         }
     }
@@ -319,6 +322,9 @@ impl C220Mte1ReadFrontend {
             C220Mte1ReadTransfer::Load2d(transfer) => {
                 Plan::Load2d(C220Load2dRequestPlan::new(transfer, self.access_width)?)
             }
+            C220Mte1ReadTransfer::Load2dTranspose(transfer) => Plan::Load2d(
+                C220Load2dRequestPlan::new_transpose(transfer, self.access_width)?,
+            ),
         };
         let request_count = plan.remaining();
         if request_count != 0 {

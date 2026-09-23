@@ -162,6 +162,92 @@ mod tests {
     }
 
     #[test]
+    fn grouped_transpose_runs_through_mte1_and_retires_captured_operands() {
+        use crate::sim::c220::mte::mte1::C220Mte1TransferResult;
+
+        for (format, group) in [(0, 2_usize), (1, 1), (2, 4), (3, 2)] {
+            for destination in 0..2 {
+                let mut core = matrix_core();
+                core.advance_to(300).unwrap();
+                let machine = core.state.scalar_mut().machine_mut();
+                for (register, value) in [
+                    (10, 4096),
+                    (11, 8192),
+                    (12, (2 << 16) | (1 << 24) | (7 << 44)),
+                    (13, 1),
+                ] {
+                    machine.set_xreg(register, value).unwrap();
+                }
+                let word = (3 << 29)
+                    | (1 << 27)
+                    | (5 << 24)
+                    | (format << 22)
+                    | (10 << 17)
+                    | (11 << 12)
+                    | (12 << 7)
+                    | (13 << 2)
+                    | destination;
+                let C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::Mte1 { issue, .. },
+                    ..
+                } = core.step_word_at(301, word).unwrap()
+                else {
+                    panic!("extended transpose admission");
+                };
+                assert_eq!(issue.uop_count, (2 * group * 2) as u64);
+                for register in 10..=13 {
+                    core.state
+                        .scalar_mut()
+                        .machine_mut()
+                        .set_xreg(register, 0)
+                        .unwrap();
+                }
+                // The data is written after issue; only operands are captured at issue.
+                core.local_memory
+                    .l1_mut()
+                    .write_known(8192, &vec![0x55; 2 * group * 512])
+                    .unwrap();
+                let retired = (302..600)
+                    .find_map(|tick| {
+                        core.advance_to(tick).unwrap();
+                        let outcome = core.last_mte1_outcomes().first().copied();
+                        let target = if destination == 0 {
+                            core.local_memory.l0a()
+                        } else {
+                            core.local_memory.l0b()
+                        };
+                        if outcome.is_none() {
+                            assert!(target.read_known(4096, 512).is_err());
+                        }
+                        outcome
+                    })
+                    .expect("extended transpose retirement");
+                let C220Mte1TransferResult::Load2dTranspose(result) = retired.result else {
+                    panic!("extended transpose result");
+                };
+                assert_eq!(result.segment_count, 2 * group);
+                let target = if destination == 0 {
+                    core.local_memory.l0a()
+                } else {
+                    core.local_memory.l0b()
+                };
+                for repeat in 0..2 {
+                    for fractal in 0..group {
+                        assert_eq!(
+                            target
+                                .read_known((4096 + (repeat * 8 + fractal * 2) * 512) as u64, 512)
+                                .unwrap(),
+                            vec![0x55; 512]
+                        );
+                    }
+                }
+                assert!(core.pending_mte1_commands().next().is_none());
+                assert!(core.mte_pipeline().unwrap().is_idle());
+            }
+        }
+    }
+
+    #[test]
     fn bt_switches_after_load2d_generation_and_commits_after_local_completion() {
         use crate::sim::c220::mte::interface::C220MteL1EventOutcome;
         use crate::sim::c220::mte::mte1::C220Mte1TransferResult;

@@ -1,6 +1,7 @@
 use crate::architecture::Architecture;
 use crate::isa::c220::mte::bias::C220MovL1ToBtInstruction;
 use crate::isa::c220::mte::load2d::C220Load2dInstruction;
+use crate::isa::c220::mte::load2d_transpose::C220Load2dTransposeInstruction;
 use crate::isa::c220::mte::set2d::C220Set2dInstruction;
 use crate::isa::flow::{FlagInstruction, FlagOperation};
 use crate::sim::c220::mte::mte1::C220Mte1Command;
@@ -35,6 +36,10 @@ impl C220Core {
                     .capture(registers)
                     .map_err(C220Load2dTransferError::from)?,
             )))
+        } else if let Some(decoded) = C220Load2dTransposeInstruction::decode(word) {
+            Some(C220Mte1Command::Read(
+                C220Mte1ReadTransfer::Load2dTranspose(decoded.capture(registers)),
+            ))
         } else {
             C220MovL1ToBtInstruction::decode(word).map(|decoded| {
                 C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(decoded.capture(registers)))
