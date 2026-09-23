@@ -2,7 +2,7 @@ use super::accumulator::C220CubeAccumulator;
 use super::execute::C220CubeWrite;
 use super::layout::{
     f16_b_address, f16_c_address, f32_b_address, f32_c_address, integer_a_element,
-    integer_b_element, read_u8_wrapped, read_u16_wrapped, read_u32_wrapped,
+    integer_b_element, read_input,
 };
 use super::numeric::{
     F32SliceOutcome, evaluate_bf16_f32_slice, evaluate_f16_f16_slice, evaluate_f16_f32_slice,
@@ -201,22 +201,16 @@ impl Mmad<'_> {
         let mut right = [0; 16];
         for lane in 0..self.active_lanes(k_base, 16) {
             let k = k_base + lane;
-            left[lane as usize] = read_u16_wrapped(
+            left[lane as usize] = u16::from_le_bytes(read_input(
                 self.memory.l0a(),
-                self.issue
-                    .parameters
-                    .xn
-                    .wrapping_add(2 * self.a_element(u64::from(self.geometry.k_tiles), 16, m, k)),
-            )?;
-            right[lane as usize] = read_u16_wrapped(
+                self.issue.parameters.xn,
+                2 * self.a_element(u64::from(self.geometry.k_tiles), 16, m, k),
+            )?);
+            right[lane as usize] = u16::from_le_bytes(read_input(
                 self.memory.l0b(),
-                f16_b_address(
-                    self.issue.parameters.xm,
-                    u64::from(self.geometry.n_tiles),
-                    k,
-                    n,
-                ),
-            )?;
+                self.issue.parameters.xm,
+                f16_b_address(0, u64::from(self.geometry.n_tiles), k, n),
+            )?);
         }
         Ok((left, right))
     }
@@ -236,22 +230,16 @@ impl Mmad<'_> {
         };
         for lane in 0..self.active_lanes(k_base, N as u64) {
             let k = k_base + lane;
-            left[lane as usize] = read_u32_wrapped(
+            left[lane as usize] = u32::from_le_bytes(read_input(
                 self.memory.l0a(),
-                self.issue
-                    .parameters
-                    .xn
-                    .wrapping_add(4 * self.a_element(a_k_tiles, 8, m, k)),
-            )?;
-            right[lane as usize] = read_u32_wrapped(
+                self.issue.parameters.xn,
+                4 * self.a_element(a_k_tiles, 8, m, k),
+            )?);
+            right[lane as usize] = u32::from_le_bytes(read_input(
                 self.memory.l0b(),
-                f32_b_address(
-                    self.issue.parameters.xm,
-                    u64::from(self.geometry.n_tiles),
-                    k,
-                    n,
-                ),
-            )?;
+                self.issue.parameters.xm,
+                f32_b_address(0, u64::from(self.geometry.n_tiles), k, n),
+            )?);
         }
         Ok((left, right))
     }
@@ -273,11 +261,11 @@ impl IntegerInputMode {
         element: u64,
     ) -> Result<u8, C220LocalBufferError> {
         if *self == Self::Signed4Signed4 {
-            let packed = read_u8_wrapped(buffer, base.wrapping_add(element / 2))?;
+            let [packed] = read_input(buffer, base, element / 2)?;
             let nibble = (packed >> (4 * (element & 1))) & 0xf;
             Ok(((nibble << 4) as i8 >> 4) as u8)
         } else {
-            read_u8_wrapped(buffer, base.wrapping_add(element))
+            Ok(read_input::<1>(buffer, base, element)?[0])
         }
     }
 

@@ -33,15 +33,25 @@ pub(super) fn integer_b_element(n_tiles: u64, k_tile: u64, k: u64, n: u64) -> u6
 pub(super) fn f32_c_address(base: u64, m_tiles: u64, m: u64, n: u64) -> u64 {
     let tile = m / TILE_EDGE + m_tiles * (n / TILE_EDGE);
     let lane = (m % TILE_EDGE) * TILE_EDGE + n % TILE_EDGE;
-    base.wrapping_add(tile * F32_TILE_BYTES + lane * 4)
+    output_tile_base(base, tile, F32_TILE_BYTES) + lane * 4
 }
 
 pub(super) fn f16_c_address(base: u64, m_tiles: u64, m: u64, n: u64) -> u64 {
     let tile = m / TILE_EDGE + m_tiles * (n / TILE_EDGE);
     let lane = (m % TILE_EDGE) * TILE_EDGE + n % TILE_EDGE;
-    base.wrapping_add(tile * F16_TILE_BYTES + lane * 2)
+    output_tile_base(base, tile, F16_TILE_BYTES) + lane * 2
 }
 
+fn output_tile_base(base: u64, tile: u64, bytes: u64) -> u64 {
+    let address = base.wrapping_add(tile * bytes);
+    if address > 131072 - bytes {
+        address % 131072
+    } else {
+        address
+    }
+}
+
+#[cfg(test)]
 pub(super) fn read_u16_wrapped(
     buffer: &C220LocalBuffer,
     address: u64,
@@ -50,13 +60,22 @@ pub(super) fn read_u16_wrapped(
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
-pub(super) fn read_u8_wrapped(
+pub(super) fn read_input<const N: usize>(
     buffer: &C220LocalBuffer,
-    address: u64,
-) -> Result<u8, C220LocalBufferError> {
-    Ok(buffer.read_known_wrapped(address, 1)?[0])
+    base: u64,
+    offset: u64,
+) -> Result<[u8; N], C220LocalBufferError> {
+    let tile = base.wrapping_add(offset / 512 * 512);
+    let tile = if tile > 65536 - 512 {
+        tile % 65536
+    } else {
+        tile
+    };
+    let bytes = buffer.read_initialized_linear(tile + offset % 512, N)?;
+    Ok(std::array::from_fn(|index| bytes[index]))
 }
 
+#[cfg(test)]
 pub(super) fn read_u32_wrapped(
     buffer: &C220LocalBuffer,
     address: u64,
@@ -65,6 +84,7 @@ pub(super) fn read_u32_wrapped(
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+#[cfg(test)]
 pub(super) fn write_u32_wrapped(
     buffer: &mut C220LocalBuffer,
     address: u64,
@@ -73,6 +93,7 @@ pub(super) fn write_u32_wrapped(
     buffer.write_known_wrapped(address, &value.to_le_bytes())
 }
 
+#[cfg(test)]
 pub(super) fn write_u16_wrapped(
     buffer: &mut C220LocalBuffer,
     address: u64,

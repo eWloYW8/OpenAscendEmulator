@@ -1,8 +1,6 @@
 use thiserror::Error;
 
-use super::layout::{
-    TILE_EDGE, f16_c_address, f32_c_address, write_u16_wrapped, write_u32_wrapped,
-};
+use super::layout::{TILE_EDGE, f16_c_address, f32_c_address};
 use super::{C220CubeAccumulatorSource, C220CubeExecutionControl, C220CubeFpStatus, C220CubeIssue};
 use crate::isa::c220::cube::{C220CubeDataType, C220CubeOperation};
 use crate::memory::pv_memory::PvMemoryError;
@@ -50,10 +48,10 @@ impl C220PreparedCubeExecution {
         for &write in &self.writes {
             match write {
                 C220CubeWrite::U16 { address, value } => {
-                    write_u16_wrapped(buffer, address, value)?;
+                    buffer.write_known_linear(address, &value.to_le_bytes())?;
                 }
                 C220CubeWrite::U32 { address, value } => {
-                    write_u32_wrapped(buffer, address, value)?;
+                    buffer.write_known_linear(address, &value.to_le_bytes())?;
                 }
             }
         }
@@ -112,6 +110,22 @@ impl C220CubeIssue {
         memory: &C220LocalMemory,
         control: C220CubeExecutionControl,
     ) -> Result<C220PreparedCubeExecution, C220CubeExecutionError> {
+        if self.parameters.m == 0 || self.parameters.effective_k == 0 || self.parameters.n == 0 {
+            return Ok(C220PreparedCubeExecution {
+                writes: Vec::new(),
+                outcome: C220CubeExecutionOutcome {
+                    accumulator_source: self.accumulator_source(),
+                    m: self.parameters.m,
+                    k: self.parameters.effective_k,
+                    n: self.parameters.n,
+                    mac_count: 0,
+                    written_lanes: 0,
+                    padded_lanes: 0,
+                    fp_status: C220CubeFpStatus::default(),
+                    integer_overflow: false,
+                },
+            });
+        }
         self.validate_functional_mode()?;
         let prepared = super::mmad::prepare(self, memory, control)?;
         Ok(self.complete_output_tiles(prepared))

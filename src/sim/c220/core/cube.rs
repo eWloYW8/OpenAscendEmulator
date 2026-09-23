@@ -43,10 +43,10 @@ impl C220Core {
             instruction: decoded,
             registers,
             parameters,
+            execution_control,
             ticket,
         };
-        self.cube
-            .issue(issue, execution_control, &mut self.local_memory)?;
+        self.cube.issue(issue, &mut self.local_memory)?;
         self.state.commit_c220_sequential_issue();
         Ok(C220CoreInstruction::Cube(issue))
     }
@@ -159,6 +159,89 @@ mod tests {
             ));
         }
         core
+    }
+
+    #[test]
+    fn cube_first_uop_observes_live_delay_controls() {
+        for initially_enabled in [false, true] {
+            let mut core = matrix_core();
+            core.advance_to(300).unwrap();
+            let delay = (1 << 4) | (10 << 5);
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_spr_value(107, if initially_enabled { delay } else { 0 })
+                .unwrap();
+            let word = (7 << 29) | (3 << 22) | (1 << 12) | (2 << 7) | (3 << 2);
+            assert!(matches!(
+                core.step_word_at(301, word).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+            core.advance_to(302).unwrap();
+            assert!(core.cube.pipeline.last_uop_releases().is_empty());
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_spr_value(107, if initially_enabled { 0 } else { delay })
+                .unwrap();
+            let expected = if initially_enabled { 304 } else { 312 };
+            core.advance_to(expected - 1).unwrap();
+            assert!(core.cube.pipeline.last_uop_releases().is_empty());
+            core.advance_to(expected).unwrap();
+            assert_eq!(core.cube.pipeline.last_uop_releases().len(), 1);
+            assert_eq!(
+                core.cube.pipeline.last_uop_releases()[0].issue_tick,
+                expected
+            );
+            core.advance_to(expected + 21).unwrap();
+            let retired = core.cube.pipeline.last_retirements();
+            assert_eq!(retired.len(), 1);
+            assert_eq!(retired[0].first_uop_tick, Some(expected));
+            assert_eq!(
+                retired[0].issue_delay_wait_ticks,
+                if initially_enabled { 1 } else { 9 }
+            );
+            assert_eq!(retired[0].resource_wait_ticks, 0);
+        }
+    }
+
+    #[test]
+    fn zero_dimension_cube_retires_without_output_or_status_changes() {
+        for (m, k, n) in [(0, 17, 17), (17, 0, 17), (17, 17, 0)] {
+            let mut core = matrix_core();
+            core.advance_to(300).unwrap();
+            let machine = core.state.scalar_mut().machine_mut();
+            machine.set_xreg(0, 4096).unwrap();
+            machine.set_xreg(1, u64::MAX).unwrap();
+            machine.set_xreg(2, u64::MAX).unwrap();
+            machine
+                .set_xreg(3, m | (k << 12) | (n << 24) | (1 << 63))
+                .unwrap();
+            machine.set_spr_value(2, 0x1234_5678_9abc_def0).unwrap();
+            core.local_memory
+                .l0c_mut()
+                .buffer_mut()
+                .write_known(4096, &[0xa5; 4096])
+                .unwrap();
+            let before = core.local_memory.clone();
+            let word = (7 << 29) | (3 << 22) | (1 << 12) | (2 << 7) | (3 << 2);
+            let C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Cube(issue),
+                ..
+            } = core.step_word_at(301, word).unwrap()
+            else {
+                panic!("Cube admission");
+            };
+            assert_eq!(issue.ticket.retire_tick, 301);
+            assert_eq!(issue.ticket.uop_count, 0);
+            core.advance_to(301).unwrap();
+            assert!(core.cube.pipeline.last_uop_releases().is_empty());
+            assert_eq!(core.cube.pipeline.pending_retirement_count(), 0);
+            assert_eq!(core.last_cube_outcomes().len(), 1);
+            assert_eq!(core.last_cube_outcomes()[0].written_lanes, 0);
+            assert_eq!(core.local_memory, before);
+            assert_eq!(core.state.scalar().machine().spr2(), 0x1234_5678_9abc_def0);
+        }
     }
 
     #[test]
@@ -731,7 +814,7 @@ mod tests {
                 assert_eq!(core.last_cube_outcomes().len(), 1);
                 assert_eq!(
                     core.local_memory.l0c().buffer().read_known(0, 4).unwrap(),
-                    48.0_f32.to_le_bytes()
+                    32.0_f32.to_le_bytes()
                 );
             }
             assert!(matches!(

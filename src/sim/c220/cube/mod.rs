@@ -69,6 +69,8 @@ pub struct C220CubeIssue {
     pub instruction: C220CubeInstruction,
     pub registers: C220CubeRegisterValues,
     pub parameters: C220MmadParameters,
+    /// Numerical modes captured when the instruction is admitted.
+    pub execution_control: C220CubeExecutionControl,
     pub ticket: C220CubeTicket,
 }
 

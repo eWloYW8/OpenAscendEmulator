@@ -2,7 +2,7 @@ use crate::isa::c220::cube::C220MmadParameters;
 use crate::sim::c220::memory::{C220LocalBuffer, C220LocalMemory};
 
 use super::C220CubeExecutionError;
-use super::layout::{integer_a_element, integer_b_element};
+use super::layout::{integer_a_element, integer_b_element, read_input};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220SparseByteLane {
@@ -56,21 +56,7 @@ pub(super) fn read_byte_pair(
         column,
     );
     Ok((
-        read_tile_byte(memory.l0a(), parameters.xn, a)?,
-        read_tile_byte(memory.l0b(), parameters.xm, b)?,
+        read_input::<1>(memory.l0a(), parameters.xn, a)?[0],
+        read_input::<1>(memory.l0b(), parameters.xm, b)?[0],
     ))
-}
-
-fn read_tile_byte(
-    buffer: &C220LocalBuffer,
-    base: u64,
-    offset: u64,
-) -> Result<u8, C220CubeExecutionError> {
-    let tile = base.wrapping_add(offset / 512 * 512);
-    let tile = if tile > 65536 - 512 {
-        tile % 65536
-    } else {
-        tile
-    };
-    Ok(buffer.read_initialized_linear(tile + offset % 512, 1)?[0])
 }

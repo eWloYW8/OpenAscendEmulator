@@ -32,6 +32,7 @@ fn s4_issue(m: u16, k: u16, n: u16, clear: bool) -> C220CubeIssue {
         instruction,
         registers,
         parameters,
+        execution_control: C220CubeExecutionControl::from_spr3(0),
         ticket,
     }
 }
@@ -40,10 +41,180 @@ fn integer_memory() -> C220LocalMemory {
     C220LocalMemory::new(C220LocalMemoryConfig {
         l0a_bytes: 4096,
         l0b_bytes: 4096,
-        l0c_bytes: 8192,
+        l0c_bytes: 131072,
         ..C220LocalMemoryConfig::default()
     })
     .unwrap()
+}
+
+#[test]
+fn accumulator_tiles_read_and_write_linear_lanes_at_the_l0c_boundary() {
+    for raw_type in [2, 3, 6] {
+        for base in [131071, 131072] {
+            let mut issue = s4_issue(17, 1, 1, false);
+            issue.word = (7 << 29) | (raw_type << 22);
+            issue.instruction = C220CubeInstruction::decode(issue.word).unwrap();
+            issue.registers.xd = base;
+            issue.parameters = issue.instruction.parameters(issue.registers);
+            let one = match raw_type {
+                2 => 0x3c00_u16.to_le_bytes().to_vec(),
+                3 => 1.0_f32.to_le_bytes().to_vec(),
+                _ => 1_u32.to_le_bytes().to_vec(),
+            };
+            let tile_bytes = 256 * one.len();
+            let mut memory = C220LocalMemory::new(C220LocalMemoryConfig {
+                l0c_bytes: 4096,
+                ..Default::default()
+            })
+            .unwrap();
+            memory
+                .l0c_mut()
+                .buffer_mut()
+                .write_known(0, &[0x5a; 64])
+                .unwrap();
+            for tile in 0..2 {
+                let address = (base + tile * tile_bytes as u64) % 131072;
+                memory
+                    .l0c_mut()
+                    .buffer_mut()
+                    .write_known_linear(address, &one.repeat(256))
+                    .unwrap();
+            }
+            let outcome = issue
+                .execute(&mut memory, C220CubeExecutionControl::from_spr3(0))
+                .unwrap();
+            assert_eq!(outcome.written_lanes, 512);
+            for row in 0..32 {
+                let tile = row / 16;
+                let tile_address = (base + tile * tile_bytes as u64) % 131072;
+                for column in 0..16 {
+                    let address = tile_address + (row % 16 * 16 + column) * one.len() as u64;
+                    let expected = if row < 17 && column == 0 {
+                        one.clone()
+                    } else {
+                        vec![0; one.len()]
+                    };
+                    assert_eq!(
+                        memory
+                            .l0c()
+                            .buffer()
+                            .read_initialized_linear(address, one.len())
+                            .unwrap(),
+                        expected
+                    );
+                }
+            }
+            if base == 131071 {
+                assert_eq!(memory.l0c().buffer().read_known(0, 64).unwrap(), [0x5a; 64]);
+            }
+        }
+    }
+}
+
+#[test]
+fn input_tiles_normalize_the_base_without_wrapping_individual_lanes() {
+    for raw_type in [0, 1, 2, 3, 5, 6, 9, 10] {
+        for base in [65535, 65536, 131071] {
+            for m in [1, 2] {
+                let mut issue = s4_issue(m, 1, 2, true);
+                issue.word = (7 << 29) | ((raw_type & 7) << 22) | (raw_type >> 3);
+                issue.instruction = C220CubeInstruction::decode(issue.word).unwrap();
+                issue.registers.xn = base;
+                issue.registers.xm = base;
+                issue.parameters = issue.instruction.parameters(issue.registers);
+                let (a, b) = match raw_type {
+                    2 | 3 => (
+                        0x4000_u16.to_le_bytes().to_vec(),
+                        0x4200_u16.to_le_bytes().to_vec(),
+                    ),
+                    9 => (
+                        0x4000_u16.to_le_bytes().to_vec(),
+                        0x4040_u16.to_le_bytes().to_vec(),
+                    ),
+                    10 => (
+                        2.0_f32.to_le_bytes().to_vec(),
+                        3.0_f32.to_le_bytes().to_vec(),
+                    ),
+                    6 => (vec![0x22], vec![0x33]),
+                    _ => (vec![2], vec![3]),
+                };
+                let mut memory = integer_memory();
+                memory
+                    .l0a_mut()
+                    .write_known_linear(base % 65536, &a.repeat(512 / a.len()))
+                    .unwrap();
+                memory
+                    .l0b_mut()
+                    .write_known_linear(base % 65536, &b.repeat(512 / b.len()))
+                    .unwrap();
+                issue
+                    .execute(&mut memory, C220CubeExecutionControl::from_spr3(0))
+                    .unwrap();
+                for row in 0..u64::from(m) {
+                    for column in 0..2 {
+                        if raw_type == 2 {
+                            assert_eq!(
+                                read_u16_wrapped(
+                                    memory.l0c().buffer(),
+                                    f16_c_address(7168, 1, row, column)
+                                )
+                                .unwrap(),
+                                0x4600
+                            );
+                        } else {
+                            let expected = if matches!(raw_type, 3 | 9 | 10) {
+                                6.0_f32.to_bits()
+                            } else {
+                                6
+                            };
+                            assert_eq!(
+                                read_u32_wrapped(
+                                    memory.l0c().buffer(),
+                                    f32_c_address(7168, 1, row, column)
+                                )
+                                .unwrap(),
+                                expected,
+                                "dtype={raw_type} base={base} row={row} col={column}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn zero_dimension_mmad_does_not_access_or_modify_memory() {
+    for (m, k, n) in [(0, 17, 17), (17, 0, 17), (17, 17, 0)] {
+        for sparse in [false, true] {
+            for controls in [0, 1 << 62, 1 << 63, (127 << 44) | (1 << 58)] {
+                let mut issue = s4_issue(m, k, n, false);
+                if sparse {
+                    issue.word |= 5 << 25;
+                    issue.instruction = C220CubeInstruction::decode(issue.word).unwrap();
+                }
+                issue.registers.xt |= controls;
+                issue.registers.xn = u64::MAX;
+                issue.registers.xm = u64::MAX;
+                issue.registers.xd = u64::MAX;
+                issue.parameters = issue.instruction.parameters(issue.registers);
+                let mut memory = integer_memory();
+                memory
+                    .l0c_mut()
+                    .buffer_mut()
+                    .write_known(0, &[0xa5; 8192])
+                    .unwrap();
+                let before = memory.clone();
+                let outcome = issue
+                    .execute(&mut memory, C220CubeExecutionControl::from_spr3(0))
+                    .unwrap();
+                assert_eq!(outcome.written_lanes, 0);
+                assert_eq!(outcome.mac_count, 0);
+                assert_eq!(memory, before);
+            }
+        }
+    }
 }
 
 #[test]
@@ -401,8 +572,17 @@ fn accumulator_controls_select_zero_bias_or_prior_output() {
 
 #[test]
 fn s4_mmad_unpacks_signed_tiles_and_wraps_buffers() {
-    let mut memory = integer_memory();
-    let issue = s4_issue(17, 65, 33, true);
+    let mut memory = C220LocalMemory::new(C220LocalMemoryConfig {
+        l0a_bytes: 65536,
+        l0b_bytes: 65536,
+        l0c_bytes: 131072,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut issue = s4_issue(17, 65, 33, true);
+    issue.registers.xn = 65024;
+    issue.registers.xm = 64512;
+    issue.parameters = issue.instruction.parameters(issue.registers);
     let mut a = vec![0x88_u8; 2048];
     let mut b = vec![0x88_u8; 3072];
     let a_value = |m: usize, k: usize| ((3 * m + 5 * k) % 16) as i32 - 8;
@@ -421,8 +601,8 @@ fn s4_mmad_unpacks_signed_tiles_and_wraps_buffers() {
             b[offset] = (b[offset] & !(0xf << shift)) | ((b_value(k, n) as u8 & 0xf) << shift);
         }
     }
-    memory.l0a_mut().write_known_wrapped(3584, &a).unwrap();
-    memory.l0b_mut().write_known_wrapped(3072, &b).unwrap();
+    memory.l0a_mut().write_known_wrapped(65024, &a).unwrap();
+    memory.l0b_mut().write_known_wrapped(64512, &b).unwrap();
     let outcome = issue
         .execute(&mut memory, C220CubeExecutionControl::from_spr3(0))
         .unwrap();

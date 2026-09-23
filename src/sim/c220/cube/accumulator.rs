@@ -87,7 +87,7 @@ impl C220CubeAccumulator {
                     &memory
                         .l0c()
                         .buffer()
-                        .read_known_wrapped(output_address, N)?,
+                        .read_initialized_linear(output_address, N)?,
                 );
             }
             C220CubeAccumulatorSource::Bias { .. } => {

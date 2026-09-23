@@ -1,7 +1,6 @@
 use crate::sim::c220::cube::{
-    C220CubeConfig, C220CubeExecutionControl, C220CubeExecutionOutcome, C220CubeIssue,
-    C220CubePipeline, C220CubeTicket, C220CubeTimingError, C220CubeUopRelease,
-    update_cube_status_spr2,
+    C220CubeConfig, C220CubeExecutionOutcome, C220CubeIssue, C220CubeIssueDelay, C220CubePipeline,
+    C220CubeTicket, C220CubeTimingError, C220CubeUopRelease, update_cube_status_spr2,
 };
 use crate::sim::c220::memory::{C220LocalBuffer, C220LocalMemory};
 use crate::sim::c220::sync::C220HardwareFlagState;
@@ -15,7 +14,6 @@ pub(in crate::sim::c220) struct CubeEngine {
 
 struct PendingCube {
     issue: C220CubeIssue,
-    control: C220CubeExecutionControl,
     prepared: Option<PreparedCube>,
 }
 
@@ -36,7 +34,6 @@ impl CubeEngine {
     pub(in crate::sim::c220) fn issue(
         &mut self,
         issue: C220CubeIssue,
-        control: C220CubeExecutionControl,
         memory: &mut C220LocalMemory,
     ) -> Result<(), C220CubeTimingError> {
         self.pipeline.issue(
@@ -47,7 +44,6 @@ impl CubeEngine {
         )?;
         self.pending.push(PendingCube {
             issue,
-            control,
             prepared: None,
         });
         Ok(())
@@ -67,6 +63,15 @@ impl CubeEngine {
     ) -> Result<(), C220CubeRuntimeError> {
         let release_start = self.pipeline.last_uop_releases().len();
         let retirement_start = self.pipeline.last_retirements().len();
+        let timing_spr = |spr| {
+            machine
+                .spr_value(spr)
+                .ok_or(C220CubeRuntimeError::MissingTimingSpr { spr })
+        };
+        self.pipeline.set_issue_delay(C220CubeIssueDelay::from_sprs(
+            timing_spr(107)?,
+            timing_spr(108)?,
+        ));
         self.pipeline
             .advance_in_batch_to(tick, memory.l0c_mut(), flags)?;
         let releases = self.pipeline.last_uop_releases()[release_start..].to_vec();
@@ -88,7 +93,9 @@ impl CubeEngine {
                 .find(|pending| pending.issue.instruction_id == release.instruction_id)
                 .ok_or(C220CubeTimingError::TicketMismatch)?;
             if pending.prepared.is_none() {
-                let prepared = pending.issue.prepare(memory, pending.control)?;
+                let prepared = pending
+                    .issue
+                    .prepare(memory, pending.issue.execution_control)?;
                 let mut result_buffer = memory.l0c().buffer().clone();
                 prepared.commit_to_buffer(&mut result_buffer)?;
                 let spr2 =
@@ -133,7 +140,9 @@ impl CubeEngine {
             let outcome = match pending.prepared {
                 Some(prepared) => prepared.outcome,
                 None => {
-                    let prepared = pending.issue.prepare(memory, pending.control)?;
+                    let prepared = pending
+                        .issue
+                        .prepare(memory, pending.issue.execution_control)?;
                     let outcome = prepared.outcome;
                     prepared.commit(memory)?;
                     let spr2 = update_cube_status_spr2(machine.spr2(), pending.issue.pc, outcome);
@@ -149,6 +158,8 @@ impl CubeEngine {
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220CubeRuntimeError {
+    #[error("missing Cube timing control SPR{spr}")]
+    MissingTimingSpr { spr: u16 },
     #[error(transparent)]
     Timing(#[from] super::C220CubeTimingError),
     #[error(transparent)]

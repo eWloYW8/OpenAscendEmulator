@@ -143,6 +143,7 @@ pub struct C220CubePipeline {
     last_retirements: Vec<C220CubeTicket>,
     last_uop_releases: Vec<C220CubeUopRelease>,
     previous_last_uop_tick: u64,
+    live_issue_delay: Option<C220CubeIssueDelay>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +153,8 @@ struct C220CubeInFlight {
     pending_uops: VecDeque<C220CubeUop>,
     next_uop_tick: Option<u64>,
     l0c_port_granted: bool,
+    first_observation_tick: Option<u64>,
+    first_bubbles_remaining: u64,
 }
 
 impl C220CubePipeline {
@@ -165,11 +168,17 @@ impl C220CubePipeline {
             last_retirements: Vec::new(),
             last_uop_releases: Vec::new(),
             previous_last_uop_tick: 0,
+            live_issue_delay: None,
         })
     }
 
     pub const fn config(&self) -> C220CubeConfig {
         self.config
+    }
+
+    /// Applies to subsequent issue attempts; advance to the write tick before changing it.
+    pub fn set_issue_delay(&mut self, control: C220CubeIssueDelay) {
+        self.live_issue_delay = Some(control);
     }
 
     pub const fn next_accept_tick(&self) -> u64 {
@@ -294,6 +303,44 @@ impl C220CubePipeline {
                     continue;
                 }
 
+                if uop.id == 0 {
+                    let observed = *flight.first_observation_tick.get_or_insert(ready_tick);
+                    let control = self.live_issue_delay.unwrap_or(flight.ticket.issue_delay);
+                    let guard = self
+                        .previous_last_uop_tick
+                        .checked_add(u64::from(control.previous_issue_guard_ticks))
+                        .ok_or(C220CubeTimingError::TimeOverflow)?;
+                    let deadline = observed
+                        .checked_add(u64::from(control.first_observation_delay_ticks))
+                        .ok_or(C220CubeTimingError::TimeOverflow)?;
+                    if control.enabled && ready_tick >= guard && ready_tick < deadline {
+                        shift_ticket_from_uop(&mut flight.ticket, 0, 1)?;
+                        flight.ticket.issue_delay_wait_ticks = flight
+                            .ticket
+                            .issue_delay_wait_ticks
+                            .checked_add(1)
+                            .ok_or(C220CubeTimingError::TimeOverflow)?;
+                        flight.next_uop_tick = Some(
+                            ready_tick
+                                .checked_add(1)
+                                .ok_or(C220CubeTimingError::TimeOverflow)?,
+                        );
+                        self.next_accept_tick = self
+                            .next_accept_tick
+                            .max(next_instruction_tick(flight.ticket)?);
+                        continue;
+                    }
+                    if flight.first_bubbles_remaining != 0 {
+                        flight.first_bubbles_remaining -= 1;
+                        flight.next_uop_tick = Some(
+                            ready_tick
+                                .checked_add(1)
+                                .ok_or(C220CubeTimingError::TimeOverflow)?,
+                        );
+                        continue;
+                    }
+                }
+
                 let port_blocked = uop.acquires_l0c_write_port
                     && !flight.l0c_port_granted
                     && !l0c.write_arbiter_mut().grant(C220L0cMaster::Cube);
@@ -392,7 +439,7 @@ impl C220CubePipeline {
 
     pub fn issue<I>(
         &mut self,
-        ticket: C220CubeTicket,
+        mut ticket: C220CubeTicket,
         uops: I,
         instruction_id: u64,
         l0c: &mut C220L0c,
@@ -415,6 +462,31 @@ impl C220CubePipeline {
         if pending_uops.len() != usize::try_from(ticket.uop_count).unwrap_or(usize::MAX) {
             return Err(C220CubeTimingError::TicketMismatch);
         }
+        let first_bubbles_remaining = pending_uops.front().map_or(0, |uop| {
+            u64::from(uop.pre_issue_bubbles) + ticket.sparse_bubbles
+        });
+        let next_uop_tick = if ticket.uop_count == 0 {
+            None
+        } else {
+            Some(
+                ticket
+                    .accept_tick
+                    .checked_add(1)
+                    .ok_or(C220CubeTimingError::TimeOverflow)?,
+            )
+        };
+        let predicted_wait = ticket.issue_delay_wait_ticks;
+        let remove_prediction = |tick: u64| {
+            tick.checked_sub(predicted_wait)
+                .ok_or(C220CubeTimingError::TicketMismatch)
+        };
+        ticket.first_uop_tick = ticket.first_uop_tick.map(remove_prediction).transpose()?;
+        ticket.last_uop_tick = ticket.last_uop_tick.map(remove_prediction).transpose()?;
+        ticket.retire_tick = ticket
+            .retire_tick
+            .checked_sub(predicted_wait)
+            .ok_or(C220CubeTimingError::TicketMismatch)?;
+        ticket.issue_delay_wait_ticks = 0;
         self.next_accept_tick = next_instruction_tick(ticket)?;
         if ticket.uop_count != 0 {
             l0c.write_arbiter_mut()
@@ -422,10 +494,12 @@ impl C220CubePipeline {
         }
         self.in_flight.push_back(C220CubeInFlight {
             instruction_id,
-            next_uop_tick: ticket.first_uop_tick,
+            next_uop_tick,
             ticket,
             pending_uops,
             l0c_port_granted: false,
+            first_observation_tick: None,
+            first_bubbles_remaining,
         });
         Ok(())
     }
@@ -440,6 +514,19 @@ fn next_instruction_tick(ticket: C220CubeTicket) -> Result<u64, C220CubeTimingEr
 }
 
 fn delay_ticket_from_uop(
+    ticket: &mut C220CubeTicket,
+    uop_id: u64,
+    delay: u64,
+) -> Result<(), C220CubeTimingError> {
+    shift_ticket_from_uop(ticket, uop_id, delay)?;
+    ticket.resource_wait_ticks = ticket
+        .resource_wait_ticks
+        .checked_add(delay)
+        .ok_or(C220CubeTimingError::TimeOverflow)?;
+    Ok(())
+}
+
+fn shift_ticket_from_uop(
     ticket: &mut C220CubeTicket,
     uop_id: u64,
     delay: u64,
@@ -460,10 +547,6 @@ fn delay_ticket_from_uop(
     }
     ticket.retire_tick = ticket
         .retire_tick
-        .checked_add(delay)
-        .ok_or(C220CubeTimingError::TimeOverflow)?;
-    ticket.resource_wait_ticks = ticket
-        .resource_wait_ticks
         .checked_add(delay)
         .ok_or(C220CubeTimingError::TimeOverflow)?;
     Ok(())
@@ -563,9 +646,17 @@ fn schedule(
     let previous_issue_guard_tick = previous_last_uop_tick
         .checked_add(u64::from(control.issue_delay.previous_issue_guard_ticks))
         .ok_or(C220CubeTimingError::TimeOverflow)?;
+    let first_attempt_tick = first_observation_tick
+        .checked_add(sparse_bubbles)
+        .and_then(|tick| tick.checked_add(first_fsm_bubbles))
+        .ok_or(C220CubeTimingError::TimeOverflow)?;
+    let delay_start_tick = first_observation_tick.max(previous_issue_guard_tick);
     let issue_delay_wait_ticks =
-        if control.issue_delay.enabled && first_observation_tick >= previous_issue_guard_tick {
-            u64::from(control.issue_delay.first_observation_delay_ticks)
+        if control.issue_delay.enabled && delay_start_tick <= first_attempt_tick {
+            first_observation_tick
+                .checked_add(u64::from(control.issue_delay.first_observation_delay_ticks))
+                .ok_or(C220CubeTimingError::TimeOverflow)?
+                .saturating_sub(delay_start_tick)
         } else {
             0
         };
@@ -626,13 +717,13 @@ mod tests {
         let mut bulk = C220CubePipeline::new(C220CubeConfig::default()).unwrap();
         let mut memory = C220L0c::new(1 << 20, 12).unwrap();
         for id in 1..=2 {
+            let control = if id == 1 {
+                C220CubeTimingControl::from_sprs(0, (1 << 4) | (3 << 5), 0)
+            } else {
+                timing_control(0)
+            };
             let ticket = bulk
-                .preview_issue(
-                    bulk.next_accept_tick(),
-                    instruction,
-                    parameters,
-                    timing_control(0),
-                )
+                .preview_issue(bulk.next_accept_tick(), instruction, parameters, control)
                 .unwrap();
             bulk.issue(
                 ticket,
@@ -677,7 +768,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 1, 2, 2]
         );
-        assert_eq!(releases[0].issue_tick, 21);
+        assert_eq!(releases[0].issue_tick, 25);
+        assert_eq!(retirements[0].issue_delay_wait_ticks, 3);
         assert!(
             releases
                 .windows(2)
@@ -685,6 +777,69 @@ mod tests {
         );
         assert_eq!(retirements.len(), 2);
         assert_eq!(bulk.pending_retirement_count(), 0);
+    }
+
+    #[test]
+    fn first_uop_delay_guard_is_rechecked_during_bubbles() {
+        for sparse in [false, true] {
+            let instruction = C220CubeInstruction {
+                word: 0,
+                operation: if sparse {
+                    C220CubeOperation::SparseMmad
+                } else {
+                    C220CubeOperation::Mmad
+                },
+                data_type: C220CubeDataType::F32F32,
+                raw_data_type: 10,
+                xd: 0,
+                xn: 1,
+                xm: 2,
+                xt: 3,
+            };
+            let parameters =
+                instruction.parameters(crate::isa::c220::cube::C220CubeRegisterValues {
+                    xd: 0,
+                    xn: 0,
+                    xm: 0,
+                    xt: 16 | (8 << 12) | (16 << 24),
+                });
+            for guard in [0, 11, 12, 14, 15, 16, 63] {
+                let mut control = timing_control(0);
+                control.issue_delay = C220CubeIssueDelay {
+                    enabled: true,
+                    previous_issue_guard_ticks: guard,
+                    first_observation_delay_ticks: 10,
+                };
+                let ticket = schedule(
+                    C220CubeConfig::default(),
+                    10,
+                    instruction,
+                    parameters,
+                    control,
+                    0,
+                )
+                .unwrap();
+                let mut tick = 11;
+                let mut bubbles = 3 + u64::from(sparse);
+                let mut wait = 0;
+                loop {
+                    if tick >= u64::from(guard) && tick < 21 {
+                        wait += 1;
+                    } else if bubbles != 0 {
+                        bubbles -= 1;
+                    } else {
+                        break;
+                    }
+                    tick += 1;
+                }
+                assert_eq!(
+                    ticket.first_uop_tick,
+                    Some(tick),
+                    "guard={guard} sparse={sparse}"
+                );
+                assert_eq!(ticket.issue_delay_wait_ticks, wait);
+            }
+        }
     }
 
     #[test]
