@@ -406,6 +406,9 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
                                     output_bytes[(sent.fragment.instruction_id - 1) as usize] +=
                                         sent.fragment.bytes;
                                     match sent.destination {
+                                        C220MteL1OutputDestination::SparseIndex => {
+                                            panic!("index responses must not emit output")
+                                        }
                                         C220MteL1OutputDestination::L0a(port) => {
                                             assert!(l0a.push(tick, port, sent.fragment).unwrap())
                                         }

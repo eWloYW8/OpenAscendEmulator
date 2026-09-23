@@ -2,6 +2,7 @@ use super::bias::{C220BtTransferError, C220BtTransferResult, prepare_c220_mov_l1
 use super::frontend::C220Mte1ReadTransfer;
 use super::load2d::prepare_c220_load2d_transpose;
 use super::load2d::{C220Load2dTransferError, C220Load2dTransferResult, prepare_c220_load2d};
+use super::sparse::{C220SparseTransferResult, prepare_c220_load2d_sparse};
 use super::{C220Mte1Command, C220Mte1Issue};
 use crate::isa::c220::hflag::C220MatrixMemory;
 use crate::isa::c220::mte::load2d::C220Load2dDestination;
@@ -38,6 +39,7 @@ pub enum C220Mte1RuntimeError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1TransferResult {
+    Load2dSparse(C220SparseTransferResult),
     Load2d(C220Load2dTransferResult),
     Load2dTranspose(C220Load2dTransferResult),
     Bt(C220BtTransferResult),
@@ -112,6 +114,7 @@ impl Mte1Engine {
                 }
             },
             C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(_)) => C220MatrixMemory::BiasTable,
+            C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dSparse(_)) => C220MatrixMemory::L0b,
             C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dTranspose(transfer)) => {
                 match transfer.instruction.destination {
                     C220Load2dDestination::L0a => C220MatrixMemory::L0a,
@@ -271,6 +274,11 @@ impl Mte1Engine {
                     let result = prepared.result;
                     prepared.commit(memory)?;
                     C220Mte1TransferResult::Load2dTranspose(result)
+                }
+                C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dSparse(transfer)) => {
+                    let prepared = prepare_c220_load2d_sparse(memory.l1(), transfer)?;
+                    let (l0b, indices) = memory.sparse_weight_buffers_mut();
+                    C220Mte1TransferResult::Load2dSparse(prepared.commit(l0b, indices)?)
                 }
             };
             let outcome = C220Mte1Outcome {

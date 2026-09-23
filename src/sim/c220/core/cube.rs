@@ -162,6 +162,207 @@ mod tests {
     }
 
     #[test]
+    fn cube_publishes_each_output_request_without_retirement_rewrite() {
+        let mut core = matrix_core();
+        core.advance_to(300).unwrap();
+        for (register, value) in [
+            (0, 4096),
+            (1, 0),
+            (2, 0),
+            (3, 1 | (16 << 12) | (17 << 24) | (1 << 63)),
+        ] {
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_xreg(register, value)
+                .unwrap();
+        }
+        core.local_memory
+            .l0a_mut()
+            .write_known(0, &0x3c00_u16.to_le_bytes().repeat(256))
+            .unwrap();
+        core.local_memory
+            .l0b_mut()
+            .write_known(0, &0x3c00_u16.to_le_bytes().repeat(512))
+            .unwrap();
+        core.local_memory
+            .l0c_mut()
+            .buffer_mut()
+            .write_known(4096, &[0; 2048])
+            .unwrap();
+        let word = (7 << 29) | (3 << 22) | (1 << 12) | (2 << 7) | (3 << 2);
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Cube(issue),
+            ..
+        } = core.step_word_at(301, word).unwrap()
+        else {
+            panic!("Cube admission");
+        };
+        let mut saw_first = false;
+        let mut retired = false;
+        for tick in 302..400 {
+            core.advance_to(tick).unwrap();
+            if core
+                .cube
+                .pipeline
+                .last_uop_releases()
+                .iter()
+                .any(|release| {
+                    release.instruction_id == issue.instruction_id && release.uop.id == 0
+                })
+            {
+                assert_eq!(
+                    core.local_memory
+                        .l0c()
+                        .buffer()
+                        .read_known(4096, 4)
+                        .unwrap(),
+                    16.0_f32.to_le_bytes()
+                );
+                assert!(core.last_cube_outcomes().is_empty());
+                core.local_memory
+                    .l0c_mut()
+                    .buffer_mut()
+                    .write_known(4096, &99.0_f32.to_le_bytes())
+                    .unwrap();
+                core.local_memory
+                    .l0a_mut()
+                    .write_known(0, &[0; 512])
+                    .unwrap();
+                saw_first = true;
+            }
+            if !core.last_cube_outcomes().is_empty() {
+                retired = true;
+                break;
+            }
+        }
+        assert!(saw_first && retired);
+        assert_eq!(
+            core.local_memory
+                .l0c()
+                .buffer()
+                .read_known(4096, 4)
+                .unwrap(),
+            99.0_f32.to_le_bytes()
+        );
+        assert_eq!(
+            core.local_memory
+                .l0c()
+                .buffer()
+                .read_known(5120, 4)
+                .unwrap(),
+            16.0_f32.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn sparse_load_reads_both_streams_but_only_weights_emit_output() {
+        use crate::sim::c220::mte::interface::{C220MteL1EventOutcome, C220MteL1OutputDestination};
+        use crate::sim::c220::mte::mte1::C220Mte1TransferResult;
+        let mut core = matrix_core();
+        core.advance_to(300).unwrap();
+        for (register, value) in [(10, 4096), (11, (16384 << 32) | 8192), (12, 2 << 16)] {
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_xreg(register, value)
+                .unwrap();
+        }
+        let word = (3 << 29) | (1 << 27) | (24 << 22) | (10 << 17) | (11 << 12) | (12 << 7);
+        let C220CoreStep::Executed {
+            instruction:
+                C220CoreInstruction::Mte1 {
+                    instruction_id,
+                    issue,
+                    ..
+                },
+            ..
+        } = core.step_word_at(301, word).unwrap()
+        else {
+            panic!("sparse instruction admission");
+        };
+        assert_eq!(issue.uop_count, 6);
+        core.local_memory
+            .l1_mut()
+            .write_known(8192, &[0x42; 1024])
+            .unwrap();
+        core.local_memory
+            .l1_mut()
+            .write_known(16384, &[0xa5; 256])
+            .unwrap();
+        for register in 10..=12 {
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_xreg(register, 0)
+                .unwrap();
+        }
+        let mut indices = 0;
+        let mut weight_output_bytes = 0;
+        let mut retired = None;
+        for tick in 302..450 {
+            core.advance_to(tick).unwrap();
+            for event in core.mte_pipeline().unwrap().last_events() {
+                match event {
+                    C220MtePipelineEvent::Interface(C220MteL1EventOutcome::Response(Some(
+                        request,
+                    ))) if request.operation.instruction_id == instruction_id
+                        && request.operation.destination
+                            == C220MteL1OutputDestination::SparseIndex =>
+                    {
+                        indices += 1;
+                        assert!(!request.operation.completes_logical_uop);
+                        assert!(!request.operation.last_in_instruction);
+                    }
+                    C220MtePipelineEvent::Interface(C220MteL1EventOutcome::Output(output)) => {
+                        if let Some(sent) = output.sent
+                            && sent.fragment.instruction_id == instruction_id
+                        {
+                            assert!(matches!(
+                                sent.destination,
+                                C220MteL1OutputDestination::L0b(_)
+                            ));
+                            weight_output_bytes += sent.fragment.bytes;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(outcome) = core
+                .last_mte1_outcomes()
+                .iter()
+                .find(|o| o.instruction_id == instruction_id)
+            {
+                retired = Some(*outcome);
+            }
+            if retired.is_none() {
+                assert!(core.local_memory.l0b().read_known(4096, 512).is_err());
+                assert_eq!(core.local_memory.weight_index().tracked_bytes(), 0);
+            }
+        }
+        assert_eq!((indices, weight_output_bytes), (2, 1024));
+        let C220Mte1TransferResult::Load2dSparse(result) =
+            retired.expect("sparse retirement").result
+        else {
+            panic!("sparse result")
+        };
+        assert_eq!((result.weight_bytes, result.index_bytes), (1024, 256));
+        assert_eq!(
+            core.local_memory.l0b().read_known(4096, 1024).unwrap(),
+            vec![0x42; 1024]
+        );
+        assert_eq!(
+            core.local_memory
+                .weight_index()
+                .read_initialized_linear(1024, 256)
+                .unwrap(),
+            vec![0xa5; 256]
+        );
+        assert!(core.pending_mte1_commands().next().is_none());
+        assert!(core.mte_pipeline().unwrap().is_idle());
+    }
+
+    #[test]
     fn grouped_transpose_runs_through_mte1_and_retires_captured_operands() {
         use crate::sim::c220::mte::mte1::C220Mte1TransferResult;
 

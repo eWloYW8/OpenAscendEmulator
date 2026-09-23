@@ -9,6 +9,7 @@ mod fsm_v1;
 mod layout;
 mod mmad;
 mod numeric;
+pub mod sparse;
 #[cfg(test)]
 mod tests;
 pub mod timing;

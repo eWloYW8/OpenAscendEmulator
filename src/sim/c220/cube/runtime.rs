@@ -1,9 +1,9 @@
 use crate::sim::c220::cube::{
     C220CubeConfig, C220CubeExecutionControl, C220CubeExecutionOutcome, C220CubeIssue,
     C220CubePipeline, C220CubeTicket, C220CubeTimingError, C220CubeUopRelease,
-    C220PreparedCubeExecution, update_cube_status_spr2,
+    update_cube_status_spr2,
 };
-use crate::sim::c220::memory::C220LocalMemory;
+use crate::sim::c220::memory::{C220LocalBuffer, C220LocalMemory};
 use crate::sim::c220::sync::C220HardwareFlagState;
 use crate::sim::common::scalar::ScalarMachine;
 
@@ -16,7 +16,12 @@ pub(in crate::sim::c220) struct CubeEngine {
 struct PendingCube {
     issue: C220CubeIssue,
     control: C220CubeExecutionControl,
-    prepared: Option<C220PreparedCubeExecution>,
+    prepared: Option<PreparedCube>,
+}
+
+struct PreparedCube {
+    outcome: C220CubeExecutionOutcome,
+    result_buffer: C220LocalBuffer,
 }
 
 impl CubeEngine {
@@ -66,23 +71,47 @@ impl CubeEngine {
             .advance_in_batch_to(tick, memory.l0c_mut(), flags)?;
         let releases = self.pipeline.last_uop_releases()[release_start..].to_vec();
         let retired = self.pipeline.last_retirements()[retirement_start..].to_vec();
-        self.prepare_released(&releases, memory)?;
+        self.execute_released(&releases, memory, machine)?;
         self.commit_retired(&retired, memory, machine)
     }
 
-    fn prepare_released(
+    fn execute_released(
         &mut self,
         releases: &[C220CubeUopRelease],
-        memory: &C220LocalMemory,
+        memory: &mut C220LocalMemory,
+        machine: &mut ScalarMachine,
     ) -> Result<(), C220CubeRuntimeError> {
-        for release in releases.iter().filter(|release| release.uop.id == 0) {
+        for release in releases {
             let pending = self
                 .pending
                 .iter_mut()
                 .find(|pending| pending.issue.instruction_id == release.instruction_id)
                 .ok_or(C220CubeTimingError::TicketMismatch)?;
             if pending.prepared.is_none() {
-                pending.prepared = Some(pending.issue.prepare(memory, pending.control)?);
+                let prepared = pending.issue.prepare(memory, pending.control)?;
+                let mut result_buffer = memory.l0c().buffer().clone();
+                prepared.commit_to_buffer(&mut result_buffer)?;
+                let spr2 =
+                    update_cube_status_spr2(machine.spr2(), pending.issue.pc, prepared.outcome);
+                machine.set_spr_value(2, spr2)?;
+                pending.prepared = Some(PreparedCube {
+                    outcome: prepared.outcome,
+                    result_buffer,
+                });
+            }
+            if let Some(request) = release.uop.l0c_write {
+                let bytes = pending
+                    .prepared
+                    .as_ref()
+                    .expect("prepared Cube result")
+                    .result_buffer
+                    .read_initialized_states_linear(request.address, usize::from(request.bytes))
+                    .map_err(super::C220CubeExecutionError::from)?;
+                memory
+                    .l0c_mut()
+                    .buffer_mut()
+                    .write_states_linear(request.address, &bytes)
+                    .map_err(super::C220CubeExecutionError::from)?;
             }
         }
         Ok(())
@@ -101,14 +130,17 @@ impl CubeEngine {
                 .position(|pending| pending.issue.ticket.accept_tick == ticket.accept_tick)
                 .ok_or(C220CubeTimingError::TicketMismatch)?;
             let pending = self.pending.remove(index);
-            let prepared = match pending.prepared {
-                Some(prepared) => prepared,
-                None => pending.issue.prepare(memory, pending.control)?,
+            let outcome = match pending.prepared {
+                Some(prepared) => prepared.outcome,
+                None => {
+                    let prepared = pending.issue.prepare(memory, pending.control)?;
+                    let outcome = prepared.outcome;
+                    prepared.commit(memory)?;
+                    let spr2 = update_cube_status_spr2(machine.spr2(), pending.issue.pc, outcome);
+                    machine.set_spr_value(2, spr2)?;
+                    outcome
+                }
             };
-            let outcome = prepared.outcome;
-            prepared.commit(memory)?;
-            let spr2 = update_cube_status_spr2(machine.spr2(), pending.issue.pc, outcome);
-            machine.set_spr_value(2, spr2)?;
             self.outcomes.push(outcome);
         }
         Ok(())

@@ -1,8 +1,8 @@
 use super::accumulator::C220CubeAccumulator;
 use super::execute::C220CubeWrite;
 use super::layout::{
-    f16_a_address, f16_b_address, f16_c_address, f32_a_address, f32_b_address, f32_c_address,
-    integer_a_element, integer_b_element, read_u8_wrapped, read_u16_wrapped, read_u32_wrapped,
+    f16_b_address, f16_c_address, f32_b_address, f32_c_address, integer_a_element,
+    integer_b_element, read_u8_wrapped, read_u16_wrapped, read_u32_wrapped,
 };
 use super::numeric::{
     F32SliceOutcome, evaluate_bf16_f32_slice, evaluate_f16_f16_slice, evaluate_f16_f32_slice,
@@ -12,7 +12,7 @@ use super::{
     C220CubeExecutionControl, C220CubeExecutionError, C220CubeExecutionOutcome, C220CubeFpStatus,
     C220CubeIssue, C220F32MmadMode, C220PreparedCubeExecution,
 };
-use crate::isa::c220::cube::{C220CubeDataType, C220CubeGeometry};
+use crate::isa::c220::cube::{C220CubeDataType, C220CubeGeometry, C220CubeOperation};
 use crate::sim::c220::memory::{C220LocalBuffer, C220LocalBufferError, C220LocalMemory};
 
 pub(super) fn prepare(
@@ -149,16 +149,23 @@ impl Mmad<'_> {
                 let k_tile = u64::from(self.geometry.k_tile_elements);
                 for lane in 0..self.active_lanes(k_base, k_tile) {
                     let k = k_base + lane;
-                    let left = input_mode.read(
-                        self.memory.l0a(),
-                        self.issue.parameters.xn,
-                        integer_a_element(u64::from(self.geometry.k_tiles), k_tile, m, k),
-                    )?;
-                    let right = input_mode.read(
-                        self.memory.l0b(),
-                        self.issue.parameters.xm,
-                        integer_b_element(u64::from(self.geometry.n_tiles), k_tile, k, n),
-                    )?;
+                    let (left, right) = if self.issue.instruction.operation
+                        == C220CubeOperation::SparseMmad
+                    {
+                        super::sparse::read_byte_pair(self.issue.parameters, self.memory, m, n, k)?
+                    } else {
+                        let left = input_mode.read(
+                            self.memory.l0a(),
+                            self.issue.parameters.xn,
+                            self.a_element(u64::from(self.geometry.k_tiles), k_tile, m, k),
+                        )?;
+                        let right = input_mode.read(
+                            self.memory.l0b(),
+                            self.issue.parameters.xm,
+                            integer_b_element(u64::from(self.geometry.n_tiles), k_tile, k, n),
+                        )?;
+                        (left, right)
+                    };
                     sum += input_mode.product(left, right);
                 }
                 let saturated = sum.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
@@ -174,6 +181,16 @@ impl Mmad<'_> {
         (u64::from(self.issue.parameters.effective_k) - k_base).min(width)
     }
 
+    fn a_element(&self, k_tiles: u64, k_tile: u64, m: u64, k: u64) -> u64 {
+        if self.issue.parameters.m == 1
+            && self.issue.instruction.operation == C220CubeOperation::Mmad
+        {
+            k
+        } else {
+            integer_a_element(k_tiles, k_tile, m, k)
+        }
+    }
+
     fn read_float16(
         &self,
         m: u64,
@@ -186,12 +203,10 @@ impl Mmad<'_> {
             let k = k_base + lane;
             left[lane as usize] = read_u16_wrapped(
                 self.memory.l0a(),
-                f16_a_address(
-                    self.issue.parameters.xn,
-                    u64::from(self.geometry.k_tiles),
-                    m,
-                    k,
-                ),
+                self.issue
+                    .parameters
+                    .xn
+                    .wrapping_add(2 * self.a_element(u64::from(self.geometry.k_tiles), 16, m, k)),
             )?;
             right[lane as usize] = read_u16_wrapped(
                 self.memory.l0b(),
@@ -214,16 +229,19 @@ impl Mmad<'_> {
     ) -> Result<([u32; N], [u32; N]), C220LocalBufferError> {
         let mut left = [0; N];
         let mut right = [0; N];
+        let a_k_tiles = if self.issue.parameters.xt_bit_58 {
+            2 * u64::from(self.issue.parameters.effective_k.div_ceil(16))
+        } else {
+            u64::from(self.geometry.k_tiles)
+        };
         for lane in 0..self.active_lanes(k_base, N as u64) {
             let k = k_base + lane;
             left[lane as usize] = read_u32_wrapped(
                 self.memory.l0a(),
-                f32_a_address(
-                    self.issue.parameters.xn,
-                    u64::from(self.geometry.k_tiles),
-                    m,
-                    k,
-                ),
+                self.issue
+                    .parameters
+                    .xn
+                    .wrapping_add(4 * self.a_element(a_k_tiles, 8, m, k)),
             )?;
             right[lane as usize] = read_u32_wrapped(
                 self.memory.l0b(),

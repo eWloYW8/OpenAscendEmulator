@@ -3,8 +3,10 @@ use std::num::NonZeroU32;
 
 use super::bias::{C220BtReadUop, C220BtRequestPlan};
 use super::load2d::{C220Load2dReadUop, C220Load2dRequestPlan};
+use super::sparse::{C220SparseOutput, C220SparseReadUop, C220SparseRequestPlan};
 use crate::isa::c220::mte::bias::C220BtTransfer;
 use crate::isa::c220::mte::load2d::{C220Load2dDestination, C220Load2dError, C220Load2dTransfer};
+use crate::isa::c220::mte::load2d_sparse::C220Load2dSparseTransfer;
 use crate::isa::c220::mte::load2d_transpose::C220Load2dTransposeTransfer;
 use crate::sim::c220::memory::l1::C220L1Access;
 use crate::sim::c220::mte::interface::{
@@ -47,6 +49,7 @@ pub struct C220Mte1ReadBandwidths {
 pub enum C220Mte1ReadTransfer {
     Load2d(C220Load2dTransfer),
     Load2dTranspose(C220Load2dTransposeTransfer),
+    Load2dSparse(C220Load2dSparseTransfer),
     Bt(C220BtTransfer),
 }
 
@@ -55,13 +58,16 @@ impl C220Mte1ReadTransfer {
         match self {
             Self::Load2d(transfer) => transfer.descriptor.repeat_count == 0,
             Self::Load2dTranspose(transfer) => transfer.repeat_count() == 0,
+            Self::Load2dSparse(transfer) => transfer.repeat_count() == 0,
             Self::Bt(transfer) => transfer.descriptor.is_empty(),
         }
     }
 
     pub const fn kind(self) -> C220Mte1ReadKind {
         match self {
-            Self::Load2d(_) | Self::Load2dTranspose(_) => C220Mte1ReadKind::Load2d,
+            Self::Load2d(_) | Self::Load2dTranspose(_) | Self::Load2dSparse(_) => {
+                C220Mte1ReadKind::Load2d
+            }
             Self::Bt(_) => C220Mte1ReadKind::Bt,
         }
     }
@@ -69,6 +75,7 @@ impl C220Mte1ReadTransfer {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1ReadUop {
+    Sparse(C220SparseReadUop),
     Load2d(C220Load2dReadUop),
     Bt(C220BtReadUop),
 }
@@ -89,6 +96,20 @@ impl C220Mte1ReadUop {
             completes_logical_uop,
             last_in_instruction,
         ) = match self {
+            Self::Sparse(uop) => (
+                uop.source_address,
+                uop.input_bytes,
+                if uop.output == C220SparseOutput::Weight {
+                    C220MteL1OutputDestination::L0b(C220L0WritePort::Port0)
+                } else {
+                    C220MteL1OutputDestination::SparseIndex
+                },
+                uop.destination_address,
+                uop.output_bytes,
+                bandwidths.l0b,
+                uop.output == C220SparseOutput::Weight && uop.completes_block,
+                uop.signals_completion,
+            ),
             Self::Bt(uop) => (
                 uop.source_address,
                 uop.input_bytes,
@@ -142,6 +163,7 @@ impl C220Mte1ReadUop {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Plan {
+    Sparse(C220SparseRequestPlan),
     Load2d(C220Load2dRequestPlan),
     Bt(C220BtRequestPlan),
 }
@@ -149,6 +171,7 @@ enum Plan {
 impl Plan {
     fn remaining(&self) -> u64 {
         match self {
+            Self::Sparse(plan) => plan.len() as u64,
             Self::Load2d(plan) => plan.len() as u64,
             Self::Bt(plan) => plan.remaining_requests(),
         }
@@ -156,6 +179,7 @@ impl Plan {
 
     fn next(&mut self) -> Option<C220Mte1ReadUop> {
         match self {
+            Self::Sparse(plan) => plan.next().map(C220Mte1ReadUop::Sparse),
             Self::Load2d(plan) => plan.next().map(C220Mte1ReadUop::Load2d),
             Self::Bt(plan) => plan.next().map(C220Mte1ReadUop::Bt),
         }
@@ -314,6 +338,9 @@ impl C220Mte1ReadFrontend {
             return Err(C220Mte1ReadFrontendError::CommandBusy);
         }
         let plan = match transfer {
+            C220Mte1ReadTransfer::Load2dSparse(transfer) => {
+                Plan::Sparse(C220SparseRequestPlan::new(transfer, self.access_width))
+            }
             C220Mte1ReadTransfer::Bt(transfer) => Plan::Bt(C220BtRequestPlan::new(
                 transfer,
                 self.bandwidths.bt,

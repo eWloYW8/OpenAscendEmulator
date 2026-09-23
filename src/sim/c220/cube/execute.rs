@@ -6,7 +6,7 @@ use super::layout::{
 use super::{C220CubeAccumulatorSource, C220CubeExecutionControl, C220CubeFpStatus, C220CubeIssue};
 use crate::isa::c220::cube::{C220CubeDataType, C220CubeOperation};
 use crate::memory::pv_memory::PvMemoryError;
-use crate::sim::c220::memory::{C220LocalBufferError, C220LocalMemory};
+use crate::sim::c220::memory::{C220LocalBuffer, C220LocalBufferError, C220LocalMemory};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CubeExecutionOutcome {
@@ -40,13 +40,20 @@ impl C220PreparedCubeExecution {
     }
 
     pub fn commit(self, memory: &mut C220LocalMemory) -> Result<(), C220CubeExecutionError> {
-        for write in self.writes {
+        self.commit_to_buffer(memory.l0c_mut().buffer_mut())
+    }
+
+    pub(super) fn commit_to_buffer(
+        &self,
+        buffer: &mut C220LocalBuffer,
+    ) -> Result<(), C220CubeExecutionError> {
+        for &write in &self.writes {
             match write {
                 C220CubeWrite::U16 { address, value } => {
-                    write_u16_wrapped(memory.l0c_mut().buffer_mut(), address, value)?;
+                    write_u16_wrapped(buffer, address, value)?;
                 }
                 C220CubeWrite::U32 { address, value } => {
-                    write_u32_wrapped(memory.l0c_mut().buffer_mut(), address, value)?;
+                    write_u32_wrapped(buffer, address, value)?;
                 }
             }
         }
@@ -85,6 +92,10 @@ pub enum C220CubeExecutionError {
     UnsupportedOperation(C220CubeOperation),
     #[error("functional Cube execution does not yet support {0:?}")]
     UnsupportedDataType(C220CubeDataType),
+    #[error(
+        "sparse selector addresses dense K={dense_k} outside the {loaded_k} loaded input lanes"
+    )]
+    SparseInputOutsideLoadedTiles { dense_k: u64, loaded_k: u64 },
     #[error("functional MMAD does not support XT controls 44:50={bits_44_50:#x}, bit58={bit_58}")]
     UnsupportedControl { bits_44_50: u8, bit_58: bool },
     #[error(transparent)]
@@ -166,12 +177,19 @@ impl C220CubeIssue {
     }
 
     fn validate_functional_mode(self) -> Result<(), C220CubeExecutionError> {
-        if self.instruction.operation != C220CubeOperation::Mmad {
+        if self.instruction.operation == C220CubeOperation::SparseMmad
+            && !matches!(
+                self.instruction.data_type,
+                C220CubeDataType::S8S8S32 | C220CubeDataType::U8U8S32 | C220CubeDataType::U8S8S32
+            )
+        {
             return Err(C220CubeExecutionError::UnsupportedOperation(
                 self.instruction.operation,
             ));
         }
-        if self.parameters.xt_bits_44_50 != 0 || self.parameters.xt_bit_58 {
+        if self.parameters.xt_bits_44_50 != 0
+            || (self.parameters.xt_bit_58 && self.instruction.data_type != C220CubeDataType::F32F32)
+        {
             return Err(C220CubeExecutionError::UnsupportedControl {
                 bits_44_50: self.parameters.xt_bits_44_50,
                 bit_58: self.parameters.xt_bit_58,

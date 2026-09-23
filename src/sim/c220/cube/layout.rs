@@ -6,22 +6,10 @@ pub(super) const F32_INPUT_K_TILE: u64 = 8;
 pub(super) const F32_INPUT_TILE_BYTES: u64 = 512;
 pub(super) const F32_TILE_BYTES: u64 = 1024;
 
-pub(super) fn f16_a_address(base: u64, k_tiles: u64, m: u64, k: u64) -> u64 {
-    let tile = (m / TILE_EDGE) * k_tiles + k / TILE_EDGE;
-    let lane = (m % TILE_EDGE) * TILE_EDGE + k % TILE_EDGE;
-    base.wrapping_add(tile * F16_TILE_BYTES + lane * 2)
-}
-
 pub(super) fn f16_b_address(base: u64, n_tiles: u64, k: u64, n: u64) -> u64 {
     let tile = (k / TILE_EDGE) * n_tiles + n / TILE_EDGE;
     let lane = (n % TILE_EDGE) * TILE_EDGE + k % TILE_EDGE;
     base.wrapping_add(tile * F16_TILE_BYTES + lane * 2)
-}
-
-pub(super) fn f32_a_address(base: u64, k_tiles: u64, m: u64, k: u64) -> u64 {
-    let tile = (m / TILE_EDGE) * k_tiles + k / F32_INPUT_K_TILE;
-    let lane = (m % TILE_EDGE) * F32_INPUT_K_TILE + k % F32_INPUT_K_TILE;
-    base.wrapping_add(tile * F32_INPUT_TILE_BYTES + lane * 4)
 }
 
 pub(super) fn f32_b_address(base: u64, n_tiles: u64, k: u64, n: u64) -> u64 {

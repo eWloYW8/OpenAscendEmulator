@@ -4,6 +4,8 @@ use super::{C220L0WritePort, C220MteOutputFragment, C220MteOutputPlan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220MteL1OutputDestination {
+    /// Read-only timing sink; index responses do not generate output fragments.
+    SparseIndex,
     Bt,
     L0a(C220L0WritePort),
     L0b(C220L0WritePort),
@@ -18,6 +20,7 @@ pub struct C220MteL1OutputCredits {
 impl C220MteL1OutputCredits {
     fn permits(self, destination: C220MteL1OutputDestination) -> bool {
         match destination {
+            C220MteL1OutputDestination::SparseIndex => false,
             C220MteL1OutputDestination::Bt => true,
             C220MteL1OutputDestination::L0a(port) => self.l0a[port as usize],
             C220MteL1OutputDestination::L0b(port) => self.l0b[port as usize],

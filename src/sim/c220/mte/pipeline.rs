@@ -1167,7 +1167,8 @@ impl C220MtePipeline {
                                 let target = match sent.destination {
                                     C220MteL1OutputDestination::L0a(port) => Some((0, port)),
                                     C220MteL1OutputDestination::L0b(port) => Some((1, port)),
-                                    C220MteL1OutputDestination::Bt => None,
+                                    C220MteL1OutputDestination::Bt
+                                    | C220MteL1OutputDestination::SparseIndex => None,
                                 };
                                 if let Some((index, port)) = target {
                                     assert!(self.l0[index].push(tick, port, sent.fragment)?);

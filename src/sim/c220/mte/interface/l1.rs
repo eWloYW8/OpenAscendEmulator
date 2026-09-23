@@ -336,6 +336,7 @@ impl<T: Copy> C220MteL1Interface<T> {
             self.inputs[index].front().map(|entry| C220MteL1ReadHead {
                 ready_tick: entry.ready_tick,
                 destination: match entry.request.operation.destination {
+                    C220MteL1OutputDestination::SparseIndex => C220MteL1ReadDestination::Sp,
                     C220MteL1OutputDestination::Bt => C220MteL1ReadDestination::Bt,
                     C220MteL1OutputDestination::L0a(_) => C220MteL1ReadDestination::L0a,
                     C220MteL1OutputDestination::L0b(_) => C220MteL1ReadDestination::L0b,
