@@ -6,6 +6,211 @@ use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadTransfer;
 use std::collections::BTreeMap;
 
 #[test]
+fn fixp_write_runs_on_shared_clock_and_retires_after_contended_response() {
+    use crate::sim::c220::mte::interface::C220MteOutputFragment;
+    let width = NonZeroU32::new(32).unwrap();
+    let mut pipeline = C220MtePipeline::new(
+        0,
+        C220MtePipelineConfig {
+            l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
+            read_width: width,
+            output_bandwidths: C220Mte1ReadBandwidths {
+                l0a: width,
+                l0b: width,
+                bt: width,
+            },
+            set2d_bandwidths: C220Set2dBandwidths {
+                l0a: width,
+                l0b: width,
+                l1: width,
+            },
+        },
+    );
+    let fragment = C220MteOutputFragment {
+        instruction_id: 71,
+        request_id: 9,
+        destination_address: 0,
+        bytes: 32,
+        last_in_uop: true,
+        last_in_instruction: true,
+    };
+    pipeline.enqueue_fixp_l1_write(fragment).unwrap();
+    assert!(
+        pipeline
+            .write_interface
+            .push(
+                0,
+                C220MteL1WritePort::Port1,
+                C220MteOutputFragment {
+                    instruction_id: 72,
+                    ..fragment
+                }
+            )
+            .unwrap()
+    );
+    let mut response_tick = None;
+    let mut completed = Vec::new();
+    let mut other_completed = Vec::new();
+    let mut contended = false;
+    for tick in 0..30 {
+        pipeline.advance(tick).unwrap();
+        for event in pipeline.last_events() {
+            match event {
+                C220MtePipelineEvent::Memory(C220L1EventOutcome::Received(cycle)) => {
+                    if let (Some(fixp), Some(mte)) = (cycle.decisions[0], cycle.decisions[1]) {
+                        contended |= fixp.granted && !mte.granted;
+                    }
+                }
+                C220MtePipelineEvent::FixpWrite(C220FixpL1WriteEvent::Response(Some(request))) => {
+                    assert_eq!(request.fragment, fragment);
+                    assert!(response_tick.replace(tick).is_none());
+                }
+                _ => {}
+            }
+        }
+        for &id in pipeline.fixp_completions() {
+            assert_eq!(tick, response_tick.unwrap() + 1);
+            completed.push(id);
+        }
+        other_completed.extend_from_slice(pipeline.l1_fill_completions());
+        if pipeline.is_idle() {
+            break;
+        }
+    }
+    assert!(contended && pipeline.is_idle());
+    assert_eq!(completed, [71]);
+    assert_eq!(other_completed, [72]);
+}
+
+#[test]
+fn fixp_engine_executes_from_read_acceptance_and_drains_through_shared_l1() {
+    use crate::isa::c220::mte::fixp::C220FixpDescriptor;
+    use crate::sim::c220::memory::{C220L0c, C220LocalBuffer};
+    use crate::sim::c220::mte::fixp::{C220FixpEngine, C220FixpEngineConfig, C220FixpFp16Command};
+    use crate::sim::c220::mte::fixp::{C220FixpSyncPoint, C220FixpSyncRequest};
+    #[derive(Default)]
+    struct Sync {
+        requests: Vec<C220FixpSyncRequest>,
+    }
+    impl C220FixpSync for Sync {
+        fn blocked(&mut self, request: C220FixpSyncRequest) -> bool {
+            let first = !self.requests.iter().any(|r| r.point == request.point);
+            self.requests.push(request);
+            first
+        }
+    }
+    let mut sync = Sync::default();
+    let width = NonZeroU32::new(32).unwrap();
+    let mut pipeline = C220MtePipeline::new(
+        0,
+        C220MtePipelineConfig {
+            l1: C220L1Geometry::new(32, 16, 2, 9).unwrap(),
+            read_width: width,
+            output_bandwidths: C220Mte1ReadBandwidths {
+                l0a: width,
+                l0b: width,
+                bt: width,
+            },
+            set2d_bandwidths: C220Set2dBandwidths {
+                l0a: width,
+                l0b: width,
+                l1: width,
+            },
+        },
+    );
+    let mut engine = C220FixpEngine::new(C220FixpEngineConfig {
+        read_bandwidth: 256,
+        read_bank_count: 32,
+        read_data_latency: 4,
+        l0c_capacity: 131072,
+    })
+    .unwrap();
+    let mut l0c = C220L0c::new(131072, 12).unwrap();
+    l0c.buffer_mut()
+        .write_known_linear(0, &1.5_f32.to_le_bytes().repeat(128))
+        .unwrap();
+    let slopes = C220LocalBuffer::new(4096);
+    let mut l1 = C220LocalBuffer::new(1048576);
+    let command = C220FixpFp16Command {
+        descriptor: C220FixpDescriptor {
+            xt: (8 << 16) | (16 << 4),
+            xm: 1 << 34,
+            nd: 0,
+        },
+        source_address: 0,
+        destination_address: 0,
+        control: 0,
+        scalar_slope: 0,
+        slope_base_block: 0,
+    };
+    engine.admit(0, 71, 1, command).unwrap();
+    use C220FixpStage::*;
+    pipeline
+        .bind_fixp_stages(&[
+            GenerateRead,
+            SendRead,
+            SendL0c,
+            ReceiveL0c,
+            Convert,
+            Slice,
+            Packetize,
+            GenerateWrite,
+            SendWrite,
+        ])
+        .unwrap();
+    let mut executed = None;
+    let mut retired = None;
+    for tick in 0..100 {
+        pipeline
+            .advance_fixp(
+                tick,
+                &mut engine,
+                C220FixpMemory {
+                    l0c: &mut l0c,
+                    slopes: &slopes,
+                    l1: &mut l1,
+                },
+                &mut sync,
+            )
+            .unwrap();
+        for &id in pipeline.fixp_completions() {
+            assert_eq!(id, 71);
+            assert!(!engine.commands().contains_key(&id));
+            assert!(executed.unwrap() < tick);
+            retired = Some(tick);
+        }
+        if pipeline.last_events().iter().any(|event| matches!(event,
+            C220MtePipelineEvent::Fixp(C220FixpEvent::ReceivedL0c { functional: Some(event), .. }) if event.executed
+        )) {
+            assert!(executed.replace(tick).is_none());
+            assert!(retired.is_none());
+            assert_eq!(
+                l1.read_known(0, 256).unwrap(),
+                0x3e00_u16.to_le_bytes().repeat(128)
+            );
+        }
+        if engine.is_idle() && pipeline.is_idle() {
+            break;
+        }
+    }
+    assert!(executed.is_some() && retired.is_some());
+    assert!(engine.is_idle() && pipeline.is_idle());
+    assert!(sync.requests.iter().all(|r| r.instruction_id == 71));
+    for (point, retry_delay) in [
+        (C220FixpSyncPoint::ReadWait, 1),
+        (C220FixpSyncPoint::ConversionSet, 4),
+        (C220FixpSyncPoint::WriteWait, 1),
+    ] {
+        let attempts: Vec<_> = sync.requests.iter().filter(|r| r.point == point).collect();
+        assert!(attempts.len() >= 2);
+        assert_eq!(attempts[1].tick - attempts[0].tick, retry_delay);
+        if point == C220FixpSyncPoint::ConversionSet {
+            assert_eq!(attempts.len(), 2);
+        }
+    }
+}
+
+#[test]
 fn biu_write_waits_for_dbid_and_all_source_packets_before_data_transport() {
     use crate::sim::c220::mte::interface::biu_write::C220BiuWriteSourceRequest;
     let width = NonZeroU32::new(32).unwrap();

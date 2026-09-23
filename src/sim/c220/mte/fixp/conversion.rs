@@ -1,3 +1,4 @@
+use super::{C220FixpSync, C220FixpSyncPoint, C220FixpSyncRequest};
 use std::collections::VecDeque;
 
 use crate::sim::c220::memory::C220L0cError;
@@ -61,7 +62,7 @@ impl C220FixpConversionPipeline {
         &mut self,
         tick: u64,
         input: &mut C220MteL0cReadInterface,
-        hardware_sync_blocked: bool,
+        mut sync: impl C220FixpSync,
     ) -> Result<C220FixpConversionReceive, C220FixpConversionError> {
         self.check_time(tick)?;
         let mut result = C220FixpConversionReceive::AwaitingRead;
@@ -78,7 +79,13 @@ impl C220FixpConversionPipeline {
             let ready_tick = tick
                 .checked_add(u64::from(conversion_ticks))
                 .ok_or(C220L0cError::TimeOverflow)?;
-            if acknowledgment.operation.last_in_instruction && hardware_sync_blocked {
+            if acknowledgment.operation.last_in_instruction
+                && sync.blocked(C220FixpSyncRequest {
+                    tick,
+                    instruction_id: acknowledgment.operation.instruction_id,
+                    point: C220FixpSyncPoint::ConversionSet,
+                })
+            {
                 result = C220FixpConversionReceive::HardwareSync {
                     retry_tick: ready_tick,
                 };
@@ -144,6 +151,7 @@ mod tests {
             .send(
                 tick,
                 C220MteL0cReadOperation {
+                    begins_unit: true,
                     instruction_id: tick,
                     uop_id: tick as u32,
                     conversion_mode: mode,

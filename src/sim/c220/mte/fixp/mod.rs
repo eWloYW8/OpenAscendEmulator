@@ -1,11 +1,29 @@
 mod conversion;
+mod events;
 mod execute;
+pub use events::{
+    C220FixpCallback, C220FixpEvent, C220FixpGates, C220FixpMemory, C220FixpResources,
+    C220FixpStage, C220FixpStageEvents,
+};
 mod fp16;
+mod functional;
+pub use functional::{C220FixpFunctionalEvent, C220FixpFunctionalState};
 mod l1_output;
 mod l1_write;
 mod layout;
 mod read_pipeline;
 mod read_uop;
+mod runtime;
+mod sync;
+pub use runtime::{
+    C220FixpCommandState, C220FixpEngine, C220FixpEngineConfig, C220FixpEngineError,
+};
+pub use sync::{C220FixpSync, C220FixpSyncPoint, C220FixpSyncRequest};
+mod write_pipeline;
+
+pub use write_pipeline::{
+    C220FixpWriteEntry, C220FixpWritePipeline, C220FixpWritePipelineError, C220FixpWriteProgress,
+};
 
 pub use read_pipeline::{
     C220FixpReadEntry, C220FixpReadEventOutcome, C220FixpReadEvents, C220FixpReadPipeline,
@@ -20,8 +38,8 @@ pub use layout::{C220FixpFp16Layout, C220FixpLayoutError, C220FixpSlice};
 pub use fp16::{C220FixpActivation, C220FixpFp16Conversion, C220FixpFp16Error, C220FixpFp16Result};
 pub use l1_output::{C220FixpL1Burst, C220FixpL1Output, C220FixpL1OutputError};
 pub use l1_write::{
-    C220FixpL1WriteEntry, C220FixpL1WriteError, C220FixpL1WriteInterface, C220FixpL1WriteRequest,
-    C220FixpL1WriteSend,
+    C220FixpL1WriteCallback, C220FixpL1WriteEntry, C220FixpL1WriteError, C220FixpL1WriteEvent,
+    C220FixpL1WriteEvents, C220FixpL1WriteInterface, C220FixpL1WriteRequest, C220FixpL1WriteSend,
 };
 
 pub use conversion::{

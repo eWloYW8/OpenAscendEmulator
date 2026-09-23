@@ -6,7 +6,6 @@ use crate::sim::c220::mte::interface::C220MteL0cReadOperation;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220FixpReadUop {
     pub operation: C220MteL0cReadOperation,
-    pub begins_unit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -88,6 +87,7 @@ impl Iterator for C220FixpReadGenerator {
         let begins_unit = address.is_multiple_of(1024) || self.source_offset == 0;
         let end_of_burst = self.source_offset + data_bytes == column_bytes;
         let operation = C220MteL0cReadOperation {
+            begins_unit,
             instruction_id: self.instruction_id,
             uop_id: self.next_id,
             conversion_mode: 1,
@@ -126,10 +126,7 @@ impl Iterator for C220FixpReadGenerator {
             self.source_offset += data_bytes;
             self.destination_offset += output_bytes;
         }
-        Some(C220FixpReadUop {
-            operation,
-            begins_unit,
-        })
+        Some(C220FixpReadUop { operation })
     }
 }
 
@@ -165,7 +162,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [128, 256, 256, 256, 256, 128, 128, 256, 256, 256, 256, 128]
         );
-        assert_eq!(packets.iter().filter(|p| p.begins_unit).count(), 4);
+        assert_eq!(
+            packets.iter().filter(|p| p.operation.begins_unit).count(),
+            4
+        );
         assert_eq!(
             packets
                 .iter()

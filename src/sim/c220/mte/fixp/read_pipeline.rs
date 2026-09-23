@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 use std::iter::Peekable;
 
-use super::{C220FixpReadGenerator, C220FixpReadUop};
+use super::{
+    C220FixpReadGenerator, C220FixpReadUop, C220FixpSync, C220FixpSyncPoint, C220FixpSyncRequest,
+};
 use crate::sim::c220::mte::interface::{C220MteL0cReadError, C220MteL0cReadInterface};
 
 mod events;
@@ -123,7 +125,7 @@ impl C220FixpReadPipeline {
         &mut self,
         tick: u64,
         input: &mut C220MteL0cReadInterface,
-        hardware_sync_blocked: bool,
+        mut sync: impl C220FixpSync,
     ) -> Result<C220FixpReadProgress, C220FixpReadPipelineError> {
         self.begin(tick, 1, "send")?;
         let Some(entry) = self.dispatch.front().copied() else {
@@ -137,7 +139,11 @@ impl C220FixpReadPipeline {
         if !input.can_enqueue() {
             return Ok(C220FixpReadProgress::QueueFull);
         }
-        if hardware_sync_blocked {
+        if sync.blocked(C220FixpSyncRequest {
+            tick,
+            instruction_id: entry.uop.operation.instruction_id,
+            point: C220FixpSyncPoint::ReadWait,
+        }) {
             return Ok(C220FixpReadProgress::HardwareSync);
         }
         if !input.enqueue(tick, entry.uop.operation)? {

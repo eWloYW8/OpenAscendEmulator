@@ -5,6 +5,9 @@ use crate::sim::c220::memory::l1::{
 };
 use crate::sim::c220::mte::interface::C220MteOutputFragment;
 
+mod events;
+pub use events::{C220FixpL1WriteCallback, C220FixpL1WriteEvent, C220FixpL1WriteEvents};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220FixpL1WriteEntry {
     pub ready_tick: u64,
@@ -46,7 +49,7 @@ pub enum C220FixpL1WriteError {
 /// contend. Sending never completes an instruction; only returned responses
 /// enter the one-tick retirement queue. This interface moves timing metadata,
 /// not numerical bytes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220FixpL1WriteInterface {
     input: VecDeque<C220FixpL1WriteEntry>,
     outstanding: BTreeMap<u64, C220FixpL1WriteRequest>,

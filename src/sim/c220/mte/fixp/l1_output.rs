@@ -131,11 +131,55 @@ impl C220FixpL1Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::c220::mte::fixp::{
+        C220FixpL1WriteInterface, C220FixpWritePipeline, C220FixpWriteProgress,
+    };
     use crate::sim::c220::{
         cube::C220CubeL0cAccess,
         memory::{C220L0c, C220L0cFragmentRequest, C220L0cReadRequest},
         mte::interface::{C220MteL0cReadInterface, C220MteL0cReadOperation},
     };
+
+    #[test]
+    fn write_pipeline_preserves_tail_across_dispatch_backpressure() {
+        let mut output = C220FixpL1Output::default();
+        output.bursts.push_back(C220FixpL1Burst {
+            instruction_id: 1,
+            request_id: 2,
+            address: 4096,
+            bytes: 8 * 256 + 32,
+            closed: true,
+            last_in_instruction: true,
+            ready_tick: 0,
+        });
+        let mut pipeline = C220FixpWritePipeline::default();
+        let mut interface = C220FixpL1WriteInterface::default();
+        for tick in 0..10 {
+            pipeline.packetize(tick, &mut output).unwrap();
+            pipeline.generate(tick).unwrap();
+            pipeline.send(tick, &mut interface, true).unwrap();
+        }
+        assert!(output.bursts().is_empty());
+        assert_eq!(pipeline.dispatch_queue().len(), 6);
+        assert_eq!(pipeline.packets().len(), 3);
+        assert!(interface.is_idle());
+        for tick in 10..20 {
+            pipeline.send(tick, &mut interface, false).unwrap();
+            pipeline.generate(tick).unwrap();
+        }
+        assert!(pipeline.is_idle());
+        assert_eq!(interface.input().len(), 9);
+        for (index, entry) in interface.input().iter().enumerate() {
+            assert_eq!(entry.ready_tick, 11 + index as u64);
+            assert_eq!(
+                entry.fragment.destination_address,
+                4096 + index as u64 * 256
+            );
+            assert_eq!(entry.fragment.bytes, if index == 8 { 32 } else { 256 });
+            assert_eq!(entry.fragment.last_in_instruction, index == 8);
+        }
+        assert_eq!(pipeline.generate(20).unwrap(), C220FixpWriteProgress::Idle);
+    }
 
     #[test]
     fn merges_converted_slices_and_preserves_write_backpressure_and_tail() {
@@ -148,6 +192,7 @@ mod tests {
                 .send(
                     tick,
                     C220MteL0cReadOperation {
+                        begins_unit: true,
                         instruction_id: 42,
                         uop_id: tick as u32,
                         conversion_mode: 0,

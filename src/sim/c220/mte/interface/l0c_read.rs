@@ -4,6 +4,8 @@ use crate::sim::c220::memory::{C220L0c, C220L0cError, C220L0cReadBlock, C220L0cR
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220MteL0cReadOperation {
+    /// Capture a 1024-byte functional snapshot when this read is accepted.
+    pub begins_unit: bool,
     pub instruction_id: u64,
     pub uop_id: u32,
     pub conversion_mode: u32,
@@ -322,6 +324,7 @@ mod tests {
 
     fn operation(id: u32, check_unit_flags: bool) -> C220MteL0cReadOperation {
         C220MteL0cReadOperation {
+            begins_unit: true,
             instruction_id: 10,
             uop_id: id,
             conversion_mode: 0,

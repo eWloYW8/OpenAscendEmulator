@@ -2,6 +2,14 @@ use super::dma::{
     C220DmaEventOutcome, C220DmaEvents, C220DmaFrontend, C220DmaFrontendError, C220DmaGenerated,
     C220DmaIssue,
 };
+use super::fixp::{
+    C220FixpCallback, C220FixpEngine, C220FixpEvent, C220FixpMemory, C220FixpResources,
+    C220FixpSliceResult, C220FixpStage, C220FixpStageEvents, C220FixpSync,
+};
+use super::fixp::{
+    C220FixpL1WriteCallback, C220FixpL1WriteError, C220FixpL1WriteEvent, C220FixpL1WriteEvents,
+    C220FixpL1WriteInterface,
+};
 use super::interface::biu_read::returns::{
     C220BiuReadBeat, C220BiuReadReturns, C220BiuReturnCallback, C220BiuReturnError,
     C220BiuReturnEvent, C220BiuReturnEvents,
@@ -76,6 +84,8 @@ pub struct C220MtePipelineConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Callback {
+    Fixp(usize, C220FixpCallback),
+    FixpWrite(C220FixpL1WriteCallback),
     Memory(C220L1Callback),
     Interface(C220MteL1Callback),
     L1Write(C220MteL1WriteCallback),
@@ -95,6 +105,9 @@ enum Callback {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220MtePipelineEvent {
+    Fixp(C220FixpEvent),
+    FixpSlice(C220FixpSliceResult),
+    FixpWrite(C220FixpL1WriteEvent),
     Memory(C220L1EventOutcome),
     Interface(C220MteL1EventOutcome<C220Mte1ReadUop>),
     L1Write(C220MteL1WriteEventOutcome),
@@ -122,6 +135,16 @@ pub enum C220MtePipelineEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220MtePipelineError {
+    #[error("FIX event binding requires each of the nine stages exactly once")]
+    InvalidFixpStages,
+    #[error("FIX events are already bound or the pipeline is active")]
+    FixpBindingBusy,
+    #[error("FIX event binding and execution context must both be present")]
+    FixpContextMismatch,
+    #[error(transparent)]
+    FixpEngine(#[from] super::fixp::C220FixpEngineError),
+    #[error(transparent)]
+    FixpWrite(#[from] C220FixpL1WriteError),
     #[error("the connected memory service owns BIU read traffic")]
     MemoryOwnedRead,
     #[error(transparent)]
@@ -224,6 +247,10 @@ mod write;
 /// destination acknowledgment, not a prediction made at command admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220MtePipeline {
+    fixp_events: Vec<C220FixpStageEvents>,
+    fixp_write: C220FixpL1WriteInterface,
+    fixp_write_events: C220FixpL1WriteEvents,
+    fixp_completions: Vec<u64>,
     events: EventDispatcher<Callback>,
     clock: EventId,
     memory_events: C220L1Events,
@@ -281,6 +308,8 @@ impl C220MtePipeline {
         let mut events = EventDispatcher::new(tick);
         let clock = events.add_event();
         let memory_events = C220L1Events::register(&mut events, clock, Callback::Memory);
+        let fixp_write_events =
+            C220FixpL1WriteEvents::register(&mut events, clock, Callback::FixpWrite);
         let interface_events = C220MteL1Events::register(&mut events, clock, Callback::Interface);
         let write_events = C220MteL1WriteEvents::register(&mut events, clock, Callback::L1Write);
         let l0_events = [false, true].map(|b| {
@@ -312,6 +341,10 @@ impl C220MtePipeline {
             valid
         });
         Self {
+            fixp_events: Vec::new(),
+            fixp_write: C220FixpL1WriteInterface::default(),
+            fixp_write_events,
+            fixp_completions: Vec::new(),
             events,
             clock,
             memory_events,
@@ -389,7 +422,8 @@ impl C220MtePipeline {
         self.selected_generator
     }
     pub fn is_idle(&self) -> bool {
-        self.generators.iter().all(C220Mte1ReadFrontend::is_idle)
+        self.fixp_write.is_idle()
+            && self.generators.iter().all(C220Mte1ReadFrontend::is_idle)
             && self.set2d.is_idle()
             && self.set2d_l1.is_idle()
             && self.dma.is_idle()
@@ -437,6 +471,11 @@ impl C220MtePipeline {
     pub fn next_event_tick(&self) -> Option<u64> {
         (!self.is_idle()).then(|| self.events.tick().saturating_add(1))
     }
+
+    /// Include the borrowed engine even before it emits its first L1 request.
+    pub fn next_fixp_event_tick(&self, engine: &C220FixpEngine) -> Option<u64> {
+        (!self.is_idle() || !engine.is_idle()).then(|| self.events.tick().saturating_add(1))
+    }
     pub fn generator(&self, kind: C220Mte1ReadKind) -> &C220Mte1ReadFrontend {
         &self.generators[kind.index()]
     }
@@ -448,6 +487,64 @@ impl C220MtePipeline {
     }
     pub fn l1_write_interface(&self) -> &C220MteL1WriteInterface {
         &self.write_interface
+    }
+
+    pub fn fixp_write_interface(&self) -> &C220FixpL1WriteInterface {
+        &self.fixp_write
+    }
+
+    /// Physical write-interface boundary. The producer must already have
+    /// completed its output-generation queues and hardware-sync gate.
+    pub fn enqueue_fixp_l1_write(
+        &mut self,
+        fragment: super::interface::C220MteOutputFragment,
+    ) -> Result<(), C220MtePipelineError> {
+        self.fixp_write.enqueue(self.events.tick(), fragment)?;
+        Ok(())
+    }
+
+    pub fn fixp_completions(&self) -> &[u64] {
+        &self.fixp_completions
+    }
+
+    /// Bind the explicit FIX stage order selected by the owning scheduler.
+    /// Existing memory and interface subscribers retain their positions.
+    pub fn bind_fixp_stages(
+        &mut self,
+        stages: &[C220FixpStage],
+    ) -> Result<(), C220MtePipelineError> {
+        if !self.fixp_events.is_empty() || !self.is_idle() {
+            return Err(C220MtePipelineError::FixpBindingBusy);
+        }
+        if stages.len() != 9
+            || stages
+                .iter()
+                .enumerate()
+                .any(|(index, stage)| stages[..index].contains(stage))
+        {
+            return Err(C220MtePipelineError::InvalidFixpStages);
+        }
+        for (index, &stage) in stages.iter().enumerate() {
+            self.fixp_events.push(C220FixpStageEvents::register(
+                &mut self.events,
+                self.clock,
+                stage,
+                |phase| Callback::Fixp(index, phase),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn send_fixp_output(
+        &mut self,
+        engine: &mut super::fixp::C220FixpEngine,
+        hardware_sync_blocked: bool,
+    ) -> Result<super::fixp::C220FixpWriteProgress, C220MtePipelineError> {
+        Ok(engine.send_write(
+            self.events.tick(),
+            &mut self.fixp_write,
+            hardware_sync_blocked,
+        )?)
     }
     pub fn l1_fill_completions(&self) -> &[u64] {
         &self.l1_fill_completions
@@ -812,10 +909,38 @@ impl C220MtePipeline {
     /// The owner supplies every active clock tick and consumes completions
     /// before advancing again. Idle intervals may be skipped.
     pub fn advance(&mut self, tick: u64) -> Result<(), C220MtePipelineError> {
+        self.advance_inner(tick, None)
+    }
+
+    pub fn advance_fixp(
+        &mut self,
+        tick: u64,
+        engine: &mut C220FixpEngine,
+        memory: C220FixpMemory<'_>,
+        mut gates: impl C220FixpSync,
+    ) -> Result<(), C220MtePipelineError> {
+        self.advance_inner(tick, Some((engine, memory, &mut gates)))
+    }
+
+    fn advance_inner(
+        &mut self,
+        tick: u64,
+        mut fixp: Option<(
+            &mut C220FixpEngine,
+            C220FixpMemory<'_>,
+            &mut dyn C220FixpSync,
+        )>,
+    ) -> Result<(), C220MtePipelineError> {
+        if self.fixp_events.is_empty() == fixp.is_some() {
+            return Err(C220MtePipelineError::FixpContextMismatch);
+        }
         if self.last_advance == Some(tick) {
             return Ok(());
         }
-        if !self.is_idle()
+        if (!self.is_idle()
+            || fixp
+                .as_ref()
+                .is_some_and(|(engine, _, _)| !engine.is_idle()))
             && let Some(expected) = self.events.tick().checked_add(1)
             && tick > expected
         {
@@ -826,6 +951,7 @@ impl C220MtePipeline {
         }
         self.events.advance_to(tick)?;
         self.completions.clear();
+        self.fixp_completions.clear();
         self.l1_fill_completions.clear();
         self.dma_completions.clear();
         self.trace.clear();
@@ -837,6 +963,47 @@ impl C220MtePipeline {
         self.events.notify_at(self.clock, tick);
         while let Some(invocation) = self.events.next_callback() {
             match invocation.callback {
+                Callback::Fixp(index, phase) => {
+                    let (engine, memory, gates) = fixp.as_mut().expect("validated FIX context");
+                    let outcome = self.fixp_events[index].handle(
+                        phase,
+                        &mut self.events,
+                        engine,
+                        C220FixpResources {
+                            l0c: memory.l0c,
+                            slopes: memory.slopes,
+                            l1: memory.l1,
+                            writer: &mut self.fixp_write,
+                            gates: &mut **gates,
+                        },
+                        |slice| {
+                            self.trace
+                                .push(C220MtePipelineEvent::FixpSlice(slice.clone()))
+                        },
+                    )?;
+                    if outcome != C220FixpEvent::Readiness {
+                        self.trace.push(C220MtePipelineEvent::Fixp(outcome));
+                    }
+                }
+                Callback::FixpWrite(phase) => {
+                    let outcome = self.fixp_write_events.handle(
+                        phase,
+                        &mut self.events,
+                        &mut self.fixp_write,
+                        &mut self.memory,
+                    )?;
+                    if let C220FixpL1WriteEvent::Acknowledged(Some(entry)) = outcome
+                        && entry.fragment.last_in_instruction
+                    {
+                        self.fixp_completions.push(entry.fragment.instruction_id);
+                        if let Some((engine, _, _)) = fixp.as_mut() {
+                            engine.retire(entry.fragment.instruction_id)?;
+                        }
+                    }
+                    if outcome != C220FixpL1WriteEvent::Readiness {
+                        self.trace.push(C220MtePipelineEvent::FixpWrite(outcome));
+                    }
+                }
                 Callback::BiuWriteSource(index) => {
                     if let Some(source) = &mut self.biu_write_source[index] {
                         if let Some(tag) = source.starting_source(tick)
