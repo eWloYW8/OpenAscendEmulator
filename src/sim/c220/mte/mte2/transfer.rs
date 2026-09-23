@@ -1,5 +1,6 @@
 use crate::architecture::Architecture;
 use crate::isa::c220::mte::C220MovInstruction;
+use crate::isa::c220::mte::out_to_l1::{C220L1DmaDescriptor, C220MovOutToL1Instruction};
 use crate::isa::c220::mte::{C220MovOutToUbDescriptor, C220MovOutToUbError, C220MovOutToUbSegment};
 use crate::memory::mapped::MappedMemory;
 use crate::memory::ub::{UbMemory, UbTransferResult};
@@ -34,6 +35,47 @@ pub struct C220Mte2TransferPlan {
     pub destination_address: u64,
     pub bytes: usize,
     pub dma_mode_word: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220Mte2L1TransferPlan {
+    pub descriptor: C220L1DmaDescriptor,
+    pub source_address: u64,
+    pub destination_address: u64,
+    pub dma_mode_word: u64,
+    pub padding: u16,
+}
+
+impl C220Mte2L1TransferPlan {
+    pub(crate) fn decode(
+        machine: &ScalarMachine,
+        pc: u64,
+        word: u32,
+        isa_instance_index: u32,
+    ) -> Result<Self, C220ExecutionError> {
+        let instruction = C220MovOutToL1Instruction::decode(word)
+            .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
+        let registers = machine.xregs();
+        Ok(Self {
+            descriptor: C220L1DmaDescriptor {
+                xm: registers[usize::from(instruction.descriptor_register)],
+                layout: instruction.layout,
+            },
+            source_address: registers[usize::from(instruction.source_register)],
+            destination_address: registers[usize::from(instruction.destination_register)],
+            dma_mode_word: if isa_instance_index == 0 {
+                0
+            } else {
+                machine
+                    .spr_value(93)
+                    .ok_or(C220ExecutionError::MissingSpr { pc, index: 93 })?
+            },
+            padding: machine
+                .spr_value(13)
+                .ok_or(C220ExecutionError::MissingSpr { pc, index: 13 })?
+                as u16,
+        })
+    }
 }
 
 impl C220Mte2TransferPlan {

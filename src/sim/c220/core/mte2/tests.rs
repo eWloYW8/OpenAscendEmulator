@@ -78,6 +78,221 @@ fn configured_dma_core() -> C220Core {
 }
 
 #[test]
+fn l1_dma_routes_cube_returns_and_commits_after_l1_acknowledgment() {
+    use crate::isa::c220::mte::out_to_l1::{C220L1DmaDescriptor, C220L1DmaLayout};
+    use crate::sim::c220::mte::C220MtePipelineEvent;
+    use crate::sim::c220::mte::interface::biu_read::returns::C220BiuReturnEvent;
+    use crate::sim::c220::mte::interface::biu_read::write::C220BiuWriteBandwidths;
+    use crate::sim::c220::mte::interface::{C220MteL1WriteEventOutcome, C220MteL1WritePort};
+    use std::collections::{BTreeMap, VecDeque};
+
+    for (layout, xm, source_offset) in [
+        (C220L1DmaLayout::Copy32, (64 << 16) | (1 << 4), 0),
+        (C220L1DmaLayout::Copy32, (60 << 16) | (1 << 4), 1),
+        (
+            C220L1DmaLayout::Copy32,
+            (1_u64 << 48) | (2 << 16) | (4 << 4),
+            32,
+        ),
+        (
+            C220L1DmaLayout::Copy32,
+            (2_u64 << 48) | (1 << 32) | (2 << 16) | (4 << 4),
+            0,
+        ),
+        (C220L1DmaLayout::Take4, (1 << 16) | (3 << 4), 0),
+        (
+            C220L1DmaLayout::Take8,
+            (1_u64 << 48) | (2 << 32) | (5 << 16) | (3 << 4),
+            1,
+        ),
+        (C220L1DmaLayout::Take16, (4 << 16) | (2 << 4), 0),
+    ]
+    .into_iter()
+    .chain(
+        [
+            C220L1DmaLayout::Pad1,
+            C220L1DmaLayout::Pad2,
+            C220L1DmaLayout::Pad4,
+            C220L1DmaLayout::Pad8,
+            C220L1DmaLayout::Pad16,
+        ]
+        .into_iter()
+        .flat_map(|layout| {
+            [0, 1].map(move |offset| {
+                (
+                    layout,
+                    (1_u64 << 48) | (1 << 32) | (2 << 16) | (9 << 4),
+                    offset,
+                )
+            })
+        }),
+    ) {
+        let mut core = configured_dma_core();
+        let width = NonZeroU32::new(32).unwrap();
+        core.connect_mte2_biu(
+            C220BiuReadConfig {
+                outstanding: NonZeroU32::new(2).unwrap(),
+                weights: [1; 3],
+                group_vector_returns: true,
+                write_bandwidths: C220BiuWriteBandwidths {
+                    l1: width,
+                    l0a: width,
+                    l0b: width,
+                    ub: width,
+                },
+            },
+            C220BiuSubcore::Cube,
+        )
+        .unwrap();
+        let word = (3 << 29) | (2 << 27) | (2 << 23) | (1 << 17) | (2 << 12) | (3 << 7) | (4 << 3);
+        let source = 0x2000 + source_offset;
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(1, 0).unwrap();
+        machine.set_xreg(2, source).unwrap();
+        machine.set_xreg(3, xm).unwrap();
+        machine.set_spr_value(13, 0xbbaa).unwrap();
+        assert!(core.step_word_at(0, word | (1 << 22) | 1).is_err());
+        assert!(!core.mte2.is_busy());
+        let mode = layout as u32;
+        let word = word | (mode & 7) | ((mode & 8) << 19);
+        core.step_word_at(0, word).unwrap();
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_spr_value(13, 0x4321)
+            .unwrap();
+        let initial = core.local_memory.l1().read_states(0, 4096).unwrap();
+        let mut beats = VecDeque::new();
+        let mut offered = BTreeMap::new();
+        let mut responses = BTreeMap::new();
+        let mut acknowledged = None;
+        let mut sent_bytes = 0;
+        let mut truncated_bytes = 0;
+        for tick in 1..400 {
+            core.advance_to(tick).unwrap();
+            if let Some(request) = core.take_mte2_biu_request() {
+                assert_eq!(request.input.subcore, C220BiuSubcore::Cube);
+                let request_data = request.input.generated.request;
+                truncated_bytes += (request_data.bytes / 32) * layout.destination_bytes();
+                core.memory
+                    .write_known_at(
+                        request_data.source_address,
+                        &vec![9; request_data.bytes as usize],
+                    )
+                    .unwrap();
+                beats.extend(
+                    (0..request_data.bytes.div_ceil(128))
+                        .rev()
+                        .map(|transaction_id| C220BiuReadBeat {
+                            tag: request.tag,
+                            transaction_id,
+                        }),
+                );
+            }
+            for event in core.mte_pipeline().unwrap().last_events() {
+                match event {
+                    C220MtePipelineEvent::BiuReturn(C220BiuReturnEvent::Send(send)) => {
+                        if let Some(fragment) = send.sent() {
+                            offered.insert(fragment.destination_address, tick);
+                        }
+                    }
+                    C220MtePipelineEvent::L1Write(C220MteL1WriteEventOutcome::Sent(send)) => {
+                        if let Some(request) = send.sent {
+                            assert_eq!(request.port, C220MteL1WritePort::Port0);
+                            assert!(tick >= offered[&request.fragment.destination_address] + 9);
+                            sent_bytes += request.fragment.bytes;
+                        }
+                    }
+                    C220MtePipelineEvent::L1Write(C220MteL1WriteEventOutcome::Response(Some(
+                        request,
+                    ))) => {
+                        responses.insert(request.id, tick);
+                    }
+                    C220MtePipelineEvent::L1Write(C220MteL1WriteEventOutcome::Acknowledged(
+                        Some(ack),
+                    )) => {
+                        assert_eq!(tick, responses[&ack.request.id] + 1);
+                        if ack.retired_instruction().is_some() {
+                            acknowledged = Some(tick);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                core.mte_pipeline()
+                    .unwrap()
+                    .l1_fill_completions()
+                    .is_empty()
+            );
+            if !core.mte2.is_busy() {
+                assert_eq!(Some(tick - 1), acknowledged);
+                break;
+            }
+            assert_eq!(
+                core.local_memory.l1().read_states(0, 4096).unwrap(),
+                initial
+            );
+            if core
+                .receive_mte2_biu_at(tick, [beats.front().copied(), None])
+                .unwrap()[0]
+            {
+                beats.pop_front();
+            }
+        }
+        assert!(!core.mte2.is_busy());
+        assert!(core.mte_pipeline().unwrap().is_idle());
+        assert!(beats.is_empty());
+        let descriptor = C220L1DmaDescriptor { xm, layout };
+        assert_eq!(
+            sent_bytes as usize,
+            if layout.source_bytes() < 32 {
+                let read_bytes =
+                    usize::from(descriptor.burst_count()) * layout.source_bytes() as usize;
+                if source_offset == 0 {
+                    read_bytes.div_ceil(32) * 32
+                } else {
+                    usize::from(descriptor.burst_count()) * 32
+                }
+            } else if layout == C220L1DmaLayout::Copy32 {
+                descriptor.segments(source, 0).len() * 32
+            } else {
+                truncated_bytes as usize
+            }
+        );
+        for segment in descriptor.segments(source, 0) {
+            use crate::memory::sparse::MemoryByteState;
+            let mut expected: Vec<_> = (0..segment.destination_bytes)
+                .map(|index| {
+                    MemoryByteState::Known(if layout == C220L1DmaLayout::Pad1 || index % 2 == 0 {
+                        0xaa
+                    } else {
+                        0xbb
+                    })
+                })
+                .collect();
+            let copied = segment.source_bytes.min(segment.destination_bytes) as usize;
+            expected[..copied].copy_from_slice(
+                &core
+                    .memory
+                    .read_states_at(segment.source_address, copied)
+                    .unwrap(),
+            );
+            assert_eq!(
+                core.local_memory
+                    .l1()
+                    .read_states(
+                        segment.destination_address,
+                        segment.destination_bytes as usize
+                    )
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
 fn native_memory_drives_mte2_through_bus_rob_and_ub_retirement() {
     for (descriptor, offset) in [
         ((128 << 16) | (1 << 4), 0),

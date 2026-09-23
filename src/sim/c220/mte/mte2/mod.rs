@@ -10,4 +10,4 @@ mod timing;
 pub use timing::{C220Mte2Ticket, C220Mte2TimingError, C220Mte2TimingRules};
 mod transfer;
 pub(crate) use transfer::decode_mte2_transfer;
-pub use transfer::{C220Mte2TransferPlan, copy_c220_mov_out_to_ub};
+pub use transfer::{C220Mte2L1TransferPlan, C220Mte2TransferPlan, copy_c220_mov_out_to_ub};

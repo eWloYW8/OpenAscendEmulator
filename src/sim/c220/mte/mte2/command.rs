@@ -1,11 +1,13 @@
-use super::{C220Mte2Ticket, C220Mte2TransferPlan};
+use super::{C220Mte2L1TransferPlan, C220Mte2Ticket, C220Mte2TransferPlan};
 use crate::isa::c220::mte::set2d::C220Set2dFill;
 use crate::memory::ub::UbTransferResult;
+use crate::sim::c220::mte::out_to_l1::C220L1DmaResult;
 use crate::sim::c220::mte::set2d::{C220Set2dIssue, C220Set2dResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte2Command {
     MovOutToUb(C220Mte2TransferPlan),
+    MovOutToL1(C220Mte2L1TransferPlan),
     Set2d(C220Set2dFill),
 }
 
@@ -57,6 +59,7 @@ pub struct C220Mte2EventState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220Mte2Result {
     MovOutToUb(UbTransferResult),
+    MovOutToL1(C220L1DmaResult),
     Set2d(C220Set2dResult),
 }
 

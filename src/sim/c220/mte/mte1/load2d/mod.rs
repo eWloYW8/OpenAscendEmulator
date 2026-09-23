@@ -33,10 +33,10 @@ impl C220PreparedLoad2d {
         for (address, states) in self.writes {
             match self.destination {
                 C220Load2dDestination::L0a => {
-                    memory.l0a_mut().write_states_wrapped(address, &states)?;
+                    memory.l0a_mut().write_states_linear(address, &states)?;
                 }
                 C220Load2dDestination::L0b => {
-                    memory.l0b_mut().write_states_wrapped(address, &states)?;
+                    memory.l0b_mut().write_states_linear(address, &states)?;
                 }
                 destination => {
                     return Err(C220Load2dTransferError::UnsupportedDestination(destination));
@@ -80,7 +80,7 @@ pub fn prepare_c220_load2d(
     for segment in transfer.segments() {
         let mut states = memory
             .l1()
-            .read_states_wrapped(segment.source_address, segment.bytes as usize)?;
+            .read_states_linear(segment.source_address, segment.bytes as usize)?;
         if transfer.instruction.transpose {
             states = transpose_block(states, transfer.instruction.element_format);
         }
@@ -150,4 +150,59 @@ fn transpose_b4(states: Vec<MemoryByteState>) -> Vec<MemoryByteState> {
             _ => MemoryByteState::Unknown,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::isa::c220::mte::load2d::C220Load2dInstruction;
+    use crate::sim::c220::memory::C220LocalMemoryConfig;
+
+    #[test]
+    fn load2d_preserves_linear_addresses_and_unknown_bytes() {
+        for destination in 0..=1 {
+            for transpose in [false, true] {
+                let mut memory = C220LocalMemory::new(C220LocalMemoryConfig {
+                    l1_bytes: 768,
+                    l0a_bytes: 768,
+                    l0b_bytes: 768,
+                    ..Default::default()
+                })
+                .unwrap();
+                memory.l1_mut().write_known(0, &[99; 512]).unwrap();
+                let mut source = vec![MemoryByteState::Known(7); 512];
+                source[300] = MemoryByteState::Unknown;
+                memory.l1_mut().write_states_linear(512, &source).unwrap();
+                let mut registers = [0; 32];
+                registers[0] = 512;
+                registers[2] = 512;
+                registers[3] = (1 << 16) | (1 << 24);
+                let word = 0x6000_2180 | destination | (u32::from(transpose) << 2);
+                let transfer = C220Load2dInstruction::decode(word)
+                    .unwrap()
+                    .capture(&registers)
+                    .unwrap();
+                let prepared = prepare_c220_load2d(&memory, transfer).unwrap();
+                assert_eq!(prepared.result.known_bytes, 511);
+                assert_eq!(prepared.result.unknown_bytes, 1);
+                prepared.commit(&mut memory).unwrap();
+                let target = if destination == 0 {
+                    memory.l0a()
+                } else {
+                    memory.l0b()
+                };
+                let expected = if transpose {
+                    transpose_block(source, C220Load2dElementFormat::B8)
+                } else {
+                    source
+                };
+                assert_eq!(target.read_states_linear(512, 512).unwrap(), expected);
+                assert_eq!(
+                    target.read_states(0, 512).unwrap(),
+                    vec![MemoryByteState::Unknown; 512]
+                );
+                assert_eq!(target.tracked_bytes(), 512);
+            }
+        }
+    }
 }

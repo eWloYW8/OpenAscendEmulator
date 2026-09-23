@@ -72,6 +72,20 @@ impl C220LocalBuffer {
         )
     }
 
+    /// Inspect linear addresses without applying the physical capacity limit.
+    pub fn read_states_linear(
+        &self,
+        address: u64,
+        len: usize,
+    ) -> Result<Vec<MemoryByteState>, C220LocalBufferError> {
+        Self::check_linear_range(address, len)?;
+        self.read_with(
+            len,
+            |offset| address + offset as u64,
+            MemoryByteState::Unknown,
+        )
+    }
+
     /// Reads without capacity wrapping. Untouched bytes are zero; explicitly
     /// unknown bytes remain errors.
     pub fn read_initialized_linear(
@@ -79,11 +93,7 @@ impl C220LocalBuffer {
         address: u64,
         len: usize,
     ) -> Result<Vec<u8>, C220LocalBufferError> {
-        if len != 0 {
-            address
-                .checked_add((len - 1) as u64)
-                .ok_or(C220LocalBufferError::RangeOverflow)?;
-        }
+        Self::check_linear_range(address, len)?;
         let states = self.read_with(
             len,
             |offset| address + offset as u64,
@@ -138,6 +148,19 @@ impl C220LocalBuffer {
         Ok(())
     }
 
+    /// Preserve known and unknown bytes at linear, non-wrapping addresses.
+    pub fn write_states_linear(
+        &mut self,
+        address: u64,
+        states: &[MemoryByteState],
+    ) -> Result<(), C220LocalBufferError> {
+        Self::check_linear_range(address, states.len())?;
+        for (offset, &state) in states.iter().enumerate() {
+            self.bytes.insert(address + offset as u64, state);
+        }
+        Ok(())
+    }
+
     pub fn write_known(&mut self, address: u64, bytes: &[u8]) -> Result<(), C220LocalBufferError> {
         let states = bytes
             .iter()
@@ -154,11 +177,7 @@ impl C220LocalBuffer {
         address: u64,
         bytes: &[u8],
     ) -> Result<(), C220LocalBufferError> {
-        if !bytes.is_empty() {
-            address
-                .checked_add((bytes.len() - 1) as u64)
-                .ok_or(C220LocalBufferError::RangeOverflow)?;
-        }
+        Self::check_linear_range(address, bytes.len())?;
         for (offset, &byte) in bytes.iter().enumerate() {
             self.bytes
                 .insert(address + offset as u64, MemoryByteState::Known(byte));
@@ -193,6 +212,16 @@ impl C220LocalBuffer {
             result.push(self.bytes.get(&address(offset)).copied().unwrap_or(default));
         }
         Ok(result)
+    }
+
+    fn check_linear_range(address: u64, len: usize) -> Result<(), C220LocalBufferError> {
+        if let Some(last) = len.checked_sub(1) {
+            let last = u64::try_from(last).map_err(|_| C220LocalBufferError::RangeOverflow)?;
+            address
+                .checked_add(last)
+                .ok_or(C220LocalBufferError::RangeOverflow)?;
+        }
+        Ok(())
     }
 
     fn check_range(&self, address: u64, len: usize) -> Result<(), C220LocalBufferError> {

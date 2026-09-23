@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 
+use super::C220Mte2L1TransferPlan;
 use super::timing::C220Mte2DmaTiming;
 use super::{
     C220Mte2Command, C220Mte2CommandState, C220Mte2Completion, C220Mte2EventState, C220Mte2Issue,
@@ -10,6 +11,7 @@ use crate::isa::c220::mte::set2d::C220Set2dFill;
 use crate::memory::mapped::MappedMemory;
 use crate::memory::ub::UbMemory;
 use crate::sim::c220::memory::{C220LocalBufferError, C220LocalMemory};
+use crate::sim::c220::mte::out_to_l1::{C220L1DmaError, execute_c220_mov_out_to_l1};
 use crate::sim::c220::mte::set2d::execute_c220_set2d;
 use crate::sim::c220::mte::{C220MtePipeline, C220MtePipelineError, C220TransferError};
 
@@ -37,6 +39,8 @@ pub enum C220Mte2RuntimeError {
     Transfer(#[from] C220TransferError),
     #[error(transparent)]
     LocalMemory(#[from] C220LocalBufferError),
+    #[error(transparent)]
+    L1Transfer(#[from] C220L1DmaError),
 }
 
 /// MTE2 command ownership and ordered functional retirement. The physical L1
@@ -156,6 +160,45 @@ impl C220Mte2Pipeline {
             pc,
             command,
             timing: C220Mte2IssueTiming::L1(timing),
+        })
+    }
+
+    pub(crate) fn issue_l1_dma(
+        &mut self,
+        pipeline: &mut C220MtePipeline,
+        instruction_id: u64,
+        pc: u64,
+        transfer: C220Mte2L1TransferPlan,
+    ) -> Result<C220Mte2Issue, C220Mte2RuntimeError> {
+        self.now
+            .checked_add(1)
+            .ok_or(C220Mte2RuntimeError::TimeOverflow)?;
+        let timing = pipeline.issue_mte2_l1_dma(
+            instruction_id,
+            transfer.descriptor,
+            transfer.source_address,
+            transfer.destination_address,
+            transfer.dma_mode_word,
+        )?;
+        let command = C220Mte2Command::MovOutToL1(transfer);
+        self.pending.push_back(C220Mte2CommandState {
+            instruction_id,
+            pc,
+            issue_tick: self.now,
+            command,
+            completion: if timing.completion_ready {
+                C220Mte2Completion::Observed { tick: self.now }
+            } else {
+                C220Mte2Completion::AwaitingDma {
+                    tail_delivered: false,
+                }
+            },
+        });
+        Ok(C220Mte2Issue {
+            instruction_id,
+            pc,
+            command,
+            timing: C220Mte2IssueTiming::Dma(timing),
         })
     }
 
@@ -326,6 +369,16 @@ impl C220Mte2Pipeline {
             }
         {
             let result = match command.command {
+                C220Mte2Command::MovOutToL1(plan) => {
+                    C220Mte2Result::MovOutToL1(execute_c220_mov_out_to_l1(
+                        source,
+                        local.l1_mut(),
+                        plan.descriptor,
+                        plan.source_address,
+                        plan.destination_address,
+                        plan.padding,
+                    )?)
+                }
                 C220Mte2Command::Set2d(fill) => {
                     C220Mte2Result::Set2d(execute_c220_set2d(local, fill)?)
                 }
@@ -365,4 +418,5 @@ impl C220Mte2Pipeline {
 
 pub(crate) fn is_mte2_transfer(word: u32) -> bool {
     crate::isa::c220::mte::C220MovOutToUbDescriptor::is_word(word)
+        || crate::isa::c220::mte::out_to_l1::C220MovOutToL1Instruction::decode(word).is_some()
 }

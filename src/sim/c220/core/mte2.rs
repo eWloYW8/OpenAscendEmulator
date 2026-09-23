@@ -1,5 +1,6 @@
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
 use crate::architecture::Architecture;
+use crate::isa::c220::mte::out_to_l1::C220MovOutToL1Instruction;
 use crate::isa::c220::mte::set2d::C220Set2dInstruction;
 use crate::isa::flow::{FlagInstruction, FlagOperation};
 use crate::sim::c220::mte::dma::C220DmaGenerated;
@@ -7,7 +8,7 @@ use crate::sim::c220::mte::interface::biu_read::returns::C220BiuReadBeat;
 use crate::sim::c220::mte::interface::biu_read::{
     C220BiuReadConfig, C220BiuReadRequest, C220BiuSubcore,
 };
-use crate::sim::c220::mte::mte2::decode_mte2_transfer;
+use crate::sim::c220::mte::mte2::{C220Mte2L1TransferPlan, decode_mte2_transfer};
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 use crate::sim::c220::state::C220ExecutionError;
 
@@ -150,6 +151,32 @@ impl C220Core {
                 self.next_instruction_id,
                 pc,
                 fill,
+            )?)
+        } else if C220MovOutToL1Instruction::decode(word).is_some() {
+            let transfer = C220Mte2L1TransferPlan::decode(
+                self.state.scalar().machine(),
+                pc,
+                word,
+                self.state.isa_instance_index,
+            )?;
+            let pipeline = self
+                .mte_pipeline
+                .as_mut()
+                .ok_or(C220CoreError::MteUnconfigured)?;
+            if !transfer.descriptor.is_disabled()
+                && pipeline.mte2_dma_connected()
+                && !pipeline.can_issue_mte2_dma()
+            {
+                return Ok(stall(
+                    tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+                    C220StallCause::Mte2IssueRate,
+                ));
+            }
+            C220CoreInstruction::Mte2(self.mte2.issue_l1_dma(
+                pipeline,
+                self.next_instruction_id,
+                pc,
+                transfer,
             )?)
         } else if let Some(flag) = FlagInstruction::decode(Architecture::Dav2201, word) {
             let flag = flag.resolve(pc, self.state.scalar().machine().xregs());

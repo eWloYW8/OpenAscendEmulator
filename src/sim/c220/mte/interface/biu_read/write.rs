@@ -50,6 +50,19 @@ pub struct C220BiuWriteFragment {
     pub last_in_instruction: bool,
 }
 
+impl C220BiuWriteFragment {
+    pub fn output_fragment(self) -> crate::sim::c220::mte::interface::C220MteOutputFragment {
+        crate::sim::c220::mte::interface::C220MteOutputFragment {
+            instruction_id: self.output.request.input.generated.instruction_id,
+            request_id: u64::from(self.output.request.tag.get()),
+            destination_address: self.destination_address,
+            bytes: self.bytes,
+            last_in_uop: self.last_in_request,
+            last_in_instruction: self.last_in_instruction,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220BiuWriteStall {
     NotReady,
@@ -101,6 +114,7 @@ pub(super) struct WritePlan {
     remaining: u32,
     full_packets: u32,
     round_full_packets: bool,
+    round_tail: bool,
     final_marker: bool,
 }
 
@@ -110,10 +124,10 @@ impl WritePlan {
             return None;
         }
         let logical_bytes = self.remaining.min(self.chunk.get());
-        let bytes = if self.round_full_packets || self.full_packets == 0 {
+        let bytes = if self.round_full_packets || (self.full_packets == 0 && self.round_tail) {
             (logical_bytes.wrapping_sub(1) & !31).wrapping_add(32)
         } else {
-            self.chunk.get()
+            logical_bytes
         };
         let last_in_request = self.remaining == logical_bytes;
         Some(C220BiuWriteFragment {
@@ -158,7 +172,9 @@ impl WriteAligner {
             return Err(C220BiuWriteError::WrongSubcore);
         }
         let collapsed = request.route == C220DmaUopRoute::DestinationGapCollapse;
-        let chunk = if collapsed {
+        let chunk = if request.route.padded_unit_bytes().is_some() {
+            NonZeroU32::new(32).unwrap()
+        } else if collapsed {
             NonZeroU32::new(generated.destination.burst_bytes)
                 .ok_or(C220BiuWriteError::EmptyBurst)?
         } else {
@@ -174,6 +190,7 @@ impl WriteAligner {
                 remaining: request.bytes,
                 full_packets: 0,
                 round_full_packets: true,
+                round_tail: true,
                 final_marker: output.last_in_instruction,
             });
         }
@@ -187,9 +204,43 @@ impl WriteAligner {
         }
         let state = &mut self.progress;
         state.instruction_id = Some(generated.instruction_id);
+        if let Some(unit_bytes) = request.route.truncated_unit_bytes() {
+            let available = (request.bytes / 32 * unit_bytes).wrapping_add(state.buffered_bytes);
+            let full_packets = available / self.bandwidth.get();
+            let remainder = available % self.bandwidth.get();
+            let plan = WritePlan {
+                output,
+                base: generated.destination.base,
+                offset: state.destination_offset,
+                stride: self.bandwidth.get(),
+                chunk: self.bandwidth,
+                remaining: if output.last_in_instruction {
+                    available
+                } else {
+                    available - remainder
+                },
+                full_packets,
+                round_full_packets: false,
+                round_tail: false,
+                final_marker: output.last_in_instruction,
+            };
+            state.buffered_bytes = remainder;
+            state.destination_offset = state
+                .destination_offset
+                .wrapping_add(full_packets.wrapping_mul(self.bandwidth.get()));
+            if output.last_in_instruction {
+                state.instruction_id = None;
+                if remainder != 0 {
+                    state.buffered_bytes = 0;
+                    state.destination_offset = 0;
+                }
+            }
+            return Ok(plan);
+        }
         let available = request.bytes.wrapping_add(state.buffered_bytes);
-        let full_packets = available / chunk.get();
-        let remainder = available % chunk.get();
+        let input_chunk = request.route.padded_unit_bytes().unwrap_or(chunk.get());
+        let full_packets = available / input_chunk;
+        let remainder = available % input_chunk;
         let stride = if collapsed {
             generated.destination.burst_stride as u32
         } else {
@@ -201,13 +252,12 @@ impl WriteAligner {
             offset: state.destination_offset,
             stride,
             chunk,
-            remaining: if request.last_in_burst {
-                available
-            } else {
-                available - remainder
-            },
+            remaining: full_packets
+                .wrapping_mul(chunk.get())
+                .wrapping_add(if request.last_in_burst { remainder } else { 0 }),
             full_packets,
             round_full_packets: false,
+            round_tail: true,
             final_marker: request.last_in_burst && output.last_in_instruction,
         };
         state.buffered_bytes = remainder;

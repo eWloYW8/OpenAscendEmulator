@@ -58,6 +58,45 @@ fn beat(request: C220BiuReadRequest, id: u32) -> Option<C220BiuReadBeat> {
 }
 
 #[test]
+fn truncation_keeps_exact_packet_offset_and_emits_raw_partial_tail() {
+    let mut aligner = WriteAligner::new(NonZeroU32::new(32).unwrap());
+    let output = |id, bytes, last| {
+        let mut request = request(1, id, C220BiuSubcore::Cube, bytes);
+        request.input.generated.request.route = C220DmaUopRoute::L1Take4;
+        request.input.generated.last_in_instruction = last;
+        C220BiuReadOutput {
+            ready_tick: 0,
+            request,
+            last_in_instruction: last,
+        }
+    };
+    let full = aligner.plan(output(1, 256, true)).unwrap().front().unwrap();
+    assert_eq!((full.destination_address, full.bytes), (0, 32));
+    assert!(full.last_in_instruction);
+    assert_eq!(aligner.progress.destination_offset, 32);
+    assert_eq!(aligner.progress.instruction_id, None);
+    let tail = aligner.plan(output(2, 32, true)).unwrap().front().unwrap();
+    assert_eq!(
+        (tail.destination_address, tail.bytes, tail.logical_bytes),
+        (32, 4, 4)
+    );
+    assert!(tail.last_in_instruction);
+    assert_eq!(aligner.progress, C220BiuWriteProgress::default());
+    assert!(
+        aligner
+            .plan(output(3, 127, false))
+            .unwrap()
+            .front()
+            .is_none()
+    );
+    assert_eq!(aligner.progress.buffered_bytes, 12);
+    let tail = aligner.plan(output(3, 1, true)).unwrap().front().unwrap();
+    assert_eq!(tail.bytes, 12);
+    assert!(tail.last_in_instruction);
+    assert_eq!(aligner.progress, C220BiuWriteProgress::default());
+}
+
+#[test]
 fn out_of_order_tail_waits_for_last_completing_request() {
     let mut returns =
         C220BiuReadReturns::new(NonZeroU32::new(2).unwrap(), true, bandwidths(128)).unwrap();

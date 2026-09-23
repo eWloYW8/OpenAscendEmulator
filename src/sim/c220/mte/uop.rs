@@ -1,3 +1,4 @@
+use crate::isa::c220::mte::out_to_l1::{C220L1DmaDescriptor, C220L1DmaLayout};
 use thiserror::Error;
 
 use crate::isa::c220::mte::{
@@ -51,6 +52,36 @@ pub enum C220DmaUopRoute {
     ContiguousBatch,
     DestinationGapCollapse,
     SourceGapGather,
+    L1Pad1,
+    L1Pad2,
+    L1Pad4,
+    L1Pad8,
+    L1Pad16,
+    L1Take4,
+    L1Take8,
+    L1Take16,
+}
+
+impl C220DmaUopRoute {
+    pub const fn padded_unit_bytes(self) -> Option<u32> {
+        match self {
+            Self::L1Pad1 => Some(1),
+            Self::L1Pad2 => Some(2),
+            Self::L1Pad4 => Some(4),
+            Self::L1Pad8 => Some(8),
+            Self::L1Pad16 => Some(16),
+            _ => None,
+        }
+    }
+
+    pub const fn truncated_unit_bytes(self) -> Option<u32> {
+        match self {
+            Self::L1Take4 => Some(4),
+            Self::L1Take8 => Some(8),
+            Self::L1Take16 => Some(16),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +188,98 @@ fn mte2_request_stream(transfer: C220Mte2TransferPlan) -> Result<C220DmaUops, C2
         C220DmaUopRoute::Ordinary,
         C220DmaUopMode::from_mode_word(transfer.dma_mode_word),
     )
+}
+
+pub fn mte2_l1_uops(
+    descriptor: C220L1DmaDescriptor,
+    source_address: u64,
+    destination_address: u64,
+    dma_mode_word: u64,
+) -> Result<C220DmaUops, C220DmaUopError> {
+    let transform = match descriptor.layout {
+        C220L1DmaLayout::Pad1 => Some(C220DmaUopRoute::L1Pad1),
+        C220L1DmaLayout::Pad2 => Some(C220DmaUopRoute::L1Pad2),
+        C220L1DmaLayout::Pad4 => Some(C220DmaUopRoute::L1Pad4),
+        C220L1DmaLayout::Pad8 => Some(C220DmaUopRoute::L1Pad8),
+        C220L1DmaLayout::Pad16 => Some(C220DmaUopRoute::L1Pad16),
+        C220L1DmaLayout::Take4 => Some(C220DmaUopRoute::L1Take4),
+        C220L1DmaLayout::Take8 => Some(C220DmaUopRoute::L1Take8),
+        C220L1DmaLayout::Take16 => Some(C220DmaUopRoute::L1Take16),
+        C220L1DmaLayout::Copy32 => None,
+    };
+    if let Some(route) = transform {
+        let source_unit = descriptor.layout.source_bytes();
+        let padding = route.padded_unit_bytes().is_some();
+        return split_requests(
+            DmaRequestGeometry {
+                source_base: source_address,
+                destination_base: destination_address,
+                burst_count: u16::from(!descriptor.is_disabled()),
+                burst_bytes: u64::from(
+                    (if padding {
+                        source_unit
+                    } else {
+                        u32::from(descriptor.burst_length()) * source_unit
+                    })
+                    .wrapping_mul(u32::from(descriptor.burst_count())),
+                ),
+                source_stride: (u64::from(descriptor.burst_length())
+                    + u64::from(descriptor.source_gap()))
+                    * u64::from(source_unit),
+                destination_stride: (u64::from(descriptor.burst_length())
+                    + u64::from(descriptor.destination_gap()))
+                    * u64::from(descriptor.layout.destination_bytes()),
+                split_on_destination: false,
+                split_enabled: padding && source_address.is_multiple_of(32),
+            },
+            route,
+            C220DmaUopMode::from_mode_word(dma_mode_word),
+        );
+    }
+    let count = descriptor.burst_count();
+    let length = descriptor.burst_length();
+    let source_gap = descriptor.source_gap();
+    let destination_gap = descriptor.destination_gap();
+    let batch = source_gap == 0 && destination_gap == 0;
+    let collapsed = !batch && source_gap == 0 && (1..=2).contains(&length);
+    let burst_bytes = u32::from(length) * 32;
+    let destination_stride = (u64::from(length) + u64::from(destination_gap)) * 32;
+    let mut requests = split_requests(
+        DmaRequestGeometry {
+            source_base: source_address,
+            destination_base: destination_address,
+            burst_count: if count == 0 || length == 0 {
+                0
+            } else if batch || collapsed {
+                1
+            } else {
+                count
+            },
+            burst_bytes: u64::from(if batch || collapsed {
+                burst_bytes.wrapping_mul(u32::from(count))
+            } else {
+                burst_bytes
+            }),
+            source_stride: (u64::from(length) + u64::from(source_gap)) * 32,
+            destination_stride,
+            split_on_destination: false,
+            split_enabled: !collapsed && source_address.is_multiple_of(32),
+        },
+        if batch {
+            C220DmaUopRoute::ContiguousBatch
+        } else if collapsed {
+            C220DmaUopRoute::DestinationGapCollapse
+        } else {
+            C220DmaUopRoute::Ordinary
+        },
+        C220DmaUopMode::from_mode_word(dma_mode_word),
+    )?;
+    requests.destination = C220DmaDestinationLayout {
+        base: destination_address,
+        burst_bytes,
+        burst_stride: destination_stride,
+    };
+    Ok(requests)
 }
 
 fn checked_descriptor(
@@ -344,12 +467,16 @@ impl Iterator for C220DmaUops {
             return None;
         }
         let burst_index = self.burst_index;
-        let source_address = geometry.source_base
-            + u64::from(u32::from(burst_index).wrapping_mul(geometry.source_stride as u32))
-            + self.offset;
-        let destination_address = geometry.destination_base
-            + u64::from(burst_index) * geometry.destination_stride
-            + self.offset;
+        let source_address = geometry
+            .source_base
+            .wrapping_add(u64::from(
+                u32::from(burst_index).wrapping_mul(geometry.source_stride as u32),
+            ))
+            .wrapping_add(self.offset);
+        let destination_address = geometry
+            .destination_base
+            .wrapping_add(u64::from(burst_index) * geometry.destination_stride)
+            .wrapping_add(self.offset);
         let aligned_address = if geometry.split_on_destination {
             destination_address
         } else {

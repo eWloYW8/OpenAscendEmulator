@@ -32,7 +32,8 @@ use super::mte3::frontend::{
     C220Mte3Callback, C220Mte3Events, C220Mte3Frontend, C220Mte3FrontendError,
     C220Mte3FrontendEvent, C220Mte3Record,
 };
-use super::uop::{C220DmaUopError, mte2_uops};
+use super::uop::{C220DmaUopError, C220DmaUops, mte2_l1_uops, mte2_uops};
+use crate::isa::c220::mte::out_to_l1::C220L1DmaDescriptor;
 use crate::isa::c220::mte::set2d::{C220Set2dDestination, C220Set2dFill};
 use crate::sim::c220::memory::biu_read::{C220BiuBusReadError, C220BiuMteBusReads};
 use crate::sim::c220::memory::biu_write::{C220BiuBusWriteError, C220BiuMteBusWrites};
@@ -61,7 +62,7 @@ use crate::sim::c220::mte::interface::{
     C220MteL1EventOutcome, C220MteL1Events, C220MteL1Interface, C220MteL1OutputCredits,
     C220MteL1OutputDestination, C220MteL1WriteCallback, C220MteL1WriteError,
     C220MteL1WriteEventInputs, C220MteL1WriteEventOutcome, C220MteL1WriteEvents,
-    C220MteL1WriteInterface,
+    C220MteL1WriteInterface, C220MteL1WritePort,
 };
 use crate::sim::common::event::{EventDispatcher, EventError, EventId};
 
@@ -161,7 +162,7 @@ pub enum C220MtePipelineError {
     UbService(#[from] C220UbServiceError),
     #[error(transparent)]
     UbWrite(#[from] C220UbWriteError),
-    #[error("BIU-connected DMA completion is owned by the UB write interface")]
+    #[error("BIU-connected DMA completion is owned by the destination write interface")]
     DestinationOwnedCompletion,
     #[error(transparent)]
     BiuReturn(#[from] C220BiuReturnError),
@@ -173,6 +174,8 @@ pub enum C220MtePipelineError {
     BiuRequestUndelivered,
     #[error("the current MTE2 DMA generator targets UB and requires a vector subcore")]
     BiuUbSubcoreRequired,
+    #[error("L1 DMA requires a connected Cube BIU subcore")]
+    BiuL1SubcoreRequired,
     #[error("MTE2 DMA requires a connected request/response consumer")]
     DmaDisconnected,
     #[error(transparent)]
@@ -469,7 +472,7 @@ impl C220MtePipeline {
         Ok(())
     }
 
-    /// Connects BIU reads and return reordering to native UB write service.
+    /// Connects BIU reads and return reordering to native L1 or UB write service.
     /// The external memory service supplies only the BIU read response beats.
     pub fn connect_mte2_biu(
         &mut self,
@@ -481,9 +484,6 @@ impl C220MtePipeline {
         }
         if !self.is_idle() {
             return Err(C220MtePipelineError::CommandBusy);
-        }
-        if subcore == C220BiuSubcore::Cube {
-            return Err(C220MtePipelineError::BiuUbSubcoreRequired);
         }
         let returns = C220BiuReadReturns::new(
             config.outstanding,
@@ -659,11 +659,42 @@ impl C220MtePipeline {
         instruction_id: u64,
         transfer: C220Mte2TransferPlan,
     ) -> Result<C220DmaIssue, C220MtePipelineError> {
+        if self.biu_read.is_some() && self.biu_subcore == C220BiuSubcore::Cube {
+            return Err(C220MtePipelineError::BiuUbSubcoreRequired);
+        }
+        let requests = mte2_uops(transfer)?;
+        self.issue_dma_requests(instruction_id, requests)
+    }
+
+    pub fn issue_mte2_l1_dma(
+        &mut self,
+        instruction_id: u64,
+        descriptor: C220L1DmaDescriptor,
+        source_address: u64,
+        destination_address: u64,
+        dma_mode_word: u64,
+    ) -> Result<C220DmaIssue, C220MtePipelineError> {
+        if self.biu_read.is_none() || self.biu_subcore != C220BiuSubcore::Cube {
+            return Err(C220MtePipelineError::BiuL1SubcoreRequired);
+        }
+        let requests = mte2_l1_uops(
+            descriptor,
+            source_address,
+            destination_address,
+            dma_mode_word,
+        )?;
+        self.issue_dma_requests(instruction_id, requests)
+    }
+
+    fn issue_dma_requests(
+        &mut self,
+        instruction_id: u64,
+        requests: C220DmaUops,
+    ) -> Result<C220DmaIssue, C220MtePipelineError> {
         if !self.dma_connected {
             return Err(C220MtePipelineError::DmaDisconnected);
         }
-        let requests = mte2_uops(transfer)?;
-        if transfer.descriptor.is_disabled() {
+        if requests.clone().next().is_none() {
             return Ok(C220DmaIssue {
                 tick: self.events.tick(),
                 instruction_id,
@@ -873,8 +904,7 @@ impl C220MtePipeline {
                                     destination: match self.biu_subcore {
                                         C220BiuSubcore::Vector0 => C220BiuWriteDestination::Ub0,
                                         C220BiuSubcore::Vector1 => C220BiuWriteDestination::Ub1,
-                                        C220BiuSubcore::Cube =>
-                                            unreachable!("UB connection requires vector"),
+                                        C220BiuSubcore::Cube => C220BiuWriteDestination::L1,
                                     },
                                     prefetch: false,
                                     generated: sent,
@@ -923,7 +953,7 @@ impl C220MtePipeline {
                             &mut self.events,
                             returns,
                             [
-                                false,
+                                self.write_interface.can_push(C220MteL1WritePort::Port0),
                                 self.ub_write[0].can_push(),
                                 self.ub_write[1].can_push(),
                             ],
@@ -931,14 +961,21 @@ impl C220MtePipeline {
                         if let C220BiuReturnEvent::Send(send) = &outcome
                             && let Some(fragment) = send.sent()
                         {
-                            let index = match send.core {
-                                C220BiuSubcore::Vector0 => 0,
-                                C220BiuSubcore::Vector1 => 1,
+                            match send.core {
                                 C220BiuSubcore::Cube => {
-                                    unreachable!("UB connection requires vector")
+                                    assert!(self.write_interface.push(
+                                        tick,
+                                        C220MteL1WritePort::Port0,
+                                        fragment.output_fragment(),
+                                    )?);
                                 }
-                            };
-                            assert!(self.ub_write[index].push(tick, fragment)?);
+                                C220BiuSubcore::Vector0 => {
+                                    assert!(self.ub_write[0].push(tick, fragment)?)
+                                }
+                                C220BiuSubcore::Vector1 => {
+                                    assert!(self.ub_write[1].push(tick, fragment)?)
+                                }
+                            }
                         }
                         if let C220BiuReturnEvent::Egress(Some(output)) = &outcome {
                             let released = self
@@ -1021,7 +1058,11 @@ impl C220MtePipeline {
                         }
                         C220MteL1WriteEventOutcome::Acknowledged(Some(ack)) => {
                             if let Some(id) = ack.retired_instruction() {
-                                self.l1_fill_completions.push(id);
+                                if ack.request.port == C220MteL1WritePort::Port0 {
+                                    self.dma_completions.push(id);
+                                } else {
+                                    self.l1_fill_completions.push(id);
+                                }
                             }
                         }
                         _ => {}
