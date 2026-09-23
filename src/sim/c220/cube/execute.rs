@@ -98,8 +98,6 @@ pub enum C220CubeExecutionError {
         "sparse INT4 input row {row} is outside the {initialized_rows} initialized temporary rows"
     )]
     SparseUninitializedRow { row: u64, initialized_rows: u64 },
-    #[error("functional MMAD does not support XT controls 44:50={bits_44_50:#x}, bit58={bit_58}")]
-    UnsupportedControl { bits_44_50: u8, bit_58: bool },
     #[error(transparent)]
     BiasMemory(#[from] PvMemoryError),
     #[error("exact C220 Cube accumulator exceeded its internal range")]
@@ -211,12 +209,6 @@ impl C220CubeIssue {
             return Err(C220CubeExecutionError::UnsupportedOperation(
                 self.instruction.operation,
             ));
-        }
-        if self.parameters.xt_bit_58 && self.instruction.data_type != C220CubeDataType::F32F32 {
-            return Err(C220CubeExecutionError::UnsupportedControl {
-                bits_44_50: self.parameters.xt_bits_44_50,
-                bit_58: self.parameters.xt_bit_58,
-            });
         }
         Ok(())
     }

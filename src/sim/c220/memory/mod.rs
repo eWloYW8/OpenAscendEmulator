@@ -2,6 +2,7 @@ pub mod biu_read;
 pub mod biu_write;
 mod buffer;
 mod l0c;
+mod l0c_read;
 pub mod l1;
 pub mod timed_memory;
 mod ub_arbiter;
@@ -14,7 +15,11 @@ use crate::sim::c220::device::C220Device;
 pub use buffer::{C220LocalBuffer, C220LocalBufferError};
 pub use l0c::{
     C220_L0C_FRAGMENT_BYTES, C220L0c, C220L0cError, C220L0cFragmentRequest, C220L0cMaster,
-    C220L0cScoreboard, C220L0cUnitFlagBlock, C220L0cWriteArbiter,
+    C220L0cScoreboard, C220L0cUnitFlagBlock, C220L0cWriteArbiter, C220L0cWritePortBlock,
+};
+pub use l0c_read::{
+    C220_L0C_READ_TRANSPORT_CAPACITY, C220_L0C_READ_TRANSPORT_TICKS, C220L0cReadBanks,
+    C220L0cReadBlock, C220L0cReadPort, C220L0cReadRequest, C220L0cReadTransit,
 };
 pub use ub_arbiter::{
     C220UbBank, C220UbBlock, C220UbCycle, C220UbDecision, C220UbPort, C220UbRequest,

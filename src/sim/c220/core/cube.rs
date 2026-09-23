@@ -223,7 +223,8 @@ mod tests {
                 .buffer_mut()
                 .write_known(4096, &[0xa5; 4096])
                 .unwrap();
-            let before = core.local_memory.clone();
+            let mut before = core.local_memory.clone();
+            before.l0c_mut().read_banks_mut().advance_to(301).unwrap();
             let word = (7 << 29) | (3 << 22) | (1 << 12) | (2 << 7) | (3 << 2);
             let C220CoreStep::Executed {
                 instruction: C220CoreInstruction::Cube(issue),

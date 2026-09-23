@@ -58,6 +58,10 @@ pub enum C220L0cUnitFlagBlock {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum C220L0cError {
+    #[error("L0C read bank count must be in 1..=32, got {0}")]
+    InvalidReadBankCount(u8),
+    #[error("L0C read tick {requested} precedes {previous}")]
+    ReadTimeReversed { requested: u64, previous: u64 },
     #[error("L0C capacity must contain at least one 512-byte fragment")]
     InvalidCapacity,
     #[error("L0C unit-flag ready tick overflowed")]
@@ -213,6 +217,18 @@ pub struct C220L0cWriteArbiter {
     waiting: [VecDeque<u64>; 2],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220L0cWritePortBlock {
+    ActiveMaster {
+        master: C220L0cMaster,
+        outstanding: u32,
+    },
+    QueuedMaster {
+        master: C220L0cMaster,
+        enqueue_tick: u64,
+    },
+}
+
 impl C220L0cWriteArbiter {
     pub fn enqueue(&mut self, master: C220L0cMaster, tick: u64) {
         self.waiting[master.index()].push_back(tick);
@@ -227,18 +243,28 @@ impl C220L0cWriteArbiter {
     }
 
     pub fn can_grant(&self, master: C220L0cMaster) -> bool {
-        if self.busy[master.other().index()] != 0 {
-            return false;
+        self.blocked_by(master).is_none()
+    }
+
+    pub fn blocked_by(&self, master: C220L0cMaster) -> Option<C220L0cWritePortBlock> {
+        let competing = master.other();
+        let outstanding = self.busy[competing.index()];
+        if outstanding != 0 {
+            return Some(C220L0cWritePortBlock::ActiveMaster {
+                master: competing,
+                outstanding,
+            });
         }
-        let own = self.waiting[master.index()].front().copied();
-        let other = self.waiting[master.other().index()].front().copied();
-        match (master, own, other) {
-            (_, _, None) => true,
-            (C220L0cMaster::Cube, Some(own), Some(other)) => own <= other,
-            (C220L0cMaster::Cube, None, Some(_)) => false,
-            (C220L0cMaster::Mte, Some(own), Some(other)) => own < other,
-            (C220L0cMaster::Mte, None, Some(_)) => true,
-        }
+        let own = self.waiting[master.index()].front().copied()?;
+        let other = self.waiting[competing.index()].front().copied()?;
+        let blocked = match master {
+            C220L0cMaster::Cube => own > other,
+            C220L0cMaster::Mte => own >= other,
+        };
+        blocked.then_some(C220L0cWritePortBlock::QueuedMaster {
+            master: competing,
+            enqueue_tick: other,
+        })
     }
 
     pub fn grant(&mut self, master: C220L0cMaster) -> bool {
@@ -255,16 +281,85 @@ impl C220L0cWriteArbiter {
     }
 }
 
+#[cfg(test)]
+mod arbiter_tests {
+    use super::*;
+
+    #[test]
+    fn priority_and_active_ownership_are_distinct() {
+        use C220L0cMaster::{Cube, Mte};
+        let mut arbiter = C220L0cWriteArbiter::default();
+        arbiter.enqueue(Mte, 5);
+        assert_eq!(arbiter.blocked_by(Cube), None);
+        arbiter.enqueue(Cube, 5);
+        assert_eq!(
+            arbiter.blocked_by(Mte),
+            Some(C220L0cWritePortBlock::QueuedMaster {
+                master: Cube,
+                enqueue_tick: 5,
+            })
+        );
+        assert!(arbiter.grant(Cube));
+        assert!(arbiter.grant(Cube));
+        assert_eq!(
+            arbiter.blocked_by(Mte),
+            Some(C220L0cWritePortBlock::ActiveMaster {
+                master: Cube,
+                outstanding: 2,
+            })
+        );
+        arbiter.complete(Cube);
+        assert!(!arbiter.can_grant(Mte));
+        arbiter.complete(Cube);
+        assert!(arbiter.grant(Mte));
+        assert!(!arbiter.can_grant(Cube));
+        arbiter.complete(Mte);
+        arbiter.enqueue(Mte, 6);
+        arbiter.enqueue(Cube, 7);
+        assert!(!arbiter.can_grant(Cube));
+        assert!(arbiter.can_grant(Mte));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220L0c {
+    read_port: super::C220L0cReadPort,
+    read_banks: super::C220L0cReadBanks,
     buffer: C220LocalBuffer,
     scoreboard: C220L0cScoreboard,
     write_arbiter: C220L0cWriteArbiter,
 }
 
 impl C220L0c {
+    pub fn read_port_mut(&mut self) -> &mut super::C220L0cReadPort {
+        &mut self.read_port
+    }
+
+    pub fn poll_read(
+        &mut self,
+        tick: u64,
+        request_id: u32,
+        bank_count: u8,
+        data_latency: u32,
+    ) -> Result<Result<u64, super::C220L0cReadBlock>, C220L0cError> {
+        self.read_banks.advance_to(tick)?;
+        self.read_port.arbitrate(&self.read_banks, bank_count)?;
+        self.read_port
+            .complete_read(request_id, tick, data_latency, &mut self.scoreboard)
+    }
+
+    pub const fn read_banks(&self) -> &super::C220L0cReadBanks {
+        &self.read_banks
+    }
+
+    pub fn read_banks_mut(&mut self) -> &mut super::C220L0cReadBanks {
+        &mut self.read_banks
+    }
+
     pub fn new(total_bytes: u64, unit_flag_read_latency: u32) -> Result<Self, C220L0cError> {
         Ok(Self {
+            read_port: super::C220L0cReadPort::default(),
+            read_banks: super::C220L0cReadBanks::default(),
             buffer: C220LocalBuffer::new(total_bytes),
             scoreboard: C220L0cScoreboard::new(total_bytes, unit_flag_read_latency)?,
             write_arbiter: C220L0cWriteArbiter::default(),

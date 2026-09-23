@@ -8,7 +8,9 @@ use crate::isa::c220::cube::{
 };
 use crate::sim::c220::cube::control::{C220CubeIssueDelay, C220CubeTimingControl, C220F32MmadMode};
 use crate::sim::c220::cube::uop::{C220CubeUop, C220CubeUopRelease};
-use crate::sim::c220::memory::{C220L0c, C220L0cError, C220L0cMaster};
+use crate::sim::c220::memory::{
+    C220L0c, C220L0cError, C220L0cMaster, C220L0cUnitFlagBlock, C220L0cWritePortBlock,
+};
 use crate::sim::c220::sync::{C220HardwareFlagState, C220HardwareFlagTimingError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +82,20 @@ enum ResourceWait {
     HardwareFlag,
     L0cWritePort,
     L0cUnitFlag,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220CubeL0cStallReason {
+    WritePort(C220L0cWritePortBlock),
+    UnitFlag(C220L0cUnitFlagBlock),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220CubeL0cStall {
+    pub instruction_id: u64,
+    pub uop_id: u64,
+    pub tick: u64,
+    pub reason: C220CubeL0cStallReason,
 }
 
 impl C220CubeTicket {
@@ -159,6 +175,7 @@ pub struct C220CubePipeline {
     in_flight: VecDeque<C220CubeInFlight>,
     last_retirements: Vec<C220CubeTicket>,
     last_uop_releases: Vec<C220CubeUopRelease>,
+    last_l0c_stalls: Vec<C220CubeL0cStall>,
     previous_last_uop_tick: u64,
     live_issue_delay: Option<C220CubeIssueDelay>,
 }
@@ -184,6 +201,7 @@ impl C220CubePipeline {
             in_flight: VecDeque::new(),
             last_retirements: Vec::new(),
             last_uop_releases: Vec::new(),
+            last_l0c_stalls: Vec::new(),
             previous_last_uop_tick: 0,
             live_issue_delay: None,
         })
@@ -221,6 +239,12 @@ impl C220CubePipeline {
             .map(|tick| tick.max(self.now))
             .into_iter()
             .chain(retirement)
+            .chain(
+                self.in_flight
+                    .iter()
+                    .filter(|flight| flight.ticket.uop_count == 0)
+                    .map(|flight| flight.ticket.retire_tick.max(self.now)),
+            )
             .min()
     }
 
@@ -234,6 +258,10 @@ impl C220CubePipeline {
 
     pub fn last_uop_releases(&self) -> &[C220CubeUopRelease] {
         &self.last_uop_releases
+    }
+
+    pub fn last_l0c_stalls(&self) -> &[C220CubeL0cStall] {
+        &self.last_l0c_stalls
     }
 
     pub fn advance_to(
@@ -250,6 +278,7 @@ impl C220CubePipeline {
     pub(crate) fn begin_advance(&mut self) {
         self.last_retirements.clear();
         self.last_uop_releases.clear();
+        self.last_l0c_stalls.clear();
     }
 
     pub(crate) fn advance_in_batch_to(
@@ -268,6 +297,7 @@ impl C220CubePipeline {
             self.advance_event_at(event_tick, l0c, hardware_flags)?;
             self.now = event_tick;
         }
+        l0c.read_banks_mut().advance_to(tick)?;
         self.now = tick;
         Ok(())
     }
@@ -368,29 +398,34 @@ impl C220CubePipeline {
                     }
                 }
 
-                let port_blocked = uop.acquires_l0c_write_port
-                    && !flight.l0c_port_granted
-                    && !l0c.write_arbiter_mut().grant(C220L0cMaster::Cube);
-                if !port_blocked && uop.acquires_l0c_write_port {
-                    flight.l0c_port_granted = true;
+                let mut blocked = None;
+                if uop.acquires_l0c_write_port && !flight.l0c_port_granted {
+                    if let Some(reason) = l0c.write_arbiter().blocked_by(C220L0cMaster::Cube) {
+                        blocked = Some(C220CubeL0cStallReason::WritePort(reason));
+                    } else {
+                        flight.l0c_port_granted =
+                            l0c.write_arbiter_mut().grant(C220L0cMaster::Cube);
+                    }
                 }
-                let unit_flag_blocked = if port_blocked {
-                    false
-                } else if let Some(request) = uop.l0c_write {
-                    l0c.scoreboard_mut()
-                        .admit(request.into(), ready_tick)?
-                        .is_err()
-                } else {
-                    false
-                };
-                if port_blocked || unit_flag_blocked {
+                if blocked.is_none()
+                    && let Some(request) = uop.l0c_write
+                    && let Err(reason) = l0c.scoreboard_mut().admit(request.into(), ready_tick)?
+                {
+                    blocked = Some(C220CubeL0cStallReason::UnitFlag(reason));
+                }
+                if let Some(blocked) = blocked {
+                    self.last_l0c_stalls.push(C220CubeL0cStall {
+                        instruction_id: flight.instruction_id,
+                        uop_id: uop.id,
+                        tick: ready_tick,
+                        reason: blocked,
+                    });
                     let resume_tick = ready_tick
                         .checked_add(1)
                         .ok_or(C220CubeTimingError::TimeOverflow)?;
-                    let reason = if port_blocked {
-                        ResourceWait::L0cWritePort
-                    } else {
-                        ResourceWait::L0cUnitFlag
+                    let reason = match blocked {
+                        C220CubeL0cStallReason::WritePort(_) => ResourceWait::L0cWritePort,
+                        C220CubeL0cStallReason::UnitFlag(_) => ResourceWait::L0cUnitFlag,
                     };
                     delay_ticket_from_uop(&mut flight.ticket, uop.id, 1, reason)?;
                     flight.next_uop_tick = Some(resume_tick);
@@ -401,6 +436,13 @@ impl C220CubePipeline {
                 }
 
                 flight.pending_uops.pop_front();
+                if let Some(request) = uop.l0c_read {
+                    l0c.read_banks_mut().send_cube_read(
+                        ready_tick,
+                        request.address,
+                        request.bytes == 512,
+                    )?;
+                }
                 self.last_uop_releases.push(C220CubeUopRelease {
                     instruction_id: flight.instruction_id,
                     uop,
@@ -430,15 +472,23 @@ impl C220CubePipeline {
             }
         }
 
-        while self.in_flight.front().is_some_and(|flight| {
-            flight.pending_uops.is_empty()
-                && (flight.l0c_port_granted || flight.ticket.uop_count == 0)
-                && flight.ticket.retire_tick <= tick
-        }) {
+        while let Some(index) = self
+            .in_flight
+            .iter()
+            .enumerate()
+            .find_map(|(index, flight)| {
+                let ready = flight.ticket.retire_tick <= tick
+                    && (flight.ticket.uop_count == 0
+                        || (index == 0
+                            && flight.pending_uops.is_empty()
+                            && flight.l0c_port_granted));
+                ready.then_some(index)
+            })
+        {
             let flight = self
                 .in_flight
-                .pop_front()
-                .expect("front Cube flight exists");
+                .remove(index)
+                .expect("completed Cube flight exists");
             if flight.l0c_port_granted {
                 l0c.write_arbiter_mut().complete(C220L0cMaster::Cube);
             }
@@ -748,6 +798,56 @@ mod tests {
     }
 
     #[test]
+    fn empty_mmad_retires_without_waiting_for_an_older_pipeline_tail() {
+        use crate::isa::c220::cube::C220CubeRegisterValues;
+        use crate::sim::c220::cube::C220CubeV1UopPlanner;
+
+        let instruction = C220CubeInstruction::decode((7 << 29) | (3 << 22)).unwrap();
+        let parameters = instruction.parameters(C220CubeRegisterValues {
+            xd: 0,
+            xn: 0,
+            xm: 0,
+            xt: 16 | (16 << 12) | (16 << 24),
+        });
+        let mut pipeline = C220CubePipeline::new(C220CubeConfig::default()).unwrap();
+        let mut l0c = C220L0c::new(1 << 20, 12).unwrap();
+        let mut flags = C220HardwareFlagState::default();
+        let older = pipeline
+            .preview_issue(0, instruction, parameters, timing_control(0))
+            .unwrap();
+        pipeline
+            .issue(
+                older,
+                C220CubeV1UopPlanner::new(older, instruction, parameters),
+                0,
+                &mut l0c,
+            )
+            .unwrap();
+        let accept = pipeline.next_accept_tick();
+        let empty_parameters = C220MmadParameters { m: 0, ..parameters };
+        let empty = pipeline
+            .preview_issue(accept, instruction, empty_parameters, timing_control(0))
+            .unwrap();
+        pipeline
+            .issue(
+                empty,
+                C220CubeV1UopPlanner::new(empty, instruction, empty_parameters),
+                1,
+                &mut l0c,
+            )
+            .unwrap();
+        assert!(accept < older.retire_tick);
+        pipeline.advance_to(accept, &mut l0c, &mut flags).unwrap();
+        assert_eq!(pipeline.last_retirements(), &[empty]);
+        assert_eq!(pipeline.pending_retirement_count(), 1);
+        pipeline
+            .advance_to(older.retire_tick, &mut l0c, &mut flags)
+            .unwrap();
+        assert_eq!(pipeline.last_retirements(), &[older]);
+        assert_eq!(pipeline.pending_retirement_count(), 0);
+    }
+
+    #[test]
     fn delayed_instructions_keep_uop_and_retirement_order_across_large_advances() {
         use crate::isa::c220::cube::C220CubeRegisterValues;
         use crate::isa::c220::hflag::C220HardwareFlagInstruction;
@@ -1036,6 +1136,7 @@ mod tests {
         let mut l0c = C220L0c::new(1 << 20, 12).unwrap();
         unit_pipeline.issue(unit_ticket, uops, 0, &mut l0c).unwrap();
         let mut hardware_flags = C220HardwareFlagState::default();
+        assert!(l0c.write_arbiter_mut().grant(C220L0cMaster::Mte));
         unit_pipeline
             .advance_to(
                 unit_ticket.first_uop_tick.unwrap(),
@@ -1043,7 +1144,39 @@ mod tests {
                 &mut hardware_flags,
             )
             .unwrap();
+        assert!(unit_pipeline.last_uop_releases().is_empty());
+        assert_eq!(
+            unit_pipeline.last_l0c_stalls(),
+            &[C220CubeL0cStall {
+                instruction_id: 0,
+                uop_id: 0,
+                tick: unit_ticket.first_uop_tick.unwrap(),
+                reason: C220CubeL0cStallReason::WritePort(C220L0cWritePortBlock::ActiveMaster {
+                    master: C220L0cMaster::Mte,
+                    outstanding: 1,
+                }),
+            }]
+        );
+        l0c.write_arbiter_mut().complete(C220L0cMaster::Mte);
+        unit_pipeline
+            .advance_to(
+                unit_ticket.first_uop_tick.unwrap() + 1,
+                &mut l0c,
+                &mut hardware_flags,
+            )
+            .unwrap();
+        assert!(unit_pipeline.last_l0c_stalls().is_empty());
         assert_eq!(unit_pipeline.last_uop_releases().len(), 1);
         assert_eq!(l0c.scoreboard().writer_flag_count(), 2);
+        assert_eq!(l0c.read_banks().occupied_mask(), 0);
+        assert_eq!(l0c.read_banks().future_masks()[1], 0x0001_0001);
+        unit_pipeline
+            .advance_to(
+                unit_ticket.first_uop_tick.unwrap() + 2,
+                &mut l0c,
+                &mut hardware_flags,
+            )
+            .unwrap();
+        assert_eq!(l0c.read_banks().occupied_mask(), 0x0001_0001);
     }
 }

@@ -631,6 +631,26 @@ fn inactive_weight_offset_index_does_not_change_mmad() {
 }
 
 #[test]
+fn non_f32_mmad_ignores_input_padding_control() {
+    let mut memory = C220LocalMemory::new(Default::default()).unwrap();
+    memory.l0a_mut().write_known(0, &[0x11; 8192]).unwrap();
+    memory.l0b_mut().write_known(0, &[0x22; 8192]).unwrap();
+    let control = C220CubeExecutionControl::from_spr3(0);
+    for raw_type in [0, 1, 2, 3, 5, 6, 9] {
+        for operation in [0, 5] {
+            let mut issue = s4_issue(2, 64, 17, true);
+            issue.word = (7 << 29) | (operation << 25) | ((raw_type & 7) << 22) | (raw_type >> 3);
+            issue.instruction = C220CubeInstruction::decode(issue.word).unwrap();
+            issue.parameters = issue.instruction.parameters(issue.registers);
+            let expected = issue.prepare(&memory, control).unwrap();
+            issue.registers.xt |= 1 << 58;
+            issue.parameters = issue.instruction.parameters(issue.registers);
+            assert_eq!(issue.prepare(&memory, control).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
 fn bias_is_broadcast_per_column_for_all_supported_mmad_formats() {
     for raw_type in [0, 1, 2, 3, 5, 6, 9, 10] {
         for hf32 in [false, true] {
