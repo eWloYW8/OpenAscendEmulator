@@ -211,6 +211,7 @@ mod tests {
             fsm_bubbles: 0,
             sparse_bubbles: 0,
             resource_wait_ticks: 0,
+            resource_waits: Default::default(),
             issue_delay_wait_ticks: 0,
             issue_delay: crate::sim::c220::cube::C220CubeIssueDelay::default(),
             fsm_version: crate::sim::c220::cube::C220CubeFsmVersion::V1,

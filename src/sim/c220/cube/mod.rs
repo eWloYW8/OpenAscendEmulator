@@ -18,8 +18,8 @@ mod uop;
 use crate::isa::c220::cube::{C220CubeInstruction, C220CubeRegisterValues, C220MmadParameters};
 
 pub use timing::{
-    C220CubeConfig, C220CubeFsmVersion, C220CubePipeline, C220CubeTicket, C220CubeTimingError,
-    C220CubeV1FrameOrder,
+    C220CubeConfig, C220CubeFsmVersion, C220CubePipeline, C220CubeResourceWaits, C220CubeTicket,
+    C220CubeTimingError, C220CubeV1FrameOrder,
 };
 
 pub use control::{

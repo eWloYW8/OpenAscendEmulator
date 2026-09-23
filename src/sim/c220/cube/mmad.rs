@@ -149,23 +149,38 @@ impl Mmad<'_> {
                 let k_tile = u64::from(self.geometry.k_tile_elements);
                 for lane in 0..self.active_lanes(k_base, k_tile) {
                     let k = k_base + lane;
-                    let (left, right) = if self.issue.instruction.operation
-                        == C220CubeOperation::SparseMmad
-                    {
-                        super::sparse::read_byte_pair(self.issue.parameters, self.memory, m, n, k)?
-                    } else {
-                        let left = input_mode.read(
-                            self.memory.l0a(),
-                            self.issue.parameters.xn,
-                            self.a_element(u64::from(self.geometry.k_tiles), k_tile, m, k),
-                        )?;
-                        let right = input_mode.read(
-                            self.memory.l0b(),
-                            self.issue.parameters.xm,
-                            integer_b_element(u64::from(self.geometry.n_tiles), k_tile, k, n),
-                        )?;
-                        (left, right)
-                    };
+                    let (left, right) =
+                        if self.issue.instruction.operation == C220CubeOperation::SparseMmad {
+                            if input_mode == IntegerInputMode::Signed4Signed4 {
+                                super::sparse::read_nibble_pair(
+                                    self.issue.parameters,
+                                    self.memory,
+                                    m,
+                                    n,
+                                    k,
+                                )?
+                            } else {
+                                super::sparse::read_byte_pair(
+                                    self.issue.parameters,
+                                    self.memory,
+                                    m,
+                                    n,
+                                    k,
+                                )?
+                            }
+                        } else {
+                            let left = input_mode.read(
+                                self.memory.l0a(),
+                                self.issue.parameters.xn,
+                                self.a_element(u64::from(self.geometry.k_tiles), k_tile, m, k),
+                            )?;
+                            let right = input_mode.read(
+                                self.memory.l0b(),
+                                self.issue.parameters.xm,
+                                integer_b_element(u64::from(self.geometry.n_tiles), k_tile, k, n),
+                            )?;
+                            (left, right)
+                        };
                     sum += input_mode.product(left, right);
                 }
                 let saturated = sum.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
@@ -196,11 +211,16 @@ impl Mmad<'_> {
         m: u64,
         n: u64,
         k_base: u64,
-    ) -> Result<([u16; 16], [u16; 16]), C220LocalBufferError> {
+    ) -> Result<([u16; 16], [u16; 16]), C220CubeExecutionError> {
         let mut left = [0; 16];
         let mut right = [0; 16];
         for lane in 0..self.active_lanes(k_base, 16) {
             let k = k_base + lane;
+            if self.issue.instruction.operation == C220CubeOperation::SparseMmad {
+                (left[lane as usize], right[lane as usize]) =
+                    super::sparse::read_half_pair(self.issue.parameters, self.memory, m, n, k)?;
+                continue;
+            }
             left[lane as usize] = u16::from_le_bytes(read_input(
                 self.memory.l0a(),
                 self.issue.parameters.xn,
@@ -220,7 +240,7 @@ impl Mmad<'_> {
         m: u64,
         n: u64,
         k_base: u64,
-    ) -> Result<([u32; N], [u32; N]), C220LocalBufferError> {
+    ) -> Result<([u32; N], [u32; N]), C220CubeExecutionError> {
         let mut left = [0; N];
         let mut right = [0; N];
         let a_k_tiles = if self.issue.parameters.xt_bit_58 {
@@ -230,6 +250,11 @@ impl Mmad<'_> {
         };
         for lane in 0..self.active_lanes(k_base, N as u64) {
             let k = k_base + lane;
+            if self.issue.instruction.operation == C220CubeOperation::SparseMmad {
+                (left[lane as usize], right[lane as usize]) =
+                    super::sparse::read_word_pair(self.issue.parameters, self.memory, m, n, k)?;
+                continue;
+            }
             left[lane as usize] = u32::from_le_bytes(read_input(
                 self.memory.l0a(),
                 self.issue.parameters.xn,

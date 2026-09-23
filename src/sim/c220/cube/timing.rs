@@ -57,12 +57,29 @@ pub struct C220CubeTicket {
     pub fsm_bubbles: u64,
     pub sparse_bubbles: u64,
     pub resource_wait_ticks: u64,
+    pub resource_waits: C220CubeResourceWaits,
     pub issue_delay_wait_ticks: u64,
     pub issue_delay: C220CubeIssueDelay,
     pub fsm_version: C220CubeFsmVersion,
     pub v1_n2_mode: bool,
     pub v1_frame_order: C220CubeV1FrameOrder,
     pub v1_dtype_bubbles_per_uop: u8,
+}
+
+/// Mutually exclusive reasons for cycles added by runtime backpressure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct C220CubeResourceWaits {
+    pub instruction_order: u64,
+    pub hardware_flag: u64,
+    pub l0c_write_port: u64,
+    pub l0c_unit_flag: u64,
+}
+
+enum ResourceWait {
+    InstructionOrder,
+    HardwareFlag,
+    L0cWritePort,
+    L0cUnitFlag,
 }
 
 impl C220CubeTicket {
@@ -272,7 +289,12 @@ impl C220CubePipeline {
                         .pending_uops
                         .front()
                         .expect("pending Cube tick has a uop");
-                    delay_ticket_from_uop(&mut flight.ticket, uop.id, ordered_tick - ready_tick)?;
+                    delay_ticket_from_uop(
+                        &mut flight.ticket,
+                        uop.id,
+                        ordered_tick - ready_tick,
+                        ResourceWait::InstructionOrder,
+                    )?;
                     flight.next_uop_tick = Some(ordered_tick);
                     self.next_accept_tick = self
                         .next_accept_tick
@@ -295,7 +317,12 @@ impl C220CubePipeline {
                     let delay = resume_tick
                         .checked_sub(ready_tick)
                         .ok_or(C220CubeTimingError::TimeOverflow)?;
-                    delay_ticket_from_uop(&mut flight.ticket, uop.id, delay)?;
+                    delay_ticket_from_uop(
+                        &mut flight.ticket,
+                        uop.id,
+                        delay,
+                        ResourceWait::HardwareFlag,
+                    )?;
                     flight.next_uop_tick = Some(resume_tick);
                     self.next_accept_tick = self
                         .next_accept_tick
@@ -360,7 +387,12 @@ impl C220CubePipeline {
                     let resume_tick = ready_tick
                         .checked_add(1)
                         .ok_or(C220CubeTimingError::TimeOverflow)?;
-                    delay_ticket_from_uop(&mut flight.ticket, uop.id, 1)?;
+                    let reason = if port_blocked {
+                        ResourceWait::L0cWritePort
+                    } else {
+                        ResourceWait::L0cUnitFlag
+                    };
+                    delay_ticket_from_uop(&mut flight.ticket, uop.id, 1, reason)?;
                     flight.next_uop_tick = Some(resume_tick);
                     self.next_accept_tick = self
                         .next_accept_tick
@@ -517,10 +549,20 @@ fn delay_ticket_from_uop(
     ticket: &mut C220CubeTicket,
     uop_id: u64,
     delay: u64,
+    reason: ResourceWait,
 ) -> Result<(), C220CubeTimingError> {
     shift_ticket_from_uop(ticket, uop_id, delay)?;
     ticket.resource_wait_ticks = ticket
         .resource_wait_ticks
+        .checked_add(delay)
+        .ok_or(C220CubeTimingError::TimeOverflow)?;
+    let counter = match reason {
+        ResourceWait::InstructionOrder => &mut ticket.resource_waits.instruction_order,
+        ResourceWait::HardwareFlag => &mut ticket.resource_waits.hardware_flag,
+        ResourceWait::L0cWritePort => &mut ticket.resource_waits.l0c_write_port,
+        ResourceWait::L0cUnitFlag => &mut ticket.resource_waits.l0c_unit_flag,
+    };
+    *counter = counter
         .checked_add(delay)
         .ok_or(C220CubeTimingError::TimeOverflow)?;
     Ok(())
@@ -602,6 +644,7 @@ fn schedule(
             fsm_bubbles: 0,
             sparse_bubbles: 0,
             resource_wait_ticks: 0,
+            resource_waits: C220CubeResourceWaits::default(),
             issue_delay_wait_ticks: 0,
             issue_delay: control.issue_delay,
             fsm_version: config.fsm_version,
@@ -685,6 +728,7 @@ fn schedule(
         fsm_bubbles,
         sparse_bubbles,
         resource_wait_ticks: 0,
+        resource_waits: C220CubeResourceWaits::default(),
         issue_delay_wait_ticks,
         issue_delay: control.issue_delay,
         fsm_version: config.fsm_version,
@@ -770,6 +814,17 @@ mod tests {
         );
         assert_eq!(releases[0].issue_tick, 25);
         assert_eq!(retirements[0].issue_delay_wait_ticks, 3);
+        assert_eq!(retirements[0].resource_waits.hardware_flag, 20);
+        for ticket in &retirements {
+            let waits = ticket.resource_waits;
+            assert_eq!(
+                ticket.resource_wait_ticks,
+                waits.instruction_order
+                    + waits.hardware_flag
+                    + waits.l0c_write_port
+                    + waits.l0c_unit_flag
+            );
+        }
         assert!(
             releases
                 .windows(2)

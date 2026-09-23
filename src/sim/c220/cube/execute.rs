@@ -94,6 +94,10 @@ pub enum C220CubeExecutionError {
         "sparse selector addresses dense K={dense_k} outside the {loaded_k} loaded input lanes"
     )]
     SparseInputOutsideLoadedTiles { dense_k: u64, loaded_k: u64 },
+    #[error(
+        "sparse INT4 input row {row} is outside the {initialized_rows} initialized temporary rows"
+    )]
+    SparseUninitializedRow { row: u64, initialized_rows: u64 },
     #[error("functional MMAD does not support XT controls 44:50={bits_44_50:#x}, bit58={bit_58}")]
     UnsupportedControl { bits_44_50: u8, bit_58: bool },
     #[error(transparent)]
@@ -194,16 +198,21 @@ impl C220CubeIssue {
         if self.instruction.operation == C220CubeOperation::SparseMmad
             && !matches!(
                 self.instruction.data_type,
-                C220CubeDataType::S8S8S32 | C220CubeDataType::U8U8S32 | C220CubeDataType::U8S8S32
+                C220CubeDataType::S8S8S32
+                    | C220CubeDataType::S4S4S32
+                    | C220CubeDataType::U8U8S32
+                    | C220CubeDataType::U8S8S32
+                    | C220CubeDataType::F16F16
+                    | C220CubeDataType::F16F32
+                    | C220CubeDataType::Bf16F32
+                    | C220CubeDataType::F32F32
             )
         {
             return Err(C220CubeExecutionError::UnsupportedOperation(
                 self.instruction.operation,
             ));
         }
-        if self.parameters.xt_bits_44_50 != 0
-            || (self.parameters.xt_bit_58 && self.instruction.data_type != C220CubeDataType::F32F32)
-        {
+        if self.parameters.xt_bit_58 && self.instruction.data_type != C220CubeDataType::F32F32 {
             return Err(C220CubeExecutionError::UnsupportedControl {
                 bits_44_50: self.parameters.xt_bits_44_50,
                 bit_58: self.parameters.xt_bit_58,

@@ -66,6 +66,10 @@ pub struct C220CoreTimingRules {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Keep per-instruction stepping allocation-free"
+)]
 pub enum C220CoreStep {
     Executed {
         tick: u64,

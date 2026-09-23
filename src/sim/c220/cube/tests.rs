@@ -333,6 +333,218 @@ fn f32_mmad_pads_a_tile_stride_when_requested() {
 }
 
 #[test]
+fn sparse_int4_mmad_sign_extends_selected_nibbles() {
+    for raw_k in [32, 128, 256] {
+        let mut issue = s4_issue(8, raw_k, 17, true);
+        issue.word = (7 << 29) | (5 << 25) | (6 << 22);
+        issue.instruction = C220CubeInstruction::decode(issue.word).unwrap();
+        issue.registers.xn = 0;
+        issue.registers.xm = 16384;
+        issue.registers.xd = 0;
+        issue.parameters = issue.instruction.parameters(issue.registers);
+        let mut memory = C220LocalMemory::new(Default::default()).unwrap();
+        memory.l0a_mut().write_known(0, &[0xf2; 4096]).unwrap();
+        memory.l0b_mut().write_known(16384, &[0x21; 4096]).unwrap();
+        memory
+            .weight_index_mut()
+            .write_known_linear(4096, &[0x55; 1024])
+            .unwrap();
+        let outcome = issue
+            .execute(&mut memory, C220CubeExecutionControl::from_spr3(0))
+            .unwrap();
+        assert!(!outcome.integer_overflow);
+        let expected = u32::from(issue.parameters.effective_k) / 2 * 3;
+        for row in 0..8 {
+            for column in 0..17 {
+                assert_eq!(
+                    read_u32_wrapped(memory.l0c().buffer(), f32_c_address(0, 1, row, column))
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+        let mut parameters = issue.parameters;
+        parameters.m = 9;
+        assert!(matches!(
+            super::sparse::read_nibble_pair(parameters, &memory, 8, 0, 0),
+            Err(C220CubeExecutionError::SparseUninitializedRow {
+                row: 8,
+                initialized_rows: 8
+            })
+        ));
+    }
+}
+
+#[test]
+fn sparse_f32_mmad_reassembles_selected_halfwords() {
+    for (raw_k, expected) in [(64, 48.0_f32), (34, 26.0)] {
+        for padded in [false, true] {
+            for hf32 in [false, true] {
+                let mut issue = s4_issue(17, raw_k, 17, true);
+                issue.word = (7 << 29) | (5 << 25) | (2 << 22) | 1;
+                issue.instruction = C220CubeInstruction::decode(issue.word).unwrap();
+                issue.registers.xn = 0;
+                issue.registers.xm = 16384;
+                issue.registers.xd = 0;
+                issue.registers.xt |= u64::from(padded) << 58;
+                issue.parameters = issue.instruction.parameters(issue.registers);
+                let k = u64::from(issue.parameters.effective_k);
+                let tiles = k.div_ceil(8);
+                let mut memory = C220LocalMemory::new(Default::default()).unwrap();
+                for row in 0..17 {
+                    for dense_k in 0..2 * tiles * 8 {
+                        let element = integer_a_element(2 * tiles, 8, row, dense_k);
+                        let mut address = 4 * element;
+                        if padded {
+                            address += (address / 512 / tiles) * (2 * k.div_ceil(16) - tiles) * 512;
+                        }
+                        let value = if dense_k % 2 == 0 { 1.0_f32 } else { 2.0 };
+                        memory
+                            .l0a_mut()
+                            .write_known(address, &value.to_le_bytes())
+                            .unwrap();
+                    }
+                }
+                for column in 0..17 {
+                    for lane in 0..k {
+                        memory
+                            .l0b_mut()
+                            .write_known(
+                                f32_b_address(16384, 2, lane, column),
+                                &1.0_f32.to_le_bytes(),
+                            )
+                            .unwrap();
+                    }
+                    for slice in 0..tiles {
+                        memory
+                            .weight_index_mut()
+                            .write_known_linear(
+                                4096 + 8 * (column + slice * 32),
+                                &[if slice % 2 == 0 { 0 } else { 0xaa }; 4],
+                            )
+                            .unwrap();
+                    }
+                }
+                issue
+                    .execute(
+                        &mut memory,
+                        C220CubeExecutionControl::from_spr3(u64::from(hf32) << 46),
+                    )
+                    .unwrap();
+                for row in 0..17 {
+                    for column in 0..17 {
+                        assert_eq!(
+                            read_u32_wrapped(
+                                memory.l0c().buffer(),
+                                f32_c_address(0, 2, row, column),
+                            )
+                            .unwrap(),
+                            expected.to_bits()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sparse_half_mmad_uses_half_slices_and_compact_input_tiles() {
+    for raw_type in [2, 3, 9] {
+        for (m, raw_k, expected) in [(17, 64, 40.0_f32), (17, 34, 19.0), (1, 32, 8.0)] {
+            let mut issue = s4_issue(m, raw_k, 17, true);
+            issue.word = (7 << 29) | (5 << 25) | ((raw_type & 7) << 22) | (raw_type >> 3);
+            issue.instruction = C220CubeInstruction::decode(issue.word).unwrap();
+            issue.registers.xn = 0;
+            issue.registers.xm = 16384;
+            issue.registers.xd = 0;
+            issue.parameters = issue.instruction.parameters(issue.registers);
+            let k = u64::from(issue.parameters.effective_k);
+            let tiles = 2 * k.div_ceil(16) - u64::from((1..=16).contains(&(k & 31)));
+            let one: u16 = if raw_type == 9 { 0x3f80 } else { 0x3c00 };
+            let mut memory = C220LocalMemory::new(Default::default()).unwrap();
+            for row in 0..u64::from(m) {
+                for dense_k in 0..tiles * 16 {
+                    let value = if dense_k % 4 == 3 { 0x4000 } else { one };
+                    memory
+                        .l0a_mut()
+                        .write_known(
+                            2 * integer_a_element(tiles, 16, row, dense_k),
+                            &value.to_le_bytes(),
+                        )
+                        .unwrap();
+                }
+            }
+            for column in 0..17 {
+                for lane in 0..k {
+                    memory
+                        .l0b_mut()
+                        .write_known(
+                            16384 + 2 * integer_b_element(2, 16, lane, column),
+                            &one.to_le_bytes(),
+                        )
+                        .unwrap();
+                }
+                for slice in 0..k.div_ceil(16) {
+                    memory
+                        .weight_index_mut()
+                        .write_known_linear(
+                            4096 + 8 * (column + slice * 32),
+                            &[if slice == 0 { 0 } else { 0x77 }; 4],
+                        )
+                        .unwrap();
+                }
+            }
+            if raw_k == 32 {
+                let mut parameters = issue.parameters;
+                parameters.m = 17;
+                assert!(matches!(
+                    super::sparse::read_half_pair(parameters, &memory, 16, 0, 8),
+                    Err(C220CubeExecutionError::SparseInputOutsideLoadedTiles {
+                        dense_k: 16,
+                        loaded_k: 16,
+                    })
+                ));
+            }
+            issue
+                .execute(&mut memory, C220CubeExecutionControl::from_spr3(0))
+                .unwrap();
+            for row in 0..u64::from(m) {
+                for column in 0..17 {
+                    if raw_type == 2 {
+                        let bits: u16 = match raw_k {
+                            64 => 0x5100,
+                            34 => 0x4cc0,
+                            _ => 0x4800,
+                        };
+                        assert_eq!(
+                            memory
+                                .l0c()
+                                .buffer()
+                                .read_known(
+                                    f16_c_address(0, u64::from(m.div_ceil(16)), row, column),
+                                    2,
+                                )
+                                .unwrap(),
+                            bits.to_le_bytes()
+                        );
+                    } else {
+                        assert_eq!(
+                            read_u32_wrapped(
+                                memory.l0c().buffer(),
+                                f32_c_address(0, u64::from(m.div_ceil(16)), row, column),
+                            )
+                            .unwrap(),
+                            expected.to_bits()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn sparse_byte_mmad_selects_dense_inputs_across_tiles_and_partial_k() {
     for raw_type in [0, 1, 5] {
         for raw_k in [32_u16, 64, 68, 128] {
@@ -393,6 +605,26 @@ fn sparse_byte_mmad_selects_dense_inputs_across_tiles_and_partial_k() {
                         expected
                     );
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn inactive_weight_offset_index_does_not_change_mmad() {
+    let memory = C220LocalMemory::new(Default::default()).unwrap();
+    let control = C220CubeExecutionControl::from_spr3(0);
+    for raw_type in [0, 1, 2, 3, 5, 6, 9, 10] {
+        for operation in [0, 5] {
+            let mut issue = s4_issue(1, 4, 1, true);
+            issue.word = (7 << 29) | (operation << 25) | ((raw_type & 7) << 22) | (raw_type >> 3);
+            issue.instruction = C220CubeInstruction::decode(issue.word).unwrap();
+            issue.parameters = issue.instruction.parameters(issue.registers);
+            let expected = issue.prepare(&memory, control).unwrap();
+            for index in [1, 63, 127] {
+                issue.registers.xt = (issue.registers.xt & !(127 << 44)) | (index << 44);
+                issue.parameters = issue.instruction.parameters(issue.registers);
+                assert_eq!(issue.prepare(&memory, control).unwrap(), expected);
             }
         }
     }
