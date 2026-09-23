@@ -1,6 +1,35 @@
 use super::fp16::{C220Fp16Mode, C220Fp16Outcome, C220Fp16Status};
 use crate::numeric::fp32::{Fp32ValueOutcome, Fp32ValueStatus};
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct C220FixpInt16Status {
+    pub positive_saturation: bool,
+    pub negative_saturation: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220FixpInt16Outcome {
+    pub value: i16,
+    /// Range status is captured before activation clamps negative values.
+    pub status: C220FixpInt16Status,
+}
+
+/// Integer dequantization with an arithmetic shift of 1–16 bits, followed by
+/// signed saturation and optional ReLU. Only factor bits 32–35 select the shift.
+pub fn c220_fixp_i32_to_i16(input: i32, factor: u64, relu: bool) -> C220FixpInt16Outcome {
+    let shift = ((factor >> 32) & 15) + 1;
+    let shifted = input >> shift;
+    let status = C220FixpInt16Status {
+        positive_saturation: shifted > i32::from(i16::MAX),
+        negative_saturation: shifted < i32::from(i16::MIN),
+    };
+    let value = shifted.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    C220FixpInt16Outcome {
+        value: if relu { value.max(0) } else { value },
+        status,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220FixpBf16Outcome {
     pub bits: u16,
@@ -181,6 +210,47 @@ fn round_significand(value: u32, shift: u32, negative: bool, mode: C220FixpRound
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_dequantization_shift_saturation_and_activation() {
+        for shift in 1..=16 {
+            let factor = (shift - 1) << 32;
+            for input in [
+                i32::MIN,
+                -65537,
+                -65536,
+                -3,
+                -1,
+                0,
+                1,
+                65534,
+                65536,
+                i32::MAX,
+            ] {
+                let shifted = i64::from(input).div_euclid(1_i64 << shift);
+                for relu in [false, true] {
+                    let result = c220_fixp_i32_to_i16(input, factor, relu);
+                    let clamped = shifted.clamp(i64::from(i16::MIN), i64::from(i16::MAX));
+                    assert_eq!(
+                        result.value,
+                        if relu { clamped.max(0) } else { clamped } as i16
+                    );
+                    assert_eq!(
+                        result.status.positive_saturation,
+                        shifted > i64::from(i16::MAX)
+                    );
+                    assert_eq!(
+                        result.status.negative_saturation,
+                        shifted < i64::from(i16::MIN)
+                    );
+                    assert_eq!(
+                        result,
+                        c220_fixp_i32_to_i16(input, factor | !(15_u64 << 32), relu)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn bf16_rounds_before_relu_and_distinguishes_operand_from_range_status() {

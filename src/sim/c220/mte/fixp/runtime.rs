@@ -242,11 +242,7 @@ impl C220FixpEngine {
         if let Some(blocked) = self.admission_backpressure() {
             return Ok(blocked);
         }
-        if command.descriptor.conversion_mode() == 1 && command.descriptor.activation_mode() > 3 {
-            return Err(
-                C220FixpExecutionError::Activation(command.descriptor.activation_mode()).into(),
-            );
-        }
+        command.validate_activation()?;
         let packets =
             C220FixpReadGenerator::new(command, id, first_request, self.config.read_bandwidth)?;
         if !self.read.submit(tick, packets)? {

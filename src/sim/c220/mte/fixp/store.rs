@@ -52,6 +52,13 @@ pub struct C220FixpStoreRead {
     complete: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220FixpStoreProbe {
+    Transferring { remaining: u32 },
+    WaitingForToken { token: NonZeroU32 },
+    Complete,
+}
+
 impl C220FixpStoreRead {
     pub fn new(token: NonZeroU32, bytes: NonZeroU32) -> Self {
         Self {
@@ -71,18 +78,29 @@ impl C220FixpStoreRead {
     }
 
     pub fn probe(&mut self, stores: &mut C220FixpStoreBuffer) -> bool {
+        self.probe_progress(stores) == C220FixpStoreProbe::Complete
+    }
+
+    pub fn probe_progress(&mut self, stores: &mut C220FixpStoreBuffer) -> C220FixpStoreProbe {
         if self.complete {
-            return true;
+            return C220FixpStoreProbe::Complete;
         }
         self.remaining = if self.remaining == 0 {
             (self.bytes.get() - 1) / 128
         } else {
             self.remaining - 1
         };
-        if self.remaining == 0 {
-            self.complete = stores.consume(self.token);
+        if self.remaining != 0 {
+            return C220FixpStoreProbe::Transferring {
+                remaining: self.remaining,
+            };
         }
-        self.complete
+        self.complete = stores.consume(self.token);
+        if self.complete {
+            C220FixpStoreProbe::Complete
+        } else {
+            C220FixpStoreProbe::WaitingForToken { token: self.token }
+        }
     }
 }
 
@@ -174,10 +192,21 @@ mod tests {
         let mut stores = C220FixpStoreBuffer::default();
         let mut read =
             C220FixpStoreRead::new(NonZeroU32::new(1).unwrap(), NonZeroU32::new(257).unwrap());
-        assert!(!read.probe(&mut stores));
+        assert_eq!(
+            read.probe_progress(&mut stores),
+            C220FixpStoreProbe::Transferring { remaining: 2 }
+        );
         assert_eq!(read.remaining(), 2);
-        assert!(!read.probe(&mut stores));
-        assert!(!read.probe(&mut stores));
+        assert_eq!(
+            read.probe_progress(&mut stores),
+            C220FixpStoreProbe::Transferring { remaining: 1 }
+        );
+        assert_eq!(
+            read.probe_progress(&mut stores),
+            C220FixpStoreProbe::WaitingForToken {
+                token: NonZeroU32::new(1).unwrap()
+            }
+        );
         let write = stores.publish(C220MteOutputFragment {
             instruction_id: 7,
             request_id: 3,

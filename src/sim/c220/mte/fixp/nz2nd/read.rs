@@ -177,6 +177,8 @@ mod tests {
             control: 0,
             scalar_slope: 0,
             slope_base_block: 0,
+            dequant_base_block: 0,
+            scalar_dequant: 0,
         };
         let generator = C220FixpNz2ndReadGenerator::new(command, 7, u32::MAX, 256).unwrap();
         let packets: Vec<_> = generator.clone().map(|p| p.operation).collect();

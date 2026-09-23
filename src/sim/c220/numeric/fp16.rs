@@ -52,6 +52,45 @@ pub struct C220Fp16Outcome {
     pub status: C220Fp16Status,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum C220Fp16AddRounding {
+    #[default]
+    NearestEven,
+    TowardZero,
+}
+
+impl C220Fp16AddRounding {
+    pub const fn from_model_value(value: u32) -> Self {
+        if value == 0 {
+            Self::NearestEven
+        } else {
+            Self::TowardZero
+        }
+    }
+}
+
+/// Overflow classification precedes finite-result rounding. Consequently,
+/// truncation does not change the overflow threshold or saturation policy.
+pub fn evaluate_c220_fp16_add(
+    first: u16,
+    second: u16,
+    mode: C220Fp16Mode,
+    rounding: C220Fp16AddRounding,
+) -> C220Fp16Outcome {
+    let mut result = evaluate_c220_fp16(C220VectorScalarOperation::Add, first, second, mode);
+    if rounding == C220Fp16AddRounding::TowardZero
+        && !result.status.nan_operand
+        && !result.status.infinity_operand
+        && !result.status.overflow
+    {
+        let exact = to_f64(first) + to_f64(second);
+        if to_f64(result.bits).abs() > exact.abs() {
+            result.bits -= 1;
+        }
+    }
+    result
+}
+
 pub fn evaluate_c220_fp16_relu(bits: u16, mode: C220Fp16Mode) -> C220Fp16Outcome {
     let nan_operand = is_nan(bits);
     let infinity_operand = is_infinite(bits);
@@ -299,6 +338,41 @@ pub(crate) fn round_finite_to_f16(value: f64) -> u16 {
 mod tests {
     use super::*;
     use C220VectorScalarOperation::{Add, LeakyRelu, Maximum, Minimum, Multiply};
+
+    #[test]
+    fn add_rounding_is_independent_of_overflow_and_saturation() {
+        for (first, second, nearest, truncated) in [
+            (0x3c01, 0x1000, 0x3c02, 0x3c01),
+            (0xbc01, 0x9000, 0xbc02, 0xbc01),
+            (0x3c00, 0x9000, 0x3bff, 0x3bff),
+            (1, 1, 2, 2),
+            (0x0400, 0x8001, 0x03ff, 0x03ff),
+            (0x8000, 0x8000, 0x8000, 0x8000),
+            (0x3c00, 0xbc00, 0, 0),
+        ] {
+            for (rounding, expected) in [
+                (C220Fp16AddRounding::NearestEven, nearest),
+                (C220Fp16AddRounding::TowardZero, truncated),
+            ] {
+                assert_eq!(
+                    evaluate_c220_fp16_add(first, second, C220Fp16Mode::NonSaturating, rounding)
+                        .bits,
+                    expected
+                );
+            }
+        }
+        for value in [0, 1, u32::MAX] {
+            let rounding = C220Fp16AddRounding::from_model_value(value);
+            for (mode, expected) in [
+                (C220Fp16Mode::Saturating, 0x7bff),
+                (C220Fp16Mode::NonSaturating, 0x7c00),
+            ] {
+                let result = evaluate_c220_fp16_add(0x7bff, 0x4c00, mode, rounding);
+                assert_eq!(result.bits, expected);
+                assert!(result.status.overflow);
+            }
+        }
+    }
 
     #[test]
     fn f16_rounding_and_nonfinite_modes_keep_their_distinct_bit_patterns() {

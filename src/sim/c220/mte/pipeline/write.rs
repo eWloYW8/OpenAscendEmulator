@@ -290,27 +290,36 @@ impl C220MtePipeline {
         &self.fixp_stores
     }
 
-    /// Transfer an available FIX packet only when the Cube command queue has
-    /// credit. The BIU mode is captured separately from the FIX output policy.
-    pub fn enqueue_fixp_biu_output(
+    /// Publish FIX source availability at packet generation, independently of
+    /// downstream BIU command credit. The packet retains its captured mode.
+    pub fn packetize_fixp_biu_output(
         &mut self,
         output: &mut crate::sim::c220::mte::fixp::C220FixpNz2ndOutput,
+        writes: &mut crate::sim::c220::mte::fixp::C220FixpBiuWritePipeline,
         mode: crate::sim::c220::mte::uop::C220DmaUopMode,
-    ) -> Result<Option<crate::sim::c220::mte::fixp::C220FixpStoreWrite>, C220MtePipelineError> {
+    ) -> Result<Option<crate::sim::c220::mte::fixp::C220FixpBiuWrite>, C220MtePipelineError> {
+        if self.biu_write_commands.is_none() {
+            return Err(C220MtePipelineError::BiuWriteCommandDisconnected);
+        }
+        Ok(writes.packetize_external(self.events.tick(), output, &mut self.fixp_stores, mode)?)
+    }
+
+    /// Handoff releases write-dispatch capacity, not the store token or the
+    /// instruction's retirement dependency on the final BIU response.
+    pub fn send_fixp_biu_output(
+        &mut self,
+        writes: &mut crate::sim::c220::mte::fixp::C220FixpBiuWritePipeline,
+    ) -> Result<
+        crate::sim::c220::mte::fixp::C220FixpWriteProgress<
+            crate::sim::c220::mte::fixp::C220FixpBiuWrite,
+        >,
+        C220MtePipelineError,
+    > {
         let commands = self
             .biu_write_commands
             .as_mut()
             .ok_or(C220MtePipelineError::BiuWriteCommandDisconnected)?;
-        let tick = self.events.tick();
-        let write = output.take_write(
-            tick,
-            commands.can_push(super::C220BiuSubcore::Cube),
-            &mut self.fixp_stores,
-        )?;
-        if let Some(write) = write {
-            assert!(commands.push(tick, C220BiuWriteInput::from_fixp(write, mode, tick))?);
-        }
-        Ok(write)
+        Ok(writes.send_external(self.events.tick(), commands)?)
     }
 
     pub(super) fn advance_biu_cube_source(
@@ -327,7 +336,12 @@ impl C220MtePipeline {
             self.trace
                 .push(C220MtePipelineEvent::BiuCubeSourceStarted { tick, tag });
         }
-        if let Some(ready) = self.biu_cube_source.egress(tick, &mut self.fixp_stores)? {
+        let ready = self.biu_cube_source.egress(tick, &mut self.fixp_stores)?;
+        if let Some(probe) = self.biu_cube_source.last_probe() {
+            self.trace
+                .push(C220MtePipelineEvent::BiuCubeSourceProbe(probe));
+        }
+        if let Some(ready) = ready {
             self.trace
                 .push(C220MtePipelineEvent::BiuCubeSourceReady(ready));
         }

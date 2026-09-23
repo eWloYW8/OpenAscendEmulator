@@ -66,14 +66,24 @@ mod tests {
             ready_tick: 0,
             policy: C220FixpNz2ndOutputPolicy::new(0, 512),
         });
+        let mut writes = crate::sim::c220::mte::fixp::C220FixpBiuWritePipeline::default();
         let write = pipeline
-            .enqueue_fixp_biu_output(&mut output, C220DmaUopMode::Wide512)
+            .packetize_fixp_biu_output(&mut output, &mut writes, C220DmaUopMode::Wide512)
             .unwrap()
             .unwrap();
         let mut tag = None;
         let mut completed = false;
         for tick in 0..24 {
             pipeline.advance(tick).unwrap();
+            writes.generate(tick).unwrap();
+            let sent = pipeline.send_fixp_biu_output(&mut writes).unwrap();
+            assert_eq!(
+                matches!(
+                    sent,
+                    crate::sim::c220::mte::fixp::C220FixpWriteProgress::Advanced(_)
+                ),
+                tick == 2
+            );
             assert!(
                 !pipeline
                     .last_events()
@@ -81,8 +91,8 @@ mod tests {
                     .any(|event| matches!(event, C220MtePipelineEvent::UbReadSent(..)))
             );
             if let Some(command) = pipeline.take_biu_write_command().unwrap() {
-                assert_eq!(tick, 5);
-                assert_eq!(command.command.input.store_token, Some(write.token));
+                assert_eq!(tick, 7);
+                assert_eq!(command.command.input.store_token, Some(write.write.token));
                 assert!(tag.replace(command.command.tag).is_none());
             }
             if tick == 10 {
@@ -105,6 +115,7 @@ mod tests {
                 assert_eq!(response.retired_instruction(), Some(91));
                 assert_eq!(pipeline.fixp_completions(), [91]);
                 assert!(pipeline.is_idle());
+                assert!(writes.is_idle());
                 completed = true;
                 break;
             }

@@ -80,16 +80,16 @@ pub struct C220FixpMemory<'a> {
 /// the shared clock topology; this API does not impose a global phase order.
 /// Do not also invoke a bound engine stage directly in the same simulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220FixpStageEvents {
-    stage: C220FixpStage,
+pub struct C220FixpStageEvents<S = C220FixpStage> {
+    stage: S,
     valid: EventId,
 }
 
-impl C220FixpStageEvents {
+impl<S: Copy> C220FixpStageEvents<S> {
     pub fn register<T: Copy>(
         events: &mut EventDispatcher<T>,
         clock: EventId,
-        stage: C220FixpStage,
+        stage: S,
         tag: impl Fn(C220FixpCallback) -> T,
     ) -> Self {
         let valid = events.add_event();
@@ -100,6 +100,18 @@ impl C220FixpStageEvents {
         Self { stage, valid }
     }
 
+    pub(crate) fn stage(&self) -> S {
+        self.stage
+    }
+
+    pub(crate) fn probe<T: Copy>(&self, events: &mut EventDispatcher<T>, ready_tick: Option<u64>) {
+        if ready_tick.is_some_and(|ready| ready <= events.tick()) {
+            events.notify_at(self.valid, events.tick());
+        }
+    }
+}
+
+impl C220FixpStageEvents {
     pub fn handle<T: Copy>(
         &self,
         callback: C220FixpCallback,
@@ -110,12 +122,7 @@ impl C220FixpStageEvents {
     ) -> Result<C220FixpEvent, C220FixpEngineError> {
         let tick = events.tick();
         if callback == C220FixpCallback::Probe {
-            if engine
-                .stage_ready_tick(self.stage, tick)
-                .is_some_and(|ready| ready <= tick)
-            {
-                events.notify_at(self.valid, tick);
-            }
+            self.probe(events, engine.stage_ready_tick(self.stage, tick));
             return Ok(C220FixpEvent::Readiness);
         }
         use C220FixpStage::*;

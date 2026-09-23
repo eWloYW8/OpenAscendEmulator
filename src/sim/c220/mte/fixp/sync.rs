@@ -224,6 +224,8 @@ mod tests {
             control: 0,
             scalar_slope: 0,
             slope_base_block: 0,
+            dequant_base_block: 0,
+            scalar_dequant: 0,
         };
         let mut flags = C220HardwareFlagState::default();
         let mut bindings = C220FixpSyncBindings::default();

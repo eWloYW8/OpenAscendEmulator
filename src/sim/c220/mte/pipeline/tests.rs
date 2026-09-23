@@ -224,6 +224,8 @@ fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
         control: 0,
         scalar_slope: 0,
         slope_base_block: 0,
+        dequant_base_block: 0,
+        scalar_dequant: 0,
     };
     use crate::sim::c220::mte::fixp::C220FixpAdmission;
     assert_eq!(

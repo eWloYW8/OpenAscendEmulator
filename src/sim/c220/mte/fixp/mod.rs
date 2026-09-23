@@ -1,3 +1,5 @@
+mod atomic;
+pub use atomic::C220FixpAtomicConfig;
 mod conversion;
 mod events;
 mod execute;
@@ -19,9 +21,10 @@ mod l1_write;
 mod layout;
 mod nz2nd;
 pub use nz2nd::{
-    C220FixpNz2ndBurst, C220FixpNz2ndInstructionPlan, C220FixpNz2ndOutput,
+    C220FixpNz2ndBurst, C220FixpNz2ndCommandState, C220FixpNz2ndEngine, C220FixpNz2ndEngineError,
+    C220FixpNz2ndEvent, C220FixpNz2ndInstructionPlan, C220FixpNz2ndMemory, C220FixpNz2ndOutput,
     C220FixpNz2ndOutputError, C220FixpNz2ndOutputPolicy, C220FixpNz2ndPlanError,
-    C220FixpNz2ndReadError, C220FixpNz2ndReadGenerator, C220FixpNz2ndStaging,
+    C220FixpNz2ndReadError, C220FixpNz2ndReadGenerator, C220FixpNz2ndStage, C220FixpNz2ndStaging,
     C220FixpNz2ndStagingEntry, C220FixpNz2ndStagingError, C220FixpNz2ndWriteBatch,
     C220FixpNz2ndWriteDescriptor, C220FixpNz2ndWriteError, C220FixpNz2ndWriteGenerator,
     C220FixpNz2ndWritePlanner, C220FixpNz2ndWriteUop, C220FixpTransposeBuffer,
@@ -36,7 +39,7 @@ pub use runtime::{
     C220FixpAdmission, C220FixpCommandState, C220FixpEngine, C220FixpEngineConfig,
     C220FixpEngineError,
 };
-pub use store::{C220FixpStoreBuffer, C220FixpStoreRead, C220FixpStoreWrite};
+pub use store::{C220FixpStoreBuffer, C220FixpStoreProbe, C220FixpStoreRead, C220FixpStoreWrite};
 pub use sync::{
     C220FixpFlagResolver, C220FixpSync, C220FixpSyncBindings, C220FixpSyncPoint,
     C220FixpSyncRequest,
@@ -44,7 +47,8 @@ pub use sync::{
 mod write_pipeline;
 
 pub use write_pipeline::{
-    C220FixpWriteEntry, C220FixpWritePipeline, C220FixpWritePipelineError, C220FixpWriteProgress,
+    C220FixpBiuWrite, C220FixpBiuWritePipeline, C220FixpWriteEntry, C220FixpWritePipeline,
+    C220FixpWritePipelineError, C220FixpWriteProgress,
 };
 
 pub use read_pipeline::{

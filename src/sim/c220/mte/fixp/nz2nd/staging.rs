@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 
 use super::super::{C220FixpConversionEntry, C220FixpConversionPipeline};
 use super::{
-    C220FixpNz2ndWriteDescriptor, C220FixpTransposeBuffer, C220FixpTransposeError,
-    C220FixpTransposeProgress,
+    C220FixpNz2ndWriteDescriptor, C220FixpNz2ndWriteGenerator, C220FixpTransposeBuffer,
+    C220FixpTransposeError, C220FixpTransposeProgress,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +41,8 @@ mod tests {
             control: 0,
             scalar_slope: 0,
             slope_base_block: 0,
+            dequant_base_block: 0,
+            scalar_dequant: 0,
         };
         let plan = C220FixpNz2ndInstructionPlan::new(command, 7, 0, 0, 64, 8).unwrap();
         let mut staging = C220FixpNz2ndStaging::new(16).unwrap();
@@ -74,7 +76,8 @@ mod tests {
             }
         }
         assert_eq!(staging.alignment().len(), 7);
-        assert_eq!(staging.pending().len(), 1);
+        assert_eq!(staging.pending_instructions(), 1);
+        assert_eq!(staging.next_write().unwrap().request_id, 7);
         assert_eq!(staging.transpose().slots()[7].rows, 1);
         assert_eq!(
             staging
@@ -138,13 +141,19 @@ pub enum C220FixpNz2ndStagingError {
     TimeOverflow,
 }
 
-/// Couples conversion credits to pre-generated write descriptors. Released
+#[derive(Debug, Clone)]
+struct PendingWrites {
+    head: C220FixpNz2ndWriteUop,
+    rest: C220FixpNz2ndWriteGenerator,
+}
+
+/// Couples conversion credits to lazily expanded write descriptors. Released
 /// descriptors spend six cycles in the bounded alignment queue before the
 /// output aggregator can accept them.
 #[derive(Debug, Clone)]
 pub struct C220FixpNz2ndStaging {
     transpose: C220FixpTransposeBuffer,
-    pending: VecDeque<C220FixpNz2ndWriteUop>,
+    pending: VecDeque<PendingWrites>,
     alignment: VecDeque<C220FixpNz2ndStagingEntry>,
     observed_tick: Option<u64>,
     output_tick: Option<u64>,
@@ -161,15 +170,23 @@ impl C220FixpNz2ndStaging {
         })
     }
 
-    pub fn submit(&mut self, operations: impl IntoIterator<Item = C220FixpNz2ndWriteUop>) {
-        self.pending.extend(operations);
+    pub fn submit(&mut self, mut operations: C220FixpNz2ndWriteGenerator) {
+        if let Some(head) = operations.next() {
+            self.pending.push_back(PendingWrites {
+                head,
+                rest: operations,
+            });
+        }
     }
 
     pub fn transpose(&self) -> &C220FixpTransposeBuffer {
         &self.transpose
     }
-    pub fn pending(&self) -> &VecDeque<C220FixpNz2ndWriteUop> {
-        &self.pending
+    pub fn pending_instructions(&self) -> usize {
+        self.pending.len()
+    }
+    pub fn next_write(&self) -> Option<&C220FixpNz2ndWriteUop> {
+        self.pending.front().map(|batch| &batch.head)
     }
     pub fn alignment(&self) -> &VecDeque<C220FixpNz2ndStagingEntry> {
         &self.alignment
@@ -200,8 +217,15 @@ impl C220FixpNz2ndStaging {
             .transpose
             .release(tick, !self.pending.is_empty() && self.alignment.len() < 7)?;
         if matches!(progress, C220FixpTransposeProgress::Released { .. }) {
+            let batch = self.pending.front_mut().expect("checked descriptor credit");
+            let operation = batch.head;
+            if let Some(next) = batch.rest.next() {
+                batch.head = next;
+            } else {
+                self.pending.pop_front();
+            }
             self.alignment.push_back(C220FixpNz2ndStagingEntry {
-                operation: self.pending.pop_front().expect("checked descriptor credit"),
+                operation,
                 ready_tick,
             });
         }

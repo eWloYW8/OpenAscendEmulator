@@ -24,6 +24,11 @@ impl C220FixpSlice {
     pub const fn slope_address(self, base_block: u8) -> u32 {
         2048 + 64 * (self.column_block as u32 + base_block as u32)
     }
+
+    /// Vector dequantization reads a full 16-lane block, even for an ND tail.
+    pub const fn dequant_address(self, base_block: u8) -> u32 {
+        128 * (self.column_block as u32 + base_block as u32)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

@@ -2,7 +2,14 @@ use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU32;
 
 use super::{C220BiuWriteDataReady, C220BiuWriteSourceRequest};
-use crate::sim::c220::mte::fixp::{C220FixpStoreBuffer, C220FixpStoreRead};
+use crate::sim::c220::mte::fixp::{C220FixpStoreBuffer, C220FixpStoreProbe, C220FixpStoreRead};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220BiuCubeWriteProbe {
+    pub tick: u64,
+    pub request: C220BiuWriteSourceRequest,
+    pub progress: C220FixpStoreProbe,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220BiuCubeWriteState {
@@ -48,9 +55,13 @@ pub struct C220BiuCubeWriteSource {
     ready: VecDeque<C220BiuWriteDataReady>,
     observed: Option<u64>,
     callbacks: [Option<u64>; 2],
+    last_probe: Option<C220BiuCubeWriteProbe>,
 }
 
 impl C220BiuCubeWriteSource {
+    pub fn last_probe(&self) -> Option<C220BiuCubeWriteProbe> {
+        self.last_probe
+    }
     pub fn is_idle(&self) -> bool {
         self.pending.is_empty()
     }
@@ -139,6 +150,7 @@ impl C220BiuCubeWriteSource {
         stores: &mut C220FixpStoreBuffer,
     ) -> Result<Option<C220BiuWriteDataReady>, C220BiuCubeWriteError> {
         self.begin(tick, 1, "egress")?;
+        self.last_probe = None;
         let Some(&tag) = self.egress.front() else {
             return Ok(None);
         };
@@ -152,7 +164,13 @@ impl C220BiuCubeWriteSource {
         let next_tick = tick
             .checked_add(1)
             .ok_or(C220BiuCubeWriteError::TimeOverflow)?;
-        if !pending.read.probe(stores) {
+        let progress = pending.read.probe_progress(stores);
+        self.last_probe = Some(C220BiuCubeWriteProbe {
+            tick,
+            request: pending.request,
+            progress,
+        });
+        if progress != C220FixpStoreProbe::Complete {
             pending.state = C220BiuCubeWriteState::Egress {
                 ready_tick,
                 remaining: pending.read.remaining(),

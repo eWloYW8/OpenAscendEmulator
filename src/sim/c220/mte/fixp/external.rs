@@ -1,3 +1,4 @@
+use super::atomic::{C220FixpAtomicConfig, combine_atomic};
 use crate::isa::c220::mte::fixp::C220FixpDestination;
 use crate::memory::mapped::MappedMemory;
 use crate::sim::c220::memory::C220LocalBuffer;
@@ -26,7 +27,7 @@ impl C220FixpExternalCommand {
         l0c: &C220LocalBuffer,
         slopes: &C220LocalBuffer,
         memory: &mut MappedMemory,
-        atomics_enabled: bool,
+        atomics: C220FixpAtomicConfig,
         mut observe: impl FnMut(&C220FixpSliceResult, &[u8]),
     ) -> Result<(), C220FixpExecutionError> {
         let operation = ((self.command.control >> 9) & 3) as u8;
@@ -35,12 +36,16 @@ impl C220FixpExternalCommand {
             let result = result?;
             let address = result.coordinate.destination_address;
             let mut bytes = result.conversion.bytes.clone();
-            if atomics_enabled && operation != 3 {
-                if matches!(data_type, 1 | 2 | 6) {
-                    return Err(C220FixpExecutionError::AtomicDataType(data_type));
-                }
+            if atomics.enabled && operation != 3 {
                 let previous = memory.read_known_at(address, bytes.len())?;
-                combine_integer_atomic(&mut bytes, &previous, data_type, operation);
+                combine_atomic(
+                    &mut bytes,
+                    &previous,
+                    data_type,
+                    operation,
+                    self.command.control,
+                    atomics.fp16_rounding,
+                );
             }
             memory.write_known_at(address, &bytes)?;
             observe(&result, &bytes);
@@ -116,44 +121,112 @@ impl C220FixpExternalCommand {
     }
 }
 
-fn combine_integer_atomic(bytes: &mut [u8], previous: &[u8], data_type: u8, operation: u8) {
-    macro_rules! combine {
-        ($ty:ty, $width:expr) => {
-            for (next, old) in bytes
-                .chunks_exact_mut($width)
-                .zip(previous.chunks_exact($width))
-            {
-                let next_value = <$ty>::from_le_bytes(next.try_into().expect("lane width"));
-                let old_value = <$ty>::from_le_bytes(old.try_into().expect("lane width"));
-                let value = match operation {
-                    0 => next_value.wrapping_add(old_value),
-                    1 => next_value.max(old_value),
-                    2 => next_value.min(old_value),
-                    _ => unreachable!("atomic operation is decoded before execution"),
-                };
-                next.copy_from_slice(&value.to_le_bytes());
-            }
-        };
-    }
-    match data_type {
-        3 => combine!(i16, 2),
-        4 => combine!(i32, 4),
-        5 => combine!(i8, 1),
-        0 | 7 => {}
-        _ => unreachable!("floating-point atomics are checked before execution"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::c220::numeric::fp16::C220Fp16AddRounding;
+    const ENABLED: C220FixpAtomicConfig = C220FixpAtomicConfig {
+        enabled: true,
+        fp16_rounding: C220Fp16AddRounding::NearestEven,
+    };
+    const DISABLED: C220FixpAtomicConfig = C220FixpAtomicConfig {
+        enabled: false,
+        ..ENABLED
+    };
     use crate::isa::c220::mte::fixp::C220FixpDescriptor;
     use crate::memory::{region::MemoryRegion, sparse::SparseMemory};
     use crate::sim::c220::mte::fixp::C220FixpSourceFormat;
 
     #[test]
+    fn half_width_atomics_respect_saturation_nan_zero_and_rounding() {
+        for (data_type, operation, first, second, saturating, nonsaturating) in [
+            (6, 0, 0x3f80u16, 0x3b80u16, 0x3f80u16, 0x3f80u16),
+            (6, 0, 0x3f81, 0x3b80, 0x3f82, 0x3f82),
+            (6, 0, 0x7f7f, 0x7f7f, 0x7f7f, 0x7f80),
+            (6, 0, 0x7f80, 0xff80, 0, 0x7fff),
+            (6, 0, 1, 1, 2, 2),
+            (6, 0, 0x8000, 0x8000, 0x8000, 0x8000),
+            (6, 1, 0x7f80, 0x3f80, 0x7f7f, 0x7f80),
+            (6, 2, 0xff80, 0x3f80, 0xff7f, 0xff80),
+            (6, 1, 0x7fc1, 0x3f80, 0, 0x7fff),
+            (6, 1, 0x8000, 0, 0, 0),
+            (6, 2, 0x8000, 0, 0x8000, 0x8000),
+            (2, 1, 0x7c00, 0x3c00, 0x7bff, 0x7c00),
+            (2, 2, 0xfc00, 0x3c00, 0xfbff, 0xfc00),
+            (2, 1, 0x7e01, 0x3c00, 0, 0x7fff),
+            (2, 2, 0x8000, 0, 0x8000, 0x8000),
+            (2, 0, 0x3c01, 0x1000, 0x3c02, 0x3c02),
+            (2, 0, 0x7c00, 0xfc00, 0, 0x7fff),
+            (2, 0, 0x7bff, 0x4c00, 0x7bff, 0x7c00),
+        ] {
+            for (control, expected) in [(0, saturating), (1 << 48, nonsaturating)] {
+                let mut bytes = first.to_le_bytes();
+                combine_atomic(
+                    &mut bytes,
+                    &second.to_le_bytes(),
+                    data_type,
+                    operation,
+                    control,
+                    C220Fp16AddRounding::NearestEven,
+                );
+                assert_eq!(u16::from_le_bytes(bytes), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn fp32_atomic_writes_canonicalize_nan_and_select_signed_zero() {
+        let source = [0x8000_0000u32, 0x7f80_0000, 0x7fc0_1234, 0x3f80_0000];
+        let old = [0u32, 0xff80_0000, 0x3f80_0000, 0x3380_0000];
+        let mut l0c = C220LocalBuffer::new(64);
+        let source: Vec<u8> = source.into_iter().flat_map(u32::to_le_bytes).collect();
+        l0c.write_known_linear(0, &source.repeat(4)).unwrap();
+        let previous: Vec<u8> = old.into_iter().flat_map(u32::to_le_bytes).collect();
+        let slopes = C220LocalBuffer::new(0);
+        for (operation, expected) in [
+            (0, [0u32, 0x7fff_ffff, 0x7fff_ffff, 0x3f80_0000]),
+            (1, [0u32, 0x7f80_0000, 0x7fff_ffff, 0x3f80_0000]),
+            (2, [0x8000_0000u32, 0xff80_0000, 0x7fff_ffff, 0x3380_0000]),
+        ] {
+            let command = C220FixpExternalCommand {
+                command: C220FixpCommand {
+                    descriptor: C220FixpDescriptor {
+                        xt: (16 << 32) | (1 << 16) | (4 << 4),
+                        xm: 1 << 43,
+                        nd: 1,
+                    },
+                    source_format: C220FixpSourceFormat::Fp32,
+                    source_address: 0,
+                    destination_address: 4096,
+                    control: (operation << 9) | (1 << 6),
+                    scalar_slope: 0,
+                    slope_base_block: 0,
+                    dequant_base_block: 0,
+                    scalar_dequant: 0,
+                },
+                biu_mode_word: 0,
+                output_mode_word: 0,
+            };
+            let mut memory = MappedMemory::bind(
+                SparseMemory::new(
+                    vec![MemoryRegion::new(16, previous.clone()).unwrap()],
+                    64,
+                    64,
+                ),
+                &[4096],
+            )
+            .unwrap();
+            command
+                .execute_to_external(&l0c, &slopes, &mut memory, ENABLED, |_, _| {})
+                .unwrap();
+            let expected: Vec<u8> = expected.into_iter().flat_map(u32::to_le_bytes).collect();
+            assert_eq!(memory.read_known_at(4096, 16).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn external_writes_preserve_row_gaps_and_apply_signed_atomic_controls() {
-        let mut command = C220FixpExternalCommand {
+        let command = C220FixpExternalCommand {
             command: C220FixpCommand {
                 descriptor: C220FixpDescriptor {
                     xt: (32 << 32) | (2 << 16) | (17 << 4),
@@ -166,6 +239,8 @@ mod tests {
                 control: 4 << 6,
                 scalar_slope: 0,
                 slope_base_block: 0,
+                dequant_base_block: 0,
+                scalar_dequant: 0,
             },
             biu_mode_word: 0,
             output_mode_word: 0,
@@ -185,7 +260,7 @@ mod tests {
         .unwrap();
         let mut observed = 0;
         command
-            .execute_to_external(&l0c, &slopes, &mut memory, true, |slice, stored| {
+            .execute_to_external(&l0c, &slopes, &mut memory, ENABLED, |slice, stored| {
                 assert_eq!(
                     slice.conversion.bytes,
                     (-2i32).to_le_bytes().repeat(stored.len() / 4)
@@ -205,23 +280,39 @@ mod tests {
                 1i32.to_le_bytes().repeat(15)
             );
         }
-        command.command.control = 1 << 6;
-        assert!(matches!(
-            command.execute_to_external(&l0c, &slopes, &mut memory, true, |_, _| {}),
-            Err(C220FixpExecutionError::AtomicDataType(1))
-        ));
         command
-            .execute_to_external(&l0c, &slopes, &mut memory, false, |_, stored| {
+            .execute_to_external(&l0c, &slopes, &mut memory, DISABLED, |_, stored| {
                 assert_eq!(stored, (-2i32).to_le_bytes().repeat(stored.len() / 4));
             })
             .unwrap();
 
         let mut bytes = [127, 128, 255];
-        combine_integer_atomic(&mut bytes, &[1, 255, 1], 5, 0);
+        combine_atomic(
+            &mut bytes,
+            &[1, 255, 1],
+            5,
+            0,
+            0,
+            C220Fp16AddRounding::NearestEven,
+        );
         assert_eq!(bytes, [128, 127, 0]);
-        combine_integer_atomic(&mut bytes, &[1, 255, 1], 5, 1);
+        combine_atomic(
+            &mut bytes,
+            &[1, 255, 1],
+            5,
+            1,
+            0,
+            C220Fp16AddRounding::NearestEven,
+        );
         assert_eq!(bytes, [1, 127, 1]);
-        combine_integer_atomic(&mut bytes, &[255, 128, 0], 5, 2);
+        combine_atomic(
+            &mut bytes,
+            &[255, 128, 0],
+            5,
+            2,
+            0,
+            C220Fp16AddRounding::NearestEven,
+        );
         assert_eq!(bytes, [255, 128, 0]);
     }
 

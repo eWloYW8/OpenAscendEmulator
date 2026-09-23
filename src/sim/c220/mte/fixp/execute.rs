@@ -15,7 +15,9 @@ pub struct C220FixpCommand {
     pub destination_address: u64,
     pub control: u64,
     pub scalar_slope: u32,
+    pub scalar_dequant: u64,
     pub slope_base_block: u8,
+    pub dequant_base_block: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +25,7 @@ pub struct C220FixpSliceResult {
     pub coordinate: C220FixpSlice,
     pub conversion: C220FixpConversionResult,
     pub slope_read_address: Option<u32>,
+    pub dequant_read_address: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -45,8 +48,6 @@ pub enum C220FixpExecutionError {
     Memory(#[from] C220LocalBufferError),
     #[error(transparent)]
     ExternalMemory(#[from] crate::memory::mapped::MappedMemoryError),
-    #[error("FIX floating-point atomic data type {0} is not implemented")]
-    AtomicDataType(u8),
     #[error("unsupported FIX activation mode {0}")]
     Activation(u8),
 }
@@ -88,8 +89,15 @@ impl C220FixpCommand {
         let xm = gpr(instruction.control_register)?;
         let mut spr =
             |register| read_spr(register).ok_or(C220FixpExecutionError::MissingSpr(register));
-        let slope_base_block = spr(64)? as u8;
+        let bases = spr(64)?;
+        let slope_base_block = bases as u8;
+        let dequant_base_block = (bases >> 8) as u8;
         let scalar_slope = spr(61)? as u32;
+        let scalar_dequant = if (C220FixpDescriptor { xt, xm, nd: 0 }).conversion_mode() == 13 {
+            spr(65)?
+        } else {
+            0
+        };
         let nd = spr(97)?;
         let command = Self {
             descriptor: C220FixpDescriptor { xt, xm, nd },
@@ -98,7 +106,9 @@ impl C220FixpCommand {
             destination_address,
             control,
             scalar_slope,
+            scalar_dequant,
             slope_base_block,
+            dequant_base_block,
         };
         command.layout()?;
         Ok(command)
@@ -124,23 +134,31 @@ impl C220FixpCommand {
         C220FixpExecutionError,
     > {
         let coordinates = self.layout()?.slices();
-        if self.descriptor.conversion_mode() == 1
-            && self.descriptor.activation_mode() > 3
-            && !self.descriptor.is_disabled()
-        {
-            return Err(C220FixpExecutionError::Activation(
-                self.descriptor.activation_mode(),
-            ));
-        }
+        self.validate_activation()?;
         Ok(coordinates.map(move |coordinate| {
             let input = l0c.read_initialized_linear(
                 coordinate.source_address,
                 coordinate.source_bytes() as usize,
             )?;
             if coordinate.output_format != C220FixpOutputFormat::Fp16 {
+                let dequant_read_address = (self.descriptor.conversion_mode() == 12)
+                    .then(|| coordinate.dequant_address(self.dequant_base_block));
+                let mut factors = [self.scalar_dequant; 16];
+                if let Some(address) = dequant_read_address {
+                    let data = slopes.read_initialized_linear(u64::from(address), 128)?;
+                    for (factor, lane) in factors.iter_mut().zip(data.chunks_exact(8)) {
+                        *factor = u64::from_le_bytes(lane.try_into().expect("eight-byte factor"));
+                    }
+                }
+                let slope_read_address = (dequant_read_address.is_some()
+                    && self.descriptor.activation_mode() == 0)
+                    .then(|| coordinate.slope_address(self.slope_base_block));
+                if let Some(address) = slope_read_address {
+                    slopes.read_initialized_linear(u64::from(address), 64)?;
+                }
                 let mut bytes = Vec::with_capacity(coordinate.destination_bytes() as usize);
                 let mut lane_status = Vec::with_capacity(input.len() / 4);
-                for lane in input.chunks_exact(4) {
+                for (index, lane) in input.chunks_exact(4).enumerate() {
                     let bits = u32::from_le_bytes([lane[0], lane[1], lane[2], lane[3]]);
                     if coordinate.output_format == C220FixpOutputFormat::Int32 {
                         let result = if self.descriptor.activation_mode() == 1 {
@@ -150,6 +168,14 @@ impl C220FixpCommand {
                         };
                         bytes.extend_from_slice(&result.to_le_bytes());
                         lane_status.push(C220FixpLaneStatus::Integer);
+                    } else if coordinate.output_format == C220FixpOutputFormat::Int16 {
+                        let result = crate::sim::c220::numeric::fixp::c220_fixp_i32_to_i16(
+                            bits as i32,
+                            factors[index],
+                            self.descriptor.activation_mode() == 1,
+                        );
+                        bytes.extend_from_slice(&result.value.to_le_bytes());
+                        lane_status.push(C220FixpLaneStatus::Int16(result.status));
                     } else if coordinate.output_format == C220FixpOutputFormat::Bf16 {
                         let result = crate::sim::c220::numeric::fixp::c220_fixp_f32_to_bf16(
                             bits,
@@ -174,7 +200,8 @@ impl C220FixpCommand {
                         bytes,
                         lane_status,
                     },
-                    slope_read_address: None,
+                    slope_read_address,
+                    dequant_read_address,
                 });
             }
             let slope_read_address = (self.descriptor.activation_mode() == 3)
@@ -203,8 +230,23 @@ impl C220FixpCommand {
                 coordinate,
                 conversion: conversion.into(),
                 slope_read_address,
+                dequant_read_address: None,
             })
         }))
+    }
+
+    pub(super) fn validate_activation(self) -> Result<(), C220FixpExecutionError> {
+        let limit = match self.descriptor.conversion_mode() {
+            1 => 3,
+            12 | 13 => 1,
+            _ => return Ok(()),
+        };
+        if !self.descriptor.is_disabled() && self.descriptor.activation_mode() > limit {
+            return Err(C220FixpExecutionError::Activation(
+                self.descriptor.activation_mode(),
+            ));
+        }
+        Ok(())
     }
 
     /// Functional L0C-to-L1 execution. This entry does not advance cycle state.
@@ -258,6 +300,31 @@ mod tests {
             (0x34, 0x3f00_0000)
         );
         assert_eq!(command.control, 1 << 48);
+        assert_eq!(command.dequant_base_block, 0x12);
+        let dequant = C220FixpCommand::capture_l1(
+            word | 1,
+            0,
+            |r| if r == 4 { Some(13 << 34) } else { gpr(r) },
+            |r| if r == 65 { Some(15 << 32) } else { spr(r) },
+        )
+        .unwrap();
+        assert_eq!(dequant.scalar_dequant, 15 << 32);
+        assert_eq!(
+            dequant
+                .layout()
+                .unwrap()
+                .slices()
+                .next()
+                .unwrap()
+                .output_format,
+            C220FixpOutputFormat::Int16
+        );
+        let mut invalid = dequant;
+        invalid.descriptor.xm |= 2 << 39;
+        assert!(matches!(
+            invalid.validate_activation(),
+            Err(C220FixpExecutionError::Activation(2))
+        ));
         let integer = C220FixpCommand::capture_l1(
             word | 1,
             0,
@@ -275,6 +342,102 @@ mod tests {
             C220FixpCommand::capture_l1(word, 0, gpr, |_| None),
             Err(C220FixpExecutionError::MissingSpr(64))
         ));
+    }
+
+    #[test]
+    fn vector_dequantization_reads_full_blocks_and_selects_each_lane() {
+        let mut l0c = C220LocalBuffer::new(128);
+        l0c.write_known_linear(0, &65536_i32.to_le_bytes().repeat(32))
+            .unwrap();
+        let mut factors = C220LocalBuffer::new(4096);
+        factors
+            .write_states(256, &[crate::memory::sparse::MemoryByteState::Unknown; 128])
+            .unwrap();
+        factors
+            .write_states(
+                2240,
+                &[crate::memory::sparse::MemoryByteState::Unknown; 128],
+            )
+            .unwrap();
+        let words: Vec<_> = (0_u64..16).map(|shift| shift << 32).collect();
+        factors
+            .write_known_linear(
+                128,
+                &words
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let mut command = C220FixpCommand {
+            descriptor: C220FixpDescriptor {
+                xt: (32 << 32) | (1 << 16) | (17 << 4),
+                xm: (12 << 34) | (1 << 39) | (1 << 43) | 1,
+                nd: 1,
+            },
+            source_format: C220FixpSourceFormat::Int32,
+            source_address: 0,
+            destination_address: 0,
+            control: 0,
+            scalar_slope: 0,
+            scalar_dequant: u64::MAX,
+            slope_base_block: 3,
+            dequant_base_block: 1,
+        };
+        let mut slices = command.evaluate(&l0c, &factors).unwrap();
+        let first = slices.next().unwrap().unwrap();
+        assert_eq!(first.dequant_read_address, Some(128));
+        assert_eq!(first.slope_read_address, None);
+        let expected: Vec<_> = (1..=16)
+            .flat_map(|shift| ((65536_i32 >> shift).min(32767) as i16).to_le_bytes())
+            .collect();
+        assert_eq!(first.conversion.bytes, expected);
+        assert!(slices.next().unwrap().is_err());
+        drop(slices);
+        factors
+            .write_known_linear(256, &0_u64.to_le_bytes())
+            .unwrap();
+        assert!(
+            command
+                .evaluate(&l0c, &factors)
+                .unwrap()
+                .nth(1)
+                .unwrap()
+                .is_err()
+        );
+        factors
+            .write_known_linear(256, &0_u64.to_le_bytes().repeat(16))
+            .unwrap();
+        let tail = command
+            .evaluate(&l0c, &factors)
+            .unwrap()
+            .nth(1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tail.conversion.bytes, i16::MAX.to_le_bytes());
+        assert_eq!(tail.dequant_read_address, Some(256));
+        command.descriptor.xm &= !(7 << 39);
+        assert!(
+            command
+                .evaluate(&l0c, &factors)
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_err()
+        );
+        factors.write_known_linear(2240, &[0; 128]).unwrap();
+        let slices = command
+            .evaluate(&l0c, &factors)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            slices
+                .iter()
+                .map(|slice| slice.slope_read_address)
+                .collect::<Vec<_>>(),
+            [Some(2240), Some(2304)]
+        );
     }
 
     #[test]
@@ -302,6 +465,8 @@ mod tests {
                 control: 1 << 48,
                 scalar_slope: 0,
                 slope_base_block: 0,
+                dequant_base_block: 0,
+                scalar_dequant: 0,
             };
             let result = command
                 .evaluate(&l0c, &slopes)
@@ -353,6 +518,8 @@ mod tests {
             control: 1 << 48,
             scalar_slope: 0,
             slope_base_block: 0,
+            dequant_base_block: 0,
+            scalar_dequant: 0,
         };
         let mut reads = Vec::new();
         command

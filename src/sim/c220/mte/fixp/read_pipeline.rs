@@ -206,6 +206,8 @@ mod tests {
             control: 0,
             scalar_slope: 0,
             slope_base_block: 0,
+            dequant_base_block: 0,
+            scalar_dequant: 0,
         };
         let mut events = EventDispatcher::new(0);
         let clock = events.add_event();
@@ -270,6 +272,8 @@ mod tests {
             control: 0,
             scalar_slope: 0,
             slope_base_block: 0,
+            dequant_base_block: 0,
+            scalar_dequant: 0,
         };
         let mut pipeline = C220FixpReadPipeline::default();
         let mut input = C220MteL0cReadInterface::new(32, 0).unwrap();
