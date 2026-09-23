@@ -111,6 +111,12 @@ impl C220LocalMemory {
         &mut self.l1
     }
 
+    pub(in crate::sim::c220) fn fixp_destinations_mut(
+        &mut self,
+    ) -> (&mut C220L0c, &mut C220LocalBuffer) {
+        (&mut self.l0c, &mut self.l1)
+    }
+
     pub const fn bt(&self) -> &PvMemory {
         &self.bt
     }

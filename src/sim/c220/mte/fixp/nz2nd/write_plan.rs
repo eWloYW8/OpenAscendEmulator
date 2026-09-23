@@ -97,7 +97,7 @@ pub enum C220FixpNz2ndWriteError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220FixpNz2ndWritePlanner {
     command: C220FixpCommand,
-    lane_bytes: u32,
+    format: C220FixpOutputFormat,
     main_slots: u32,
     gather: bool,
     aligned_512: bool,
@@ -113,26 +113,27 @@ impl C220FixpNz2ndWritePlanner {
         if main_slots == 0 {
             return Err(C220FixpNz2ndWriteError::BufferSize);
         }
-        let lane_bytes =
+        let format =
             C220FixpOutputFormat::from_conversion_mode(command.source_format, d.conversion_mode())
-                .expect("validated layout")
-                .lane_bytes();
+                .expect("validated layout");
         let column_bytes = if d.conversion_mode() == 0 && d.channel_split() {
             32
         } else {
-            16 * lane_bytes
+            format.storage_bytes(16)
         };
         let gather = column_bytes * u32::from(d.columns()).div_ceil(16)
             <= main_slots.wrapping_mul(32)
             && u32::from(d.columns()) == d.destination_stride();
-        let aligned_512 = (u32::from(d.columns()) * lane_bytes).is_multiple_of(512)
+        let aligned_512 = format
+            .storage_bytes(u32::from(d.columns()))
+            .is_multiple_of(512)
             && command.destination_address.is_multiple_of(512)
-            && d.destination_stride()
-                .wrapping_mul(lane_bytes)
+            && format
+                .storage_bytes(d.destination_stride())
                 .is_multiple_of(512);
         Ok(Self {
             command,
-            lane_bytes,
+            format,
             main_slots,
             gather,
             aligned_512,
@@ -164,7 +165,7 @@ impl C220FixpNz2ndWritePlanner {
         let bytes = if !end_of_group {
             self.main_slots.wrapping_mul(32)
         } else if tail_lanes != 0 {
-            32 * (group_index & 7) + tail_lanes * self.lane_bytes
+            32 * (group_index & 7) + self.format.storage_bytes(tail_lanes)
         } else {
             32 * ((group_index & 7) + 1)
         };

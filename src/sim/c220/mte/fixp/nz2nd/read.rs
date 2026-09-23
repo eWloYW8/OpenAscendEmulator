@@ -132,7 +132,11 @@ impl Iterator for C220FixpNz2ndReadGenerator {
             data_bytes,
             destination_address: 0,
             output_bytes: 32 * rows,
-            last_in_uop: true,
+            last_in_uop: match d.conversion_mode() {
+                8 | 9 | 23 | 24 => self.column % 2 == 1 || self.column + 1 == self.columns,
+                21 | 22 | 25 | 26 => self.column % 4 == 3 || self.column + 1 == self.columns,
+                _ => true,
+            },
             end_of_burst,
         };
         self.next_id = self.next_id.wrapping_add(1);

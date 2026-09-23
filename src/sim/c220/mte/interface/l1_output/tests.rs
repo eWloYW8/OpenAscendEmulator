@@ -5,6 +5,42 @@ use crate::sim::c220::mte::mte1::load2d::C220Load2dRequestPlan;
 use std::num::NonZeroU32;
 
 #[test]
+fn factor_output_retires_after_last_fragment_without_bt_delay() {
+    let mut output = C220MteL1Output::default();
+    output
+        .receive(
+            10,
+            C220MteL1OutputDestination::Fb,
+            C220MteOutputPlan::new(7, 3, 2048, 128, true, NonZeroU32::new(64).unwrap()),
+            3_u64,
+        )
+        .unwrap();
+    assert!(
+        output
+            .send(10, C220MteL1OutputCredits::default())
+            .unwrap()
+            .sent
+            .is_none()
+    );
+    let first = output
+        .send(11, C220MteL1OutputCredits::default())
+        .unwrap()
+        .sent
+        .unwrap();
+    assert!(!first.fragment.last_in_instruction);
+    assert_eq!(output.retirement_ready_tick(), None);
+    let last = output
+        .send(12, C220MteL1OutputCredits::default())
+        .unwrap()
+        .sent
+        .unwrap();
+    assert!(last.fragment.last_in_instruction);
+    assert_eq!(output.retirement_ready_tick(), Some(12));
+    assert_eq!(output.retire(12).unwrap(), Some(last));
+    assert!(output.is_idle());
+}
+
+#[test]
 fn blocked_load2d_holds_bt_until_output_tail_and_l0_confirms_separately() {
     let mut registers = [0; 32];
     registers[0] = u64::MAX - 255;

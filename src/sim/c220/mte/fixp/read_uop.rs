@@ -51,6 +51,8 @@ pub enum C220FixpReadGeneratorError {
 
 /// Read packets are column-major, unlike functional slices. Channel splitting
 /// reads full source columns but accounts for one half-column at the output.
+/// Byte output combines column pairs: only the group's last column publishes
+/// output credits, with separate accounting for a singleton tail.
 /// Bandwidth is an explicit model input, not an assumed device constant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220FixpReadGenerator {
@@ -109,7 +111,14 @@ impl Iterator for C220FixpReadGenerator {
         }
         let d = self.command.descriptor;
         let split = d.conversion_mode() == 0 && d.channel_split();
-        let column_bytes = u32::from(d.rows()) * 64;
+        let int4 = matches!(d.conversion_mode(), 21 | 22 | 25 | 26);
+        let group_columns = if int4 { 4 } else { 2 };
+        let merge = matches!(d.conversion_mode(), 8 | 9 | 23 | 24)
+            || (int4 && d.columns().is_multiple_of(64));
+        let group_start = self.column_block / group_columns * group_columns;
+        let singleton = merge && group_start + 1 == self.column_blocks;
+        let partial_singleton = singleton && !d.columns().is_multiple_of(16);
+        let column_bytes = u32::from(d.rows()) * if partial_singleton { 32 } else { 64 };
         let address = self
             .command
             .source_address
@@ -121,10 +130,14 @@ impl Iterator for C220FixpReadGenerator {
             .wrapping_add(u64::from(self.source_offset));
         let boundary = self.bandwidth - (address as u32 % self.bandwidth);
         let data_bytes = (column_bytes - self.source_offset).min(boundary);
-        let output_bytes = if split {
+        let output_bytes = if singleton {
+            data_bytes / 4
+        } else if split {
             data_bytes / 2
         } else if d.conversion_mode() == 0 {
             data_bytes
+        } else if int4 && !merge {
+            data_bytes.wrapping_mul(8) / 64
         } else {
             data_bytes.wrapping_mul(32) / 64
         };
@@ -149,17 +162,25 @@ impl Iterator for C220FixpReadGenerator {
                 half_accumulator: false,
             },
             data_bytes,
-            destination_address: self
-                .command
-                .destination_address
-                .wrapping_add(
-                    u64::from(self.column_block)
-                        * u64::from(d.destination_stride().wrapping_mul(32))
-                        * if split { 2 } else { 1 },
+            destination_address: if merge {
+                self.command.destination_address.wrapping_add(
+                    u64::from(group_start / group_columns)
+                        * u64::from(d.destination_stride().wrapping_mul(32)),
                 )
-                .wrapping_add(u64::from(self.destination_offset)),
+            } else {
+                self.command
+                    .destination_address
+                    .wrapping_add(
+                        u64::from(self.column_block)
+                            * u64::from(d.destination_stride().wrapping_mul(32))
+                            * if split { 2 } else { 1 },
+                    )
+                    .wrapping_add(u64::from(self.destination_offset))
+            },
             output_bytes,
-            last_in_uop: true,
+            last_in_uop: !merge
+                || singleton
+                || self.column_block % group_columns == group_columns - 1,
             end_of_burst,
         };
         self.next_id = self.next_id.wrapping_add(1);

@@ -11,6 +11,13 @@ use crate::sim::common::scalar::ScalarProgramStep;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220CoreInstruction {
+    Fixp {
+        instruction_id: u64,
+        pc: u64,
+        word: u32,
+        command: crate::sim::c220::mte::fixp::C220FixpCommand,
+        admission: crate::sim::c220::mte::fixp::C220FixpAdmission,
+    },
     Scalar {
         step: ScalarProgramStep,
         timing: Option<C220ScalarTimingTicket>,

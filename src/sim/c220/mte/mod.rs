@@ -1,5 +1,6 @@
 pub mod dma;
 mod error;
+pub mod factor;
 mod generator;
 pub use generator::C220MteGeneratorCallback;
 pub mod fixp;
@@ -14,4 +15,5 @@ pub use error::C220TransferError;
 mod pipeline;
 pub use pipeline::{
     C220MtePipeline, C220MtePipelineConfig, C220MtePipelineError, C220MtePipelineEvent,
+    C220MteReadPayload,
 };

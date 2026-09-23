@@ -15,6 +15,7 @@ pub enum C220StallCause {
     Mte3Dependency,
     VectorDependency,
     CubeDependency,
+    FixpDependency,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

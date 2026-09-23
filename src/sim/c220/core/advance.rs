@@ -18,6 +18,11 @@ impl C220Core {
                 .chain(self.vector.next_event_tick())
                 .chain(self.mte3.pending_retirement_tick())
                 .chain(self.mte_pipeline.as_ref().and_then(|p| p.next_event_tick()))
+                .chain(self.fixp.as_ref().and_then(|fixp| {
+                    self.mte_pipeline
+                        .as_ref()
+                        .and_then(|pipeline| pipeline.next_fixp_event_tick(&fixp.engine))
+                }))
                 .min()
                 .map_or(tick, |next| next.min(tick));
             self.mte1.commit_ready_at(
@@ -32,7 +37,22 @@ impl C220Core {
                 &self.memory,
             )?;
             if let Some(pipeline) = &mut self.mte_pipeline {
-                pipeline.advance(event_tick)?;
+                if let Some(fixp) = &mut self.fixp {
+                    self.hardware_flags.advance_to(event_tick)?;
+                    let (l0c, l1) = self.local_memory.fixp_destinations_mut();
+                    pipeline.advance_fixp(
+                        event_tick,
+                        &mut fixp.engine,
+                        crate::sim::c220::mte::fixp::C220FixpMemory {
+                            l0c,
+                            l1,
+                            slopes: &fixp.factors,
+                        },
+                        fixp.bindings.resolver(&mut self.hardware_flags),
+                    )?;
+                } else {
+                    pipeline.advance(event_tick)?;
+                }
                 self.mte1
                     .observe_completions(event_tick, pipeline.mte1_completions());
                 self.mte2

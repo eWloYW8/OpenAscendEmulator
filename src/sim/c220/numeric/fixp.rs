@@ -14,6 +14,76 @@ pub struct C220FixpInt16Outcome {
     pub status: C220FixpInt16Status,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220FixpDequantActivation {
+    None,
+    Relu,
+    NegativeSlope(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220FixpDequantFp16Outcome {
+    pub input_after_preshift: i32,
+    pub scaled_fp32_bits: u32,
+    pub factor_status: C220Fp16Status,
+    pub conversion: C220Fp16Outcome,
+}
+
+/// Zero-bias integer dequantization. Activation selects the multiplier before
+/// FP16 rounding; CTRL does not change this operation's saturation policy.
+pub fn c220_fixp_i32_to_f16(
+    input: i32,
+    factor: u64,
+    activation: C220FixpDequantActivation,
+) -> C220FixpDequantFp16Outcome {
+    let input = if factor & (1 << 36) != 0 {
+        i32::from(c220_fixp_i32_to_i16(input, factor, false).value)
+    } else {
+        input
+    };
+    let factor_bits = factor as u32 & 0xffff_e000;
+    let magnitude = factor_bits & 0x7fff_ffff;
+    let factor_status = C220Fp16Status {
+        nan_operand: magnitude > 0x7f80_0000,
+        infinity_operand: magnitude == 0x7f80_0000,
+        ..C220Fp16Status::default()
+    };
+    let scale = if factor_status.nan_operand {
+        0.0
+    } else {
+        f32::from_bits(factor_bits)
+    };
+    let operand = f64::from(input as f32);
+    let product = if input < 0 {
+        match activation {
+            C220FixpDequantActivation::None => operand * f64::from(scale),
+            C220FixpDequantActivation::Relu => 0.0,
+            C220FixpDequantActivation::NegativeSlope(bits) => {
+                operand * f64::from(f32::from_bits(bits & 0xffff_e000))
+            }
+        }
+    } else {
+        operand * f64::from(scale)
+    };
+    let scaled = if product.is_nan() || product > f64::from(f32::MAX) {
+        f32::MAX
+    } else if product < -f64::from(f32::MAX) {
+        -f32::MAX
+    } else {
+        product as f32
+    };
+    C220FixpDequantFp16Outcome {
+        input_after_preshift: input,
+        scaled_fp32_bits: scaled.to_bits(),
+        factor_status,
+        conversion: c220_fixp_f32_to_f16(
+            scaled.to_bits(),
+            C220FixpRoundMode::NearestEven,
+            C220Fp16Mode::Saturating,
+        ),
+    }
+}
+
 /// Integer dequantization with an arithmetic shift of 1–16 bits, followed by
 /// signed saturation and optional ReLU. Only factor bits 32–35 select the shift.
 pub fn c220_fixp_i32_to_i16(input: i32, factor: u64, relu: bool) -> C220FixpInt16Outcome {
@@ -210,6 +280,37 @@ fn round_significand(value: u32, shift: u32, negative: bool, mode: C220FixpRound
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fp16_dequantization_preserves_stage_order_and_special_values() {
+        use C220FixpDequantActivation::{NegativeSlope, None, Relu};
+        for (input, factor, activation, expected) in [
+            (3, 0x3f80_0000, None, 0x4200),
+            (-3, 0x3f80_0000, Relu, 0),
+            (-3, 0x4000_0000, NegativeSlope(0x3f00_0000), 0xbe00),
+            (3, 0x4000_0000, NegativeSlope(0x3f00_0000), 0x4600),
+            (3, 0x3f80_1fff, None, 0x4200),
+            (-1, 0x7fc0_0000, None, 0x8000),
+            (0, 0x7f80_0000, None, 0x7bff),
+            (-1, 0x3f80_0000, NegativeSlope(0x7fc0_0000), 0x7bff),
+            (i32::MAX, (1 << 36) | 0x3f80_0000, None, 0x7800),
+            (65536, (1 << 36) | (15 << 32) | 0x3f80_0000, None, 0x3c00),
+        ] {
+            assert_eq!(
+                c220_fixp_i32_to_f16(input, factor, activation)
+                    .conversion
+                    .bits,
+                expected
+            );
+        }
+        let nan = c220_fixp_i32_to_f16(-1, 0x7fc0_0000, None);
+        assert!(nan.factor_status.nan_operand);
+        assert!(!nan.conversion.status.nan_operand);
+        let infinity = c220_fixp_i32_to_f16(0, 0x7f80_0000, None);
+        assert!(infinity.factor_status.infinity_operand);
+        assert!(infinity.conversion.status.overflow);
+        assert_eq!(infinity.scaled_fp32_bits, f32::MAX.to_bits());
+    }
 
     #[test]
     fn integer_dequantization_shift_saturation_and_activation() {

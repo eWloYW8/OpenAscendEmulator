@@ -7,6 +7,7 @@ pub enum C220MteL1OutputDestination {
     /// Read-only timing sink; index responses do not generate output fragments.
     SparseIndex,
     Bt,
+    Fb,
     L0a(C220L0WritePort),
     L0b(C220L0WritePort),
 }
@@ -21,7 +22,7 @@ impl C220MteL1OutputCredits {
     fn permits(self, destination: C220MteL1OutputDestination) -> bool {
         match destination {
             C220MteL1OutputDestination::SparseIndex => false,
-            C220MteL1OutputDestination::Bt => true,
+            C220MteL1OutputDestination::Bt | C220MteL1OutputDestination::Fb => true,
             C220MteL1OutputDestination::L0a(port) => self.l0a[port as usize],
             C220MteL1OutputDestination::L0b(port) => self.l0b[port as usize],
         }
@@ -47,7 +48,7 @@ pub struct C220MteL1OutputCycle<T> {
     pub tick: u64,
     pub sent: Option<C220MteL1OutputTransfer<T>>,
     pub blocked: Option<C220MteL1OutputDestination>,
-    /// Local BT completion. L0 destinations retire through their write interface.
+    /// Local BT/FB completion. L0 destinations retire through their write interface.
     pub retired: Option<C220MteL1OutputTransfer<T>>,
     pub queues: C220MteL1OutputQueues,
 }
@@ -264,9 +265,17 @@ impl<T: Copy> C220MteL1Output<T> {
                     };
                     sent = Some(transfer);
                     if fragment.last_in_uop {
-                        if head.destination == C220MteL1OutputDestination::Bt {
+                        if matches!(
+                            head.destination,
+                            C220MteL1OutputDestination::Bt | C220MteL1OutputDestination::Fb
+                        ) {
                             self.retiring.push_back(Retirement {
-                                ready_tick: tick + 5,
+                                ready_tick: tick
+                                    + if head.destination == C220MteL1OutputDestination::Bt {
+                                        5
+                                    } else {
+                                        0
+                                    },
                                 transfer,
                             });
                         }

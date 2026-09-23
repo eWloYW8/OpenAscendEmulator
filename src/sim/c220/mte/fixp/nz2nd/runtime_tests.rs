@@ -10,7 +10,8 @@ use std::num::NonZeroU32;
 
 #[test]
 fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
-    for conversion in [0, 1, 12, 13] {
+    for conversion in [0, 1, 8, 9, 10, 11, 12, 13, 21, 22, 23, 24, 25, 26] {
+        let int4 = matches!(conversion, 21 | 22 | 25 | 26);
         use C220FixpNz2ndStage::*;
         let width = NonZeroU32::new(32).unwrap();
         let mut pipeline = C220MtePipeline::new(
@@ -50,7 +51,7 @@ fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
         )
         .unwrap();
         let mut l0c = C220L0c::new(131072, 12).unwrap();
-        let input = if matches!(conversion, 12 | 13) {
+        let input = if matches!(conversion, 8..=13 | 21 | 22) {
             2_i32.to_le_bytes()
         } else {
             1_f32.to_le_bytes()
@@ -59,8 +60,17 @@ fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
             .write_known_linear(0, &input.repeat(1024))
             .unwrap();
         let mut slopes = C220LocalBuffer::new(2176);
-        if conversion == 12 {
-            slopes.write_known_linear(0, &[0; 256]).unwrap();
+        if matches!(conversion, 8 | 10 | 12 | 21 | 23 | 25) {
+            let factor = if matches!(conversion, 23 | 25) {
+                0x3f80_0000_u64
+            } else if matches!(conversion, 8 | 10 | 21) {
+                0x3f00_0000_u64
+            } else {
+                0
+            };
+            slopes
+                .write_known_linear(0, &factor.to_le_bytes().repeat(32))
+                .unwrap();
             slopes.write_known_linear(2048, &[0; 128]).unwrap();
         }
         let mut memory = MappedMemory::bind(
@@ -75,11 +85,11 @@ fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
         let operands = C220FixpExternalCommand {
             command: C220FixpCommand {
                 descriptor: C220FixpDescriptor {
-                    xt: (32 << 32) | (2 << 16) | (17 << 4),
+                    xt: (32 << 32) | (2 << 16) | ((if int4 { 19 } else { 17 }) << 4),
                     xm: (1 << 43) | (conversion << 34) | 2,
                     nd: 1,
                 },
-                source_format: if matches!(conversion, 12 | 13) {
+                source_format: if matches!(conversion, 8..=13 | 21 | 22) {
                     C220FixpSourceFormat::Int32
                 } else {
                     C220FixpSourceFormat::Fp32
@@ -90,7 +100,13 @@ fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
                 scalar_slope: 0,
                 slope_base_block: 0,
                 dequant_base_block: 0,
-                scalar_dequant: 0,
+                scalar_dequant: if matches!(conversion, 24 | 26) {
+                    0x3f80_0000
+                } else if matches!(conversion, 9 | 11 | 22) {
+                    0x3f00_0000
+                } else {
+                    0
+                },
             },
             biu_mode_word: 0,
             output_mode_word: 0,
@@ -176,14 +192,31 @@ fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
         assert!(state.lifecycle.write_dispatched_tick.unwrap() < tick);
         assert!(engine.is_idle() && pipeline.is_idle());
         assert_eq!(pipeline.next_nz2nd_event_tick(&engine), None);
+        if int4 {
+            assert_eq!(sent_bytes, 2);
+            for row in 0..2 {
+                assert_eq!(memory.read_known_at(4096 + row * 16, 9).unwrap(), [0x11; 9]);
+                assert_eq!(memory.read_known_at(4105 + row * 16, 7).unwrap(), [0; 7]);
+            }
+            continue;
+        }
         let lane = if conversion == 0 {
             1_f32.to_le_bytes().to_vec()
+        } else if matches!(conversion, 8 | 9 | 23 | 24) {
+            vec![1]
         } else if matches!(conversion, 12 | 13) {
             1_i16.to_le_bytes().to_vec()
         } else {
             0x3c00u16.to_le_bytes().to_vec()
         };
-        assert_eq!(sent_bytes as usize, 34 * lane.len());
+        assert_eq!(
+            sent_bytes as usize,
+            if matches!(conversion, 8 | 9 | 23 | 24) {
+                2
+            } else {
+                34 * lane.len()
+            }
+        );
         for row in 0..2 {
             let address = 4096 + row * 32 * lane.len() as u64;
             assert_eq!(

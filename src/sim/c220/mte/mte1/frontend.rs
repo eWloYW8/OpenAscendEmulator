@@ -415,6 +415,16 @@ impl C220Mte1ReadFrontend {
         hardware_sync_blocked: bool,
         interface: &mut C220MteL1Interface<C220Mte1ReadUop>,
     ) -> Result<C220Mte1ReadSend, C220Mte1ReadFrontendError> {
+        self.send_mapped(tick, hardware_sync_blocked, interface, |payload| payload)
+    }
+
+    pub fn send_mapped<T: Copy>(
+        &mut self,
+        tick: u64,
+        hardware_sync_blocked: bool,
+        interface: &mut C220MteL1Interface<T>,
+        map: impl FnOnce(C220Mte1ReadUop) -> T,
+    ) -> Result<C220Mte1ReadSend, C220Mte1ReadFrontendError> {
         self.check_callback(tick, self.send_tick, "send")?;
         let offered = self.generated.front().copied();
         let mut stall = None;
@@ -425,7 +435,16 @@ impl C220Mte1ReadFrontend {
             } else if hardware_sync_blocked {
                 Some(C220Mte1ReadStall::HardwareFlag)
             } else {
-                queued = interface.push(tick, C220MteL1ReadPort::Port0, head.operation)?;
+                queued = interface
+                    .push(
+                        tick,
+                        C220MteL1ReadPort::Port0,
+                        head.operation.map_payload(map),
+                    )?
+                    .map(|request| C220MteL1ReadRequest {
+                        id: request.id,
+                        operation: head.operation,
+                    });
                 if queued.is_some() {
                     self.generated.pop_front();
                     None

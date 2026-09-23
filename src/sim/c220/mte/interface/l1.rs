@@ -34,6 +34,22 @@ pub struct C220MteL1ReadRequest<T> {
     pub operation: C220MteL1ReadOperation<T>,
 }
 
+impl<T> C220MteL1ReadOperation<T> {
+    pub fn map_payload<U>(self, map: impl FnOnce(T) -> U) -> C220MteL1ReadOperation<U> {
+        C220MteL1ReadOperation {
+            instruction_id: self.instruction_id,
+            access: self.access,
+            destination: self.destination,
+            output_address: self.output_address,
+            output_bytes: self.output_bytes,
+            output_bandwidth: self.output_bandwidth,
+            completes_logical_uop: self.completes_logical_uop,
+            last_in_instruction: self.last_in_instruction,
+            payload: map(self.payload),
+        }
+    }
+}
+
 impl<T> C220MteL1ReadRequest<T> {
     pub const fn l1_request(&self) -> C220L1Request {
         C220L1Request {
@@ -338,6 +354,7 @@ impl<T: Copy> C220MteL1Interface<T> {
                 destination: match entry.request.operation.destination {
                     C220MteL1OutputDestination::SparseIndex => C220MteL1ReadDestination::Sp,
                     C220MteL1OutputDestination::Bt => C220MteL1ReadDestination::Bt,
+                    C220MteL1OutputDestination::Fb => C220MteL1ReadDestination::Fb,
                     C220MteL1OutputDestination::L0a(_) => C220MteL1ReadDestination::L0a,
                     C220MteL1OutputDestination::L0b(_) => C220MteL1ReadDestination::L0b,
                 },

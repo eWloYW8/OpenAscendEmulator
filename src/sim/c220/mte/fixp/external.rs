@@ -95,10 +95,7 @@ impl C220FixpExternalCommand {
         .expect("validated format");
         Ok(C220FixpNz2ndOutputPolicy::new(
             self.output_mode_word,
-            self.command
-                .descriptor
-                .destination_stride()
-                .wrapping_mul(format.lane_bytes()),
+            format.storage_bytes(self.command.descriptor.destination_stride()),
         ))
     }
 

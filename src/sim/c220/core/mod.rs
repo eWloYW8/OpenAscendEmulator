@@ -22,6 +22,7 @@ mod advance;
 mod cube;
 mod decode;
 mod dispatch;
+mod fixp;
 mod hflag;
 mod mte1;
 mod mte2;
@@ -103,6 +104,7 @@ pub struct C220Core {
     scalar_timing: C220ScalarTimingLane,
     mte1: Mte1Engine,
     mte_pipeline: Option<C220MtePipeline>,
+    fixp: Option<fixp::CoreFixp>,
     hardware_flags: C220HardwareFlagState,
     mte3: Mte3Engine,
     cube: CubeEngine,
@@ -146,6 +148,7 @@ impl C220Core {
             scalar_timing: C220ScalarTimingLane::default(),
             mte1: Mte1Engine::default(),
             mte_pipeline: None,
+            fixp: None,
             hardware_flags: C220HardwareFlagState::default(),
             mte3: Mte3Engine::new(timing.mte3),
             cube: CubeEngine::new(cube_config)?,
@@ -184,6 +187,10 @@ impl C220Core {
         config: C220MtePipelineConfig,
     ) -> Result<(), C220CoreError> {
         if self.mte1.pending_commands().next().is_some()
+            || self
+                .fixp
+                .as_ref()
+                .is_some_and(|fixp| !fixp.engine.is_idle() || !fixp.bindings.is_idle())
             || self.mte2.is_busy()
             || !self.mte3.dma_commands.is_empty()
             || self.mte_pipeline.as_ref().is_some_and(|p| !p.is_idle())
@@ -191,6 +198,7 @@ impl C220Core {
             return Err(C220CoreError::MtePipelineBusy);
         }
         self.mte_pipeline = Some(C220MtePipeline::new(self.mte1.tick(), config));
+        self.fixp = None;
         Ok(())
     }
 
@@ -359,6 +367,14 @@ impl C220Core {
 
     fn pending_compute_drain(&self) -> Option<(u64, C220StallCause)> {
         [
+            self.fixp
+                .as_ref()
+                .and_then(|fixp| {
+                    self.mte_pipeline
+                        .as_ref()
+                        .and_then(|pipeline| pipeline.next_fixp_event_tick(&fixp.engine))
+                })
+                .map(|tick| (tick, C220StallCause::FixpDependency)),
             self.scalar_timing
                 .pending_drain_tick()
                 .map(|tick| (tick, C220StallCause::ScalarDependency)),

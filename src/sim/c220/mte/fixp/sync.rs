@@ -57,6 +57,10 @@ pub struct C220FixpSyncBindings {
 }
 
 impl C220FixpSyncBindings {
+    pub fn is_idle(&self) -> bool {
+        self.waits.is_empty() && self.sets.is_empty()
+    }
+
     /// Disabled commands publish their sets before attempting waits. A blocked
     /// set prevents any waits from being consumed during that decode attempt.
     pub fn disabled_blocked(

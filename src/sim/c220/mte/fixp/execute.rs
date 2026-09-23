@@ -93,7 +93,10 @@ impl C220FixpCommand {
         let slope_base_block = bases as u8;
         let dequant_base_block = (bases >> 8) as u8;
         let scalar_slope = spr(61)? as u32;
-        let scalar_dequant = if (C220FixpDescriptor { xt, xm, nd: 0 }).conversion_mode() == 13 {
+        let scalar_dequant = if matches!(
+            (C220FixpDescriptor { xt, xm, nd: 0 }).conversion_mode(),
+            9 | 11 | 13 | 22 | 24 | 26
+        ) {
             spr(65)?
         } else {
             0
@@ -140,8 +143,10 @@ impl C220FixpCommand {
                 coordinate.source_address,
                 coordinate.source_bytes() as usize,
             )?;
-            if coordinate.output_format != C220FixpOutputFormat::Fp16 {
-                let dequant_read_address = (self.descriptor.conversion_mode() == 12)
+            if self.descriptor.conversion_mode() != 1 {
+                let mode = self.descriptor.conversion_mode();
+                let activation = self.descriptor.activation_mode();
+                let dequant_read_address = matches!(mode, 8 | 10 | 12 | 21 | 23 | 25)
                     .then(|| coordinate.dequant_address(self.dequant_base_block));
                 let mut factors = [self.scalar_dequant; 16];
                 if let Some(address) = dequant_read_address {
@@ -150,17 +155,53 @@ impl C220FixpCommand {
                         *factor = u64::from_le_bytes(lane.try_into().expect("eight-byte factor"));
                     }
                 }
-                let slope_read_address = (dequant_read_address.is_some()
-                    && self.descriptor.activation_mode() == 0)
+                let slope_read_address = ((dequant_read_address.is_some() && activation == 0)
+                    || (matches!(mode, 8..=11 | 21..=26) && activation == 3))
                     .then(|| coordinate.slope_address(self.slope_base_block));
+                let mut slope_words = [if activation == 2 {
+                    self.scalar_slope
+                } else {
+                    0
+                }; 16];
                 if let Some(address) = slope_read_address {
-                    slopes.read_initialized_linear(u64::from(address), 64)?;
+                    let data = slopes.read_initialized_linear(u64::from(address), 64)?;
+                    for (word, lane) in slope_words.iter_mut().zip(data.chunks_exact(4)) {
+                        *word = u32::from_le_bytes(lane.try_into().expect("four-byte slope"));
+                    }
                 }
                 let mut bytes = Vec::with_capacity(coordinate.destination_bytes() as usize);
                 let mut lane_status = Vec::with_capacity(input.len() / 4);
                 for (index, lane) in input.chunks_exact(4).enumerate() {
                     let bits = u32::from_le_bytes([lane[0], lane[1], lane[2], lane[3]]);
-                    if coordinate.output_format == C220FixpOutputFormat::Int32 {
+                    if matches!(
+                        coordinate.output_format,
+                        C220FixpOutputFormat::Bits8 | C220FixpOutputFormat::Int4
+                    ) {
+                        use crate::sim::c220::numeric::fixp::C220FixpDequantActivation;
+                        use crate::sim::c220::numeric::requant::{
+                            C220FixpQuantizedWidth, c220_fixp_quantize_f32, c220_fixp_requantize,
+                        };
+                        let activation = match activation {
+                            0 => C220FixpDequantActivation::None,
+                            1 => C220FixpDequantActivation::Relu,
+                            _ => C220FixpDequantActivation::NegativeSlope(slope_words[index]),
+                        };
+                        let width = if coordinate.output_format == C220FixpOutputFormat::Int4 {
+                            C220FixpQuantizedWidth::Bits4
+                        } else {
+                            C220FixpQuantizedWidth::Bits8
+                        };
+                        let result = match self.source_format {
+                            C220FixpSourceFormat::Int32 => {
+                                c220_fixp_requantize(bits as i32, factors[index], activation, width)
+                            }
+                            C220FixpSourceFormat::Fp32 => {
+                                c220_fixp_quantize_f32(bits, factors[index], activation, width)
+                            }
+                        };
+                        bytes.push(result.bits);
+                        lane_status.push(C220FixpLaneStatus::Requant(result));
+                    } else if coordinate.output_format == C220FixpOutputFormat::Int32 {
                         let result = if self.descriptor.activation_mode() == 1 {
                             (bits as i32).max(0) as u32
                         } else {
@@ -176,6 +217,18 @@ impl C220FixpCommand {
                         );
                         bytes.extend_from_slice(&result.value.to_le_bytes());
                         lane_status.push(C220FixpLaneStatus::Int16(result.status));
+                    } else if coordinate.output_format == C220FixpOutputFormat::Fp16 {
+                        use crate::sim::c220::numeric::fixp::{
+                            C220FixpDequantActivation, c220_fixp_i32_to_f16,
+                        };
+                        let activation = match activation {
+                            0 => C220FixpDequantActivation::None,
+                            1 => C220FixpDequantActivation::Relu,
+                            _ => C220FixpDequantActivation::NegativeSlope(slope_words[index]),
+                        };
+                        let result = c220_fixp_i32_to_f16(bits as i32, factors[index], activation);
+                        bytes.extend_from_slice(&result.conversion.bits.to_le_bytes());
+                        lane_status.push(C220FixpLaneStatus::DequantFp16(result));
                     } else if coordinate.output_format == C220FixpOutputFormat::Bf16 {
                         let result = crate::sim::c220::numeric::fixp::c220_fixp_f32_to_bf16(
                             bits,
@@ -192,6 +245,12 @@ impl C220FixpCommand {
                         bytes.extend_from_slice(&result.bits.to_le_bytes());
                         lane_status.push(C220FixpLaneStatus::Fp32(result.status));
                     }
+                }
+                if coordinate.output_format == C220FixpOutputFormat::Int4 {
+                    for index in 0..bytes.len() / 2 {
+                        bytes[index] = (bytes[2 * index] & 15) | ((bytes[2 * index + 1] & 15) << 4);
+                    }
+                    bytes.truncate(coordinate.destination_bytes() as usize);
                 }
                 return Ok(C220FixpSliceResult {
                     coordinate,
@@ -438,6 +497,153 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some(2240), Some(2304)]
         );
+    }
+
+    #[test]
+    fn byte_output_merges_columns_and_keeps_nd_tail_unpadded() {
+        let mut command = C220FixpCommand {
+            descriptor: C220FixpDescriptor {
+                xt: (8 << 32) | (2 << 16) | (48 << 4),
+                xm: (9 << 34) | 2,
+                nd: 1,
+            },
+            source_format: C220FixpSourceFormat::Int32,
+            source_address: 0,
+            destination_address: 0,
+            control: 0,
+            scalar_slope: 0,
+            scalar_dequant: (1 << 46) | 0x3f80_0000,
+            slope_base_block: 0,
+            dequant_base_block: 0,
+        };
+        let mut l0c = C220LocalBuffer::new(384);
+        l0c.write_known_linear(0, &(-3_i32).to_le_bytes().repeat(96))
+            .unwrap();
+        let factors = C220LocalBuffer::new(0);
+        let results = command
+            .evaluate(&l0c, &factors)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.coordinate.destination_address)
+                .collect::<Vec<_>>(),
+            [0, 16, 256, 32, 48, 272]
+        );
+        assert!(results.iter().all(|r| r.conversion.bytes == [253; 16]));
+        let packets = super::super::C220FixpReadGenerator::new(command, 0, 0, 128)
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            packets
+                .iter()
+                .map(|p| (
+                    p.operation.destination_address,
+                    p.operation.output_bytes,
+                    p.operation.last_in_uop
+                ))
+                .collect::<Vec<_>>(),
+            [(0, 64, false), (0, 64, true), (256, 32, true)]
+        );
+        command.descriptor.xt = (32 << 32) | (2 << 16) | (17 << 4);
+        command.descriptor.xm |= 1 << 43;
+        let results = command
+            .evaluate(&l0c, &factors)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| (r.coordinate.destination_address, r.conversion.bytes.len()))
+                .collect::<Vec<_>>(),
+            [(0, 16), (16, 1), (32, 16), (48, 1)]
+        );
+    }
+
+    #[test]
+    fn int4_packs_low_lane_first_and_selects_column_layout() {
+        let mut command = C220FixpCommand {
+            descriptor: C220FixpDescriptor {
+                xt: (8 << 32) | (2 << 16) | (64 << 4),
+                xm: (22 << 34) | 2,
+                nd: 1,
+            },
+            source_format: C220FixpSourceFormat::Int32,
+            source_address: 0,
+            destination_address: 0,
+            control: 0,
+            scalar_slope: 0,
+            scalar_dequant: 0x3f80_0000,
+            slope_base_block: 0,
+            dequant_base_block: 0,
+        };
+        let mut l0c = C220LocalBuffer::new(512);
+        let input: Vec<_> = (-8_i32..8).flat_map(i32::to_le_bytes).collect();
+        l0c.write_known_linear(0, &input.repeat(8)).unwrap();
+        let mut factors = C220LocalBuffer::new(4096);
+        factors
+            .write_known_linear(0, &0x3f80_0000_u64.to_le_bytes().repeat(64))
+            .unwrap();
+        for mode in [21_u64, 22] {
+            command.descriptor.xm = (mode << 34) | 2;
+            for (columns, addresses) in [
+                (64, vec![0, 8, 16, 24, 32, 40, 48, 56]),
+                (48, vec![0, 256, 512, 8, 264, 520]),
+            ] {
+                command.descriptor.xt = (8 << 32) | (2 << 16) | (columns << 4);
+                let results = command
+                    .evaluate(&l0c, &factors)
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(
+                    results
+                        .iter()
+                        .map(|r| r.coordinate.destination_address)
+                        .collect::<Vec<_>>(),
+                    addresses
+                );
+                assert!(results.iter().all(
+                    |r| r.conversion.bytes == [0x98, 0xba, 0xdc, 0xfe, 0x10, 0x32, 0x54, 0x76]
+                ));
+                let packets: Vec<_> = super::super::C220FixpReadGenerator::new(command, 0, 0, 128)
+                    .unwrap()
+                    .collect();
+                assert_eq!(
+                    packets
+                        .iter()
+                        .filter(|p| p.operation.last_in_uop)
+                        .map(|p| p.operation.output_bytes)
+                        .sum::<u32>(),
+                    if columns == 64 { 64 } else { 48 }
+                );
+            }
+            command.descriptor.xt = (32 << 32) | (2 << 16) | (19 << 4);
+            command.descriptor.xm |= 1 << 43;
+            let results = command
+                .evaluate(&l0c, &factors)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|r| (r.coordinate.destination_address, r.conversion.bytes.len()))
+                    .collect::<Vec<_>>(),
+                [(0, 8), (8, 1), (16, 8), (24, 1)]
+            );
+            assert_eq!(results[1].conversion.bytes, [0x98]);
+            assert_eq!(results[1].conversion.lane_status.len(), 3);
+            let mut destination = C220LocalBuffer::new(32);
+            destination.write_known_linear(0, &[0xaa; 32]).unwrap();
+            command
+                .execute_to_l1(&l0c, &factors, &mut destination, |_| {})
+                .unwrap();
+            assert_eq!(destination.read_known(8, 2).unwrap(), [0x98, 0xaa]);
+        }
     }
 
     #[test]

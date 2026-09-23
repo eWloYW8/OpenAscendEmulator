@@ -44,7 +44,9 @@ pub use sync::{
     C220FixpFlagResolver, C220FixpSync, C220FixpSyncBindings, C220FixpSyncPoint,
     C220FixpSyncRequest,
 };
+mod dispatch;
 mod write_pipeline;
+pub use dispatch::{C220FixpDispatchPacket, C220FixpDispatchPipeline};
 
 pub use write_pipeline::{
     C220FixpBiuWrite, C220FixpBiuWritePipeline, C220FixpWriteEntry, C220FixpWritePipeline,

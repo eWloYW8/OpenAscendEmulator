@@ -17,6 +17,14 @@ use crate::sim::common::scalar::ScalarInstructionError;
 
 #[derive(Debug, Error)]
 pub enum C220CoreError {
+    #[error("FIX requires explicit engine, factor-buffer and clock-stage configuration")]
+    FixpUnconfigured,
+    #[error("FIX L0C capacity differs from the core's shared L0C")]
+    FixpCapacityMismatch,
+    #[error(transparent)]
+    FixpExecution(#[from] crate::sim::c220::mte::fixp::C220FixpExecutionError),
+    #[error(transparent)]
+    FixpEngine(#[from] crate::sim::c220::mte::fixp::C220FixpEngineError),
     #[error("MTE requires explicit L1 geometry and bandwidth configuration")]
     MteUnconfigured,
     #[error("MTE cannot be reconfigured while commands or physical transfers are active")]

@@ -32,12 +32,11 @@ impl C220FixpNz2ndInstructionPlan {
         let reads =
             C220FixpNz2ndReadGenerator::new(command, instruction_id, first_read_id, bandwidth)?;
         let planner = C220FixpNz2ndWritePlanner::new(command, main_slots)?;
-        let lane_bytes = C220FixpOutputFormat::from_conversion_mode(
+        let format = C220FixpOutputFormat::from_conversion_mode(
             command.source_format,
             command.descriptor.conversion_mode(),
         )
-        .expect("validated command")
-        .lane_bytes();
+        .expect("validated command");
         Ok(Self {
             writes: C220FixpNz2ndWriteGenerator {
                 command,
@@ -46,7 +45,7 @@ impl C220FixpNz2ndInstructionPlan {
                 reads: reads.clone(),
                 planner,
                 main_slots,
-                lane_bytes,
+                format,
                 position: None,
                 group_index: 0,
                 destination_column: 0,
@@ -78,7 +77,7 @@ pub struct C220FixpNz2ndWriteGenerator {
     reads: C220FixpNz2ndReadGenerator,
     planner: C220FixpNz2ndWritePlanner,
     main_slots: u32,
-    lane_bytes: u32,
+    format: C220FixpOutputFormat,
     position: Option<(u32, u32, u32)>,
     group_index: u32,
     destination_column: u32,
@@ -101,16 +100,16 @@ impl Iterator for C220FixpNz2ndWriteGenerator {
                     .command
                     .destination_address
                     .wrapping_add(u64::from(
-                        rows.nd
-                            .wrapping_mul(d.destination_nd_stride())
-                            .wrapping_mul(self.lane_bytes),
+                        self.format
+                            .storage_bytes(rows.nd.wrapping_mul(d.destination_nd_stride())),
                     ))
                     .wrapping_add(u64::from(
-                        rows.row
-                            .wrapping_mul(d.destination_stride())
-                            .wrapping_mul(self.lane_bytes),
+                        self.format
+                            .storage_bytes(rows.row.wrapping_mul(d.destination_stride())),
                     ))
-                    .wrapping_add(u64::from(rows.column) * 16 * u64::from(self.lane_bytes));
+                    .wrapping_add(
+                        u64::from(rows.column) * u64::from(self.format.storage_bytes(16)),
+                    );
                 let mut batch =
                     self.planner
                         .plan_row(rows.group_index, rows.end_of_group, destination);

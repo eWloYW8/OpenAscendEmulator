@@ -71,6 +71,78 @@ mod tests {
     use crate::sim::common::scalar::{ScalarMachine, ScalarStepper};
     use std::num::NonZeroU32;
 
+    #[test]
+    fn fixp_instruction_dispatches_and_drains_on_shared_core_clock() {
+        use crate::sim::c220::memory::C220LocalBuffer;
+        use crate::sim::c220::mte::fixp::{C220FixpEngineConfig, C220FixpStage::*};
+        let mut core = matrix_core();
+        core.advance_to(300).unwrap();
+        let pc = core.state.scalar().pc();
+        core.configure_fixp_l1(
+            C220FixpEngineConfig {
+                instruction_fifo_depth: 1,
+                read_bandwidth: 256,
+                read_bank_count: 32,
+                read_data_latency: 4,
+                l0c_capacity: core.local_memory.l0c().buffer().capacity(),
+            },
+            C220LocalBuffer::new(4096),
+            &[
+                GenerateRead,
+                SendRead,
+                SendL0c,
+                ReceiveL0c,
+                Convert,
+                Slice,
+                Packetize,
+                GenerateWrite,
+                SendWrite,
+            ],
+        )
+        .unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        for (reg, value) in [
+            (1, 4096),
+            (2, 0),
+            (3, (8 << 32) | (8 << 16) | (16 << 4)),
+            (4, 1 << 34),
+        ] {
+            machine.set_xreg(reg, value).unwrap();
+        }
+        for reg in [3, 61, 64, 97] {
+            machine.set_spr_value(reg, 0).unwrap();
+        }
+        core.local_memory
+            .l0c_mut()
+            .buffer_mut()
+            .write_known_linear(0, &2_f32.to_le_bytes().repeat(128))
+            .unwrap();
+        let word = (6 << 29) | (3 << 24) | (1 << 17) | (2 << 12) | (3 << 7) | (4 << 2);
+        assert!(matches!(
+            core.step_word_at(301, word).unwrap(),
+            super::super::C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Fixp {
+                    instruction_id: 6,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            core.step_word_at(302, word).unwrap(),
+            super::super::C220CoreStep::Stalled(_)
+        ));
+        assert_eq!(core.state.scalar().pc(), pc + 4);
+        assert!(core.pending_compute_drain().is_some());
+        core.advance_to(500).unwrap();
+        assert!(core.fixp_engine().unwrap().is_idle());
+        assert_eq!(
+            core.local_memory.l1().read_known(4096, 256).unwrap(),
+            0x4000_u16.to_le_bytes().repeat(128)
+        );
+        assert!(core.pending_compute_drain().is_none());
+    }
+
     fn matrix_core() -> C220Core {
         let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
         for (register, value) in [

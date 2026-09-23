@@ -70,8 +70,8 @@ pub enum C220FixpAdmission {
 /// Ordinary 32-bit-source FIX-to-L1 execution from admitted command to write
 /// handoff. The owner supplies scheduler callbacks, hardware synchronization,
 /// shared memories and write acknowledgments. Frontend queue timing and global
-/// phase order are external. Int32, FP32, FP16 and BF16 output are supported; NZ2ND timing
-/// and other conversion modes fail explicitly.
+/// phase order are external. NZ2ND uses a separate engine; unsupported source
+/// and conversion combinations fail during command validation.
 #[derive(Debug, Clone)]
 pub struct C220FixpEngine {
     config: C220FixpEngineConfig,
@@ -83,7 +83,7 @@ pub struct C220FixpEngine {
     functional: C220FixpFunctionalState,
     conversion: C220FixpConversionPipeline,
     output: C220FixpL1Output,
-    write: C220FixpWritePipeline,
+    write: C220FixpDispatchPipeline,
 }
 
 impl C220FixpEngine {
@@ -126,7 +126,7 @@ impl C220FixpEngine {
             functional: C220FixpFunctionalState::new(config.l0c_capacity),
             conversion: C220FixpConversionPipeline::default(),
             output: C220FixpL1Output::default(),
-            write: C220FixpWritePipeline::default(),
+            write: C220FixpDispatchPipeline::default(),
         })
     }
 
@@ -174,7 +174,7 @@ impl C220FixpEngine {
     pub fn output(&self) -> &C220FixpL1Output {
         &self.output
     }
-    pub fn write_pipeline(&self) -> &C220FixpWritePipeline {
+    pub fn write_pipeline(&self) -> &C220FixpDispatchPipeline {
         &self.write
     }
     pub fn functional(&self) -> &C220FixpFunctionalState {
@@ -341,13 +341,13 @@ impl C220FixpEngine {
         &mut self,
         tick: u64,
     ) -> Result<Option<C220MteOutputFragment>, C220FixpEngineError> {
-        Ok(self.write.packetize(tick, &mut self.output)?)
+        Ok(self.write.packetize_output(tick, &mut self.output)?)
     }
 
     pub fn generate_write(
         &mut self,
         tick: u64,
-    ) -> Result<C220FixpWriteProgress, C220FixpEngineError> {
+    ) -> Result<C220FixpWriteProgress<C220FixpDispatchPacket>, C220FixpEngineError> {
         Ok(self.write.generate(tick)?)
     }
 
@@ -355,9 +355,12 @@ impl C220FixpEngine {
         &mut self,
         tick: u64,
         interface: &mut C220FixpL1WriteInterface,
-    ) -> Result<C220FixpWriteProgress, C220FixpEngineError> {
-        let result = self.write.send(tick, interface)?;
-        if let C220FixpWriteProgress::Advanced(fragment) = result
+        reader: &mut crate::sim::c220::mte::interface::C220MteL1Interface<
+            crate::sim::c220::mte::C220MteReadPayload,
+        >,
+    ) -> Result<C220FixpWriteProgress<C220FixpDispatchPacket>, C220FixpEngineError> {
+        let result = self.write.send_shared(tick, interface, reader)?;
+        if let C220FixpWriteProgress::Advanced(C220FixpDispatchPacket::Write(fragment)) = result
             && fragment.last_in_instruction
         {
             let id = fragment.instruction_id;
@@ -372,6 +375,22 @@ impl C220FixpEngine {
             self.instruction_fifo.pop_front();
         }
         Ok(result)
+    }
+
+    /// Adds an already-generated physical factor read to the same FIFO as
+    /// converted writes. Instruction admission and functional commit belong
+    /// to the caller; enqueue does not mark the instruction complete.
+    pub fn enqueue_factor_read(
+        &mut self,
+        tick: u64,
+        port: crate::sim::c220::mte::interface::C220MteL1ReadPort,
+        operation: crate::sim::c220::mte::interface::C220MteL1ReadOperation<
+            crate::sim::c220::mte::factor::C220FactorReadPacket,
+        >,
+    ) -> Result<(), C220FixpEngineError> {
+        Ok(self
+            .write
+            .enqueue(tick, C220FixpDispatchPacket::FactorRead { port, operation })?)
     }
 
     /// Only the owner of the destination acknowledgment may call this method.

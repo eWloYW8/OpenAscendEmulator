@@ -54,6 +54,25 @@ impl C220Mte1ReadEvents {
         hardware_sync_blocked: bool,
         interface: &mut C220MteL1Interface<C220Mte1ReadUop>,
     ) -> Result<C220Mte1ReadEventOutcome, C220Mte1ReadFrontendError> {
+        self.handle_mapped(
+            callback,
+            events,
+            frontend,
+            hardware_sync_blocked,
+            interface,
+            |payload| payload,
+        )
+    }
+
+    pub fn handle_mapped<T: Copy, U: Copy>(
+        &self,
+        callback: C220MteGeneratorCallback,
+        events: &mut EventDispatcher<T>,
+        frontend: &mut C220Mte1ReadFrontend,
+        hardware_sync_blocked: bool,
+        interface: &mut C220MteL1Interface<U>,
+        map: impl FnOnce(C220Mte1ReadUop) -> U,
+    ) -> Result<C220Mte1ReadEventOutcome, C220Mte1ReadFrontendError> {
         let tick = events.tick();
         match callback {
             C220MteGeneratorCallback::InstructionReady => {
@@ -76,7 +95,7 @@ impl C220Mte1ReadEvents {
                 Ok(C220Mte1ReadEventOutcome::Generated(generated))
             }
             C220MteGeneratorCallback::Send => frontend
-                .send(tick, hardware_sync_blocked, interface)
+                .send_mapped(tick, hardware_sync_blocked, interface, map)
                 .map(C220Mte1ReadEventOutcome::Sent),
         }
     }

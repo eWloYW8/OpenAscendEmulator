@@ -17,7 +17,7 @@ impl C220FixpSlice {
         self.lanes as u32 * 4
     }
     pub const fn destination_bytes(self) -> u32 {
-        self.lanes as u32 * self.output_format.lane_bytes()
+        self.output_format.storage_bytes(self.lanes as u32)
     }
 
     /// PReLU reads a full 16-lane slope block, including for a partial ND tail.
@@ -72,13 +72,20 @@ impl C220FixpLayout {
 
     pub fn slices(self) -> impl Iterator<Item = C220FixpSlice> + Clone {
         let d = self.descriptor;
-        let lane_bytes = self.format.lane_bytes();
+        let format = self.format;
         let split = matches!(
             self.format,
             C220FixpOutputFormat::Fp32 | C220FixpOutputFormat::Int32
         ) && d.channel_split()
             && !d.nz_to_nd();
-        let blocks = if split {
+        let byte_merge = self.format == C220FixpOutputFormat::Bits8 && !d.nz_to_nd();
+        let nibble_merge = self.format == C220FixpOutputFormat::Int4
+            && !d.nz_to_nd()
+            && d.columns().is_multiple_of(64);
+        let merged_blocks = u32::from(d.columns() / 32) * 2;
+        let blocks = if byte_merge {
+            merged_blocks + u32::from(!d.columns().is_multiple_of(32))
+        } else if split {
             u32::from(d.columns() / 16) * 2 + u32::from(d.columns() % 16 == 8)
         } else {
             u32::from(d.columns()).div_ceil(16)
@@ -111,17 +118,30 @@ impl C220FixpLayout {
                         .wrapping_add(u64::from(source_block));
                     let destination_address = if d.nz_to_nd() {
                         self.destination
-                            .wrapping_add(u64::from(
-                                u32::from(nd_index)
-                                    .wrapping_mul(d.destination_nd_stride())
-                                    .wrapping_mul(lane_bytes),
-                            ))
-                            .wrapping_add(u64::from(
-                                u32::from(row)
-                                    .wrapping_mul(d.destination_stride())
-                                    .wrapping_mul(lane_bytes),
-                            ))
-                            .wrapping_add(u64::from(block) * 16 * u64::from(lane_bytes))
+                            .wrapping_add(u64::from(format.storage_bytes(
+                                u32::from(nd_index).wrapping_mul(d.destination_nd_stride()),
+                            )))
+                            .wrapping_add(u64::from(format.storage_bytes(
+                                u32::from(row).wrapping_mul(d.destination_stride()),
+                            )))
+                            .wrapping_add(u64::from(block) * u64::from(format.storage_bytes(16)))
+                    } else if nibble_merge {
+                        self.destination
+                            .wrapping_add(u64::from(row) * 32)
+                            .wrapping_add(
+                                u64::from(block / 4)
+                                    * u64::from(d.destination_stride().wrapping_mul(32)),
+                            )
+                            .wrapping_add(u64::from(block % 4) * 8)
+                    } else if byte_merge {
+                        let tail = block == merged_blocks;
+                        self.destination
+                            .wrapping_add(u64::from(row) * if tail { 16 } else { 32 })
+                            .wrapping_add(
+                                u64::from(block / 2)
+                                    * u64::from(d.destination_stride().wrapping_mul(32)),
+                            )
+                            .wrapping_add(if tail { 0 } else { u64::from(block % 2) * 16 })
                     } else {
                         self.destination
                             .wrapping_add(
@@ -129,7 +149,7 @@ impl C220FixpLayout {
                                     * if split {
                                         32
                                     } else {
-                                        16 * u64::from(lane_bytes)
+                                        u64::from(format.storage_bytes(16))
                                     },
                             )
                             .wrapping_add(

@@ -37,8 +37,8 @@ pub enum C220FixpEvent {
     Converted(C220FixpConversionReceive),
     Sliced(Option<C220FixpConversionEntry>),
     Packetized(Option<C220MteOutputFragment>),
-    GeneratedWrite(C220FixpWriteProgress),
-    SentWrite(C220FixpWriteProgress),
+    GeneratedWrite(C220FixpWriteProgress<C220FixpDispatchPacket>),
+    SentWrite(C220FixpWriteProgress<C220FixpDispatchPacket>),
 }
 
 /// Read dispatch and final conversion admission have independent gates.
@@ -67,6 +67,9 @@ pub struct C220FixpResources<'a> {
     pub slopes: &'a C220LocalBuffer,
     pub l1: &'a mut C220LocalBuffer,
     pub writer: &'a mut C220FixpL1WriteInterface,
+    pub reader: &'a mut crate::sim::c220::mte::interface::C220MteL1Interface<
+        crate::sim::c220::mte::C220MteReadPayload,
+    >,
     pub gates: &'a mut dyn C220FixpSync,
 }
 
@@ -147,7 +150,11 @@ impl C220FixpStageEvents {
             Slice => C220FixpEvent::Sliced(engine.slice(tick)?),
             Packetize => C220FixpEvent::Packetized(engine.packetize(tick)?),
             GenerateWrite => C220FixpEvent::GeneratedWrite(engine.generate_write(tick)?),
-            SendWrite => C220FixpEvent::SentWrite(engine.send_write(tick, resources.writer)?),
+            SendWrite => C220FixpEvent::SentWrite(engine.send_write(
+                tick,
+                resources.writer,
+                resources.reader,
+            )?),
         })
     }
 }

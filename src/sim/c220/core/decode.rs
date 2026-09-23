@@ -14,6 +14,7 @@ use crate::sim::c220::vector::dispatch::is_vector_word;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum C220DispatchKind {
     Mte1,
+    Fixp,
     Mte2,
     HardwareFlag(C220HardwareFlagInstruction),
     Cube(C220CubeInstruction),
@@ -31,7 +32,9 @@ pub(super) struct C220DecodedWord {
 impl C220DecodedWord {
     pub(super) fn decode(word: u32) -> Self {
         let flow_flag = FlagInstruction::decode(Architecture::Dav2201, word);
-        let kind = if C220Load2dInstruction::decode(word)
+        let kind = if crate::isa::c220::mte::fixp::C220FixpInstruction::decode(word).is_some() {
+            C220DispatchKind::Fixp
+        } else if C220Load2dInstruction::decode(word)
             .is_some_and(|instruction| instruction.is_mte1())
             || C220Load2dTransposeInstruction::decode(word).is_some()
             || C220Load2dSparseInstruction::decode(word).is_some()
@@ -40,7 +43,8 @@ impl C220DecodedWord {
                 .is_some_and(|instruction| instruction.destination != C220Set2dDestination::L1)
             || flow_flag.is_some_and(|instruction| {
                 instruction.source_pipe_code == 3 && instruction.trigger_pipe_code == 2
-            }) {
+            })
+        {
             C220DispatchKind::Mte1
         } else if is_mte2_transfer(word)
             || C220Set2dInstruction::decode(word)

@@ -6,6 +6,91 @@ use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadTransfer;
 use std::collections::BTreeMap;
 
 #[test]
+fn factor_reads_share_l1_and_complete_on_fix_lane() {
+    use crate::isa::c220::mte::factor::{C220FactorDescriptor, C220FactorLoad, C220FactorSource};
+    use crate::sim::c220::memory::{C220L0c, C220LocalBuffer};
+    use crate::sim::c220::mte::factor::c220_factor_l1_requests;
+    use crate::sim::c220::mte::fixp::{C220FixpEngineConfig, C220FixpGates, C220FixpStage::*};
+    use crate::sim::c220::mte::interface::C220MteL1ReadPort;
+    let width = NonZeroU32::new(32).unwrap();
+    let mut pipeline = C220MtePipeline::new(
+        0,
+        C220MtePipelineConfig {
+            l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
+            read_width: width,
+            output_bandwidths: C220Mte1ReadBandwidths {
+                l0a: width,
+                l0b: width,
+                bt: width,
+            },
+            set2d_bandwidths: C220Set2dBandwidths {
+                l0a: width,
+                l0b: width,
+                l1: width,
+            },
+        },
+    );
+    let load = C220FactorLoad {
+        source: C220FactorSource::L1,
+        source_address: 0,
+        destination_address: 2048,
+        descriptor: C220FactorDescriptor((1 << 16) | (1 << 4) | 8),
+    };
+    pipeline
+        .bind_fixp_stages(&[
+            GenerateRead,
+            SendRead,
+            SendL0c,
+            ReceiveL0c,
+            Convert,
+            Slice,
+            Packetize,
+            GenerateWrite,
+            SendWrite,
+        ])
+        .unwrap();
+    let mut engine = C220FixpEngine::new(C220FixpEngineConfig {
+        instruction_fifo_depth: 1,
+        read_bandwidth: 128,
+        read_bank_count: 32,
+        read_data_latency: 4,
+        l0c_capacity: 131072,
+    })
+    .unwrap();
+    let mut l0c = C220L0c::new(131072, 12).unwrap();
+    let mut l1 = C220LocalBuffer::new(4096);
+    let factors = C220LocalBuffer::new(4096);
+    for request in c220_factor_l1_requests(load, 91, width, width) {
+        engine
+            .enqueue_factor_read(0, C220MteL1ReadPort::Port2, request)
+            .unwrap();
+    }
+    assert_eq!(pipeline.next_event_tick(), None);
+    assert_eq!(pipeline.next_fixp_event_tick(&engine), Some(1));
+    assert!(pipeline.fixp_completions().is_empty());
+    let mut completions = Vec::new();
+    for tick in 1..=100 {
+        pipeline
+            .advance_fixp(
+                tick,
+                &mut engine,
+                C220FixpMemory {
+                    l0c: &mut l0c,
+                    l1: &mut l1,
+                    slopes: &factors,
+                },
+                C220FixpGates::default(),
+            )
+            .unwrap();
+        completions.extend_from_slice(pipeline.fixp_completions());
+        assert!(pipeline.mte1_completions().is_empty());
+    }
+    assert_eq!(completions, [91]);
+    assert!(pipeline.is_idle());
+    assert!(engine.is_idle());
+}
+
+#[test]
 fn mte3_output_and_biu_split_use_independent_captured_modes() {
     use crate::isa::c220::mte::{C220DmaMovDescriptor, CAPTURED_C220_MOV_UB_TO_OUT_WORD};
     use crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteConfig;
@@ -148,12 +233,16 @@ fn fixp_write_runs_on_shared_clock_and_retires_after_contended_response() {
 
 #[test]
 fn fixp_engine_executes_from_read_acceptance_and_drains_through_shared_l1() {
-    for conversion_mode in [0, 1, 16] {
+    for conversion_mode in [0, 1, 16, 23, 24, 25, 26] {
         run_fixp_output(conversion_mode, false, false);
     }
     run_fixp_output(0, true, false);
     run_fixp_output(0, false, true);
     run_fixp_output(0, true, true);
+    run_fixp_output(8, true, false);
+    run_fixp_output(9, true, false);
+    run_fixp_output(21, true, false);
+    run_fixp_output(22, true, false);
 }
 
 fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
@@ -203,10 +292,30 @@ fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
     })
     .unwrap();
     let mut l0c = C220L0c::new(131072, 12).unwrap();
+    let byte_output = matches!(conversion_mode, 8 | 9 | 23 | 24);
+    let nibble_output = matches!(conversion_mode, 21 | 22 | 25 | 26);
+    let quantized = byte_output || nibble_output;
     l0c.buffer_mut()
-        .write_known_linear(0, &1.5_f32.to_le_bytes().repeat(128))
+        .write_known_linear(
+            0,
+            &if quantized {
+                if integer {
+                    2_i32.to_le_bytes()
+                } else {
+                    2_f32.to_le_bytes()
+                }
+                .repeat(512)
+            } else {
+                1.5_f32.to_le_bytes().repeat(128)
+            },
+        )
         .unwrap();
-    let slopes = C220LocalBuffer::new(4096);
+    let mut slopes = C220LocalBuffer::new(4096);
+    if quantized {
+        slopes
+            .write_known_linear(0, &0x3f80_0000_u64.to_le_bytes().repeat(64))
+            .unwrap();
+    }
     let mut l1 = C220LocalBuffer::new(1048576);
     let command = C220FixpCommand {
         source_format: if integer {
@@ -215,8 +324,18 @@ fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
             crate::sim::c220::mte::fixp::C220FixpSourceFormat::Fp32
         },
         descriptor: C220FixpDescriptor {
-            xt: (8 << 32) | (8 << 16) | (16 << 4),
-            xm: (u64::from(conversion_mode) << 34) | (u64::from(split) << 42),
+            xt: (8 << 32)
+                | (8 << 16)
+                | (if nibble_output {
+                    64
+                } else if byte_output {
+                    48
+                } else {
+                    16
+                } << 4),
+            xm: (u64::from(conversion_mode) << 34)
+                | (u64::from(split) << 42)
+                | if quantized { 8 } else { 0 },
             nd: 0,
         },
         source_address: 0,
@@ -225,7 +344,7 @@ fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
         scalar_slope: 0,
         slope_base_block: 0,
         dequant_base_block: 0,
-        scalar_dequant: 0,
+        scalar_dequant: if quantized { 0x3f80_0000 } else { 0 },
     };
     use crate::sim::c220::mte::fixp::C220FixpAdmission;
     assert_eq!(
@@ -310,7 +429,11 @@ fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
         )) {
             assert!(executed.replace(tick).is_none());
             assert!(retired.is_none());
-            let expected = if conversion_mode == 0 {
+            let expected = if nibble_output {
+                vec![0x22; 256]
+            } else if byte_output {
+                vec![2; 384]
+            } else if conversion_mode == 0 {
                 1.5_f32.to_le_bytes().repeat(128)
             } else if conversion_mode == 16 {
                 0x3fc0_u16.to_le_bytes().repeat(128)
@@ -332,11 +455,14 @@ fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
     assert!(sync.requests.iter().all(|r| r.instruction_id == 71));
     for (point, retry_delay) in [
         (C220FixpSyncPoint::ReadWait, 1),
-        (C220FixpSyncPoint::ConversionSet, 4),
+        (
+            C220FixpSyncPoint::ConversionSet,
+            crate::sim::c220::mte::fixp::c220_fixp_conversion_ticks(u32::from(conversion_mode)),
+        ),
     ] {
         let attempts: Vec<_> = sync.requests.iter().filter(|r| r.point == point).collect();
         assert!(attempts.len() >= 2);
-        assert_eq!(attempts[1].tick - attempts[0].tick, retry_delay);
+        assert_eq!(attempts[1].tick - attempts[0].tick, u64::from(retry_delay));
         if point == C220FixpSyncPoint::ConversionSet {
             assert_eq!(attempts.len(), 2);
         }

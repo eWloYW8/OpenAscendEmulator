@@ -120,7 +120,7 @@ pub enum C220MtePipelineEvent {
     FixpSlice(C220FixpSliceResult),
     FixpWrite(C220FixpL1WriteEvent),
     Memory(C220L1EventOutcome),
-    Interface(C220MteL1EventOutcome<C220Mte1ReadUop>),
+    Interface(C220MteL1EventOutcome<C220MteReadPayload>),
     L1Write(C220MteL1WriteEventOutcome),
     L0a(C220L0WriteEventOutcome),
     L0b(C220L0WriteEventOutcome),
@@ -265,6 +265,12 @@ enum Mte2Generator {
 mod memory;
 mod nz2nd;
 mod read;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220MteReadPayload {
+    Mte1(C220Mte1ReadUop),
+    Factor(super::factor::C220FactorReadPacket),
+}
 #[cfg(test)]
 mod tests;
 mod ub;
@@ -296,7 +302,7 @@ pub struct C220MtePipeline {
     biu_return_events: C220BiuReturnEvents,
     ub_write_events: [C220UbWriteEvents; 2],
     memory: C220L1Transport,
-    interface: C220MteL1Interface<C220Mte1ReadUop>,
+    interface: C220MteL1Interface<C220MteReadPayload>,
     write_interface: C220MteL1WriteInterface,
     l0: [C220L0WritePipeline; 2],
     generators: [C220Mte1ReadFrontend; 2],
@@ -577,8 +583,15 @@ impl C220MtePipeline {
     pub fn send_fixp_output(
         &mut self,
         engine: &mut super::fixp::C220FixpEngine,
-    ) -> Result<super::fixp::C220FixpWriteProgress, C220MtePipelineError> {
-        Ok(engine.send_write(self.events.tick(), &mut self.fixp_write)?)
+    ) -> Result<
+        super::fixp::C220FixpWriteProgress<super::fixp::C220FixpDispatchPacket>,
+        C220MtePipelineError,
+    > {
+        Ok(engine.send_write(
+            self.events.tick(),
+            &mut self.fixp_write,
+            &mut self.interface,
+        )?)
     }
     pub fn l1_fill_completions(&self) -> &[u64] {
         &self.l1_fill_completions
@@ -883,7 +896,7 @@ impl C220MtePipeline {
     pub fn memory(&self) -> &C220L1Transport {
         &self.memory
     }
-    pub fn interface(&self) -> &C220MteL1Interface<C220Mte1ReadUop> {
+    pub fn interface(&self) -> &C220MteL1Interface<C220MteReadPayload> {
         &self.interface
     }
     pub fn l0a(&self) -> &C220L0WritePipeline {
@@ -1028,6 +1041,7 @@ impl C220MtePipeline {
                             slopes: memory.slopes,
                             l1: memory.l1,
                             writer: &mut self.fixp_write,
+                            reader: &mut self.interface,
                             gates: &mut **gates,
                         },
                         |slice| {
@@ -1314,12 +1328,13 @@ impl C220MtePipeline {
                     }
                 }
                 Callback::Generator(kind, phase) => {
-                    let outcome = self.generator_events[kind.index()].handle(
+                    let outcome = self.generator_events[kind.index()].handle_mapped(
                         phase,
                         &mut self.events,
                         &mut self.generators[kind.index()],
                         false,
                         &mut self.interface,
+                        C220MteReadPayload::Mte1,
                     )?;
                     if outcome != C220Mte1ReadEventOutcome::Readiness {
                         self.trace
@@ -1389,6 +1404,7 @@ impl C220MtePipeline {
                                     C220MteL1OutputDestination::L0a(port) => Some((0, port)),
                                     C220MteL1OutputDestination::L0b(port) => Some((1, port)),
                                     C220MteL1OutputDestination::Bt
+                                    | C220MteL1OutputDestination::Fb
                                     | C220MteL1OutputDestination::SparseIndex => None,
                                 };
                                 if let Some((index, port)) = target {
@@ -1399,7 +1415,14 @@ impl C220MtePipeline {
                         C220MteL1EventOutcome::Retired(Some(output))
                             if output.fragment.last_in_instruction =>
                         {
-                            self.completions.push(output.fragment.instruction_id);
+                            match output.payload.operation.payload {
+                                C220MteReadPayload::Mte1(_) => {
+                                    self.completions.push(output.fragment.instruction_id)
+                                }
+                                C220MteReadPayload::Factor(_) => {
+                                    self.fixp_completions.push(output.fragment.instruction_id)
+                                }
+                            }
                         }
                         _ => {}
                     }

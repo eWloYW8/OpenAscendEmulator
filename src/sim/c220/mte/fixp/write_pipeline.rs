@@ -43,6 +43,8 @@ pub enum C220FixpWritePipelineError {
     ExternalOutput(#[from] C220FixpNz2ndOutputError),
     #[error(transparent)]
     Biu(#[from] C220BiuWriteCommandError),
+    #[error(transparent)]
+    L1Read(#[from] crate::sim::c220::mte::interface::C220MteL1Error),
 }
 
 /// FIX write generation. Packetization, bounded dispatch, and
@@ -76,6 +78,25 @@ pub struct C220FixpBiuWrite {
 pub type C220FixpBiuWritePipeline = C220FixpWritePipeline<C220FixpBiuWrite>;
 
 impl<T: Copy> C220FixpWritePipeline<T> {
+    pub fn enqueue(&mut self, tick: u64, fragment: T) -> Result<(), C220FixpWritePipelineError> {
+        if let Some(previous) = self.observed_tick
+            && tick < previous
+        {
+            return Err(C220FixpWritePipelineError::TimeReversed {
+                previous,
+                requested: tick,
+            });
+        }
+        let ready_tick = tick
+            .checked_add(1)
+            .ok_or(C220FixpWritePipelineError::Overflow)?;
+        self.packets.push_back(C220FixpWriteEntry {
+            fragment,
+            ready_tick,
+        });
+        self.observed_tick = Some(tick);
+        Ok(())
+    }
     pub fn packets(&self) -> &VecDeque<C220FixpWriteEntry<T>> {
         &self.packets
     }
@@ -115,7 +136,7 @@ impl<T: Copy> C220FixpWritePipeline<T> {
         Ok(C220FixpWriteProgress::Advanced(head.fragment))
     }
 
-    fn send_with(
+    pub(super) fn send_with(
         &mut self,
         tick: u64,
         send: impl FnOnce(T) -> Result<bool, C220FixpWritePipelineError>,
@@ -136,7 +157,7 @@ impl<T: Copy> C220FixpWritePipeline<T> {
         Ok(C220FixpWriteProgress::Advanced(head.fragment))
     }
 
-    fn begin(
+    pub(super) fn begin(
         &mut self,
         tick: u64,
         index: usize,
