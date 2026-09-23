@@ -4,6 +4,7 @@ use std::num::NonZeroU32;
 use super::ub_read::{C220UbReadError, C220UbReadFragment, C220UbReadInterface};
 
 pub mod command;
+pub mod cube;
 pub mod data;
 
 /// Source metadata for one issued BIU write transaction, after BIU splitting.

@@ -6,6 +6,70 @@ use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadTransfer;
 use std::collections::BTreeMap;
 
 #[test]
+fn mte3_output_and_biu_split_use_independent_captured_modes() {
+    use crate::isa::c220::mte::{C220DmaMovDescriptor, CAPTURED_C220_MOV_UB_TO_OUT_WORD};
+    use crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteConfig;
+    let width = NonZeroU32::new(32).unwrap();
+    let mut pipeline = C220MtePipeline::new(
+        0,
+        C220MtePipelineConfig {
+            l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
+            read_width: width,
+            output_bandwidths: C220Mte1ReadBandwidths {
+                l0a: width,
+                l0b: width,
+                bt: width,
+            },
+            set2d_bandwidths: C220Set2dBandwidths {
+                l0a: width,
+                l0b: width,
+                l1: width,
+            },
+        },
+    );
+    pipeline
+        .connect_mte3_biu(C220BiuWriteConfig {
+            outstanding: NonZeroU32::new(4).unwrap(),
+            weights: [1; 3],
+            source_bandwidth: width,
+        })
+        .unwrap();
+    pipeline
+        .issue_mte3_dma(
+            8,
+            C220Mte3TransferPlan {
+                descriptor: C220DmaMovDescriptor::decode(
+                    CAPTURED_C220_MOV_UB_TO_OUT_WORD,
+                    (16 << 16) | (1 << 4),
+                )
+                .unwrap(),
+                source_address: 0,
+                destination_address: 4096,
+                bytes: 512,
+                dma_mode_word: 0,
+                biu_mode_word: 5,
+            },
+        )
+        .unwrap();
+    let mut fragments = Vec::new();
+    for tick in 0..40 {
+        pipeline.advance(tick).unwrap();
+        if let Some(transfer) = pipeline.take_biu_write_command().unwrap() {
+            let command = transfer.command;
+            fragments.push((
+                command.input.generated.uop_index,
+                command.byte_offset,
+                command.input.generated.request.bytes,
+            ));
+        }
+    }
+    assert_eq!(
+        fragments,
+        [(0, 0, 128), (0, 128, 128), (0, 256, 128), (0, 384, 128)]
+    );
+}
+
+#[test]
 fn fixp_write_runs_on_shared_clock_and_retires_after_contended_response() {
     use crate::sim::c220::mte::interface::C220MteOutputFragment;
     let width = NonZeroU32::new(32).unwrap();

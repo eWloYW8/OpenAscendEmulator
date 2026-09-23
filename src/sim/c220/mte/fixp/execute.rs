@@ -29,7 +29,7 @@ pub struct C220FixpSliceResult {
 pub enum C220FixpExecutionError {
     #[error("word {0:#010x} is not an L0C FIX instruction")]
     Instruction(u32),
-    #[error("FIX L1 command does not support destination {0:?}")]
+    #[error("FIX command destination {0:?} does not match the selected execution path")]
     Destination(C220FixpDestination),
     #[error("unsupported FIX source format {0}")]
     SourceFormat(u8),
@@ -43,6 +43,10 @@ pub enum C220FixpExecutionError {
     Conversion(#[from] C220FixpFp16Error),
     #[error(transparent)]
     Memory(#[from] C220LocalBufferError),
+    #[error(transparent)]
+    ExternalMemory(#[from] crate::memory::mapped::MappedMemoryError),
+    #[error("FIX floating-point atomic data type {0} is not implemented")]
+    AtomicDataType(u8),
     #[error("unsupported FIX activation mode {0}")]
     Activation(u8),
 }
@@ -53,12 +57,22 @@ impl C220FixpCommand {
     pub fn capture_l1(
         word: u32,
         control: u64,
+        read_gpr: impl FnMut(u8) -> Option<u64>,
+        read_spr: impl FnMut(u8) -> Option<u64>,
+    ) -> Result<Self, C220FixpExecutionError> {
+        Self::capture_destination(word, C220FixpDestination::L1, control, read_gpr, read_spr)
+    }
+
+    pub(super) fn capture_destination(
+        word: u32,
+        destination: C220FixpDestination,
+        control: u64,
         mut read_gpr: impl FnMut(u8) -> Option<u64>,
         mut read_spr: impl FnMut(u8) -> Option<u64>,
     ) -> Result<Self, C220FixpExecutionError> {
         let instruction =
             C220FixpInstruction::decode(word).ok_or(C220FixpExecutionError::Instruction(word))?;
-        if instruction.destination != C220FixpDestination::L1 {
+        if instruction.destination != destination {
             return Err(C220FixpExecutionError::Destination(instruction.destination));
         }
         let source_format = match instruction.source_format {

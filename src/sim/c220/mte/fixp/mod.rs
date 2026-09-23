@@ -1,6 +1,8 @@
 mod conversion;
 mod events;
 mod execute;
+mod external;
+pub use external::C220FixpExternalCommand;
 mod format;
 pub use events::{
     C220FixpCallback, C220FixpEvent, C220FixpGates, C220FixpMemory, C220FixpResources,
@@ -28,11 +30,13 @@ pub use nz2nd::{
 mod read_pipeline;
 mod read_uop;
 mod runtime;
+mod store;
 mod sync;
 pub use runtime::{
     C220FixpAdmission, C220FixpCommandState, C220FixpEngine, C220FixpEngineConfig,
     C220FixpEngineError,
 };
+pub use store::{C220FixpStoreBuffer, C220FixpStoreRead, C220FixpStoreWrite};
 pub use sync::{
     C220FixpFlagResolver, C220FixpSync, C220FixpSyncBindings, C220FixpSyncPoint,
     C220FixpSyncRequest,

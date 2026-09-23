@@ -42,6 +42,20 @@ impl C220FixpFunctionalState {
         l1: &mut C220LocalBuffer,
         observe: impl FnMut(&C220FixpSliceResult),
     ) -> Result<C220FixpFunctionalEvent, C220FixpExecutionError> {
+        self.accept_read_with(acknowledgment, l0c, |snapshot| {
+            command.execute_to_l1(snapshot, slopes, l1, observe)
+        })
+    }
+
+    /// Updates the shared snapshot and invokes the destination-specific
+    /// executor only on the final accepted read. The callback must not advance
+    /// timing state; conversion delivery and write retirement are separate.
+    pub fn accept_read_with(
+        &mut self,
+        acknowledgment: C220MteL0cReadAcknowledgment,
+        l0c: &C220LocalBuffer,
+        execute: impl FnOnce(&C220LocalBuffer) -> Result<(), C220FixpExecutionError>,
+    ) -> Result<C220FixpFunctionalEvent, C220FixpExecutionError> {
         let operation = acknowledgment.operation;
         let snapshot_address = operation
             .begins_unit
@@ -51,7 +65,7 @@ impl C220FixpFunctionalState {
             self.snapshot.write_known_linear(address, &bytes)?;
         }
         if operation.last_in_instruction {
-            command.execute_to_l1(&self.snapshot, slopes, l1, observe)?;
+            execute(&self.snapshot)?;
         }
         Ok(C220FixpFunctionalEvent {
             tick: acknowledgment.accepted_tick,

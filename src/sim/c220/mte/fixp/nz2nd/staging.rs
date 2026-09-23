@@ -18,6 +18,7 @@ pub struct C220FixpNz2ndWriteUop {
 mod tests {
     use super::*;
     use crate::isa::c220::mte::fixp::C220FixpDescriptor;
+    use crate::sim::c220::mte::fixp::{C220FixpStoreBuffer, C220FixpStoreRead};
     use crate::sim::c220::{
         memory::C220L0c,
         mte::{
@@ -91,24 +92,31 @@ mod tests {
         assert_eq!(staging.alignment().back().unwrap().ready_tick, 84);
         assert!(staging.take_ready(79, false).unwrap().is_none());
         let mut output = super::super::C220FixpNz2ndOutput::default();
-        let policy = super::super::C220FixpNz2ndOutputPolicy {
-            burst_sizes: [512, 256, 32].map(|n| std::num::NonZeroU32::new(n).unwrap()),
-            burst_control: 0,
-            row_stride_bytes: 4,
-        };
+        let mut stores = C220FixpStoreBuffer::default();
+        let policy = super::super::C220FixpNz2ndOutputPolicy::new(0, 4);
         for id in 1..8 {
             let tick = 84 + u64::from(id);
             let entry = output.receive(tick, &mut staging, policy).unwrap().unwrap();
             assert_eq!(entry.operation.request_id, id);
             assert_eq!(entry.operation.descriptor.bytes, 2);
             assert_eq!(entry.operation.last_in_instruction, id == 7);
-            let fragment = output.take_write(tick + 1, true).unwrap().unwrap();
+            let write = output
+                .take_write(tick + 1, true, &mut stores)
+                .unwrap()
+                .unwrap();
+            let fragment = write.fragment;
             assert_eq!(fragment.destination_address, u64::from(id) * 4);
             assert_eq!(fragment.bytes, 2);
             assert_eq!(fragment.last_in_instruction, id == 7);
+            let mut source = C220FixpStoreRead::new(
+                write.token,
+                std::num::NonZeroU32::new(fragment.bytes).unwrap(),
+            );
+            assert!(source.probe(&mut stores));
         }
         assert!(output.bursts().is_empty());
         assert!(staging.is_idle());
+        assert!(stores.is_empty());
     }
 }
 

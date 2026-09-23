@@ -2,6 +2,7 @@ use super::dma::{
     C220DmaEventOutcome, C220DmaEvents, C220DmaFrontend, C220DmaFrontendError, C220DmaGenerated,
     C220DmaIssue,
 };
+use super::fixp::C220FixpStoreBuffer;
 use super::fixp::{
     C220FixpCallback, C220FixpEngine, C220FixpEvent, C220FixpMemory, C220FixpResources,
     C220FixpSliceResult, C220FixpStage, C220FixpStageEvents, C220FixpSync,
@@ -22,6 +23,7 @@ use super::interface::biu_read::{
 use super::interface::biu_write::command::{
     C220BiuWriteCommandCycle, C220BiuWriteCommandError, C220BiuWriteCommands,
 };
+use super::interface::biu_write::cube::{C220BiuCubeWriteError, C220BiuCubeWriteSource};
 use super::interface::biu_write::data::{
     C220BiuWriteDataError, C220BiuWriteDataPort, C220BiuWriteDataSend, C220BiuWriteResponse,
 };
@@ -131,10 +133,16 @@ pub enum C220MtePipelineEvent {
     BiuWriteData(C220BiuWriteDataSend),
     BiuWriteResponse(C220BiuWriteResponse),
     BiuWriteCommand(C220BiuWriteCommandCycle),
+    BiuCubeSourceStarted { tick: u64, tag: NonZeroU32 },
+    BiuCubeSourceReady(super::interface::biu_write::C220BiuWriteDataReady),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220MtePipelineError {
+    #[error(transparent)]
+    BiuCubeWrite(#[from] C220BiuCubeWriteError),
+    #[error(transparent)]
+    FixpOutput(#[from] super::fixp::C220FixpNz2ndOutputError),
     #[error("FIX event binding requires each of the nine stages exactly once")]
     InvalidFixpStages,
     #[error("FIX events are already bound or the pipeline is active")]
@@ -285,6 +293,8 @@ pub struct C220MtePipeline {
     ub_write: [C220UbWriteInterface; 2],
     ub_read: [C220UbReadInterface; 2],
     biu_write_source: [Option<C220BiuWriteSource>; 2],
+    biu_cube_source: C220BiuCubeWriteSource,
+    fixp_stores: C220FixpStoreBuffer,
     biu_write_data: C220BiuWriteDataPort,
     biu_write_commands: Option<C220BiuWriteCommands>,
     biu_bus_writes: Option<C220BiuMteBusWrites>,
@@ -363,6 +373,8 @@ impl C220MtePipeline {
             ub_read_valid,
             ub_read: std::array::from_fn(|_| C220UbReadInterface::default()),
             biu_write_source: [None, None],
+            biu_cube_source: C220BiuCubeWriteSource::default(),
+            fixp_stores: C220FixpStoreBuffer::default(),
             biu_write_data: C220BiuWriteDataPort::default(),
             biu_write_commands: None,
             biu_bus_writes: None,
@@ -423,6 +435,8 @@ impl C220MtePipeline {
     }
     pub fn is_idle(&self) -> bool {
         self.fixp_write.is_idle()
+            && self.biu_cube_source.is_idle()
+            && self.fixp_stores.is_empty()
             && self.generators.iter().all(C220Mte1ReadFrontend::is_idle)
             && self.set2d.is_idle()
             && self.set2d_l1.is_idle()
@@ -1351,6 +1365,7 @@ impl C220MtePipeline {
             }
         }
         self.advance_biu_write_commands(tick)?;
+        self.advance_biu_cube_source(tick)?;
         self.advance_biu_write_data(tick)?;
         self.advance_biu_bus_inputs(tick)?;
         self.advance_biu_read_inputs(tick)?;

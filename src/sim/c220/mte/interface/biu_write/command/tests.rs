@@ -4,6 +4,63 @@ use crate::sim::c220::mte::uop::{
 };
 
 #[test]
+fn fixp_command_keeps_store_identity_across_transport_splits() {
+    use crate::sim::c220::mte::interface::C220MteOutputFragment;
+    let token = NonZeroU32::new(87).unwrap();
+    let input = C220BiuWriteInput::from_fixp(
+        C220FixpStoreWrite {
+            token,
+            fragment: C220MteOutputFragment {
+                instruction_id: 12,
+                request_id: 19,
+                destination_address: 64,
+                bytes: 160,
+                last_in_uop: true,
+                last_in_instruction: true,
+            },
+        },
+        C220DmaUopMode::Fixed128,
+        0,
+    );
+    let mut commands = C220BiuWriteCommands::new(C220BiuWriteConfig {
+        outstanding: NonZeroU32::new(2).unwrap(),
+        weights: [1; 3],
+        source_bandwidth: NonZeroU32::new(32).unwrap(),
+    });
+    assert!(commands.push(0, input).unwrap());
+    let mut issued = Vec::new();
+    for tick in 0..8 {
+        commands.advance(tick).unwrap();
+        if let Some(transfer) = commands.take_request(tick).unwrap() {
+            issued.push(transfer.command);
+        }
+    }
+    assert_eq!(issued.len(), 2);
+    assert_eq!(
+        issued
+            .iter()
+            .map(|c| c.input.generated.request.bytes)
+            .collect::<Vec<_>>(),
+        [64, 96]
+    );
+    assert!(
+        issued
+            .iter()
+            .all(|c| c.input.store_token == Some(token) && c.input.subcore == C220BiuSubcore::Cube)
+    );
+    assert_eq!(issued[0].input.generated.uop_index, 19);
+    assert!(!issued[0].input.generated.last_in_instruction);
+    assert!(issued[1].input.generated.last_in_instruction);
+    assert_eq!(issued[1].input.generated.request.destination_address, 128);
+    let mut invalid = input;
+    invalid.subcore = C220BiuSubcore::Vector0;
+    assert!(matches!(
+        commands.push(8, invalid),
+        Err(C220BiuWriteCommandError::InvalidSource)
+    ));
+}
+
+#[test]
 fn destination_splitting_preserves_reserved_tags_and_recycles_after_response() {
     let mut commands = C220BiuWriteCommands::new(C220BiuWriteConfig {
         outstanding: NonZeroU32::new(3).unwrap(),
@@ -11,6 +68,7 @@ fn destination_splitting_preserves_reserved_tags_and_recycles_after_response() {
         source_bandwidth: NonZeroU32::new(32).unwrap(),
     });
     let input = C220BiuWriteInput {
+        store_token: None,
         subcore: C220BiuSubcore::Vector0,
         gather_stride: None,
         generated: C220DmaGenerated {

@@ -189,6 +189,7 @@ mod tests {
             destination_address: 0x2000,
             bytes: 128,
             dma_mode_word: 0,
+            biu_mode_word: 0,
         };
         for tick in 0..C220_MTE3_OUTSTANDING_LIMIT as u64 {
             let ticket = engine.timing.preview_issue(tick, plan).unwrap();

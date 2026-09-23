@@ -1,5 +1,6 @@
 use std::{collections::VecDeque, num::NonZeroU32};
 
+use super::super::{C220FixpStoreBuffer, C220FixpStoreWrite};
 use super::{C220FixpNz2ndStaging, C220FixpNz2ndStagingEntry, C220FixpNz2ndStagingError};
 use crate::sim::c220::mte::interface::C220MteOutputFragment;
 
@@ -16,13 +17,123 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cube_packets_drain_through_shared_pipeline_after_dbid_and_store_beats() {
+        use crate::sim::c220::memory::l1::C220L1Geometry;
+        use crate::sim::c220::mte::{
+            interface::biu_read::C220BiuSubcore,
+            interface::biu_write::command::C220BiuWriteConfig,
+            mte1::frontend::C220Mte1ReadBandwidths,
+            pipeline::{C220MtePipeline, C220MtePipelineConfig, C220MtePipelineEvent},
+            set2d::C220Set2dBandwidths,
+            uop::C220DmaUopMode,
+        };
+        let width = NonZeroU32::new(32).unwrap();
+        let mut pipeline = C220MtePipeline::new(
+            0,
+            C220MtePipelineConfig {
+                l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
+                read_width: width,
+                output_bandwidths: C220Mte1ReadBandwidths {
+                    l0a: width,
+                    l0b: width,
+                    bt: width,
+                },
+                set2d_bandwidths: C220Set2dBandwidths {
+                    l0a: width,
+                    l0b: width,
+                    l1: width,
+                },
+            },
+        );
+        pipeline
+            .connect_fixp_biu(C220BiuWriteConfig {
+                outstanding: NonZeroU32::new(1).unwrap(),
+                weights: [1; 3],
+                source_bandwidth: width,
+            })
+            .unwrap();
+        let mut output = C220FixpNz2ndOutput::default();
+        output.bursts.push_back(C220FixpNz2ndBurst {
+            instruction_id: 91,
+            request_id: 7,
+            address: 512,
+            bytes: 512,
+            closed: true,
+            last_in_instruction: true,
+            gather: false,
+            row_bytes: 512,
+            row_offset: 0,
+            ready_tick: 0,
+            policy: C220FixpNz2ndOutputPolicy::new(0, 512),
+        });
+        let write = pipeline
+            .enqueue_fixp_biu_output(&mut output, C220DmaUopMode::Wide512)
+            .unwrap()
+            .unwrap();
+        let mut tag = None;
+        let mut completed = false;
+        for tick in 0..24 {
+            pipeline.advance(tick).unwrap();
+            assert!(
+                !pipeline
+                    .last_events()
+                    .iter()
+                    .any(|event| matches!(event, C220MtePipelineEvent::UbReadSent(..)))
+            );
+            if let Some(command) = pipeline.take_biu_write_command().unwrap() {
+                assert_eq!(tick, 5);
+                assert_eq!(command.command.input.store_token, Some(write.token));
+                assert!(tag.replace(command.command.tag).is_none());
+            }
+            if tick == 10 {
+                assert!(
+                    pipeline
+                        .receive_biu_write_dbid(C220BiuSubcore::Vector0, tag.unwrap())
+                        .is_err()
+                );
+                pipeline
+                    .receive_biu_write_dbid(C220BiuSubcore::Cube, tag.unwrap())
+                    .unwrap();
+                assert!(pipeline.receive_biu_write_response(tag.unwrap()).is_err());
+            }
+            assert_eq!(pipeline.fixp_store_buffer().len(), usize::from(tick < 15));
+            if let Some(data) = pipeline.take_biu_write_data().unwrap() {
+                assert_eq!(tick, 17);
+                assert_eq!(data.subcore, C220BiuSubcore::Cube);
+                assert!(!pipeline.is_idle());
+                let response = pipeline.receive_biu_write_response(tag.unwrap()).unwrap();
+                assert_eq!(response.retired_instruction(), Some(91));
+                assert_eq!(pipeline.fixp_completions(), [91]);
+                assert!(pipeline.is_idle());
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+    }
+
+    #[test]
     fn row_packets_preserve_holes_and_gather_respects_alignment_and_control() {
+        use crate::sim::c220::mte::uop::C220DmaUopMode;
+
+        for control in [0, 1, 3, 5, 7] {
+            let native = C220FixpNz2ndOutputPolicy::new(control, 1024);
+            let downstream = C220DmaUopMode::from_mode_word(control);
+            for address in [0, 16, 64, 128, 256, 384, 496, 512] {
+                for bytes in [1, 16, 127, 128, 129, 256, 384, 512, 700] {
+                    let packet = native.row_packet(address, bytes);
+                    assert_eq!(downstream.split_bytes(address, packet), packet);
+                }
+            }
+        }
+
         let policy = C220FixpNz2ndOutputPolicy {
             burst_sizes: [512, 256, 32].map(|n| NonZeroU32::new(n).unwrap()),
             burst_control: 0,
             row_stride_bytes: 1024,
         };
         let mut output = C220FixpNz2ndOutput::default();
+        let mut stores = C220FixpStoreBuffer::default();
         output.bursts.push_back(C220FixpNz2ndBurst {
             instruction_id: 3,
             request_id: 7,
@@ -36,13 +147,19 @@ mod tests {
             policy,
             ready_tick: 1,
         });
-        assert!(output.take_write(0, true).unwrap().is_none());
-        assert!(output.take_write(1, false).unwrap().is_none());
+        assert!(output.take_write(0, true, &mut stores).unwrap().is_none());
+        assert!(output.take_write(1, false, &mut stores).unwrap().is_none());
+        assert!(stores.is_empty());
         for (index, (address, bytes)) in [(16, 16), (32, 24), (1040, 16), (1056, 24)]
             .into_iter()
             .enumerate()
         {
-            let fragment = output.take_write(index as u64 + 2, true).unwrap().unwrap();
+            let write = output
+                .take_write(index as u64 + 2, true, &mut stores)
+                .unwrap()
+                .unwrap();
+            assert_eq!(write.token.get(), index as u32 + 1);
+            let fragment = write.fragment;
             assert_eq!(
                 (fragment.destination_address, fragment.bytes),
                 (address, bytes)
@@ -65,6 +182,20 @@ mod tests {
 }
 
 impl C220FixpNz2ndOutputPolicy {
+    /// Construct the C220 packet policy from the FIX burst-control word and
+    /// the destination row stride. The control word is not the BIU mode word.
+    pub const fn new(burst_control: u64, row_stride_bytes: u32) -> Self {
+        Self {
+            burst_sizes: [
+                NonZeroU32::new(512).unwrap(),
+                NonZeroU32::new(256).unwrap(),
+                NonZeroU32::new(128).unwrap(),
+            ],
+            burst_control,
+            row_stride_bytes,
+        }
+    }
+
     fn mode(self) -> u8 {
         if self.burst_control & 1 == 0 {
             0
@@ -203,7 +334,8 @@ impl C220FixpNz2ndOutput {
         &mut self,
         tick: u64,
         destination_ready: bool,
-    ) -> Result<Option<C220MteOutputFragment>, C220FixpNz2ndOutputError> {
+        stores: &mut C220FixpStoreBuffer,
+    ) -> Result<Option<C220FixpStoreWrite>, C220FixpNz2ndOutputError> {
         self.observe(tick)?;
         if self.packet_tick == Some(tick) {
             return Err(C220FixpNz2ndOutputError::RepeatedPacket(tick));
@@ -258,7 +390,7 @@ impl C220FixpNz2ndOutput {
         if finished {
             self.bursts.pop_front();
         }
-        Ok(Some(fragment))
+        Ok(Some(stores.publish(fragment)))
     }
 
     fn observe(&mut self, tick: u64) -> Result<(), C220FixpNz2ndOutputError> {

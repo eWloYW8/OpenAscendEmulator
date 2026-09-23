@@ -535,6 +535,7 @@ mod tests {
             destination_address,
             bytes: usize::from(descriptor.burst_count) * usize::from(descriptor.burst_length) * 32,
             dma_mode_word: 0,
+            biu_mode_word: 0,
         }
     }
 

@@ -405,6 +405,7 @@ mod tests {
                 destination_address: 0x2000,
                 bytes: 1024,
                 dma_mode_word: 5,
+                biu_mode_word: 0,
             };
             let mut delivered = Vec::new();
             let disabled = C220Mte3TransferPlan {

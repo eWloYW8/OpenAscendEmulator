@@ -81,6 +81,7 @@ pub struct C220Mte3TransferPlan {
     pub destination_address: u64,
     pub bytes: usize,
     pub dma_mode_word: u64,
+    pub biu_mode_word: u64,
 }
 
 pub(crate) fn decode_mte3_transfer(
@@ -102,12 +103,17 @@ pub(crate) fn decode_mte3_transfer(
         C220DmaMovDescriptor::decode(word, x[usize::from(selectors.descriptor_register)])
             .map_err(C220TransferError::from)?;
     let bytes = usize::from(descriptor.burst_count) * usize::from(descriptor.burst_length) * 32;
-    let dma_mode_word = if isa_instance_index == 0 {
-        0
+    let (biu_mode_word, dma_mode_word) = if isa_instance_index == 0 {
+        (0, 0)
     } else {
-        machine
-            .spr_value(94)
-            .ok_or(C220ExecutionError::MissingSpr { pc, index: 94 })?
+        (
+            machine
+                .spr_value(93)
+                .ok_or(C220ExecutionError::MissingSpr { pc, index: 93 })?,
+            machine
+                .spr_value(94)
+                .ok_or(C220ExecutionError::MissingSpr { pc, index: 94 })?,
+        )
     };
     Ok(C220Mte3TransferPlan {
         descriptor,
@@ -115,5 +121,6 @@ pub(crate) fn decode_mte3_transfer(
         destination_address,
         bytes,
         dma_mode_word,
+        biu_mode_word,
     })
 }

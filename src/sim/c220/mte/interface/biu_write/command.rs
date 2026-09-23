@@ -3,7 +3,11 @@ use std::num::NonZeroU32;
 
 use super::C220BiuWriteSourceRequest;
 use crate::sim::c220::mte::dma::C220DmaGenerated;
+use crate::sim::c220::mte::fixp::C220FixpStoreWrite;
 use crate::sim::c220::mte::interface::biu_read::C220BiuSubcore;
+use crate::sim::c220::mte::uop::{
+    C220DmaDestinationLayout, C220DmaUopMode, C220DmaUopRequest, C220DmaUopRoute,
+};
 
 const CORES: [C220BiuSubcore; 3] = [
     C220BiuSubcore::Cube,
@@ -26,6 +30,39 @@ pub struct C220BiuWriteInput {
     pub subcore: C220BiuSubcore,
     pub generated: C220DmaGenerated,
     pub gather_stride: Option<u32>,
+    pub store_token: Option<NonZeroU32>,
+}
+
+impl C220BiuWriteInput {
+    pub fn from_fixp(write: C220FixpStoreWrite, mode: C220DmaUopMode, tick: u64) -> Self {
+        let fragment = write.fragment;
+        Self {
+            subcore: C220BiuSubcore::Cube,
+            gather_stride: None,
+            store_token: Some(write.token),
+            generated: C220DmaGenerated {
+                instruction_id: fragment.instruction_id,
+                uop_index: fragment.request_id,
+                ready_tick: tick,
+                request: C220DmaUopRequest {
+                    route: C220DmaUopRoute::Ordinary,
+                    burst_index: 0,
+                    source_address: 0,
+                    destination_address: fragment.destination_address,
+                    bytes: fragment.bytes,
+                    last_in_burst: true,
+                },
+                destination: C220DmaDestinationLayout {
+                    base: fragment.destination_address,
+                    burst_bytes: fragment.bytes,
+                    burst_stride: u64::from(fragment.bytes),
+                },
+                mode,
+                out_of_order: false,
+                last_in_instruction: fragment.last_in_instruction,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +118,10 @@ pub enum C220BiuWriteCommandError {
     TimeOverflow,
     #[error("BIU write input is empty")]
     EmptyInput,
+    #[error(
+        "Cube writes require a store token and no UB gather stride; vector writes cannot carry store tokens"
+    )]
+    InvalidSource,
     #[error("BIU write tag {0} has no command awaiting DBID")]
     UnexpectedDbid(NonZeroU32),
     #[error("BIU write tag {0} has no issued command")]
@@ -192,6 +233,11 @@ impl C220BiuWriteCommands {
         input: C220BiuWriteInput,
     ) -> Result<bool, C220BiuWriteCommandError> {
         self.check_time(tick)?;
+        if (input.subcore == C220BiuSubcore::Cube) != input.store_token.is_some()
+            || (input.store_token.is_some() && input.gather_stride.is_some())
+        {
+            return Err(C220BiuWriteCommandError::InvalidSource);
+        }
         if input.generated.request.bytes == 0 {
             return Err(C220BiuWriteCommandError::EmptyInput);
         }
