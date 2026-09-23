@@ -3,6 +3,37 @@ use crate::sim::c220::cube::C220CubeL0cAccess;
 use crate::sim::c220::memory::{C220L0cFragmentRequest, C220L0cReadRequest};
 use crate::sim::c220::mte::interface::C220MteL0cReadOperation;
 
+#[derive(Debug, Clone)]
+pub enum C220FixpReadStream {
+    Columns(C220FixpReadGenerator),
+    Nz2nd(super::C220FixpNz2ndReadGenerator),
+}
+
+impl From<C220FixpReadGenerator> for C220FixpReadStream {
+    fn from(generator: C220FixpReadGenerator) -> Self {
+        Self::Columns(generator)
+    }
+}
+
+impl From<super::C220FixpNz2ndReadGenerator> for C220FixpReadStream {
+    fn from(generator: super::C220FixpNz2ndReadGenerator) -> Self {
+        Self::Nz2nd(generator)
+    }
+}
+
+impl Iterator for C220FixpReadStream {
+    type Item = C220FixpReadUop;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Columns(generator) => generator.next(),
+            Self::Nz2nd(generator) => generator.next(),
+        }
+    }
+}
+
+impl std::iter::FusedIterator for C220FixpReadStream {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220FixpReadUop {
     pub operation: C220MteL0cReadOperation,
@@ -16,11 +47,10 @@ pub enum C220FixpReadGeneratorError {
     ZeroBandwidth,
     #[error("NZ-to-ND requires its own FIX read generator")]
     NzToNd,
-    #[error("32-bit channel-split timing requires its own FIX read generator")]
-    ChannelSplit,
 }
 
-/// Ordinary read packets are column-major, unlike functional slices.
+/// Read packets are column-major, unlike functional slices. Channel splitting
+/// reads full source columns but accounts for one half-column at the output.
 /// Bandwidth is an explicit model input, not an assumed device constant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220FixpReadGenerator {
@@ -53,9 +83,6 @@ impl C220FixpReadGenerator {
         if command.descriptor.nz_to_nd() {
             return Err(C220FixpReadGeneratorError::NzToNd);
         }
-        if command.descriptor.conversion_mode() == 0 && command.descriptor.channel_split() {
-            return Err(C220FixpReadGeneratorError::ChannelSplit);
-        }
         Ok(Self {
             command,
             instruction_id,
@@ -81,6 +108,7 @@ impl Iterator for C220FixpReadGenerator {
             return None;
         }
         let d = self.command.descriptor;
+        let split = d.conversion_mode() == 0 && d.channel_split();
         let column_bytes = u32::from(d.rows()) * 64;
         let address = self
             .command
@@ -93,7 +121,9 @@ impl Iterator for C220FixpReadGenerator {
             .wrapping_add(u64::from(self.source_offset));
         let boundary = self.bandwidth - (address as u32 % self.bandwidth);
         let data_bytes = (column_bytes - self.source_offset).min(boundary);
-        let output_bytes = if d.conversion_mode() == 0 {
+        let output_bytes = if split {
+            data_bytes / 2
+        } else if d.conversion_mode() == 0 {
             data_bytes
         } else {
             data_bytes.wrapping_mul(32) / 64
@@ -124,7 +154,8 @@ impl Iterator for C220FixpReadGenerator {
                 .destination_address
                 .wrapping_add(
                     u64::from(self.column_block)
-                        * u64::from(d.destination_stride().wrapping_mul(32)),
+                        * u64::from(d.destination_stride().wrapping_mul(32))
+                        * if split { 2 } else { 1 },
                 )
                 .wrapping_add(u64::from(self.destination_offset)),
             output_bytes,
@@ -206,6 +237,23 @@ mod tests {
             && p.operation.conversion_mode == 0));
         assert_eq!(packets[9].operation.destination_address, 4096 + 9 * 128);
         assert_eq!(packets[10].operation.destination_address, 6144);
+        let mut split = fp32;
+        split.descriptor.xm |= 1 << 42;
+        let packets: Vec<_> = C220FixpReadGenerator::new(split, 9, 50, 256)
+            .unwrap()
+            .collect();
+        assert_eq!(packets.len(), 20);
+        assert!(
+            packets
+                .iter()
+                .all(|p| p.operation.data_bytes == 128 && p.operation.output_bytes == 64)
+        );
+        assert_eq!(packets[9].operation.destination_address, 4096 + 9 * 64);
+        assert_eq!(packets[10].operation.destination_address, 8192);
+        assert_eq!(packets[10].operation.request.fragments.address, 2176);
+        assert!(packets[9].operation.end_of_burst);
+        assert!(!packets[9].operation.last_in_instruction);
+        assert!(packets[19].operation.last_in_instruction);
         assert!(matches!(
             C220FixpReadGenerator::new(fp32, 8, 30, 1),
             Err(C220FixpReadGeneratorError::ZeroBandwidth)

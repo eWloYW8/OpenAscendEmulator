@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::iter::Peekable;
 
 use super::{
-    C220FixpReadGenerator, C220FixpReadUop, C220FixpSync, C220FixpSyncPoint, C220FixpSyncRequest,
+    C220FixpReadStream, C220FixpReadUop, C220FixpSync, C220FixpSyncPoint, C220FixpSyncRequest,
 };
 use crate::sim::c220::mte::interface::{C220MteL0cReadError, C220MteL0cReadInterface};
 
@@ -40,7 +40,7 @@ pub enum C220FixpReadPipelineError {
 
 #[derive(Debug, Clone)]
 struct Batch {
-    packets: Peekable<C220FixpReadGenerator>,
+    packets: Peekable<C220FixpReadStream>,
     ready_tick: u64,
 }
 
@@ -74,10 +74,10 @@ impl C220FixpReadPipeline {
     pub fn submit(
         &mut self,
         tick: u64,
-        packets: C220FixpReadGenerator,
+        packets: impl Into<C220FixpReadStream>,
     ) -> Result<bool, C220FixpReadPipelineError> {
         self.check_time(tick)?;
-        let mut packets = packets.peekable();
+        let mut packets = packets.into().peekable();
         if packets.peek().is_none() {
             return Ok(false);
         }
@@ -188,7 +188,7 @@ mod tests {
     use super::*;
     use crate::isa::c220::mte::fixp::C220FixpDescriptor;
     use crate::sim::c220::memory::C220L0c;
-    use crate::sim::c220::mte::fixp::C220FixpCommand;
+    use crate::sim::c220::mte::fixp::{C220FixpCommand, C220FixpReadGenerator};
     use crate::sim::c220::mte::interface::C220MteL0cReadSend;
     use crate::sim::common::event::EventDispatcher;
 

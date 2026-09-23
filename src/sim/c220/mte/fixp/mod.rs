@@ -15,6 +15,16 @@ pub use functional::{C220FixpFunctionalEvent, C220FixpFunctionalState};
 mod l1_output;
 mod l1_write;
 mod layout;
+mod nz2nd;
+pub use nz2nd::{
+    C220FixpNz2ndBurst, C220FixpNz2ndInstructionPlan, C220FixpNz2ndOutput,
+    C220FixpNz2ndOutputError, C220FixpNz2ndOutputPolicy, C220FixpNz2ndPlanError,
+    C220FixpNz2ndReadError, C220FixpNz2ndReadGenerator, C220FixpNz2ndStaging,
+    C220FixpNz2ndStagingEntry, C220FixpNz2ndStagingError, C220FixpNz2ndWriteBatch,
+    C220FixpNz2ndWriteDescriptor, C220FixpNz2ndWriteError, C220FixpNz2ndWriteGenerator,
+    C220FixpNz2ndWritePlanner, C220FixpNz2ndWriteUop, C220FixpTransposeBuffer,
+    C220FixpTransposeError, C220FixpTransposeProgress, C220FixpTransposeSlot,
+};
 mod read_pipeline;
 mod read_uop;
 mod runtime;
@@ -38,7 +48,9 @@ pub use read_pipeline::{
     C220FixpReadPipelineError, C220FixpReadProgress,
 };
 
-pub use read_uop::{C220FixpReadGenerator, C220FixpReadGeneratorError, C220FixpReadUop};
+pub use read_uop::{
+    C220FixpReadGenerator, C220FixpReadGeneratorError, C220FixpReadStream, C220FixpReadUop,
+};
 
 pub use execute::{C220FixpCommand, C220FixpExecutionError, C220FixpSliceResult};
 pub use layout::{C220FixpLayout, C220FixpLayoutError, C220FixpSlice};

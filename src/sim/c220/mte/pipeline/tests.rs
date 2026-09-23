@@ -85,12 +85,14 @@ fn fixp_write_runs_on_shared_clock_and_retires_after_contended_response() {
 #[test]
 fn fixp_engine_executes_from_read_acceptance_and_drains_through_shared_l1() {
     for conversion_mode in [0, 1, 16] {
-        run_fixp_output(conversion_mode, false);
+        run_fixp_output(conversion_mode, false, false);
     }
-    run_fixp_output(0, true);
+    run_fixp_output(0, true, false);
+    run_fixp_output(0, false, true);
+    run_fixp_output(0, true, true);
 }
 
-fn run_fixp_output(conversion_mode: u8, integer: bool) {
+fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
     use crate::isa::c220::mte::fixp::C220FixpDescriptor;
     use crate::sim::c220::memory::{C220L0c, C220LocalBuffer};
     use crate::sim::c220::mte::fixp::{C220FixpCommand, C220FixpEngine, C220FixpEngineConfig};
@@ -149,8 +151,8 @@ fn run_fixp_output(conversion_mode: u8, integer: bool) {
             crate::sim::c220::mte::fixp::C220FixpSourceFormat::Fp32
         },
         descriptor: C220FixpDescriptor {
-            xt: (8 << 16) | (16 << 4),
-            xm: u64::from(conversion_mode) << 34,
+            xt: (8 << 32) | (8 << 16) | (16 << 4),
+            xm: (u64::from(conversion_mode) << 34) | (u64::from(split) << 42),
             nd: 0,
         },
         source_address: 0,

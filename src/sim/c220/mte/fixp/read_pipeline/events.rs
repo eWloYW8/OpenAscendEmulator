@@ -1,5 +1,5 @@
 use super::{
-    C220FixpReadGenerator, C220FixpReadPipeline, C220FixpReadPipelineError, C220FixpReadProgress,
+    C220FixpReadPipeline, C220FixpReadPipelineError, C220FixpReadProgress, C220FixpReadStream,
 };
 use crate::sim::c220::mte::generator::{C220MteGeneratorCallback, GeneratorEvents};
 use crate::sim::c220::mte::interface::C220MteL0cReadInterface;
@@ -35,7 +35,7 @@ impl C220FixpReadEvents {
         &self,
         events: &mut EventDispatcher<T>,
         pipeline: &mut C220FixpReadPipeline,
-        packets: C220FixpReadGenerator,
+        packets: impl Into<C220FixpReadStream>,
     ) -> Result<bool, C220FixpReadPipelineError> {
         let submitted = pipeline.submit(events.tick(), packets)?;
         if submitted {
