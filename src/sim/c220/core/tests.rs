@@ -30,7 +30,14 @@ const C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD: u32 = 0x40c2_14cc;
 
 #[test]
 fn native_mte3_waits_for_responses_and_reads_ub_at_retirement() {
+    for bus in [false, true] {
+        native_mte3_write_path(bus);
+    }
+}
+
+fn native_mte3_write_path(bus: bool) {
     use crate::isa::c220::mte::C220MovInstruction;
+    use crate::sim::c220::memory::biu_write::C220BiuWriteReturnKind::{Completion, Dbid};
     use crate::sim::c220::memory::l1::C220L1Geometry;
     use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadBandwidths;
     use crate::sim::c220::mte::set2d::C220Set2dBandwidths;
@@ -91,7 +98,17 @@ fn native_mte3_waits_for_responses_and_reads_ub_at_retirement() {
         },
     })
     .unwrap();
-    core.connect_mte3_dma().unwrap();
+    let config = crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteConfig {
+        outstanding: NonZeroU32::new(2).unwrap(),
+        weights: [1; 3],
+        source_bandwidth: width,
+    };
+    if bus {
+        core.connect_mte3_bus(config, NonZeroU32::new(2).unwrap())
+            .unwrap();
+    } else {
+        core.connect_mte3_biu(config).unwrap();
+    }
     assert!(matches!(
         core.step_word_at(0, word).unwrap(),
         C220CoreStep::Executed {
@@ -114,35 +131,121 @@ fn native_mte3_waits_for_responses_and_reads_ub_at_retirement() {
     core.advance_to(6).unwrap();
     assert!(core.take_mte3_dma_request().is_none());
     core.advance_to(7).unwrap();
-    let request = core.take_mte3_dma_request().unwrap();
+    assert!(core.take_mte3_dma_request().is_none());
+    let transfer = (8..30)
+        .find_map(|tick| core.take_mte3_biu_command_at(tick).unwrap())
+        .expect("MTE3 automatically enters BIU command transport");
+    let request = transfer.command.input.generated;
+    let tag = transfer.command.tag;
+    let command_tick = transfer.ready_tick;
+    assert_eq!(command_tick, if bus { 13 } else { 12 });
     assert!(request.last_in_instruction);
+    assert!(
+        core.register_mte3_biu_write_at(command_tick, transfer.command.source_request())
+            .is_err()
+    );
+    assert!(
+        core.receive_mte3_biu_write_response_at(command_tick, tag)
+            .is_err()
+    );
+    if bus {
+        assert!(core.receive_mte3_biu_dbid_at(command_tick, tag).is_err());
+        assert!(
+            core.receive_mte3_bus_return_at(command_tick, Completion, tag)
+                .is_err()
+        );
+        assert!(
+            core.receive_mte3_bus_return_at(command_tick, Dbid, tag)
+                .unwrap()
+        );
+        assert!(
+            core.receive_mte3_bus_return_at(command_tick, Dbid, tag)
+                .is_err()
+        );
+        assert_eq!(
+            core.mte_pipeline()
+                .unwrap()
+                .biu_bus_writes()
+                .unwrap()
+                .outstanding(),
+            1
+        );
+    } else {
+        core.receive_mte3_biu_dbid_at(command_tick, tag).unwrap();
+    }
+    assert!(
+        core.acknowledge_mte3_dma_at(command_tick, request.instruction_id, request.uop_index)
+            .is_err()
+    );
     assert!(core.last_mte3_dma_outcomes().is_empty());
     assert!(matches!(
-        core.step_word_at(8, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
+        core.step_word_at(command_tick + 1, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
             .unwrap(),
         C220CoreStep::Stalled(_)
     ));
-    core.advance_to(20).unwrap();
+    let data = (command_tick + 2..60)
+        .find_map(|tick| core.take_mte3_biu_write_data_at(tick).unwrap())
+        .expect("source packets reach the shared data port");
+    assert_eq!(data.source.request.tag, tag);
     assert!(core.memory().read_known_at(0x2000, 128).is_err());
+    assert!(core.last_mte3_dma_outcomes().is_empty());
     core.state
         .ub
         .write_states(0, &vec![MemoryByteState::Known(9); 128])
         .unwrap();
-    core.acknowledge_mte3_dma_at(20, request.instruction_id, request.uop_index)
-        .unwrap();
-    core.advance_to(21).unwrap();
+    let response_tick = data.ready_tick + 3;
+    let retirement_tick = if bus {
+        assert!(
+            core.receive_mte3_bus_return_at(response_tick, Completion, tag)
+                .unwrap()
+        );
+        assert_eq!(
+            core.mte_pipeline()
+                .unwrap()
+                .biu_bus_writes()
+                .unwrap()
+                .outstanding(),
+            1
+        );
+        core.advance_to(response_tick + 1).unwrap();
+        assert_eq!(
+            core.mte_pipeline()
+                .unwrap()
+                .biu_bus_writes()
+                .unwrap()
+                .outstanding(),
+            0
+        );
+        assert!(core.memory().read_known_at(0x2000, 128).is_err());
+        response_tick + 2
+    } else {
+        let response = core
+            .receive_mte3_biu_write_response_at(response_tick, tag)
+            .unwrap();
+        assert_eq!(response.retired_instruction(), Some(request.instruction_id));
+        response_tick + 1
+    };
+    core.advance_to(retirement_tick).unwrap();
     assert_eq!(
         core.memory().read_known_at(0x2000, 128).unwrap(),
         vec![9; 128]
     );
     assert_eq!(core.last_mte3_dma_outcomes().len(), 1);
-    assert_eq!(core.last_mte3_dma_outcomes()[0].tick, 21);
+    assert_eq!(core.last_mte3_dma_outcomes()[0].tick, retirement_tick);
     assert!(matches!(
-        core.step_word_at(22, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
+        core.step_word_at(retirement_tick + 1, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
             .unwrap(),
         C220CoreStep::Executed { .. }
     ));
     assert!(core.mte_pipeline().unwrap().is_idle());
+    assert_eq!(
+        core.mte_pipeline()
+            .unwrap()
+            .biu_write_commands()
+            .unwrap()
+            .free_tag_count(),
+        2
+    );
 }
 
 #[test]

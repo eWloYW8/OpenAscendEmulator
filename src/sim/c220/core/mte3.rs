@@ -5,8 +5,161 @@ use crate::sim::c220::mte::mte3::{
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
+use crate::sim::c220::mte::interface::biu_write::C220BiuWriteSourceRequest;
+use crate::sim::c220::mte::interface::biu_write::command::{
+    C220BiuWriteCommandTransfer, C220BiuWriteConfig,
+};
+use crate::sim::c220::mte::interface::biu_write::data::{C220BiuWriteData, C220BiuWriteResponse};
+use crate::sim::c220::mte::interface::ub_read::{C220UbReadAcknowledgment, C220UbReadFragment};
+use std::num::NonZeroU32;
 
 impl C220Core {
+    /// Connects MTE3 through the core BIU write route. The caller supplies a
+    /// downstream bus/memory endpoint, not direct MTE acknowledgments.
+    pub fn connect_mte3_bus(
+        &mut self,
+        config: C220BiuWriteConfig,
+        bus_outstanding: NonZeroU32,
+    ) -> Result<(), C220CoreError> {
+        self.connect_mte3_biu(config)?;
+        self.mte_pipeline
+            .as_mut()
+            .expect("connected pipeline")
+            .connect_biu_bus_writes(bus_outstanding)?;
+        Ok(())
+    }
+
+    pub fn receive_mte3_bus_return_at(
+        &mut self,
+        tick: u64,
+        kind: crate::sim::c220::memory::biu_write::C220BiuWriteReturnKind,
+        tag: NonZeroU32,
+    ) -> Result<bool, C220CoreError> {
+        self.advance_to(tick)?;
+        Ok(self
+            .mte_pipeline
+            .as_mut()
+            .ok_or(C220CoreError::MteUnconfigured)?
+            .receive_biu_bus_write_return(kind, tag)?)
+    }
+
+    pub fn connect_mte3_biu(&mut self, config: C220BiuWriteConfig) -> Result<(), C220CoreError> {
+        if self.mte3.pending_commands().next().is_some() || !self.mte3.dma_commands.is_empty() {
+            return Err(C220CoreError::MtePipelineBusy);
+        }
+        self.mte_pipeline
+            .as_mut()
+            .ok_or(C220CoreError::MteUnconfigured)?
+            .connect_mte3_biu(config)?;
+        self.mte3.physical = true;
+        Ok(())
+    }
+
+    pub fn take_mte3_biu_command_at(
+        &mut self,
+        tick: u64,
+    ) -> Result<Option<C220BiuWriteCommandTransfer>, C220CoreError> {
+        self.advance_to(tick)?;
+        Ok(self
+            .mte_pipeline
+            .as_mut()
+            .ok_or(C220CoreError::MteUnconfigured)?
+            .take_biu_write_command()?)
+    }
+
+    pub fn configure_mte3_biu_source(
+        &mut self,
+        bandwidth: NonZeroU32,
+    ) -> Result<(), C220CoreError> {
+        let pipeline = self
+            .mte_pipeline
+            .as_mut()
+            .ok_or(C220CoreError::MteUnconfigured)?;
+        pipeline.configure_biu_write_source(pipeline.ub_vector_subcore(), bandwidth)?;
+        pipeline.connect_mte3_biu_retirement()?;
+        Ok(())
+    }
+
+    pub fn receive_mte3_biu_write_response_at(
+        &mut self,
+        tick: u64,
+        tag: NonZeroU32,
+    ) -> Result<C220BiuWriteResponse, C220CoreError> {
+        self.advance_to(tick)?;
+        let pipeline = self
+            .mte_pipeline
+            .as_mut()
+            .ok_or(C220CoreError::MteUnconfigured)?;
+        Ok(pipeline.receive_biu_write_response(tag)?)
+    }
+
+    pub fn register_mte3_biu_write_at(
+        &mut self,
+        tick: u64,
+        request: C220BiuWriteSourceRequest,
+    ) -> Result<(), C220CoreError> {
+        self.advance_to(tick)?;
+        let pipeline = self
+            .mte_pipeline
+            .as_mut()
+            .ok_or(C220CoreError::MteUnconfigured)?;
+        pipeline.register_biu_write_source(pipeline.ub_vector_subcore(), request)?;
+        Ok(())
+    }
+
+    pub fn receive_mte3_biu_dbid_at(
+        &mut self,
+        tick: u64,
+        tag: NonZeroU32,
+    ) -> Result<(), C220CoreError> {
+        self.advance_to(tick)?;
+        let pipeline = self
+            .mte_pipeline
+            .as_mut()
+            .ok_or(C220CoreError::MteUnconfigured)?;
+        pipeline.receive_biu_write_dbid(pipeline.ub_vector_subcore(), tag)?;
+        Ok(())
+    }
+
+    pub fn take_mte3_biu_write_data_at(
+        &mut self,
+        tick: u64,
+    ) -> Result<Option<C220BiuWriteData>, C220CoreError> {
+        self.advance_to(tick)?;
+        let pipeline = self
+            .mte_pipeline
+            .as_mut()
+            .ok_or(C220CoreError::MteUnconfigured)?;
+        Ok(pipeline.take_biu_write_data()?)
+    }
+
+    /// Supplies a source packet from the BIU write transport to this core's UB.
+    pub fn push_mte3_ub_read_at(
+        &mut self,
+        tick: u64,
+        fragment: C220UbReadFragment,
+    ) -> Result<bool, C220CoreError> {
+        self.advance_to(tick)?;
+        let pipeline = self
+            .mte_pipeline
+            .as_mut()
+            .ok_or(C220CoreError::MteUnconfigured)?;
+        Ok(pipeline.push_ub_read(pipeline.ub_vector_subcore(), fragment)?)
+    }
+
+    pub fn take_mte3_ub_read_completion_at(
+        &mut self,
+        tick: u64,
+        tag: u32,
+    ) -> Result<Option<C220UbReadAcknowledgment>, C220CoreError> {
+        self.advance_to(tick)?;
+        let pipeline = self
+            .mte_pipeline
+            .as_mut()
+            .ok_or(C220CoreError::MteUnconfigured)?;
+        Ok(pipeline.take_ub_read_completion(pipeline.ub_vector_subcore(), tag)?)
+    }
+
     /// Use the native command/generator path. The transport must drain and
     /// acknowledge each request; no aggregate completion estimate is used.
     pub fn connect_mte3_dma(&mut self) -> Result<(), C220CoreError> {

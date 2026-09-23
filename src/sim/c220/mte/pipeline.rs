@@ -11,6 +11,16 @@ use super::interface::biu_read::{
     C220BiuReadCallback, C220BiuReadConfig, C220BiuReadError, C220BiuReadEvent, C220BiuReadEvents,
     C220BiuReadFrontend, C220BiuReadInput, C220BiuReadRequest, C220BiuSubcore,
 };
+use super::interface::biu_write::command::{
+    C220BiuWriteCommandCycle, C220BiuWriteCommandError, C220BiuWriteCommands,
+};
+use super::interface::biu_write::data::{
+    C220BiuWriteDataError, C220BiuWriteDataPort, C220BiuWriteDataSend, C220BiuWriteResponse,
+};
+use super::interface::biu_write::{
+    C220BiuWriteSource, C220BiuWriteSourceError, C220BiuWriteSourceEvent,
+};
+use super::interface::ub_read::{C220UbReadError, C220UbReadInterface, C220UbReadRequest};
 use super::interface::ub_write::{
     C220UbWriteCallback, C220UbWriteError, C220UbWriteEvent, C220UbWriteEvents,
     C220UbWriteInterface, C220UbWriteRequest,
@@ -24,6 +34,7 @@ use super::mte3::frontend::{
 };
 use super::uop::{C220DmaUopError, mte2_uops};
 use crate::isa::c220::mte::set2d::{C220Set2dDestination, C220Set2dFill};
+use crate::sim::c220::memory::biu_write::{C220BiuBusWriteError, C220BiuMteBusWrites};
 use crate::sim::c220::memory::ub_service::{
     C220UbMteService, C220UbServiceCycle, C220UbServiceError,
 };
@@ -74,6 +85,9 @@ enum Callback {
     BiuRead(C220BiuReadCallback),
     BiuReturn(C220BiuReturnCallback),
     UbWrite(usize, C220UbWriteCallback),
+    UbReadProbe(usize),
+    UbReadSend(usize),
+    BiuWriteSource(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,10 +108,43 @@ pub enum C220MtePipelineEvent {
     UbRequest(C220BiuSubcore, C220UbWriteRequest),
     UbResponse(C220BiuSubcore, C220UbWriteRequest),
     UbService(C220BiuSubcore, C220UbServiceCycle),
+    UbReadSent(C220BiuSubcore, C220UbReadRequest),
+    UbReadRequest(C220BiuSubcore, C220UbReadRequest),
+    UbReadResponse(C220BiuSubcore, C220UbReadRequest),
+    BiuWriteSource(C220BiuSubcore, C220BiuWriteSourceEvent),
+    BiuWriteData(C220BiuWriteDataSend),
+    BiuWriteResponse(C220BiuWriteResponse),
+    BiuWriteCommand(C220BiuWriteCommandCycle),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220MtePipelineError {
+    #[error(transparent)]
+    BiuBusWrite(#[from] C220BiuBusWriteError),
+    #[error("BIU bus owns write responses; use its bounded return channels")]
+    BiuBusOwnedResponse,
+    #[error("BIU bus write route is not connected")]
+    BiuBusDisconnected,
+    #[error(transparent)]
+    BiuWriteCommand(#[from] C220BiuWriteCommandError),
+    #[error("BIU write command transport owns source registration")]
+    BiuOwnedSource,
+    #[error("BIU write command transport is not configured")]
+    BiuWriteCommandDisconnected,
+    #[error("BIU write DBID does not match the command subcore")]
+    BiuWriteWrongSubcore,
+    #[error(transparent)]
+    BiuWriteData(#[from] C220BiuWriteDataError),
+    #[error(transparent)]
+    BiuWriteSource(#[from] C220BiuWriteSourceError),
+    #[error("BIU write source transport is not configured")]
+    BiuWriteSourceDisconnected,
+    #[error("UB source packets and completions are owned by the connected BIU write source")]
+    BiuOwnedUbRead,
+    #[error(transparent)]
+    UbRead(#[from] C220UbReadError),
+    #[error("UB read service requires a vector subcore")]
+    UbReadSubcoreRequired,
     #[error(transparent)]
     Mte3(#[from] C220Mte3FrontendError),
     #[error(transparent)]
@@ -155,6 +202,7 @@ enum Mte2Generator {
 #[cfg(test)]
 mod tests;
 mod ub;
+mod write;
 
 /// Physical MTE paths. Generators, shared L1 interfaces, L1 service and
 /// destinations execute on one event dispatcher. Retirement is an observed
@@ -191,6 +239,12 @@ pub struct C220MtePipeline {
     biu_subcore: C220BiuSubcore,
     biu_output: Option<C220BiuReadRequest>,
     ub_write: [C220UbWriteInterface; 2],
+    ub_read: [C220UbReadInterface; 2],
+    biu_write_source: [Option<C220BiuWriteSource>; 2],
+    biu_write_data: C220BiuWriteDataPort,
+    biu_write_commands: Option<C220BiuWriteCommands>,
+    biu_bus_writes: Option<C220BiuMteBusWrites>,
+    ub_read_valid: [EventId; 2],
     ub_memory: [C220UbMteService; 2],
     last_ub_service: Option<u64>,
     dma_hardware_sync_blocked: bool,
@@ -229,6 +283,16 @@ impl C220MtePipeline {
         let ub_write_events = [0, 1].map(|index| {
             C220UbWriteEvents::register(&mut events, clock, |phase| Callback::UbWrite(index, phase))
         });
+        let ub_read_valid = [0, 1].map(|index| {
+            let valid = events.add_event();
+            let probe = events.add_process(Callback::UbReadProbe(index), false);
+            let send = events.add_process(Callback::UbReadSend(index), false);
+            events.subscribe(clock, probe);
+            events.subscribe(valid, send);
+            let source = events.add_process(Callback::BiuWriteSource(index), false);
+            events.subscribe(clock, source);
+            valid
+        });
         Self {
             events,
             clock,
@@ -245,6 +309,12 @@ impl C220MtePipeline {
             biu_events,
             biu_return_events,
             ub_write_events,
+            ub_read_valid,
+            ub_read: std::array::from_fn(|_| C220UbReadInterface::default()),
+            biu_write_source: [None, None],
+            biu_write_data: C220BiuWriteDataPort::default(),
+            biu_write_commands: None,
+            biu_bus_writes: None,
             memory: C220L1Transport::new(config.l1),
             interface: C220MteL1Interface::default(),
             write_interface: C220MteL1WriteInterface::default(),
@@ -306,6 +376,21 @@ impl C220MtePipeline {
             && self.dma_output.is_none()
             && self.biu_output.is_none()
             && self.ub_write.iter().all(C220UbWriteInterface::is_idle)
+            && self.ub_read.iter().all(C220UbReadInterface::is_idle)
+            && self.biu_write_data.is_idle()
+            && self
+                .biu_bus_writes
+                .as_ref()
+                .is_none_or(C220BiuMteBusWrites::is_idle)
+            && self
+                .biu_write_commands
+                .as_ref()
+                .is_none_or(C220BiuWriteCommands::is_idle)
+            && self
+                .biu_write_source
+                .iter()
+                .flatten()
+                .all(C220BiuWriteSource::is_idle)
             && self.ub_memory.iter().all(C220UbMteService::is_idle)
             && self
                 .biu_read
@@ -448,6 +533,16 @@ impl C220MtePipeline {
         &self.mte3
     }
 
+    pub fn connect_mte3_biu_retirement(&mut self) -> Result<(), C220MtePipelineError> {
+        if !self.is_idle() {
+            return Err(C220MtePipelineError::CommandBusy);
+        }
+        if self.biu_write_source(self.biu_subcore)?.is_none() {
+            return Err(C220MtePipelineError::BiuWriteSourceDisconnected);
+        }
+        Ok(self.mte3.connect_biu_retirement()?)
+    }
+
     pub fn issue_mte3_dma(
         &mut self,
         instruction_id: u64,
@@ -459,6 +554,9 @@ impl C220MtePipeline {
     }
 
     pub fn take_mte3_dma_output(&mut self) -> Option<C220DmaGenerated> {
+        if self.biu_write_commands.is_some() {
+            return None;
+        }
         self.mte3.take_output()
     }
 
@@ -654,9 +752,43 @@ impl C220MtePipeline {
         self.l1_fill_completions.clear();
         self.dma_completions.clear();
         self.trace.clear();
+        self.advance_biu_bus_returns(tick)?;
         self.events.notify_at(self.clock, tick);
         while let Some(invocation) = self.events.next_callback() {
             match invocation.callback {
+                Callback::BiuWriteSource(index) => {
+                    if let Some(source) = &mut self.biu_write_source[index] {
+                        if let Some(tag) = source.starting_source(tick)
+                            && let Some(commands) = &mut self.biu_write_commands
+                        {
+                            let request = commands.begin_source(tag);
+                            source.set_source_tail(tag, request.last_in_instruction);
+                        }
+                        for event in source.advance(tick, &mut self.ub_read[index])? {
+                            self.trace.push(C220MtePipelineEvent::BiuWriteSource(
+                                [C220BiuSubcore::Vector0, C220BiuSubcore::Vector1][index],
+                                event,
+                            ));
+                        }
+                    }
+                }
+                Callback::UbReadProbe(index) => {
+                    if self.ub_read[index]
+                        .inputs()
+                        .front()
+                        .is_some_and(|head| head.ready_tick <= tick)
+                    {
+                        self.events.notify_at(self.ub_read_valid[index], tick);
+                    }
+                }
+                Callback::UbReadSend(index) => {
+                    if let Some(request) = self.ub_read[index].send(tick)? {
+                        self.trace.push(C220MtePipelineEvent::UbReadSent(
+                            [C220BiuSubcore::Vector0, C220BiuSubcore::Vector1][index],
+                            request,
+                        ));
+                    }
+                }
                 Callback::Mte3(phase) => {
                     if let Some(outcome) =
                         self.mte3_events
@@ -958,6 +1090,9 @@ impl C220MtePipeline {
                 }
             }
         }
+        self.advance_biu_write_commands(tick)?;
+        self.advance_biu_write_data(tick)?;
+        self.advance_biu_bus_inputs(tick)?;
         self.last_advance = Some(tick);
         Ok(())
     }

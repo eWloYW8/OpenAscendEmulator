@@ -47,6 +47,10 @@ pub enum C220Mte3FrontendError {
     NotRetirable(u64),
     #[error("MTE3 frontend time overflowed")]
     TimeOverflow,
+    #[error("MTE3 completion is owned by the connected BIU")]
+    BiuOwnedCompletion,
+    #[error("MTE3 BIU retirement notification is invalid for instruction {0}")]
+    UnexpectedBiuRetirement(u64),
     #[error(transparent)]
     Dma(#[from] C220DmaFrontendError),
     #[error(transparent)]
@@ -66,6 +70,7 @@ struct Pending {
     record_ready_tick: Option<u64>,
     tail_delivered: bool,
     responses: BTreeSet<u64>,
+    biu_retired: bool,
 }
 
 /// Command decode, ordinary DMA generation and destination acknowledgments.
@@ -80,9 +85,54 @@ pub struct C220Mte3Frontend {
     output: Option<C220DmaGenerated>,
     hardware_sync_blocked: bool,
     last_retirement_tick: Option<u64>,
+    biu_retirement: bool,
 }
 
 impl C220Mte3Frontend {
+    pub fn connect_biu_retirement(&mut self) -> Result<(), C220Mte3FrontendError> {
+        if !self.is_idle() {
+            return Err(C220Mte3FrontendError::QueueFull);
+        }
+        self.biu_retirement = true;
+        Ok(())
+    }
+
+    pub fn uses_biu_retirement(&self) -> bool {
+        self.biu_retirement
+    }
+
+    pub fn validate_biu_retirement(
+        &self,
+        instruction_id: u64,
+    ) -> Result<(), C220Mte3FrontendError> {
+        if self.biu_retirement
+            && self.records.iter().any(|pending| {
+                pending.record.instruction_id == instruction_id
+                    && pending.tail_delivered
+                    && !pending.biu_retired
+            })
+        {
+            Ok(())
+        } else {
+            Err(C220Mte3FrontendError::UnexpectedBiuRetirement(
+                instruction_id,
+            ))
+        }
+    }
+
+    pub fn notify_biu_retirement(
+        &mut self,
+        instruction_id: u64,
+    ) -> Result<(), C220Mte3FrontendError> {
+        self.validate_biu_retirement(instruction_id)?;
+        self.records
+            .iter_mut()
+            .find(|pending| pending.record.instruction_id == instruction_id)
+            .expect("validated record")
+            .biu_retired = true;
+        Ok(())
+    }
+
     pub fn can_issue(&self) -> bool {
         self.commands.len() < COMMAND_CAPACITY && self.records.len() < C220_MTE3_OUTSTANDING_LIMIT
     }
@@ -114,7 +164,9 @@ impl C220Mte3Frontend {
             .iter_mut()
             .find(|p| p.record.instruction_id == output.instruction_id)
             .expect("generated request retains its command record");
-        pending.responses.insert(output.uop_index);
+        if !self.biu_retirement {
+            pending.responses.insert(output.uop_index);
+        }
         pending.tail_delivered |= output.last_in_instruction;
         Some(output)
     }
@@ -128,6 +180,9 @@ impl C220Mte3Frontend {
         instruction_id: u64,
         uop_index: u64,
     ) -> Result<(), C220Mte3FrontendError> {
+        if self.biu_retirement {
+            return Err(C220Mte3FrontendError::BiuOwnedCompletion);
+        }
         if self
             .records
             .iter_mut()
@@ -155,7 +210,11 @@ impl C220Mte3Frontend {
             .filter(|p| {
                 p.record_ready_tick.is_some_and(|ready| tick >= ready)
                     && p.tail_delivered
-                    && p.responses.is_empty()
+                    && if self.biu_retirement {
+                        p.biu_retired
+                    } else {
+                        p.responses.is_empty()
+                    }
             })
             .map(|p| p.record)
     }
@@ -237,6 +296,7 @@ impl C220Mte3Events {
             record_ready_tick: None,
             tail_delivered: false,
             responses: BTreeSet::new(),
+            biu_retired: false,
         });
         frontend.commands.push_back(Command {
             instruction_id,
@@ -293,6 +353,7 @@ impl C220Mte3Events {
                 pending.record.dispatch_tick = Some(events.tick());
                 pending.record_ready_tick = Some(ready);
                 pending.tail_delivered = disabled;
+                pending.biu_retired = disabled;
                 frontend.commands.pop_front();
                 Ok(Some(C220Mte3FrontendEvent::Dispatched {
                     instruction_id: id,
@@ -326,86 +387,102 @@ mod tests {
 
     #[test]
     fn command_delay_backpressure_and_ordered_acknowledgments() {
-        let mut events = EventDispatcher::new(0);
-        let clock = events.add_event();
-        let callbacks = C220Mte3Events::register(&mut events, clock, |phase| phase);
-        let mut frontend = C220Mte3Frontend::default();
-        let plan = C220Mte3TransferPlan {
-            descriptor: C220DmaMovDescriptor::decode(
-                CAPTURED_C220_MOV_UB_TO_OUT_WORD,
-                (32 << 16) | (1 << 4),
-            )
-            .unwrap(),
-            source_address: 0,
-            destination_address: 0x2000,
-            bytes: 1024,
-            dma_mode_word: 5,
-        };
-        let mut delivered = Vec::new();
-        let disabled = C220Mte3TransferPlan {
-            descriptor: C220DmaMovDescriptor::decode(CAPTURED_C220_MOV_UB_TO_OUT_WORD, 0).unwrap(),
-            bytes: 0,
-            ..plan
-        };
-        for tick in 0..60 {
-            events.advance_to(tick).unwrap();
-            if tick < 3 {
-                callbacks
-                    .issue(
-                        &mut events,
-                        &mut frontend,
-                        tick,
-                        if tick == 2 { disabled } else { plan },
-                    )
-                    .unwrap();
+        for biu in [false, true] {
+            let mut events = EventDispatcher::new(0);
+            let clock = events.add_event();
+            let callbacks = C220Mte3Events::register(&mut events, clock, |phase| phase);
+            let mut frontend = C220Mte3Frontend::default();
+            if biu {
+                frontend.connect_biu_retirement().unwrap();
             }
-            if tick == 2 {
-                assert!(!frontend.can_issue());
-                assert!(matches!(
-                    callbacks.issue(&mut events, &mut frontend, 99, plan),
-                    Err(C220Mte3FrontendError::QueueFull)
-                ));
+            let plan = C220Mte3TransferPlan {
+                descriptor: C220DmaMovDescriptor::decode(
+                    CAPTURED_C220_MOV_UB_TO_OUT_WORD,
+                    (32 << 16) | (1 << 4),
+                )
+                .unwrap(),
+                source_address: 0,
+                destination_address: 0x2000,
+                bytes: 1024,
+                dma_mode_word: 5,
+            };
+            let mut delivered = Vec::new();
+            let disabled = C220Mte3TransferPlan {
+                descriptor: C220DmaMovDescriptor::decode(CAPTURED_C220_MOV_UB_TO_OUT_WORD, 0)
+                    .unwrap(),
+                bytes: 0,
+                ..plan
+            };
+            for tick in 0..60 {
+                events.advance_to(tick).unwrap();
+                if tick < 3 {
+                    callbacks
+                        .issue(
+                            &mut events,
+                            &mut frontend,
+                            tick,
+                            if tick == 2 { disabled } else { plan },
+                        )
+                        .unwrap();
+                }
+                if tick == 2 {
+                    assert!(!frontend.can_issue());
+                    assert!(matches!(
+                        callbacks.issue(&mut events, &mut frontend, 99, plan),
+                        Err(C220Mte3FrontendError::QueueFull)
+                    ));
+                }
+                events.notify_at(clock, tick);
+                while let Some(invocation) = events.next_callback() {
+                    callbacks
+                        .handle(invocation.callback, &mut events, &mut frontend)
+                        .unwrap();
+                }
+                if tick == 2 {
+                    assert_eq!(frontend.records().next().unwrap().dispatch_tick, None);
+                }
+                if tick == 3 {
+                    assert_eq!(frontend.records().next().unwrap().dispatch_tick, Some(3));
+                }
+                if tick < 7 {
+                    assert!(frontend.output().is_none());
+                }
+                if tick == 15 {
+                    assert_eq!(frontend.generator().generated().len(), 4);
+                    assert_eq!(frontend.output().unwrap().uop_index, 0);
+                    assert!(frontend.acknowledge(0, 0).is_err());
+                }
+                if tick >= 16
+                    && let Some(request) = frontend.take_output()
+                {
+                    delivered.push((request.instruction_id, request.uop_index));
+                }
             }
-            events.notify_at(clock, tick);
-            while let Some(invocation) = events.next_callback() {
-                callbacks
-                    .handle(invocation.callback, &mut events, &mut frontend)
-                    .unwrap();
+            assert_eq!(delivered.len(), 16);
+            if biu {
+                frontend.notify_biu_retirement(1).unwrap();
+                assert!(frontend.notify_biu_retirement(1).is_err());
+            } else {
+                for &(id, index) in delivered.iter().rev().filter(|(id, _)| *id != 0) {
+                    frontend.acknowledge(id, index).unwrap();
+                }
             }
-            if tick == 2 {
-                assert_eq!(frontend.records().next().unwrap().dispatch_tick, None);
-            }
-            if tick == 3 {
-                assert_eq!(frontend.records().next().unwrap().dispatch_tick, Some(3));
-            }
-            if tick < 7 {
-                assert!(frontend.output().is_none());
-            }
-            if tick == 15 {
-                assert_eq!(frontend.generator().generated().len(), 4);
-                assert_eq!(frontend.output().unwrap().uop_index, 0);
+            assert!(frontend.retirement_candidate(60).is_none());
+            assert!(frontend.retire(60, 1).is_err());
+            if biu {
                 assert!(frontend.acknowledge(0, 0).is_err());
+                frontend.notify_biu_retirement(0).unwrap();
+            } else {
+                for &(id, index) in delivered.iter().rev().filter(|(id, _)| *id == 0) {
+                    frontend.acknowledge(id, index).unwrap();
+                    assert!(frontend.acknowledge(id, index).is_err());
+                }
             }
-            if tick >= 16
-                && let Some(request) = frontend.take_output()
-            {
-                delivered.push((request.instruction_id, request.uop_index));
-            }
+            assert_eq!(frontend.retire(60, 0).unwrap().instruction_id, 0);
+            assert!(frontend.retire(60, 1).is_err());
+            frontend.retire(61, 1).unwrap();
+            frontend.retire(62, 2).unwrap();
+            assert!(frontend.is_idle());
         }
-        assert_eq!(delivered.len(), 16);
-        for &(id, index) in delivered.iter().rev().filter(|(id, _)| *id != 0) {
-            frontend.acknowledge(id, index).unwrap();
-        }
-        assert!(frontend.retirement_candidate(60).is_none());
-        assert!(frontend.retire(60, 1).is_err());
-        for &(id, index) in delivered.iter().rev().filter(|(id, _)| *id == 0) {
-            frontend.acknowledge(id, index).unwrap();
-            assert!(frontend.acknowledge(id, index).is_err());
-        }
-        assert_eq!(frontend.retire(60, 0).unwrap().instruction_id, 0);
-        assert!(frontend.retire(60, 1).is_err());
-        frontend.retire(61, 1).unwrap();
-        frontend.retire(62, 2).unwrap();
-        assert!(frontend.is_idle());
     }
 }
