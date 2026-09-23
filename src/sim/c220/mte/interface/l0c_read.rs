@@ -49,10 +49,18 @@ pub enum C220MteL0cReadDelivery {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220MteL0cReadSend {
+    Idle,
+    InputLatency { ready_tick: u64 },
     Sent,
     PendingLimit,
     AcknowledgmentLimit,
     TransportFull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220MteL0cReadEntry {
+    pub operation: C220MteL0cReadOperation,
+    pub ready_tick: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,18 +82,21 @@ pub enum C220MteL0cReadError {
     Memory(#[from] C220L0cError),
 }
 
-/// Egress and return path for already-ready MTE L0C read micro-operations.
-/// The owner schedules send, response, and FIXP delivery independently.
+/// Input staging, egress and return path for MTE L0C read micro-operations.
+/// The owner schedules admission, send, response, and FIXP delivery independently.
+/// Direct `send` is available for operations whose input delay was modeled by
+/// the caller; otherwise use `enqueue` followed by `send_queued`.
 /// Response acceptance exposes the functional-read point; delivery only
 /// removes an acknowledgment when the downstream FIXP accepts it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220MteL0cReadInterface {
     bank_count: u8,
     data_latency: u32,
+    input: VecDeque<C220MteL0cReadEntry>,
     pending: VecDeque<C220MteL0cReadOperation>,
     acknowledgments: VecDeque<C220MteL0cReadAcknowledgment>,
     observed_tick: Option<u64>,
-    callbacks: [Option<u64>; 3],
+    callbacks: [Option<u64>; 4],
 }
 
 impl C220MteL0cReadInterface {
@@ -96,10 +107,11 @@ impl C220MteL0cReadInterface {
         Ok(Self {
             bank_count,
             data_latency,
+            input: VecDeque::new(),
             pending: VecDeque::new(),
             acknowledgments: VecDeque::new(),
             observed_tick: None,
-            callbacks: [None; 3],
+            callbacks: [None; 4],
         })
     }
 
@@ -112,7 +124,70 @@ impl C220MteL0cReadInterface {
     }
 
     pub fn is_idle(&self) -> bool {
-        self.pending.is_empty() && self.acknowledgments.is_empty()
+        self.input.is_empty() && self.pending.is_empty() && self.acknowledgments.is_empty()
+    }
+
+    pub fn input(&self) -> &VecDeque<C220MteL0cReadEntry> {
+        &self.input
+    }
+
+    pub fn can_enqueue(&self) -> bool {
+        self.input.len() < 5
+    }
+
+    /// Admission keeps credit charged for both delayed and ready input entries.
+    pub fn enqueue(
+        &mut self,
+        tick: u64,
+        operation: C220MteL0cReadOperation,
+    ) -> Result<bool, C220MteL0cReadError> {
+        self.begin_callback(tick, 3, "enqueue")?;
+        if !self.can_enqueue() {
+            return Ok(false);
+        }
+        if self
+            .input
+            .iter()
+            .any(|entry| entry.operation.request.id == operation.request.id)
+            || self
+                .pending
+                .iter()
+                .any(|entry| entry.request.id == operation.request.id)
+            || self
+                .acknowledgments
+                .iter()
+                .any(|entry| entry.operation.request.id == operation.request.id)
+        {
+            return Err(C220MteL0cReadError::DuplicateRequest(operation.request.id));
+        }
+        let ready_tick = tick.checked_add(4).ok_or(C220L0cError::TimeOverflow)?;
+        self.input.push_back(C220MteL0cReadEntry {
+            operation,
+            ready_tick,
+        });
+        Ok(true)
+    }
+
+    pub fn send_queued(
+        &mut self,
+        tick: u64,
+        memory: &mut C220L0c,
+    ) -> Result<C220MteL0cReadSend, C220MteL0cReadError> {
+        let Some(entry) = self.input.front().copied() else {
+            self.begin_callback(tick, 0, "send")?;
+            return Ok(C220MteL0cReadSend::Idle);
+        };
+        if tick < entry.ready_tick {
+            self.begin_callback(tick, 0, "send")?;
+            return Ok(C220MteL0cReadSend::InputLatency {
+                ready_tick: entry.ready_tick,
+            });
+        }
+        let sent = self.send(tick, entry.operation, memory)?;
+        if sent == C220MteL0cReadSend::Sent {
+            self.input.pop_front();
+        }
+        Ok(sent)
     }
 
     pub fn send(
@@ -269,6 +344,45 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn staged_input_keeps_credit_until_transport_acceptance() {
+        let mut memory = C220L0c::new(131072, 12).unwrap();
+        let mut interface = C220MteL0cReadInterface::new(32, 0).unwrap();
+        for tick in 0..5 {
+            assert!(
+                interface
+                    .enqueue(tick, operation(tick as u32, false))
+                    .unwrap()
+            );
+        }
+        assert!(!interface.can_enqueue());
+        assert!(!interface.enqueue(5, operation(5, false)).unwrap());
+        assert_eq!(
+            interface.send_queued(5, &mut memory).unwrap(),
+            C220MteL0cReadSend::Sent
+        );
+        assert!(interface.can_enqueue());
+        interface.receive(6, &mut memory).unwrap();
+        assert_eq!(
+            interface.send_queued(6, &mut memory).unwrap(),
+            C220MteL0cReadSend::AcknowledgmentLimit
+        );
+        assert_eq!(interface.input()[0].operation.request.id, 1);
+        assert_eq!(interface.input().len(), 4);
+        interface.deliver(7, true).unwrap();
+        assert_eq!(
+            interface.send_queued(7, &mut memory).unwrap(),
+            C220MteL0cReadSend::Sent
+        );
+        let mut delayed = C220MteL0cReadInterface::new(32, 0).unwrap();
+        delayed.enqueue(10, operation(10, false)).unwrap();
+        assert_eq!(
+            delayed.send_queued(13, &mut memory).unwrap(),
+            C220MteL0cReadSend::InputLatency { ready_tick: 14 }
+        );
+        assert!(!delayed.is_idle());
     }
 
     #[test]

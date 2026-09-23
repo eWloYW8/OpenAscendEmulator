@@ -16,7 +16,7 @@ pub use l0_write::{
     C220L0WritePort, C220L0WriteSend,
 };
 pub use l0c_read::{
-    C220MteL0cReadAcknowledgment, C220MteL0cReadDelivery, C220MteL0cReadError,
+    C220MteL0cReadAcknowledgment, C220MteL0cReadDelivery, C220MteL0cReadEntry, C220MteL0cReadError,
     C220MteL0cReadInterface, C220MteL0cReadOperation, C220MteL0cReadResponse, C220MteL0cReadSend,
 };
 pub use l1::{

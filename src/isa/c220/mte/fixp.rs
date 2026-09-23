@@ -1,3 +1,40 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220FixpDestination {
+    External,
+    L1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220FixpInstruction {
+    pub destination: C220FixpDestination,
+    pub source_format: u8,
+    pub destination_register: u8,
+    pub source_register: u8,
+    pub shape_register: u8,
+    pub control_register: u8,
+}
+
+impl C220FixpInstruction {
+    pub const fn decode(word: u32) -> Option<Self> {
+        if word >> 29 != 6 {
+            return None;
+        }
+        let destination = match (word >> 24) & 31 {
+            2 => C220FixpDestination::External,
+            3 => C220FixpDestination::L1,
+            _ => return None,
+        };
+        Some(Self {
+            destination,
+            source_format: (word & 3) as u8,
+            destination_register: ((word >> 17) & 31) as u8,
+            source_register: ((word >> 12) & 31) as u8,
+            shape_register: ((word >> 7) & 31) as u8,
+            control_register: ((word >> 2) & 31) as u8,
+        })
+    }
+}
+
 /// Captured FIX operand registers. Decoding does not access execution state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220FixpDescriptor {
