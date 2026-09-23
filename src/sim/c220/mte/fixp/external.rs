@@ -87,9 +87,7 @@ impl C220FixpExternalCommand {
         C220DmaUopMode::from_mode_word(self.biu_mode_word)
     }
 
-    pub fn nz2nd_output_policy(
-        self,
-    ) -> Result<C220FixpExternalOutputPolicy, C220FixpExecutionError> {
+    pub fn output_policy(self) -> Result<C220FixpExternalOutputPolicy, C220FixpExecutionError> {
         self.command.layout()?;
         let format = C220FixpOutputFormat::from_conversion_mode(
             self.command.source_format,
@@ -336,7 +334,7 @@ mod tests {
         let captured = C220FixpExternalCommand::capture(word, 1 << 48, 1, gpr, spr).unwrap();
         assert_eq!(captured.command.control, 1 << 48);
         assert_eq!(captured.biu_mode(), C220DmaUopMode::Fixed128);
-        let policy = captured.nz2nd_output_policy().unwrap();
+        let policy = captured.output_policy().unwrap();
         assert_eq!((policy.burst_control, policy.row_stride_bytes), (3, 64));
         let mut plan = captured.plan_nz2nd(71, 8, 16, 128, 8).unwrap();
         assert!(plan.reads.next().is_some());

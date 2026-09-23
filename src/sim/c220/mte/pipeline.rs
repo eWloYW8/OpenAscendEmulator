@@ -8,11 +8,11 @@ use super::fixp::{
     C220FixpSliceResult, C220FixpStage, C220FixpStageEvents, C220FixpSync,
 };
 use super::fixp::{
-    C220FixpL1WriteCallback, C220FixpL1WriteError, C220FixpL1WriteEvent, C220FixpL1WriteEvents,
-    C220FixpL1WriteInterface,
+    C220FixpExternalEngine, C220FixpExternalEvent, C220FixpExternalMemory, C220FixpExternalStage,
 };
 use super::fixp::{
-    C220FixpNz2ndEngine, C220FixpNz2ndEvent, C220FixpNz2ndMemory, C220FixpNz2ndStage,
+    C220FixpL1WriteCallback, C220FixpL1WriteError, C220FixpL1WriteEvent, C220FixpL1WriteEvents,
+    C220FixpL1WriteInterface,
 };
 use super::interface::biu_read::returns::{
     C220BiuReadBeat, C220BiuReadReturns, C220BiuReturnCallback, C220BiuReturnError,
@@ -89,7 +89,7 @@ pub struct C220MtePipelineConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Callback {
-    Nz2nd(usize, C220FixpCallback),
+    FixpExternal(usize, C220FixpCallback),
     Fixp(usize, C220FixpCallback),
     FixpWrite(C220FixpL1WriteCallback),
     Memory(C220L1Callback),
@@ -111,8 +111,8 @@ enum Callback {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220MtePipelineEvent {
-    Nz2nd(C220FixpNz2ndEvent),
-    Nz2ndStored {
+    FixpExternal(C220FixpExternalEvent),
+    FixpExternalStored {
         slice: C220FixpSliceResult,
         bytes: Vec<u8>,
     },
@@ -153,13 +153,13 @@ pub enum C220MtePipelineEvent {
 #[derive(Debug, thiserror::Error)]
 pub enum C220MtePipelineError {
     #[error(transparent)]
-    Nz2nd(Box<super::fixp::C220FixpNz2ndEngineError>),
-    #[error("NZ2ND event binding requires each of the eleven stages exactly once")]
-    InvalidNz2ndStages,
+    FixpExternal(Box<super::fixp::C220FixpExternalEngineError>),
+    #[error("external FIX event binding requires each of the eleven stages exactly once")]
+    InvalidExternalFixpStages,
     #[error(transparent)]
     BiuCubeWrite(#[from] C220BiuCubeWriteError),
     #[error(transparent)]
-    FixpOutput(#[from] super::fixp::C220FixpNz2ndOutputError),
+    FixpOutput(#[from] super::fixp::C220FixpExternalOutputError),
     #[error(transparent)]
     FixpWritePipeline(#[from] super::fixp::C220FixpWritePipelineError),
     #[error("FIX event binding requires each of the nine stages exactly once")]
@@ -262,8 +262,8 @@ enum Mte2Generator {
     L1Fill,
 }
 
+mod external_fixp;
 mod memory;
-mod nz2nd;
 mod read;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,7 +282,7 @@ mod write;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220MtePipeline {
     fixp_events: Vec<C220FixpStageEvents>,
-    nz2nd_events: Vec<C220FixpStageEvents<C220FixpNz2ndStage>>,
+    external_fixp_events: Vec<C220FixpStageEvents<C220FixpExternalStage>>,
     fixp_write: C220FixpL1WriteInterface,
     fixp_write_events: C220FixpL1WriteEvents,
     fixp_completions: Vec<u64>,
@@ -379,7 +379,7 @@ impl C220MtePipeline {
         });
         Self {
             fixp_events: Vec::new(),
-            nz2nd_events: Vec::new(),
+            external_fixp_events: Vec::new(),
             fixp_write: C220FixpL1WriteInterface::default(),
             fixp_write_events,
             fixp_completions: Vec::new(),
@@ -558,7 +558,8 @@ impl C220MtePipeline {
         &mut self,
         stages: &[C220FixpStage],
     ) -> Result<(), C220MtePipelineError> {
-        if !self.fixp_events.is_empty() || !self.nz2nd_events.is_empty() || !self.is_idle() {
+        if !self.fixp_events.is_empty() || !self.external_fixp_events.is_empty() || !self.is_idle()
+        {
             return Err(C220MtePipelineError::FixpBindingBusy);
         }
         if stages.len() != 9
@@ -591,6 +592,7 @@ impl C220MtePipeline {
             self.events.tick(),
             &mut self.fixp_write,
             &mut self.interface,
+            self.biu_write_commands.as_mut(),
         )?)
     }
     pub fn l1_fill_completions(&self) -> &[u64] {
@@ -977,14 +979,14 @@ impl C220MtePipeline {
             C220FixpMemory<'_>,
             &mut dyn C220FixpSync,
         )>,
-        mut nz2nd: Option<(
-            &mut C220FixpNz2ndEngine,
-            C220FixpNz2ndMemory<'_>,
+        mut external_fixp: Option<(
+            &mut C220FixpExternalEngine,
+            C220FixpExternalMemory<'_>,
             &mut dyn C220FixpSync,
         )>,
     ) -> Result<(), C220MtePipelineError> {
         if self.fixp_events.is_empty() == fixp.is_some()
-            || self.nz2nd_events.is_empty() == nz2nd.is_some()
+            || self.external_fixp_events.is_empty() == external_fixp.is_some()
         {
             return Err(C220MtePipelineError::FixpContextMismatch);
         }
@@ -995,7 +997,7 @@ impl C220MtePipeline {
             || fixp
                 .as_ref()
                 .is_some_and(|(engine, _, _)| !engine.is_idle())
-            || nz2nd
+            || external_fixp
                 .as_ref()
                 .is_some_and(|(engine, _, _)| !engine.is_idle());
         if active
@@ -1016,22 +1018,35 @@ impl C220MtePipeline {
         if let Some((engine, _, _)) = fixp.as_mut() {
             engine.retire_ready_write(tick)?;
         }
+        if let Some((engine, _, _)) = external_fixp.as_mut()
+            && let Some((instruction_id, state)) = engine.retire_ready_write(tick)?
+        {
+            self.trace.push(C220MtePipelineEvent::FixpExternal(
+                C220FixpExternalEvent::Retired {
+                    tick,
+                    instruction_id,
+                    state,
+                },
+            ));
+        }
         if let Some(memory) = &mut self.timed_memory {
             memory.advance(tick)?;
         }
         self.advance_biu_bus_returns(tick)?;
-        if let Some((engine, _, _)) = nz2nd.as_mut() {
+        if let Some((engine, _, _)) = external_fixp.as_mut() {
             for &id in &self.fixp_completions {
-                engine.retire_completed_write(id)?;
+                engine.complete_write_transport(tick, id)?;
             }
         }
         self.advance_biu_read_returns(tick)?;
         self.events.notify_at(self.clock, tick);
         while let Some(invocation) = self.events.next_callback() {
             match invocation.callback {
-                Callback::Nz2nd(index, phase) => {
-                    let (engine, memory, gates) = nz2nd.as_mut().expect("validated NZ2ND context");
-                    self.handle_nz2nd(index, phase, engine, memory, &mut **gates)?;
+                Callback::FixpExternal(index, phase) => {
+                    let (engine, memory, gates) = external_fixp
+                        .as_mut()
+                        .expect("validated external FIX context");
+                    self.handle_external_fixp(index, phase, engine, memory, &mut **gates)?;
                 }
                 Callback::Fixp(index, phase) => {
                     let (engine, memory, gates) = fixp.as_mut().expect("validated FIX context");
@@ -1040,6 +1055,7 @@ impl C220MtePipeline {
                         &mut self.events,
                         engine,
                         C220FixpResources {
+                            biu: self.biu_write_commands.as_mut(),
                             l0c: memory.l0c,
                             slopes: memory.slopes,
                             l1: memory.l1,

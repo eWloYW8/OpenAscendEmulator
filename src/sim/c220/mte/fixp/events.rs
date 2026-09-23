@@ -63,6 +63,8 @@ impl C220FixpSync for C220FixpGates {
 }
 
 pub struct C220FixpResources<'a> {
+    pub biu:
+        Option<&'a mut crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteCommands>,
     pub l0c: &'a mut C220L0c,
     pub slopes: &'a C220LocalBuffer,
     pub l1: &'a mut C220LocalBuffer,
@@ -154,6 +156,7 @@ impl C220FixpStageEvents {
                 tick,
                 resources.writer,
                 resources.reader,
+                resources.biu,
             )?),
         })
     }

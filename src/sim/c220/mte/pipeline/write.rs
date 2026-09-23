@@ -294,8 +294,8 @@ impl C220MtePipeline {
     /// downstream BIU command credit. The packet retains its captured mode.
     pub fn packetize_fixp_biu_output(
         &mut self,
-        output: &mut crate::sim::c220::mte::fixp::C220FixpNz2ndOutput,
-        writes: &mut crate::sim::c220::mte::fixp::C220FixpBiuWritePipeline,
+        output: &mut crate::sim::c220::mte::fixp::C220FixpExternalOutput,
+        writes: &mut crate::sim::c220::mte::fixp::C220FixpDispatchPipeline,
         mode: crate::sim::c220::mte::uop::C220DmaUopMode,
     ) -> Result<Option<crate::sim::c220::mte::fixp::C220FixpBiuWrite>, C220MtePipelineError> {
         if self.biu_write_commands.is_none() {
@@ -308,10 +308,10 @@ impl C220MtePipeline {
     /// instruction's retirement dependency on the final BIU response.
     pub fn send_fixp_biu_output(
         &mut self,
-        writes: &mut crate::sim::c220::mte::fixp::C220FixpBiuWritePipeline,
+        writes: &mut crate::sim::c220::mte::fixp::C220FixpDispatchPipeline,
     ) -> Result<
         crate::sim::c220::mte::fixp::C220FixpWriteProgress<
-            crate::sim::c220::mte::fixp::C220FixpBiuWrite,
+            crate::sim::c220::mte::fixp::C220FixpDispatchPacket,
         >,
         C220MtePipelineError,
     > {
@@ -319,7 +319,12 @@ impl C220MtePipeline {
             .biu_write_commands
             .as_mut()
             .ok_or(C220MtePipelineError::BiuWriteCommandDisconnected)?;
-        Ok(writes.send_external(self.events.tick(), commands)?)
+        Ok(writes.send_shared(
+            self.events.tick(),
+            &mut self.fixp_write,
+            &mut self.interface,
+            Some(commands),
+        )?)
     }
 
     pub(super) fn advance_biu_cube_source(

@@ -1,3 +1,8 @@
+mod external_queue;
+pub use external_queue::{
+    C220FixpExternalBurst, C220FixpExternalOutput, C220FixpExternalOutputError,
+    C220FixpExternalWriteBatch,
+};
 mod external_output;
 pub use external_output::C220FixpExternalOutputPolicy;
 mod atomic;
@@ -20,19 +25,23 @@ pub use format::{
 mod fp16;
 mod functional;
 pub use functional::{C220FixpFunctionalEvent, C220FixpFunctionalState};
+mod external_events;
 mod l1_output;
 mod l1_write;
 mod layout;
 mod nz2nd;
+pub use external_events::{C220FixpExternalEvent, C220FixpExternalMemory, C220FixpExternalStage};
+mod external_runtime;
+pub use external_runtime::{
+    C220FixpExternalCommandState, C220FixpExternalEngine, C220FixpExternalEngineError,
+};
 pub use nz2nd::{
-    C220FixpNz2ndBurst, C220FixpNz2ndCommandState, C220FixpNz2ndEngine, C220FixpNz2ndEngineError,
-    C220FixpNz2ndEvent, C220FixpNz2ndInstructionPlan, C220FixpNz2ndMemory, C220FixpNz2ndOutput,
-    C220FixpNz2ndOutputError, C220FixpNz2ndPlanError, C220FixpNz2ndReadError,
-    C220FixpNz2ndReadGenerator, C220FixpNz2ndStage, C220FixpNz2ndStaging,
-    C220FixpNz2ndStagingEntry, C220FixpNz2ndStagingError, C220FixpNz2ndWriteBatch,
-    C220FixpNz2ndWriteDescriptor, C220FixpNz2ndWriteError, C220FixpNz2ndWriteGenerator,
-    C220FixpNz2ndWritePlanner, C220FixpNz2ndWriteUop, C220FixpTransposeBuffer,
-    C220FixpTransposeError, C220FixpTransposeProgress, C220FixpTransposeSlot,
+    C220FixpNz2ndInstructionPlan, C220FixpNz2ndPlanError, C220FixpNz2ndReadError,
+    C220FixpNz2ndReadGenerator, C220FixpNz2ndStaging, C220FixpNz2ndStagingEntry,
+    C220FixpNz2ndStagingError, C220FixpNz2ndWriteBatch, C220FixpNz2ndWriteDescriptor,
+    C220FixpNz2ndWriteError, C220FixpNz2ndWriteGenerator, C220FixpNz2ndWritePlanner,
+    C220FixpNz2ndWriteUop, C220FixpTransposeBuffer, C220FixpTransposeError,
+    C220FixpTransposeProgress, C220FixpTransposeSlot,
 };
 mod read_pipeline;
 mod read_uop;
@@ -53,8 +62,8 @@ mod write_pipeline;
 pub use dispatch::{C220FixpDispatchPacket, C220FixpDispatchPipeline};
 
 pub use write_pipeline::{
-    C220FixpBiuWrite, C220FixpBiuWritePipeline, C220FixpWriteEntry, C220FixpWritePipeline,
-    C220FixpWritePipelineError, C220FixpWriteProgress,
+    C220FixpBiuWrite, C220FixpWriteEntry, C220FixpWritePipeline, C220FixpWritePipelineError,
+    C220FixpWriteProgress,
 };
 
 pub use read_pipeline::{

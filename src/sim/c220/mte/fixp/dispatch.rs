@@ -1,16 +1,18 @@
 use super::{
-    C220FixpL1Output, C220FixpL1WriteInterface, C220FixpWritePipeline, C220FixpWritePipelineError,
-    C220FixpWriteProgress,
+    C220FixpBiuWrite, C220FixpExternalOutput, C220FixpL1Output, C220FixpL1WriteInterface,
+    C220FixpStoreBuffer, C220FixpWritePipeline, C220FixpWritePipelineError, C220FixpWriteProgress,
 };
 use crate::sim::c220::mte::C220MteReadPayload;
 use crate::sim::c220::mte::factor::C220FactorReadPacket;
 use crate::sim::c220::mte::interface::{
     C220MteL1Interface, C220MteL1ReadOperation, C220MteL1ReadPort, C220MteOutputFragment,
 };
+use crate::sim::c220::mte::uop::C220DmaUopMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220FixpDispatchPacket {
     Write(C220MteOutputFragment),
+    External(super::C220FixpBiuWrite),
     FactorBatch {
         port: C220MteL1ReadPort,
         cursor: crate::sim::c220::mte::factor::C220FactorRequestCursor,
@@ -77,8 +79,27 @@ impl C220FixpDispatchPipeline {
         tick: u64,
         writer: &mut C220FixpL1WriteInterface,
         reader: &mut C220MteL1Interface<C220MteReadPayload>,
+        biu: Option<
+            &mut crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteCommands,
+        >,
     ) -> Result<C220FixpWriteProgress<C220FixpDispatchPacket>, C220FixpWritePipelineError> {
+        let mut biu = biu;
         self.send_with(tick, |packet| match packet {
+            C220FixpDispatchPacket::External(packet) => {
+                use crate::sim::c220::mte::interface::{
+                    biu_read::C220BiuSubcore, biu_write::command::C220BiuWriteInput,
+                };
+                let commands = biu
+                    .as_mut()
+                    .ok_or(C220FixpWritePipelineError::BiuDisconnected)?;
+                if !commands.can_push(C220BiuSubcore::Cube) {
+                    return Ok(false);
+                }
+                Ok(commands.push(
+                    tick,
+                    C220BiuWriteInput::from_fixp(packet.write, packet.mode, tick),
+                )?)
+            }
             C220FixpDispatchPacket::FactorBatch { .. } => {
                 Err(C220FixpWritePipelineError::UnexpandedBatch)
             }
@@ -97,12 +118,123 @@ impl C220FixpDispatchPipeline {
     }
 }
 
+impl C220FixpDispatchPipeline {
+    /// Enqueue the optional second channel before the primary packet, with
+    /// the same queue-ready tick. The returned receipt identifies the primary.
+    pub fn packetize_external(
+        &mut self,
+        tick: u64,
+        output: &mut C220FixpExternalOutput,
+        stores: &mut C220FixpStoreBuffer,
+        mode: C220DmaUopMode,
+    ) -> Result<Option<C220FixpBiuWrite>, C220FixpWritePipelineError> {
+        self.begin(tick, 0, "packetize")?;
+        tick.checked_add(1)
+            .ok_or(C220FixpWritePipelineError::Overflow)?;
+        let batch = output.take_writes(tick, true, stores)?;
+        if let Some(write) = batch.and_then(|batch| batch.second_channel) {
+            self.enqueue(
+                tick,
+                C220FixpDispatchPacket::External(C220FixpBiuWrite { write, mode }),
+            )?;
+        }
+        let fragment = batch.map(|batch| C220FixpBiuWrite {
+            write: batch.primary,
+            mode,
+        });
+        if let Some(fragment) = fragment {
+            self.enqueue(tick, C220FixpDispatchPacket::External(fragment))?;
+        }
+        Ok(fragment)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::isa::c220::mte::factor::{C220FactorDescriptor, C220FactorLoad, C220FactorSource};
     use crate::sim::c220::mte::factor::c220_factor_l1_requests;
     use std::num::NonZeroU32;
+
+    #[test]
+    fn external_backpressure_blocks_younger_l1_write() {
+        use crate::sim::c220::mte::interface::biu_write::command::{
+            C220BiuWriteCommands, C220BiuWriteConfig, C220BiuWriteInput,
+        };
+        let mut stores = super::super::C220FixpStoreBuffer::default();
+        let fragment = C220MteOutputFragment {
+            instruction_id: 1,
+            request_id: 1,
+            destination_address: 4096,
+            bytes: 32,
+            last_in_uop: true,
+            last_in_instruction: true,
+        };
+        let external = super::super::C220FixpBiuWrite {
+            write: stores.publish(fragment),
+            mode: crate::sim::c220::mte::uop::C220DmaUopMode::Wide512,
+        };
+        let mut commands = C220BiuWriteCommands::new(C220BiuWriteConfig {
+            outstanding: NonZeroU32::new(1).unwrap(),
+            weights: [1; 3],
+            source_bandwidth: NonZeroU32::new(32).unwrap(),
+        });
+        for _ in 0..4 {
+            assert!(
+                commands
+                    .push(
+                        0,
+                        C220BiuWriteInput::from_fixp(external.write, external.mode, 0)
+                    )
+                    .unwrap()
+            );
+        }
+        let mut queue = C220FixpDispatchPipeline::default();
+        queue
+            .enqueue(0, C220FixpDispatchPacket::External(external))
+            .unwrap();
+        queue
+            .enqueue(
+                0,
+                C220FixpDispatchPacket::Write(C220MteOutputFragment {
+                    instruction_id: 2,
+                    ..fragment
+                }),
+            )
+            .unwrap();
+        queue.generate_shared(1).unwrap();
+        queue.generate_shared(2).unwrap();
+        let mut writer = C220FixpL1WriteInterface::default();
+        let mut reader = C220MteL1Interface::default();
+        assert!(matches!(
+            queue.send_shared(2, &mut writer, &mut reader, None),
+            Err(C220FixpWritePipelineError::BiuDisconnected)
+        ));
+        assert_eq!(
+            queue
+                .send_shared(3, &mut writer, &mut reader, Some(&mut commands))
+                .unwrap(),
+            C220FixpWriteProgress::QueueFull
+        );
+        assert!(writer.is_idle());
+        assert_eq!(queue.dispatch_queue().len(), 2);
+        commands.advance(4).unwrap();
+        assert_eq!(
+            queue
+                .send_shared(4, &mut writer, &mut reader, Some(&mut commands))
+                .unwrap(),
+            C220FixpWriteProgress::Advanced(C220FixpDispatchPacket::External(external))
+        );
+        assert!(matches!(
+            queue
+                .send_shared(5, &mut writer, &mut reader, Some(&mut commands))
+                .unwrap(),
+            C220FixpWriteProgress::Advanced(C220FixpDispatchPacket::Write(_))
+        ));
+        assert!(queue.is_idle());
+        assert!(!writer.is_idle());
+        assert_eq!(stores.len(), 1);
+    }
 
     #[test]
     fn factor_batch_expansion_preserves_readiness_and_queue_credit() {
@@ -143,7 +275,9 @@ mod tests {
         let mut reader = C220MteL1Interface::default();
         let mut writer = C220FixpL1WriteInterface::default();
         for tick in 8..=9 {
-            queue.send_shared(tick, &mut writer, &mut reader).unwrap();
+            queue
+                .send_shared(tick, &mut writer, &mut reader, None)
+                .unwrap();
             let C220FixpWriteProgress::Advanced(C220FixpDispatchPacket::FactorRead {
                 operation,
                 ..
@@ -208,18 +342,24 @@ mod tests {
         queue.generate(1).unwrap();
         queue.generate(2).unwrap();
         assert_eq!(
-            queue.send_shared(2, &mut writer, &mut reader).unwrap(),
+            queue
+                .send_shared(2, &mut writer, &mut reader, None)
+                .unwrap(),
             C220FixpWriteProgress::QueueFull
         );
         assert!(writer.is_idle());
         assert_eq!(queue.dispatch_queue().len(), 2);
         assert!(reader.send_request(4, true).unwrap().sent.is_some());
         assert!(matches!(
-            queue.send_shared(4, &mut writer, &mut reader).unwrap(),
+            queue
+                .send_shared(4, &mut writer, &mut reader, None)
+                .unwrap(),
             C220FixpWriteProgress::Advanced(C220FixpDispatchPacket::FactorRead { .. })
         ));
         assert!(matches!(
-            queue.send_shared(5, &mut writer, &mut reader).unwrap(),
+            queue
+                .send_shared(5, &mut writer, &mut reader, None)
+                .unwrap(),
             C220FixpWriteProgress::Advanced(C220FixpDispatchPacket::Write(_))
         ));
         assert!(queue.is_idle());

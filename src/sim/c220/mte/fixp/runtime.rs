@@ -69,6 +69,7 @@ pub enum C220FixpEngineError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220FixpAdmission {
+    Mte3RetirementPending,
     ResourceConflict,
     ReadGenerationBusy,
     InstructionFifoFull,
@@ -407,8 +408,11 @@ impl C220FixpEngine {
         reader: &mut crate::sim::c220::mte::interface::C220MteL1Interface<
             crate::sim::c220::mte::C220MteReadPayload,
         >,
+        biu: Option<
+            &mut crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteCommands,
+        >,
     ) -> Result<C220FixpWriteProgress<C220FixpDispatchPacket>, C220FixpEngineError> {
-        let result = self.write.send_shared(tick, interface, reader)?;
+        let result = self.write.send_shared(tick, interface, reader, biu)?;
         if let C220FixpWriteProgress::Advanced(C220FixpDispatchPacket::FactorRead {
             operation, ..
         }) = result

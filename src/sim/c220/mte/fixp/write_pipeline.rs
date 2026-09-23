@@ -1,16 +1,11 @@
 use std::collections::VecDeque;
 
+use super::{C220FixpExternalOutputError, C220FixpStoreWrite};
 use super::{
     C220FixpL1Output, C220FixpL1OutputError, C220FixpL1WriteError, C220FixpL1WriteInterface,
 };
-use super::{
-    C220FixpNz2ndOutput, C220FixpNz2ndOutputError, C220FixpStoreBuffer, C220FixpStoreWrite,
-};
 use crate::sim::c220::mte::interface::C220MteOutputFragment;
-use crate::sim::c220::mte::interface::biu_read::C220BiuSubcore;
-use crate::sim::c220::mte::interface::biu_write::command::{
-    C220BiuWriteCommandError, C220BiuWriteCommands, C220BiuWriteInput,
-};
+use crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteCommandError;
 use crate::sim::c220::mte::uop::C220DmaUopMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +24,8 @@ pub enum C220FixpWriteProgress<T = C220MteOutputFragment> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220FixpWritePipelineError {
+    #[error("FIX external dispatch requires a connected BIU command interface")]
+    BiuDisconnected,
     #[error("FIX dispatch contains an empty request batch")]
     EmptyBatch,
     #[error("FIX dispatch contains a batch that has not been expanded")]
@@ -44,7 +41,7 @@ pub enum C220FixpWritePipelineError {
     #[error(transparent)]
     Interface(#[from] C220FixpL1WriteError),
     #[error(transparent)]
-    ExternalOutput(#[from] C220FixpNz2ndOutputError),
+    ExternalOutput(#[from] C220FixpExternalOutputError),
     #[error(transparent)]
     Biu(#[from] C220BiuWriteCommandError),
     #[error(transparent)]
@@ -78,8 +75,6 @@ pub struct C220FixpBiuWrite {
     pub write: C220FixpStoreWrite,
     pub mode: C220DmaUopMode,
 }
-
-pub type C220FixpBiuWritePipeline = C220FixpWritePipeline<C220FixpBiuWrite>;
 
 impl<T: Copy> C220FixpWritePipeline<T> {
     pub fn enqueue(&mut self, tick: u64, fragment: T) -> Result<(), C220FixpWritePipelineError> {
@@ -225,47 +220,6 @@ impl C220FixpWritePipeline {
         self.send_with(tick, |fragment| {
             interface.enqueue(tick, fragment)?;
             Ok(true)
-        })
-    }
-}
-
-impl C220FixpBiuWritePipeline {
-    pub fn packetize_external(
-        &mut self,
-        tick: u64,
-        output: &mut C220FixpNz2ndOutput,
-        stores: &mut C220FixpStoreBuffer,
-        mode: C220DmaUopMode,
-    ) -> Result<Option<C220FixpBiuWrite>, C220FixpWritePipelineError> {
-        self.begin(tick, 0, "packetize")?;
-        let ready_tick = tick
-            .checked_add(1)
-            .ok_or(C220FixpWritePipelineError::Overflow)?;
-        let fragment = output
-            .take_write(tick, true, stores)?
-            .map(|write| C220FixpBiuWrite { write, mode });
-        if let Some(fragment) = fragment {
-            self.packets.push_back(C220FixpWriteEntry {
-                fragment,
-                ready_tick,
-            });
-        }
-        Ok(fragment)
-    }
-
-    pub fn send_external(
-        &mut self,
-        tick: u64,
-        commands: &mut C220BiuWriteCommands,
-    ) -> Result<C220FixpWriteProgress<C220FixpBiuWrite>, C220FixpWritePipelineError> {
-        self.send_with(tick, |packet| {
-            if !commands.can_push(C220BiuSubcore::Cube) {
-                return Ok(false);
-            }
-            Ok(commands.push(
-                tick,
-                C220BiuWriteInput::from_fixp(packet.write, packet.mode, tick),
-            )?)
         })
     }
 }

@@ -15,6 +15,9 @@ pub struct C220MteL0cReadOperation {
     pub data_bytes: u32,
     pub destination_address: u64,
     pub output_bytes: u32,
+    /// Optional second-channel byte offset for ordinary external FIX output.
+    /// L1 and NZ2ND consumers do not duplicate this read's output.
+    pub second_channel_offset: Option<u64>,
     pub last_in_uop: bool,
     pub end_of_burst: bool,
 }
@@ -330,6 +333,7 @@ mod tests {
             data_bytes: 128,
             destination_address: 0,
             output_bytes: 128,
+            second_channel_offset: None,
             last_in_uop: true,
             end_of_burst: true,
             request: C220L0cReadRequest {

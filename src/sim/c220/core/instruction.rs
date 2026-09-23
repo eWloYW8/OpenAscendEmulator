@@ -11,6 +11,13 @@ use crate::sim::common::scalar::ScalarProgramStep;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220CoreInstruction {
+    FixpExternal {
+        instruction_id: u64,
+        pc: u64,
+        word: u32,
+        command: crate::sim::c220::mte::fixp::C220FixpExternalCommand,
+        admission: crate::sim::c220::mte::fixp::C220FixpAdmission,
+    },
     Factor {
         instruction_id: u64,
         pc: u64,

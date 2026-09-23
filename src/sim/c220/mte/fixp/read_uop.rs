@@ -178,6 +178,9 @@ impl Iterator for C220FixpReadGenerator {
                     .wrapping_add(u64::from(self.destination_offset))
             },
             output_bytes,
+            second_channel_offset: (split
+                && (d.columns().is_multiple_of(16) || self.column_block + 1 != self.column_blocks))
+                .then_some(u64::from(d.destination_stride().wrapping_mul(32)) & !511),
             last_in_uop: !merge
                 || singleton
                 || self.column_block % group_columns == group_columns - 1,

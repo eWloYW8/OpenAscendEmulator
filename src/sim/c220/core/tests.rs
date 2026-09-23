@@ -172,7 +172,7 @@ fn native_mte3_write_path(mode: u8) {
     core.advance_to(7).unwrap();
     assert!(core.take_mte3_dma_request().is_none());
     if mode == 2 {
-        assert!(core.take_mte3_biu_command_at(7).is_err());
+        assert!(core.take_biu_write_command_at(7).is_err());
         core.state
             .ub
             .write_states(0, &vec![MemoryByteState::Known(9); 128])
@@ -212,7 +212,7 @@ fn native_mte3_write_path(mode: u8) {
         return;
     }
     let transfer = (8..30)
-        .find_map(|tick| core.take_mte3_biu_command_at(tick).unwrap())
+        .find_map(|tick| core.take_biu_write_command_at(tick).unwrap())
         .expect("MTE3 automatically enters BIU command transport");
     let request = transfer.command.input.generated;
     let tag = transfer.command.tag;
@@ -263,7 +263,7 @@ fn native_mte3_write_path(mode: u8) {
         C220CoreStep::Stalled(_)
     ));
     let data = (command_tick + 2..60)
-        .find_map(|tick| core.take_mte3_biu_write_data_at(tick).unwrap())
+        .find_map(|tick| core.take_biu_write_data_at(tick).unwrap())
         .expect("source packets reach the shared data port");
     assert_eq!(data.source.request.tag, tag);
     assert!(core.memory().read_known_at(0x2000, 128).is_err());

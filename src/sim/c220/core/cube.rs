@@ -217,6 +217,121 @@ mod tests {
         }
     }
 
+    #[test]
+    fn external_fixp_core_waits_for_transport_before_retirement() {
+        use crate::memory::region::MemoryRegion;
+        use crate::sim::c220::core::C220CoreExternalFixpConfig;
+        use crate::sim::c220::memory::C220LocalBuffer;
+        use crate::sim::c220::mte::fixp::{
+            C220FixpAtomicConfig, C220FixpEngineConfig, C220FixpExternalStage::*,
+        };
+        use crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteConfig;
+        let mut core = matrix_core();
+        core.advance_to(300).unwrap();
+        core.memory = MappedMemory::bind(
+            SparseMemory::new(
+                vec![MemoryRegion::new(4096, vec![0; 4096]).unwrap()],
+                4096,
+                4096,
+            ),
+            &[4096],
+        )
+        .unwrap();
+        core.configure_external_fixp(
+            C220CoreExternalFixpConfig {
+                engine: C220FixpEngineConfig {
+                    instruction_fifo_depth: 1,
+                    read_bandwidth: 256,
+                    read_bank_count: 32,
+                    read_data_latency: 4,
+                    l0c_capacity: core.local_memory.l0c().buffer().capacity(),
+                },
+                main_transpose_slots: 8,
+                total_transpose_slots: 16,
+                atomics: C220FixpAtomicConfig::default(),
+            },
+            C220LocalBuffer::new(4096),
+            &[
+                GenerateRead,
+                SendRead,
+                SendL0c,
+                ReceiveL0c,
+                Convert,
+                Slice,
+                Transpose,
+                Align,
+                Packetize,
+                GenerateWrite,
+                SendWrite,
+            ],
+            C220BiuWriteConfig {
+                outstanding: NonZeroU32::new(1).unwrap(),
+                weights: [1; 3],
+                source_bandwidth: NonZeroU32::new(32).unwrap(),
+            },
+        )
+        .unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        for (register, value) in [
+            (1, 4096),
+            (2, 0),
+            (3, (8 << 32) | (8 << 16) | (16 << 4)),
+            (4, 1 << 34),
+        ] {
+            machine.set_xreg(register, value).unwrap();
+        }
+        for register in [3, 61, 64, 93, 94, 97] {
+            machine.set_spr_value(register, 0).unwrap();
+        }
+        core.local_memory
+            .l0c_mut()
+            .buffer_mut()
+            .write_known_linear(0, &2_f32.to_le_bytes().repeat(128))
+            .unwrap();
+        let pc = core.state.scalar().pc();
+        let word = (6 << 29) | (2 << 24) | (1 << 17) | (2 << 12) | (3 << 7) | (4 << 2);
+        assert!(matches!(
+            core.step_word_at(301, word).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::FixpExternal { .. },
+                ..
+            }
+        ));
+        assert_eq!(core.state.scalar().pc(), pc + 4);
+        assert!(core.pending_compute_drain().is_some());
+        let mut responses = std::collections::VecDeque::new();
+        let mut sent_bytes = 0;
+        let mut last_response = None;
+        for tick in 302..700 {
+            core.advance_to(tick).unwrap();
+            if let Some(command) = core.take_biu_write_command_at(tick).unwrap() {
+                core.receive_external_fixp_dbid_at(tick, command.command.tag)
+                    .unwrap();
+            }
+            if let Some(data) = core.take_biu_write_data_at(tick).unwrap() {
+                sent_bytes += data.source.request.bytes;
+                responses.push_back((tick + 10, data.source.request.tag));
+            }
+            if let Some((_, tag)) = responses.pop_front_if(|(ready, _)| *ready <= tick) {
+                assert!(!core.external_fixp_engine().unwrap().is_idle());
+                core.receive_external_fixp_response_at(tick, tag).unwrap();
+                assert!(!core.external_fixp_engine().unwrap().is_idle());
+                last_response = Some(tick);
+            }
+            if core.external_fixp_engine().unwrap().is_idle() {
+                assert!(tick > last_response.unwrap());
+                break;
+            }
+        }
+        assert_eq!(sent_bytes, 256);
+        assert!(core.external_fixp_engine().unwrap().is_idle());
+        assert!(core.pending_compute_drain().is_none());
+        assert_eq!(
+            core.memory.read_known_at(4096, 256).unwrap(),
+            0x4000_u16.to_le_bytes().repeat(128)
+        );
+    }
+
     fn matrix_core() -> C220Core {
         let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
         for (register, value) in [

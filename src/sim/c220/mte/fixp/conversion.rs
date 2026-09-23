@@ -162,6 +162,7 @@ mod tests {
                     data_bytes: 128,
                     destination_address: 0,
                     output_bytes: 128,
+                    second_channel_offset: None,
                     last_in_uop: true,
                     end_of_burst: true,
                     request: C220L0cReadRequest {

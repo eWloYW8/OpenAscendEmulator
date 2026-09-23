@@ -94,7 +94,7 @@ mod tests {
         ));
         assert_eq!(staging.alignment().back().unwrap().ready_tick, 84);
         assert!(staging.take_ready(79, false).unwrap().is_none());
-        let mut output = super::super::C220FixpNz2ndOutput::default();
+        let mut output = crate::sim::c220::mte::fixp::C220FixpExternalOutput::default();
         let mut stores = C220FixpStoreBuffer::default();
         let policy = crate::sim::c220::mte::fixp::C220FixpExternalOutputPolicy::new(0, 4);
         for id in 1..8 {
@@ -104,9 +104,10 @@ mod tests {
             assert_eq!(entry.operation.descriptor.bytes, 2);
             assert_eq!(entry.operation.last_in_instruction, id == 7);
             let write = output
-                .take_write(tick + 1, true, &mut stores)
+                .take_writes(tick + 1, true, &mut stores)
                 .unwrap()
-                .unwrap();
+                .unwrap()
+                .primary;
             let fragment = write.fragment;
             assert_eq!(fragment.destination_address, u64::from(id) * 4);
             assert_eq!(fragment.bytes, 2);

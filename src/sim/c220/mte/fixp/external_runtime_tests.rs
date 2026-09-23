@@ -9,10 +9,14 @@ use crate::sim::c220::mte::{
 use std::num::NonZeroU32;
 
 #[test]
-fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
-    for conversion in [0, 1, 8, 9, 10, 11, 12, 13, 21, 22, 23, 24, 25, 26] {
+fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
+    let cases = [0, 1, 8, 9, 10, 11, 12, 13, 21, 22, 23, 24, 25, 26]
+        .into_iter()
+        .map(|mode| (mode, true, false))
+        .chain([(0, false, false), (0, false, true)]);
+    for (conversion, nz2nd, split) in cases {
         let int4 = matches!(conversion, 21 | 22 | 25 | 26);
-        use C220FixpNz2ndStage::*;
+        use C220FixpExternalStage::*;
         let width = NonZeroU32::new(32).unwrap();
         let mut pipeline = C220MtePipeline::new(
             0,
@@ -38,7 +42,7 @@ fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
                 source_bandwidth: width,
             })
             .unwrap();
-        let mut engine = C220FixpNz2ndEngine::new(
+        let mut engine = C220FixpExternalEngine::new(
             C220FixpEngineConfig {
                 instruction_fifo_depth: 1,
                 read_bandwidth: 128,
@@ -75,7 +79,7 @@ fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
         }
         let mut memory = MappedMemory::bind(
             SparseMemory::new(
-                vec![MemoryRegion::new(256, vec![0; 256]).unwrap()],
+                vec![MemoryRegion::new(4096, vec![0; 4096]).unwrap()],
                 4096,
                 4096,
             ),
@@ -85,8 +89,21 @@ fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
         let operands = C220FixpExternalCommand {
             command: C220FixpCommand {
                 descriptor: C220FixpDescriptor {
-                    xt: (32 << 32) | (2 << 16) | ((if int4 { 19 } else { 17 }) << 4),
-                    xm: (1 << 43) | (conversion << 34) | 2,
+                    xt: (32 << 32)
+                        | (2 << 16)
+                        | ((if split {
+                            24
+                        } else if !nz2nd {
+                            32
+                        } else if int4 {
+                            19
+                        } else {
+                            17
+                        }) << 4),
+                    xm: (u64::from(nz2nd) << 43)
+                        | (u64::from(split) << 42)
+                        | (conversion << 34)
+                        | 2,
                     nd: 1,
                 },
                 source_format: if matches!(conversion, 8..=13 | 21 | 22) {
@@ -111,12 +128,59 @@ fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
             biu_mode_word: 0,
             output_mode_word: 0,
         };
+        use crate::isa::c220::mte::{C220DmaMovDescriptor, CAPTURED_C220_MOV_UB_TO_OUT_WORD};
+        pipeline
+            .issue_mte3_dma(
+                1,
+                crate::sim::c220::mte::mte3::C220Mte3TransferPlan {
+                    descriptor: C220DmaMovDescriptor::decode(CAPTURED_C220_MOV_UB_TO_OUT_WORD, 0)
+                        .unwrap(),
+                    source_address: 0,
+                    destination_address: 4096,
+                    bytes: 0,
+                    dma_mode_word: 0,
+                    biu_mode_word: 0,
+                },
+            )
+            .unwrap();
         assert_eq!(
-            engine.admit(0, 7, 0, 0, operands).unwrap(),
+            pipeline
+                .admit_external_fixp(&mut engine, 7, (0, 0), operands)
+                .unwrap(),
+            C220FixpAdmission::Mte3RetirementPending
+        );
+        assert!(engine.commands().is_empty());
+        for tick in 0..=4 {
+            pipeline.advance(tick).unwrap();
+        }
+        assert_eq!(pipeline.mte3_frontend().queued_commands(), 0);
+        assert!(pipeline.mte3_retirement_candidate().is_some());
+        assert!(pipeline.external_fixp_admission_blocked(operands));
+        let mut empty = operands;
+        empty.command.descriptor.xt &= !(0xffff << 16);
+        assert!(!pipeline.external_fixp_admission_blocked(empty));
+        pipeline.retire_mte3(1).unwrap();
+        assert!(!pipeline.external_fixp_admission_blocked(operands));
+        assert_eq!(
+            pipeline
+                .admit_external_fixp(&mut engine, 7, (0, 0), operands)
+                .unwrap(),
             C220FixpAdmission::Active
         );
+        let mut disabled = operands;
+        disabled.command.descriptor.nd = 0;
+        disabled.command.descriptor.xt &= !(0xffff << 16);
+        assert_eq!(
+            pipeline
+                .admit_external_fixp(&mut engine, 8, (0, 0), disabled)
+                .unwrap(),
+            C220FixpAdmission::DisabledReady
+        );
+        assert_eq!(engine.write_completion_tick(8), Some(4));
+        assert_eq!(engine.instruction_fifo().len(), 1);
+        assert_eq!(engine.retirement_fifo().len(), 2);
         pipeline
-            .bind_nz2nd_stages(&[
+            .bind_external_fixp_stages(&[
                 GenerateRead,
                 SendRead,
                 SendL0c,
@@ -131,20 +195,21 @@ fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
             ])
             .unwrap();
         assert!(matches!(
-            pipeline.advance(0),
+            pipeline.advance(4),
             Err(C220MtePipelineError::FixpContextMismatch)
         ));
         let mut dbids = VecDeque::new();
         let mut responses = VecDeque::new();
         let mut retired = None;
+        let mut disabled_retired = None;
         let mut executed = None;
         let mut sent_bytes = 0;
-        for tick in 0..512 {
+        for tick in 4..512 {
             pipeline
-                .advance_nz2nd(
+                .advance_external_fixp(
                     tick,
                     &mut engine,
-                    C220FixpNz2ndMemory {
+                    C220FixpExternalMemory {
                         l0c: &mut l0c,
                         slopes: &slopes,
                         external: &mut memory,
@@ -154,8 +219,27 @@ fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
                 )
                 .unwrap();
             for event in pipeline.last_events() {
-                if let crate::sim::c220::mte::pipeline::C220MtePipelineEvent::Nz2nd(
-                    C220FixpNz2ndEvent::Read(C220FixpEvent::ReceivedL0c {
+                if let crate::sim::c220::mte::pipeline::C220MtePipelineEvent::FixpExternal(
+                    C220FixpExternalEvent::Retired {
+                        tick,
+                        instruction_id,
+                        state,
+                    },
+                ) = event
+                {
+                    if *instruction_id == 7 {
+                        retired = Some((*tick, *state));
+                        assert!(engine.commands().contains_key(&8));
+                        assert!(engine.retire_ready_write(*tick).unwrap().is_none());
+                    } else {
+                        assert_eq!(*instruction_id, 8);
+                        assert!(state.lifecycle.executed_tick.is_none());
+                        assert!(state.lifecycle.write_dispatched_tick.is_none());
+                        disabled_retired = Some(*tick);
+                    }
+                }
+                if let crate::sim::c220::mte::pipeline::C220MtePipelineEvent::FixpExternal(
+                    C220FixpExternalEvent::Read(C220FixpEvent::ReceivedL0c {
                         functional: Some(event),
                         ..
                     }),
@@ -164,6 +248,9 @@ fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
                 {
                     assert!(executed.replace(tick).is_none());
                 }
+            }
+            if disabled_retired.is_some() {
+                break;
             }
             if let Some(command) = pipeline.take_biu_write_command().unwrap() {
                 dbids.push_back((tick + 5, command.command.tag));
@@ -180,18 +267,40 @@ fn nz2nd_engine_executes_rows_and_waits_for_external_response() {
             }
             if let Some((_, tag)) = responses.pop_front_if(|(ready, _)| *ready <= tick) {
                 let response = pipeline.receive_biu_write_response(tag).unwrap();
-                if let Some(state) = engine.retire_response(response).unwrap() {
-                    retired = Some((tick, state));
-                    break;
+                if let Some(id) = engine.complete_response(response).unwrap() {
+                    assert_eq!(engine.write_completion_tick(id), Some(tick));
+                    assert!(engine.commands().contains_key(&id));
+                    assert!(engine.retire_ready_write(tick).unwrap().is_none());
                 }
             }
         }
         let (tick, state) = retired.expect("external instruction must retire");
+        assert_eq!(disabled_retired, Some(tick + 1));
         assert_eq!(state.lifecycle.executed_tick, executed);
         assert!(executed.unwrap() < state.lifecycle.write_dispatched_tick.unwrap());
         assert!(state.lifecycle.write_dispatched_tick.unwrap() < tick);
         assert!(engine.is_idle() && pipeline.is_idle());
-        assert_eq!(pipeline.next_nz2nd_event_tick(&engine), None);
+        assert_eq!(pipeline.next_external_fixp_event_tick(&engine), None);
+        if !nz2nd {
+            let blocks = if split { 3 } else { 2 };
+            let lanes = if split { 16 } else { 32 };
+            assert_eq!(sent_bytes, blocks * lanes * 4);
+            for block in 0..blocks {
+                let address = 4096 + u64::from(block) * 1024;
+                assert_eq!(
+                    memory.read_known_at(address, lanes as usize * 4).unwrap(),
+                    1_f32.to_le_bytes().repeat(lanes as usize)
+                );
+                assert_eq!(
+                    memory
+                        .read_known_at(address + u64::from(lanes) * 4, 32)
+                        .unwrap(),
+                    [0; 32]
+                );
+            }
+            assert!(engine.staging().is_idle());
+            continue;
+        }
         if int4 {
             assert_eq!(sent_bytes, 2);
             for row in 0..2 {

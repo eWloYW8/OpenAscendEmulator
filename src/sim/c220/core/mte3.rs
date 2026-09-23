@@ -55,7 +55,7 @@ impl C220Core {
         Ok(())
     }
 
-    pub fn take_mte3_biu_command_at(
+    pub fn take_biu_write_command_at(
         &mut self,
         tick: u64,
     ) -> Result<Option<C220BiuWriteCommandTransfer>, C220CoreError> {
@@ -121,7 +121,7 @@ impl C220Core {
         Ok(())
     }
 
-    pub fn take_mte3_biu_write_data_at(
+    pub fn take_biu_write_data_at(
         &mut self,
         tick: u64,
     ) -> Result<Option<C220BiuWriteData>, C220CoreError> {

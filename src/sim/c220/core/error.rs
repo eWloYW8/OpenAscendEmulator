@@ -17,6 +17,8 @@ use crate::sim::common::scalar::ScalarInstructionError;
 
 #[derive(Debug, Error)]
 pub enum C220CoreError {
+    #[error(transparent)]
+    ExternalFixp(#[from] crate::sim::c220::mte::fixp::C220FixpExternalEngineError),
     #[error("factor loads require explicit read port and bandwidth configuration")]
     FactorUnconfigured,
     #[error(transparent)]
@@ -25,6 +27,8 @@ pub enum C220CoreError {
     FixpUnconfigured,
     #[error("FIX L0C capacity differs from the core's shared L0C")]
     FixpCapacityMismatch,
+    #[error("FIX command requires {required} request identifiers, exceeding the u32 namespace")]
+    FixpRequestCapacity { required: u64 },
     #[error(transparent)]
     FixpExecution(#[from] crate::sim::c220::mte::fixp::C220FixpExecutionError),
     #[error(transparent)]

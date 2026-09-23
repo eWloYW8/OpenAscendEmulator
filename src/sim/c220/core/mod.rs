@@ -22,8 +22,10 @@ mod advance;
 mod cube;
 mod decode;
 mod dispatch;
+mod external_fixp;
 mod factor;
 mod fixp;
+pub use external_fixp::C220CoreExternalFixpConfig;
 pub use factor::{C220FactorOutcome, C220FactorReadConfig};
 mod hflag;
 mod mte1;
@@ -107,6 +109,7 @@ pub struct C220Core {
     mte1: Mte1Engine,
     mte_pipeline: Option<C220MtePipeline>,
     fixp: Option<fixp::CoreFixp>,
+    external_fixp: Option<external_fixp::CoreExternalFixp>,
     hardware_flags: C220HardwareFlagState,
     mte3: Mte3Engine,
     cube: CubeEngine,
@@ -151,6 +154,7 @@ impl C220Core {
             mte1: Mte1Engine::default(),
             mte_pipeline: None,
             fixp: None,
+            external_fixp: None,
             hardware_flags: C220HardwareFlagState::default(),
             mte3: Mte3Engine::new(timing.mte3),
             cube: CubeEngine::new(cube_config)?,
@@ -194,6 +198,10 @@ impl C220Core {
                 .as_ref()
                 .is_some_and(|fixp| !fixp.engine.is_idle() || !fixp.bindings.is_idle())
             || self.mte2.is_busy()
+            || self
+                .external_fixp
+                .as_ref()
+                .is_some_and(|fixp| !fixp.engine.is_idle() || !fixp.bindings.is_idle())
             || !self.mte3.dma_commands.is_empty()
             || self.mte_pipeline.as_ref().is_some_and(|p| !p.is_idle())
         {
@@ -201,6 +209,7 @@ impl C220Core {
         }
         self.mte_pipeline = Some(C220MtePipeline::new(self.mte1.tick(), config));
         self.fixp = None;
+        self.external_fixp = None;
         Ok(())
     }
 
@@ -369,6 +378,14 @@ impl C220Core {
 
     fn pending_compute_drain(&self) -> Option<(u64, C220StallCause)> {
         [
+            self.external_fixp
+                .as_ref()
+                .and_then(|fixp| {
+                    self.mte_pipeline
+                        .as_ref()
+                        .and_then(|pipeline| pipeline.next_external_fixp_event_tick(&fixp.engine))
+                })
+                .map(|tick| (tick, C220StallCause::FixpDependency)),
             self.fixp
                 .as_ref()
                 .and_then(|fixp| {

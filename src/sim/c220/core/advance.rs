@@ -26,6 +26,11 @@ impl C220Core {
                         .as_ref()
                         .and_then(|pipeline| pipeline.next_fixp_event_tick(&fixp.engine))
                 }))
+                .chain(self.external_fixp.as_ref().and_then(|fixp| {
+                    self.mte_pipeline
+                        .as_ref()
+                        .and_then(|pipeline| pipeline.next_external_fixp_event_tick(&fixp.engine))
+                }))
                 .min()
                 .map_or(tick, |next| next.min(tick));
             self.mte1.commit_ready_at(
@@ -51,6 +56,19 @@ impl C220Core {
                             l0c,
                             l1,
                             slopes: &fixp.factors,
+                        },
+                        fixp.bindings.resolver(&mut self.hardware_flags),
+                    )?;
+                } else if let Some(fixp) = &mut self.external_fixp {
+                    self.hardware_flags.advance_to(event_tick)?;
+                    pipeline.advance_external_fixp(
+                        event_tick,
+                        &mut fixp.engine,
+                        crate::sim::c220::mte::fixp::C220FixpExternalMemory {
+                            l0c: self.local_memory.l0c_mut(),
+                            slopes: &fixp.factors,
+                            external: &mut self.memory,
+                            atomics: fixp.atomics,
                         },
                         fixp.bindings.resolver(&mut self.hardware_flags),
                     )?;
