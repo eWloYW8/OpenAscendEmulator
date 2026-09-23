@@ -78,7 +78,150 @@ fn configured_dma_core() -> C220Core {
 }
 
 #[test]
+fn native_memory_drives_mte2_through_bus_rob_and_ub_retirement() {
+    for (descriptor, offset) in [
+        ((128 << 16) | (1 << 4), 0),
+        ((120 << 16) | (1 << 4), 1),
+        ((1_u64 << 48) | (2 << 16) | (4 << 4), 32),
+        ((2_u64 << 48) | (1 << 32) | (2 << 16) | (4 << 4), 0),
+    ] {
+        run_native_memory_retirement(descriptor, offset);
+    }
+}
+
+fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
+    use crate::memory::sparse::MemoryByteState;
+    use crate::sim::c220::memory::timed_memory::{
+        C220MemoryCredits, C220MemoryLatency, C220MemoryRegionTiming, C220TimedMemoryConfig,
+    };
+    use crate::sim::c220::mte::interface::biu_read::write::C220BiuWriteBandwidths;
+    let mut core = configured_dma_core();
+    let word = CAPTURED_C220_MOV_OUT_TO_UB_X_WORD;
+    let operands = C220MovInstruction::decode(word).unwrap();
+    let source = 0x2000 + source_offset;
+    let machine = core.state.scalar_mut().machine_mut();
+    machine.set_xreg(operands.source_register, source).unwrap();
+    machine
+        .set_xreg(operands.descriptor_register, descriptor)
+        .unwrap();
+    let plan = decode_mte2_transfer(core.state.scalar().machine(), 0, word, 0).unwrap();
+    let width = NonZeroU32::new(128).unwrap();
+    core.connect_mte2_bus(
+        C220BiuReadConfig {
+            outstanding: NonZeroU32::new(2).unwrap(),
+            weights: [1; 3],
+            group_vector_returns: true,
+            write_bandwidths: C220BiuWriteBandwidths {
+                l1: width,
+                l0a: width,
+                l0b: width,
+                ub: width,
+            },
+        },
+        C220BiuSubcore::Vector0,
+        NonZeroU32::new(1).unwrap(),
+    )
+    .unwrap();
+    let timing = C220MemoryRegionTiming {
+        read: C220MemoryLatency {
+            minimum: 1,
+            spread: 5,
+        },
+        dbid: C220MemoryLatency::fixed(2),
+        completion: C220MemoryLatency::fixed(4),
+    };
+    let credits = C220MemoryCredits {
+        limit: 1025,
+        refill: 128,
+    };
+    core.configure_timed_memory(C220TimedMemoryConfig {
+        input_capacity: NonZeroU32::new(2).unwrap(),
+        pending_limit: NonZeroU32::new(1).unwrap(),
+        credit_period: NonZeroU64::new(4).unwrap(),
+        ddr_credits: credits,
+        l2_read_credits: credits,
+        l2_write_credits: credits,
+        ddr: timing,
+        l2: timing,
+        l2_start: 0,
+        l2_bytes: 0,
+    })
+    .unwrap();
+    let id = core.next_instruction_id();
+    let initial_ub = core.state.ub().read_states(0, 8192).unwrap();
+    core.step_word_at(0, word).unwrap();
+    core.memory.write_unknown_at(source, 1).unwrap();
+    core.memory.write_known_at(source + 1, &[5]).unwrap();
+    let mut admitted = std::collections::BTreeSet::new();
+    let mut admitted_bytes = 0;
+    assert!(core.receive_mte2_biu_at(0, [None; 2]).is_err());
+    for tick in 1..250 {
+        core.advance_to(tick).unwrap();
+        core.advance_to(tick).unwrap();
+        for admission in core
+            .mte_pipeline
+            .as_ref()
+            .unwrap()
+            .timed_memory()
+            .unwrap()
+            .read_admissions()
+        {
+            let request = admission.request;
+            assert_eq!(request.input.generated.instruction_id, id);
+            assert!(admission.tick <= tick);
+            if admitted.insert((request.input.generated.uop_index, request.byte_offset)) {
+                let request = request.input.generated.request;
+                admitted_bytes += request.bytes as usize;
+                core.memory
+                    .write_known_at(request.source_address, &vec![9; request.bytes as usize])
+                    .unwrap();
+                core.memory.write_unknown_at(source + 2, 1).unwrap();
+            }
+        }
+        assert!(core.take_mte2_biu_request().is_none());
+        if !core.mte2.is_busy() {
+            break;
+        }
+        assert_eq!(core.state.ub().read_states(0, 8192).unwrap(), initial_ub);
+    }
+    assert!(!core.mte2.is_busy());
+    assert!(core.mte_pipeline().unwrap().is_idle());
+    assert_eq!(
+        core.mte_pipeline()
+            .unwrap()
+            .biu_bus_reads()
+            .unwrap()
+            .outstanding(),
+        0
+    );
+    assert_eq!(admitted_bytes, plan.bytes);
+    for segment in plan.descriptor_segments().unwrap() {
+        let expected: Vec<_> = (0..segment.bytes)
+            .map(
+                |offset| match segment.source_hbm + u64::from(offset) - source {
+                    2 => MemoryByteState::Unknown,
+                    _ => MemoryByteState::Known(9),
+                },
+            )
+            .collect();
+        assert_eq!(
+            core.state
+                .ub()
+                .read_states(segment.destination_local, segment.bytes as usize)
+                .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn biu_tags_backpressure_dma_without_retiring_on_request_delivery() {
+    for bus_connected in [false, true] {
+        run_biu_dma(bus_connected);
+    }
+}
+
+fn run_biu_dma(bus_connected: bool) {
     let mut core = configured_dma_core();
     core.connect_mte2_biu(
         C220BiuReadConfig {
@@ -96,6 +239,13 @@ fn biu_tags_backpressure_dma_without_retiring_on_request_delivery() {
         C220BiuSubcore::Vector0,
     )
     .unwrap();
+    if bus_connected {
+        core.mte_pipeline
+            .as_mut()
+            .unwrap()
+            .connect_biu_bus_reads(NonZeroU32::new(1).unwrap())
+            .unwrap();
+    }
     let C220CoreStep::Executed {
         instruction: C220CoreInstruction::Mte2(issue),
         ..
@@ -121,8 +271,10 @@ fn biu_tags_backpressure_dma_without_retiring_on_request_delivery() {
         )
         .is_err()
     );
+    let first_tick = if bus_connected { 10 } else { 8 };
+    core.advance_to(first_tick).unwrap();
     let first = core.take_mte2_biu_request().unwrap();
-    core.advance_to(9).unwrap();
+    core.advance_to(first_tick + 1).unwrap();
     let second = core.take_mte2_biu_request().unwrap();
     core.advance_to(20).unwrap();
     assert!(core.take_mte2_biu_request().is_none());
@@ -148,7 +300,7 @@ fn biu_tags_backpressure_dma_without_retiring_on_request_delivery() {
         .collect();
     let mut outputs = Vec::new();
     let mut completed_at = None;
-    for tick in 21..160 {
+    for tick in 21..250 {
         core.advance_to(tick).unwrap();
         if let Some(request) = core.take_mte2_biu_request() {
             requests.push(request);

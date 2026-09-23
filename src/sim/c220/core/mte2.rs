@@ -15,6 +15,20 @@ use crate::sim::c220::state::C220ExecutionError;
 mod tests;
 
 impl C220Core {
+    pub fn connect_mte2_bus(
+        &mut self,
+        config: C220BiuReadConfig,
+        subcore: C220BiuSubcore,
+        outstanding: std::num::NonZeroU32,
+    ) -> Result<(), C220CoreError> {
+        self.connect_mte2_biu(config, subcore)?;
+        self.mte_pipeline
+            .as_mut()
+            .expect("configured pipeline")
+            .connect_biu_bus_reads(outstanding)?;
+        Ok(())
+    }
+
     pub fn connect_mte2_biu(
         &mut self,
         config: C220BiuReadConfig,

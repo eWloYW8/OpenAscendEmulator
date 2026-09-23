@@ -91,6 +91,9 @@ impl C220MtePipeline {
     pub fn take_biu_write_data(
         &mut self,
     ) -> Result<Option<C220BiuWriteData>, C220MtePipelineError> {
+        if self.timed_memory.is_some() {
+            return Err(C220MtePipelineError::MemoryOwnedWrite);
+        }
         if let Some(bus) = &mut self.biu_bus_writes {
             return Ok(bus.take_data(self.events.tick()));
         }

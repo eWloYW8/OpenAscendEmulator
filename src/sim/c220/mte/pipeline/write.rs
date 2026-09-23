@@ -30,6 +30,9 @@ impl C220MtePipeline {
         kind: C220BiuWriteReturnKind,
         tag: NonZeroU32,
     ) -> Result<bool, C220MtePipelineError> {
+        if self.timed_memory.is_some() {
+            return Err(C220MtePipelineError::MemoryOwnedWrite);
+        }
         Ok(self
             .biu_bus_writes
             .as_mut()
@@ -44,6 +47,19 @@ impl C220MtePipeline {
         let Some(bus) = &mut self.biu_bus_writes else {
             return Ok(());
         };
+        if let Some(memory) = &mut self.timed_memory {
+            for kind in [
+                C220BiuWriteReturnKind::Dbid,
+                C220BiuWriteReturnKind::Completion,
+            ] {
+                while let Some(tag) = memory.front(tick, kind) {
+                    if !bus.receive(tick, kind, tag)? {
+                        break;
+                    }
+                    memory.pop(kind);
+                }
+            }
+        }
         bus.advance(tick)?;
         let dbid = bus.take_return(tick, C220BiuWriteReturnKind::Dbid);
         let completion = bus.take_return(tick, C220BiuWriteReturnKind::Completion);
@@ -72,6 +88,18 @@ impl C220MtePipeline {
         if let Some(data) = self.biu_write_data.take_request(tick)? {
             bus.push_data(tick, data)?;
         }
+        if let Some(memory) = &mut self.timed_memory {
+            if memory.can_push(C220BiuWriteReturnKind::Dbid)
+                && let Some(command) = bus.take_command(tick)
+            {
+                memory.push_command(tick, command)?;
+            }
+            if memory.can_push(C220BiuWriteReturnKind::Completion)
+                && let Some(data) = bus.take_data(tick)
+            {
+                memory.push_data(tick, data)?;
+            }
+        }
         Ok(())
     }
 
@@ -79,6 +107,9 @@ impl C220MtePipeline {
         &mut self,
         config: C220BiuWriteConfig,
     ) -> Result<(), C220MtePipelineError> {
+        if self.timed_memory.is_some() {
+            return Err(C220MtePipelineError::MemoryOwnedWrite);
+        }
         self.configure_biu_write_source(self.biu_subcore, config.source_bandwidth)?;
         self.connect_mte3_biu_retirement()?;
         self.biu_write_commands = Some(C220BiuWriteCommands::new(config));
@@ -92,6 +123,9 @@ impl C220MtePipeline {
     pub fn take_biu_write_command(
         &mut self,
     ) -> Result<Option<C220BiuWriteCommandTransfer>, C220MtePipelineError> {
+        if self.timed_memory.is_some() {
+            return Err(C220MtePipelineError::MemoryOwnedWrite);
+        }
         if let Some(bus) = &mut self.biu_bus_writes {
             return Ok(bus.take_command(self.events.tick()));
         }

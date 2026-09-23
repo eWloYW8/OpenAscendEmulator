@@ -34,7 +34,9 @@ use super::mte3::frontend::{
 };
 use super::uop::{C220DmaUopError, mte2_uops};
 use crate::isa::c220::mte::set2d::{C220Set2dDestination, C220Set2dFill};
+use crate::sim::c220::memory::biu_read::{C220BiuBusReadError, C220BiuMteBusReads};
 use crate::sim::c220::memory::biu_write::{C220BiuBusWriteError, C220BiuMteBusWrites};
+use crate::sim::c220::memory::timed_memory::{C220TimedMemory, C220TimedMemoryError};
 use crate::sim::c220::memory::ub_service::{
     C220UbMteService, C220UbServiceCycle, C220UbServiceError,
 };
@@ -119,6 +121,14 @@ pub enum C220MtePipelineEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220MtePipelineError {
+    #[error("the connected memory service owns BIU read traffic")]
+    MemoryOwnedRead,
+    #[error(transparent)]
+    BiuBusRead(#[from] C220BiuBusReadError),
+    #[error(transparent)]
+    TimedMemory(#[from] C220TimedMemoryError),
+    #[error("the connected memory service owns BIU write traffic")]
+    MemoryOwnedWrite,
     #[error(transparent)]
     BiuBusWrite(#[from] C220BiuBusWriteError),
     #[error("BIU bus owns write responses; use its bounded return channels")]
@@ -199,6 +209,8 @@ enum Mte2Generator {
     L1Fill,
 }
 
+mod memory;
+mod read;
 #[cfg(test)]
 mod tests;
 mod ub;
@@ -238,12 +250,15 @@ pub struct C220MtePipeline {
     biu_returns: Option<C220BiuReadReturns>,
     biu_subcore: C220BiuSubcore,
     biu_output: Option<C220BiuReadRequest>,
+    dma_tails: Vec<u64>,
+    biu_bus_reads: Option<C220BiuMteBusReads>,
     ub_write: [C220UbWriteInterface; 2],
     ub_read: [C220UbReadInterface; 2],
     biu_write_source: [Option<C220BiuWriteSource>; 2],
     biu_write_data: C220BiuWriteDataPort,
     biu_write_commands: Option<C220BiuWriteCommands>,
     biu_bus_writes: Option<C220BiuMteBusWrites>,
+    timed_memory: Option<C220TimedMemory>,
     ub_read_valid: [EventId; 2],
     ub_memory: [C220UbMteService; 2],
     last_ub_service: Option<u64>,
@@ -315,6 +330,7 @@ impl C220MtePipeline {
             biu_write_data: C220BiuWriteDataPort::default(),
             biu_write_commands: None,
             biu_bus_writes: None,
+            timed_memory: None,
             memory: C220L1Transport::new(config.l1),
             interface: C220MteL1Interface::default(),
             write_interface: C220MteL1WriteInterface::default(),
@@ -332,6 +348,8 @@ impl C220MtePipeline {
             biu_returns: None,
             biu_subcore: C220BiuSubcore::Vector0,
             biu_output: None,
+            dma_tails: Vec::new(),
+            biu_bus_reads: None,
             ub_write: std::array::from_fn(|_| C220UbWriteInterface::default()),
             ub_memory: std::array::from_fn(|_| C220UbMteService::default()),
             last_ub_service: None,
@@ -375,9 +393,17 @@ impl C220MtePipeline {
             && self.mte3.is_idle()
             && self.dma_output.is_none()
             && self.biu_output.is_none()
+            && self
+                .biu_bus_reads
+                .as_ref()
+                .is_none_or(C220BiuMteBusReads::is_idle)
             && self.ub_write.iter().all(C220UbWriteInterface::is_idle)
             && self.ub_read.iter().all(C220UbReadInterface::is_idle)
             && self.biu_write_data.is_idle()
+            && self
+                .timed_memory
+                .as_ref()
+                .is_none_or(C220TimedMemory::is_idle)
             && self
                 .biu_bus_writes
                 .as_ref()
@@ -430,12 +456,16 @@ impl C220MtePipeline {
     /// Enables explicit DMA requests. The caller must consume every request
     /// and report destination completion; this boundary is not a BIU model.
     pub fn connect_mte2_dma(&mut self) -> Result<(), C220MtePipelineError> {
+        if self.timed_memory.is_some() {
+            return Err(C220MtePipelineError::MemoryOwnedRead);
+        }
         if !self.is_idle() {
             return Err(C220MtePipelineError::CommandBusy);
         }
         self.dma_connected = true;
         self.biu_read = None;
         self.biu_returns = None;
+        self.biu_bus_reads = None;
         Ok(())
     }
 
@@ -446,6 +476,9 @@ impl C220MtePipeline {
         config: C220BiuReadConfig,
         subcore: C220BiuSubcore,
     ) -> Result<(), C220MtePipelineError> {
+        if self.timed_memory.is_some() {
+            return Err(C220MtePipelineError::MemoryOwnedRead);
+        }
         if !self.is_idle() {
             return Err(C220MtePipelineError::CommandBusy);
         }
@@ -458,6 +491,7 @@ impl C220MtePipeline {
             config.write_bandwidths,
         )?;
         self.biu_read = Some(C220BiuReadFrontend::new(config));
+        self.biu_bus_reads = None;
         self.biu_returns = Some(returns);
         self.biu_subcore = subcore;
         self.dma_connected = true;
@@ -469,6 +503,12 @@ impl C220MtePipeline {
     }
 
     pub fn take_biu_read_request(&mut self) -> Option<C220BiuReadRequest> {
+        if self.timed_memory.is_some() {
+            return None;
+        }
+        if let Some(bus) = &mut self.biu_bus_reads {
+            return bus.take_command(self.events.tick());
+        }
         self.biu_output.take()
     }
 
@@ -480,6 +520,12 @@ impl C220MtePipeline {
         &mut self,
         heads: [Option<C220BiuReadBeat>; 2],
     ) -> Result<[bool; 2], C220MtePipelineError> {
+        if self.timed_memory.is_some() {
+            return Err(C220MtePipelineError::MemoryOwnedRead);
+        }
+        if let Some(bus) = &mut self.biu_bus_reads {
+            return Ok(bus.receive(self.events.tick(), heads)?);
+        }
         if heads.iter().flatten().any(|beat| {
             self.biu_output
                 .is_some_and(|request| request.tag == beat.tag)
@@ -752,7 +798,11 @@ impl C220MtePipeline {
         self.l1_fill_completions.clear();
         self.dma_completions.clear();
         self.trace.clear();
+        if let Some(memory) = &mut self.timed_memory {
+            memory.advance(tick)?;
+        }
         self.advance_biu_bus_returns(tick)?;
+        self.advance_biu_read_returns(tick)?;
         self.events.notify_at(self.clock, tick);
         while let Some(invocation) = self.events.next_callback() {
             match invocation.callback {
@@ -844,7 +894,9 @@ impl C220MtePipeline {
                             phase,
                             &mut self.events,
                             frontend,
-                            self.biu_output.is_none(),
+                            self.biu_bus_reads
+                                .as_ref()
+                                .map_or(self.biu_output.is_none(), C220BiuMteBusReads::can_push),
                         )?;
                         if let C220BiuReadEvent::Send(send) = outcome
                             && let Some(request) = send.sent()
@@ -853,7 +905,11 @@ impl C220MtePipeline {
                                 .as_mut()
                                 .expect("connected return path")
                                 .track(tick, request)?;
-                            self.biu_output = Some(request);
+                            if let Some(bus) = &mut self.biu_bus_reads {
+                                bus.push(tick, request)?;
+                            } else {
+                                self.biu_output = Some(request);
+                            }
                         }
                         if outcome != C220BiuReadEvent::Readiness {
                             self.trace.push(C220MtePipelineEvent::BiuRead(outcome));
@@ -1093,6 +1149,7 @@ impl C220MtePipeline {
         self.advance_biu_write_commands(tick)?;
         self.advance_biu_write_data(tick)?;
         self.advance_biu_bus_inputs(tick)?;
+        self.advance_biu_read_inputs(tick)?;
         self.last_advance = Some(tick);
         Ok(())
     }

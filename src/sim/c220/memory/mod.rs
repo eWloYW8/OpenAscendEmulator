@@ -1,7 +1,9 @@
+pub mod biu_read;
 pub mod biu_write;
 mod buffer;
 mod l0c;
 pub mod l1;
+pub mod timed_memory;
 mod ub_arbiter;
 mod ub_block;
 pub mod ub_service;

@@ -190,6 +190,17 @@ impl C220Core {
         Ok(())
     }
 
+    pub fn configure_timed_memory(
+        &mut self,
+        config: crate::sim::c220::memory::timed_memory::C220TimedMemoryConfig,
+    ) -> Result<(), C220CoreError> {
+        self.mte_pipeline
+            .as_mut()
+            .ok_or(C220CoreError::MteUnconfigured)?
+            .connect_timed_memory(config)?;
+        Ok(())
+    }
+
     pub fn pending_mte1_commands(&self) -> impl Iterator<Item = C220Mte1CommandState> + '_ {
         self.mte1.pending_commands()
     }

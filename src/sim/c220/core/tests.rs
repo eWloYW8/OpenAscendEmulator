@@ -30,12 +30,13 @@ const C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD: u32 = 0x40c2_14cc;
 
 #[test]
 fn native_mte3_waits_for_responses_and_reads_ub_at_retirement() {
-    for bus in [false, true] {
-        native_mte3_write_path(bus);
+    for mode in 0..3 {
+        native_mte3_write_path(mode);
     }
 }
 
-fn native_mte3_write_path(bus: bool) {
+fn native_mte3_write_path(mode: u8) {
+    let bus = mode != 0;
     use crate::isa::c220::mte::C220MovInstruction;
     use crate::sim::c220::memory::biu_write::C220BiuWriteReturnKind::{Completion, Dbid};
     use crate::sim::c220::memory::l1::C220L1Geometry;
@@ -109,6 +110,44 @@ fn native_mte3_write_path(bus: bool) {
     } else {
         core.connect_mte3_biu(config).unwrap();
     }
+    if mode == 2 {
+        use crate::sim::c220::memory::timed_memory::{
+            C220MemoryCredits, C220MemoryLatency, C220MemoryRegionTiming, C220TimedMemoryConfig,
+        };
+        let region = C220MemoryRegionTiming {
+            read: C220MemoryLatency::fixed(5),
+            dbid: C220MemoryLatency {
+                minimum: 2,
+                spread: 3,
+            },
+            completion: C220MemoryLatency {
+                minimum: 3,
+                spread: 4,
+            },
+        };
+        core.configure_timed_memory(C220TimedMemoryConfig {
+            input_capacity: NonZeroU32::new(2).unwrap(),
+            pending_limit: NonZeroU32::new(4).unwrap(),
+            credit_period: NonZeroU64::new(4).unwrap(),
+            ddr_credits: C220MemoryCredits {
+                limit: 257,
+                refill: 64,
+            },
+            l2_read_credits: C220MemoryCredits {
+                limit: 257,
+                refill: 64,
+            },
+            l2_write_credits: C220MemoryCredits {
+                limit: 257,
+                refill: 64,
+            },
+            ddr: region,
+            l2: region,
+            l2_start: 0,
+            l2_bytes: 0,
+        })
+        .unwrap();
+    }
     assert!(matches!(
         core.step_word_at(0, word).unwrap(),
         C220CoreStep::Executed {
@@ -132,6 +171,46 @@ fn native_mte3_write_path(bus: bool) {
     assert!(core.take_mte3_dma_request().is_none());
     core.advance_to(7).unwrap();
     assert!(core.take_mte3_dma_request().is_none());
+    if mode == 2 {
+        assert!(core.take_mte3_biu_command_at(7).is_err());
+        core.state
+            .ub
+            .write_states(0, &vec![MemoryByteState::Known(9); 128])
+            .unwrap();
+        let retired = (8..160)
+            .find(|&tick| {
+                core.advance_to(tick).unwrap();
+                !core.last_mte3_dma_outcomes().is_empty()
+            })
+            .expect("native memory service completes without externally injected responses");
+        assert_eq!(
+            core.memory().read_known_at(0x2000, 128).unwrap(),
+            vec![9; 128]
+        );
+        assert!(matches!(
+            core.step_word_at(retired + 1, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
+                .unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        assert!(core.mte_pipeline().unwrap().is_idle());
+        assert_eq!(
+            core.mte_pipeline()
+                .unwrap()
+                .biu_bus_writes()
+                .unwrap()
+                .outstanding(),
+            0
+        );
+        assert_eq!(
+            core.mte_pipeline()
+                .unwrap()
+                .timed_memory()
+                .unwrap()
+                .pending_completions(),
+            0
+        );
+        return;
+    }
     let transfer = (8..30)
         .find_map(|tick| core.take_mte3_biu_command_at(tick).unwrap())
         .expect("MTE3 automatically enters BIU command transport");
