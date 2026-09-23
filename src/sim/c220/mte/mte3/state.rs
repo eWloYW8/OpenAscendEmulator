@@ -236,18 +236,6 @@ impl C220Mte3State {
         self.mte2_reuse_flags
     }
 
-    pub(crate) fn barrier_busy(&self) -> bool {
-        self.output_buffer_busy() || self.mte2_reuse_flags.iter().any(|set| *set)
-    }
-
-    pub(crate) fn output_buffer_busy(&self) -> bool {
-        self.unsignaled_output.is_some()
-            || self.mte3_flags.iter().any(Option::is_some)
-            || self.ready_output.is_some()
-            || self.copied_output.is_some()
-            || self.mte3_completion_flags.iter().any(Option::is_some)
-    }
-
     pub(crate) const fn output_flags_set(&self) -> [bool; 4] {
         [
             self.mte3_flags[0].is_some(),

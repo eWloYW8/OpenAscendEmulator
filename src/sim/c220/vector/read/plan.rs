@@ -266,7 +266,15 @@ impl PendingVectorRead {
                 issue.control.vector_control(),
                 issue.addresses(),
                 [u64::MAX; 4],
-                issue.read_accesses_for_repeat(repeat_index)?,
+                {
+                    let mut accesses = issue.read_accesses_for_repeat(repeat_index)?;
+                    if functional {
+                        for access in &mut accesses {
+                            access.bytes = 8 * u16::from(issue.instruction.element_bytes);
+                        }
+                    }
+                    accesses
+                },
                 C220VectorReadOperation::Broadcast {
                     instruction: issue.instruction,
                     control: issue.control,

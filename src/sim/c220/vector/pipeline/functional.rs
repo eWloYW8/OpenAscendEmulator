@@ -5,7 +5,8 @@ use crate::sim::c220::vector::C220_VECTOR_TILE_BYTES;
 use crate::sim::c220::vector::ops::{
     arithmetic::C220VectorArithmeticIssue,
     axpy::C220AxpyIssue,
-    compare::{C220CompareMask, C220CompareMaskIssue, C220MoveMaskIssue},
+    broadcast::C220BroadcastIssue,
+    compare::{C220CompareMask, C220CompareMaskIssue, C220MoveMaskIssue, C220PackedCompareIssue},
     conversion::C220ConversionIssue,
     copy::C220CopyIssue,
     fused::C220FusedIssue,
@@ -14,6 +15,7 @@ use crate::sim::c220::vector::ops::{
     shift::C220ShiftIssue,
     special::C220SpecialUnaryIssue,
     ternary::C220TernaryIssue,
+    transpose::C220TransposeIssue,
 };
 use crate::sim::c220::vector::read::{C220VectorReadIssue, PendingVectorRead};
 use crate::sim::c220::vector::timing::C220VectorUopKind;
@@ -32,6 +34,9 @@ pub(super) enum FunctionalInstruction {
     MoveMask(C220MoveMaskIssue),
     Select(Box<C220SelectIssue>),
     Compare(Box<C220CompareMaskIssue>),
+    PackedCompare(Box<C220PackedCompareIssue>),
+    Transpose(Box<C220TransposeIssue>),
+    Broadcast(Box<C220BroadcastIssue>),
 }
 
 impl FunctionalInstruction {
@@ -55,6 +60,11 @@ impl FunctionalInstruction {
             C220VectorReadIssue::MoveMask(issue) => Some(Self::MoveMask(issue.clone())),
             C220VectorReadIssue::Select(issue) => Some(Self::Select(Box::new(issue.clone()))),
             C220VectorReadIssue::CompareMask(issue) => Some(Self::Compare(Box::new(issue.clone()))),
+            C220VectorReadIssue::PackedCompare(issue) => {
+                Some(Self::PackedCompare(Box::new(issue.clone())))
+            }
+            C220VectorReadIssue::Transpose(issue) => Some(Self::Transpose(Box::new(issue.clone()))),
+            C220VectorReadIssue::Broadcast(issue) => Some(Self::Broadcast(Box::new(issue.clone()))),
             _ => None,
         }
     }
@@ -73,6 +83,9 @@ impl FunctionalInstruction {
             Self::MoveMask(issue) => C220VectorReadIssue::MoveMask(issue),
             Self::Select(issue) => C220VectorReadIssue::Select(issue),
             Self::Compare(issue) => C220VectorReadIssue::CompareMask(issue),
+            Self::PackedCompare(issue) => C220VectorReadIssue::PackedCompare(issue),
+            Self::Transpose(issue) => C220VectorReadIssue::Transpose(issue),
+            Self::Broadcast(issue) => C220VectorReadIssue::Broadcast(issue),
         }
     }
 
@@ -124,7 +137,11 @@ impl FunctionalInstruction {
             Self::Fused(issue) => {
                 return (issue.iteration_masks.len(), issue.instruction.lane_count());
             }
-            Self::MoveMask(_) => return (1, 0),
+            Self::MoveMask(_) | Self::Transpose(_) => return (1, 0),
+            Self::Broadcast(issue) => return (usize::from(issue.control.repeat_count), 0),
+            Self::PackedCompare(issue) => {
+                return (issue.uop_count(), issue.instruction.width.lane_count());
+            }
             Self::Compare(issue) => (
                 issue.iteration_masks.len(),
                 issue.instruction.width.element_bytes(),
@@ -149,7 +166,12 @@ impl C220VectorPipeline {
         for repeat in 0..repeats {
             let instruction = self.functional_instructions.get_mut(&group).unwrap();
             instruction.prepare_repeat(core);
-            let (lane_group, kind) = if matches!(instruction, FunctionalInstruction::MoveMask(_)) {
+            let (lane_group, kind) = if matches!(
+                instruction,
+                FunctionalInstruction::MoveMask(_)
+                    | FunctionalInstruction::Transpose(_)
+                    | FunctionalInstruction::Broadcast(_)
+            ) {
                 (None, C220VectorUopKind::Ordinary)
             } else {
                 (

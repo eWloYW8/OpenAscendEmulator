@@ -70,9 +70,6 @@ impl C220State {
         if self.scalar.machine().architecture() != Architecture::Dav2201 {
             return Err(C220ExecutionError::UnsupportedWord { pc, word });
         }
-        if self.output.output_buffer_busy() {
-            return Err(C220ExecutionError::OutputDependencyOutstanding);
-        }
         Ok(pc)
     }
 
@@ -371,18 +368,9 @@ impl C220State {
         &self,
         word: u32,
     ) -> Result<C220TransposeIssue, C220ExecutionError> {
-        let pc = self.scalar.pc();
-        if self.scalar.is_halted() {
-            return Err(C220ExecutionError::ProgramEnded { pc });
-        }
-        if self.scalar.machine().architecture() != Architecture::Dav2201 {
-            return Err(C220ExecutionError::UnsupportedWord { pc, word });
-        }
+        let pc = self.vector_issue_pc(word)?;
         let instruction = C220TransposeInstruction::decode(word)
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
-        if self.output.output_buffer_busy() {
-            return Err(C220ExecutionError::OutputDependencyOutstanding);
-        }
         let xregs = self.scalar.machine().xregs();
         Ok(plan_c220_transpose_issue(
             pc,
@@ -397,18 +385,9 @@ impl C220State {
         &self,
         word: u32,
     ) -> Result<C220BroadcastIssue, C220ExecutionError> {
-        let pc = self.scalar.pc();
-        if self.scalar.is_halted() {
-            return Err(C220ExecutionError::ProgramEnded { pc });
-        }
-        if self.scalar.machine().architecture() != Architecture::Dav2201 {
-            return Err(C220ExecutionError::UnsupportedWord { pc, word });
-        }
+        let pc = self.vector_issue_pc(word)?;
         let instruction = C220BroadcastInstruction::decode(word)
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
-        if self.output.output_buffer_busy() {
-            return Err(C220ExecutionError::OutputDependencyOutstanding);
-        }
         let xregs = self.scalar.machine().xregs();
         Ok(plan_c220_broadcast_issue(
             pc,
@@ -424,21 +403,12 @@ impl C220State {
         &self,
         word: u32,
     ) -> Result<C220MovevStep, C220ExecutionError> {
-        let pc = self.scalar.pc();
-        if self.scalar.is_halted() {
-            return Err(C220ExecutionError::ProgramEnded { pc });
-        }
-        if self.scalar.machine().architecture() != Architecture::Dav2201 {
-            return Err(C220ExecutionError::UnsupportedWord { pc, word });
-        }
+        let pc = self.vector_issue_pc(word)?;
         let instruction = C220MovevInstruction::decode(word)
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
         let element_bytes = instruction
             .supported_element_bytes()
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
-        if self.output.output_buffer_busy() {
-            return Err(C220ExecutionError::OutputDependencyOutstanding);
-        }
         let machine = self.scalar.machine();
         let xregs = machine.xregs();
         let control = xregs[usize::from(instruction.control_register)];

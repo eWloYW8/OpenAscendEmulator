@@ -19,9 +19,6 @@ impl C220Core {
         let barrier = PipelineBarrierStep::decode(architecture, pc, word)
             .filter(|step| step.scope == PipelineBarrierScope::All)
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
-        if self.mte2.is_busy() || self.state.output.barrier_busy() {
-            return Err(C220ExecutionError::BarrierBusy { pc });
-        }
         self.state.scalar.advance_sequential();
         Ok(ScalarProgramStep {
             pc,

@@ -333,6 +333,13 @@ impl C220Core {
 
     fn pending_compute_drain(&self) -> Option<(u64, C220StallCause)> {
         [
+            self.scalar_timing
+                .pending_drain_tick()
+                .map(|tick| (tick, C220StallCause::ScalarDependency)),
+            self.mte3
+                .timing
+                .latest_retirement_tick()
+                .map(|tick| (tick, C220StallCause::Mte3Dependency)),
             self.vector
                 .pending_drain_tick()
                 .map(|tick| (tick, C220StallCause::VectorDependency)),

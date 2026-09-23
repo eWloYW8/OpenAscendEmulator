@@ -46,15 +46,12 @@ pub enum C220CompareCondition {
 pub enum C220PackedCompareOperand {
     VectorRegister(u8),
     ScalarRegister(u8),
-    ScalarMemoryRegister(u8),
 }
 
 impl C220PackedCompareOperand {
     pub const fn register(self) -> u8 {
         match self {
-            Self::VectorRegister(register)
-            | Self::ScalarRegister(register)
-            | Self::ScalarMemoryRegister(register) => register,
+            Self::VectorRegister(register) | Self::ScalarRegister(register) => register,
         }
     }
 
@@ -178,7 +175,7 @@ impl C220PackedCompareInstruction {
             0x9800_0002 if word & 0x01c0_0000 == 0x0100_0000 => (
                 C220CompareWidth::S32,
                 C220CompareCondition::Equal,
-                C220PackedCompareOperand::ScalarMemoryRegister(((word >> 7) & 0x1f) as u8),
+                C220PackedCompareOperand::ScalarRegister(((word >> 7) & 0x1f) as u8),
             ),
             _ => return None,
         };

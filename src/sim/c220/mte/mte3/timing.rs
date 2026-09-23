@@ -62,6 +62,14 @@ impl C220TimedMte3Lane {
         self.next_issue_tick
     }
 
+    pub fn latest_retirement_tick(&self) -> Option<u64> {
+        self.unsignaled
+            .iter()
+            .chain(self.completion_flags.iter().flatten())
+            .map(|ticket| ticket.retire_tick)
+            .max()
+    }
+
     pub fn completion_ready_tick(&self, flag_id: u8) -> Option<u64> {
         self.completion_flags
             .get(usize::from(flag_id))

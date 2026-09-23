@@ -14,8 +14,6 @@ pub enum C220ExecutionError {
     MissingSpr { pc: u64, index: u16 },
     #[error("MTE2 transfer byte count overflows usize")]
     TransferSizeOverflow,
-    #[error("pipeline barrier at PC {pc:#x} has outstanding modeled work")]
-    BarrierBusy { pc: u64 },
     #[error("C220 output was not produced before its flag")]
     OutputNotProduced,
     #[error("C220 output is still waiting for a flag")]

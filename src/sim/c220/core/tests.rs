@@ -404,7 +404,7 @@ fn nchw_uses_va_rows_and_two_timed_uops_for_each_element_width() {
 }
 
 #[test]
-fn transpose_reads_full_matrix_before_two_half_tile_writebacks() {
+fn transpose_reads_full_matrix_at_functional_completion() {
     for in_place in [false, true] {
         let word = 0x8240_0c00 | (3 << 17) | (4 << 12);
         let memory = SparseMemory::new(vec![MemoryRegion::unknown(256)], 512, 512);
@@ -472,23 +472,47 @@ fn transpose_reads_full_matrix_before_two_half_tile_writebacks() {
             uops.iter()
                 .all(|uop| uop.lane_group.is_none() && uop.stages.execute_ticks == 1)
         );
+        let mut releases = 0;
+        let mut timing_reads = 0;
+        for tick in 0..100 {
+            core.advance_to(tick).unwrap();
+            releases += core.last_vector_releases().len();
+            for sample in core.vector_pipeline().last_read_samples() {
+                timing_reads += 1;
+                assert_eq!(sample.accesses.len(), 16);
+                assert!(sample.lanes.is_empty());
+            }
+            assert!(core.vector_pipeline().last_functional_samples().is_empty());
+            if releases == 2 {
+                break;
+            }
+        }
+        assert_eq!(releases, 2);
+        assert_eq!(timing_reads, 1);
+        let original = if in_place { 0_u16 } else { 0xaaaa };
+        assert_eq!(
+            core.state().ub().read_known(0x400, 2).unwrap(),
+            original.to_le_bytes()
+        );
+        let updated = (256..512_u16)
+            .flat_map(u16::to_le_bytes)
+            .map(MemoryByteState::Known)
+            .collect::<Vec<_>>();
+        for (index, block) in updated.chunks_exact(32).enumerate() {
+            core.state
+                .ub_mut()
+                .write_states(source_address + (index * 32) as u64, block)
+                .unwrap();
+        }
         core.advance_to(100).unwrap();
-        assert_eq!(core.last_vector_releases().len(), 2);
-        assert_eq!(core.vector_pipeline().last_read_samples().len(), 1);
-        assert_eq!(
-            core.vector_pipeline().last_read_samples()[0]
-                .source_0_bytes
-                .len(),
-            512
-        );
-        assert_eq!(
-            core.vector_pipeline().last_read_samples()[0].accesses.len(),
-            16
-        );
+        let samples = core.vector_pipeline().last_functional_samples();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].source_0_bytes.len(), 512);
+        assert_eq!(samples[0].lanes.len(), 256);
         for row in 0..16 {
             for column in 0..16 {
                 let destination = 0x400 + (row * 16 + column) as u64 * 2;
-                let expected = (column * 16 + row) as u16;
+                let expected = (256 + column * 16 + row) as u16;
                 assert_eq!(
                     core.state().ub().read_known(destination, 2).unwrap(),
                     expected.to_le_bytes()
@@ -596,8 +620,47 @@ fn broadcast_issues_one_full_tile_uop_per_repeat() {
             core.vector_pipeline()
                 .last_read_samples()
                 .iter()
-                .all(|sample| sample.lane_group.is_none())
+                .all(|sample| sample.lane_group.is_none() && sample.lanes.is_empty())
         );
+        let samples = core.vector_pipeline().last_functional_samples();
+        assert_eq!(samples.len(), 2);
+        assert!(
+            samples
+                .iter()
+                .all(|sample| sample.accesses[0].bytes as usize == 8 * width)
+        );
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(3, (8 * width) as u64)
+            .unwrap();
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(5, (2_u64 << 56) | (8 << 32) | 1)
+            .unwrap();
+        assert!(matches!(
+            core.step_word_at(101, word).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        core.advance_to(200).unwrap();
+        let expected = 1_u32.to_le_bytes()[..width].repeat(32 / width);
+        for block in 0..8 {
+            assert_eq!(
+                core.state()
+                    .ub()
+                    .read_known((8 * width + 256 + block * 32) as u64, 32)
+                    .unwrap(),
+                expected
+            );
+        }
+        assert!(matches!(
+            core.step_word_at(201, 0x40e0_1800).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Barrier(_),
+                ..
+            }
+        ));
     }
 }
 
@@ -2034,6 +2097,14 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
     assert_eq!(ticket.retire_tick, issue_tick + 7);
     assert_eq!(ticket.uop_count, 1);
     assert!(core.memory().read_known_at(0x2000, 128).is_err());
+    assert!(matches!(
+        core.step_word_at(issue_tick + 1, 0x40e0_1800).unwrap(),
+        C220CoreStep::Stalled(C220Stall {
+            resume_tick,
+            cause: C220StallCause::Mte3Dependency,
+            ..
+        }) if resume_tick == ticket.retire_tick
+    ));
     core.state
         .scalar_mut()
         .machine_mut()
@@ -2079,7 +2150,14 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
         core.memory().read_known_at(0x2000, 128).unwrap(),
         0x4000_0000_u32.to_le_bytes().repeat(32)
     );
-    core.step_word_at(ticket.retire_tick, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
+    assert!(matches!(
+        core.step_word_at(ticket.retire_tick, 0x40e0_1800).unwrap(),
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Barrier(_),
+            ..
+        }
+    ));
+    core.step_word_at(ticket.retire_tick + 1, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
         .unwrap();
     assert_eq!(
         core.memory().read_known_at(0x2000, 128).unwrap(),

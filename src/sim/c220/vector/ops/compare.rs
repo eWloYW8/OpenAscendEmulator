@@ -321,16 +321,6 @@ pub fn plan_c220_packed_compare_issue(
         C220PackedCompareOperand::ScalarRegister(register) => {
             (0, Some(registers[usize::from(register)] as u32))
         }
-        C220PackedCompareOperand::ScalarMemoryRegister(register) => {
-            let address = registers[usize::from(register)];
-            let bytes = ub.read_known(address, 4)?;
-            (
-                0,
-                Some(u32::from_le_bytes(
-                    bytes.try_into().expect("four scalar bytes"),
-                )),
-            )
-        }
     };
     let addresses = C220VectorAddresses {
         destination: registers[usize::from(instruction.destination_register)],
@@ -350,21 +340,25 @@ pub fn plan_c220_packed_compare_issue(
         for access in issue.read_accesses_for_uop(uop_index)? {
             ub.check_range(access.address, 32)?;
         }
-        let (_, stores) = evaluate_c220_packed_compare_uop(
-            C220PackedCompareValueInputs {
-                instruction,
-                control,
-                addresses,
-                scalar_bits,
+        let packed_bytes = instruction.width.packed_bytes_per_repeat();
+        for packed_offset in 0..packed_bytes {
+            let address = addresses
+                .destination
+                .checked_add((uop_index * packed_bytes + packed_offset) as u64)
+                .ok_or(C220VectorError::AddressOverflow {
+                    base: addresses.destination,
+                    lane: packed_offset * 8,
+                })?;
+            ub.check_range(address, 1)?;
+            issue.write_targets.push(C220VectorStore {
                 repeat_index: uop_index,
-            },
-            &[0; C220_VECTOR_TILE_BYTES],
-            &[0; C220_VECTOR_TILE_BYTES],
-        )?;
-        for store in &stores {
-            ub.check_range(store.address, 1)?;
+                lane_index: packed_offset,
+                address,
+                bank: C220UbBank::from_address(address),
+                width_bytes: 1,
+                data: [0; 8],
+            });
         }
-        issue.write_targets.extend(stores);
     }
     Ok(issue)
 }
@@ -408,15 +402,15 @@ pub fn evaluate_c220_packed_compare_uop(
             base: inputs.addresses.destination,
             lane: 0,
         })?;
+    let scalar = inputs.scalar_bits.map(u32::to_le_bytes);
     for packed_offset in 0..lane_count / 8 {
         let mut packed = 0_u8;
         for bit_index in 0..8 {
             let lane = packed_offset * 8 + bit_index;
             let offset = lane * element_bytes;
-            let scalar = inputs.scalar_bits.map(u32::to_le_bytes);
             let second = scalar
                 .as_ref()
-                .map_or(&source_1_bytes[offset..], |bytes| bytes.as_slice());
+                .map_or_else(|| &source_1_bytes[offset..], |bytes| bytes.as_slice());
             let result = evaluate_compare(
                 inputs.instruction.width,
                 inputs.instruction.condition,
@@ -625,7 +619,14 @@ mod tests {
             (0x9800_110f, 8_usize, 2_usize, 0x800, vector_control),
             (0x9a00_110e, 16_usize, 2_usize, 0, scalar_control),
             (0x9a00_110f, 8_usize, 2_usize, 0, scalar_control),
-            (0x9900_110e, 8_usize, 2_usize, 0x800, scalar_control),
+            (0x9900_110e, 8_usize, 2_usize, 0, scalar_control),
+            (
+                0x9900_110e,
+                8_usize,
+                2_usize,
+                0x1234_5678_dead_beef,
+                scalar_control,
+            ),
         ] {
             registers[2] = operand;
             registers[3] = control;
@@ -634,8 +635,21 @@ mod tests {
                 ub.write_states(address, &[MemoryByteState::Known(0); 256])
                     .unwrap();
             }
+            if word == 0x9900_110e {
+                let scalar = (operand as u32).to_le_bytes();
+                let source = std::array::from_fn::<_, 256, _>(|index| {
+                    MemoryByteState::Known(scalar[index % scalar.len()])
+                });
+                for address in [0x400, 0x500] {
+                    ub.write_states(address, &source).unwrap();
+                }
+            }
             let issue =
                 plan_c220_packed_compare_issue(0x2000, word, control, &registers, &ub).unwrap();
+            if !issue.instruction.operand.is_vector() {
+                assert_eq!(issue.scalar_bits, Some(operand as u32));
+                assert_eq!(issue.addresses.source_1, 0);
+            }
             assert_eq!(issue.uop_count(), uops);
             assert_eq!(issue.write_targets.len(), bytes_per_repeat * 2);
             assert_eq!(issue.write_targets.first().unwrap().address, 0x100);
@@ -643,12 +657,7 @@ mod tests {
                 issue.write_targets.last().unwrap().address,
                 0xff + (bytes_per_repeat * 2) as u64
             );
-            assert!(
-                issue
-                    .write_targets
-                    .iter()
-                    .all(|store| store.data[0] == 0xff)
-            );
+            assert!(issue.write_targets.iter().all(|store| store.data == [0; 8]));
 
             let instruction =
                 C220CoreInstruction::Vector(C220VectorInstruction::PackedCompare(issue.clone()));
@@ -672,6 +681,38 @@ mod tests {
             assert_eq!(
                 core.ub().read_known(0x100, bytes_per_repeat * 2).unwrap(),
                 vec![0xff; bytes_per_repeat * 2]
+            );
+            let mut alias_registers = registers;
+            alias_registers[0] = 0x500;
+            let alias =
+                plan_c220_packed_compare_issue(0x2004, word, control, &alias_registers, core.ub())
+                    .unwrap();
+            let alias_uops = C220VectorInstruction::PackedCompare(alias.clone())
+                .uops()
+                .unwrap();
+            pipeline
+                .issue_at(
+                    201,
+                    &alias_uops,
+                    &alias.write_targets,
+                    Some(C220VectorReadIssue::PackedCompare(&alias)),
+                )
+                .unwrap();
+            pipeline.advance_to(400, &mut core).unwrap();
+            let overwritten_lanes =
+                bytes_per_repeat / usize::from(alias.instruction.width.element_bytes());
+            let mut expected = vec![0xff; bytes_per_repeat * 2];
+            expected[bytes_per_repeat] = !((1_u16 << overwritten_lanes) - 1) as u8;
+            assert_eq!(
+                core.ub().read_known(0x500, bytes_per_repeat * 2).unwrap(),
+                expected
+            );
+            assert_eq!(pipeline.last_functional_samples().len(), 2);
+            assert!(
+                pipeline
+                    .last_read_samples()
+                    .iter()
+                    .all(|sample| sample.lanes.is_empty())
             );
         }
     }

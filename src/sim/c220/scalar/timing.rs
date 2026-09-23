@@ -264,6 +264,10 @@ impl C220ScalarTimingLane {
             .copied()
             .flatten()
     }
+
+    pub fn pending_drain_tick(&self) -> Option<u64> {
+        self.pending_xreg_retirement.iter().flatten().copied().max()
+    }
 }
 
 impl C220ScalarTimingTicket {
