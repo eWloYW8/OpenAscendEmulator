@@ -25,6 +25,14 @@ pub struct C220FixpCommandState {
     pub write_dispatched_tick: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220FactorCommandState {
+    pub load: crate::isa::c220::mte::factor::C220FactorLoad,
+    pub admitted_tick: u64,
+    pub dispatched_tick: Option<u64>,
+    pub completed_tick: Option<u64>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum C220FixpEngineError {
     #[error("FIX write command {0} is not the instruction FIFO head")]
@@ -41,6 +49,8 @@ pub enum C220FixpEngineError {
     NotExecuted(u64),
     #[error("FIX command {0} cannot retire before its final write dispatch")]
     NotDispatched(u64),
+    #[error("factor command {0} cannot retire before transport completion")]
+    FactorIncomplete(u64),
     #[error(transparent)]
     Generator(#[from] C220FixpReadGeneratorError),
     #[error(transparent)]
@@ -76,8 +86,12 @@ pub enum C220FixpAdmission {
 pub struct C220FixpEngine {
     config: C220FixpEngineConfig,
     commands: BTreeMap<u64, C220FixpCommandState>,
+    factor_commands: BTreeMap<u64, C220FactorCommandState>,
     instruction_fifo: VecDeque<u64>,
     retirement_fifo: VecDeque<u64>,
+    command_retirement: VecDeque<u64>,
+    write_completions: BTreeMap<u64, u64>,
+    last_retirement_tick: Option<u64>,
     read: C220FixpReadPipeline,
     input: C220MteL0cReadInterface,
     functional: C220FixpFunctionalState,
@@ -98,16 +112,12 @@ impl C220FixpEngine {
         bindings: &mut C220FixpSyncBindings,
         flags: &mut C220HardwareFlagState,
     ) -> Result<C220FixpAdmission, C220FixpEngineError> {
-        if self.commands.contains_key(&id) {
+        if self.commands.contains_key(&id) || self.factor_commands.contains_key(&id) {
             return Err(C220FixpEngineError::DuplicateCommand(id));
         }
         bindings.capture_pending(id, flags);
-        if command.descriptor.is_disabled() {
-            return Ok(if bindings.disabled_blocked(tick, id, flags)? {
-                C220FixpAdmission::HardwareSync
-            } else {
-                C220FixpAdmission::DisabledReady
-            });
+        if command.descriptor.is_disabled() && bindings.disabled_blocked(tick, id, flags)? {
+            return Ok(C220FixpAdmission::HardwareSync);
         }
         self.admit(tick, id, first_request, command)
     }
@@ -119,8 +129,12 @@ impl C220FixpEngine {
         Ok(Self {
             config,
             commands: BTreeMap::new(),
+            factor_commands: BTreeMap::new(),
             instruction_fifo: VecDeque::new(),
             retirement_fifo: VecDeque::new(),
+            command_retirement: VecDeque::new(),
+            write_completions: BTreeMap::new(),
+            last_retirement_tick: None,
             read: C220FixpReadPipeline::default(),
             input: C220MteL0cReadInterface::new(config.read_bank_count, config.read_data_latency)?,
             functional: C220FixpFunctionalState::new(config.l0c_capacity),
@@ -132,6 +146,27 @@ impl C220FixpEngine {
 
     pub fn commands(&self) -> &BTreeMap<u64, C220FixpCommandState> {
         &self.commands
+    }
+    pub fn factor_commands(&self) -> &BTreeMap<u64, C220FactorCommandState> {
+        &self.factor_commands
+    }
+    pub fn command_retirement_head(&self) -> Option<u64> {
+        self.command_retirement.front().copied()
+    }
+
+    pub fn command_retirement_queue(&self) -> &VecDeque<u64> {
+        &self.command_retirement
+    }
+
+    pub fn write_completion_tick(&self, id: u64) -> Option<u64> {
+        self.write_completions.get(&id).copied()
+    }
+
+    pub fn can_retire_at(&self, tick: u64, id: u64) -> bool {
+        self.command_retirement_head() == Some(id)
+            && self
+                .last_retirement_tick
+                .is_none_or(|previous| previous < tick)
     }
     pub fn instruction_fifo(&self) -> &VecDeque<u64> {
         &self.instruction_fifo
@@ -214,6 +249,7 @@ impl C220FixpEngine {
 
     pub fn is_idle(&self) -> bool {
         self.commands.is_empty()
+            && self.factor_commands.is_empty()
             && self.read.is_idle()
             && self.input.is_idle()
             && self.conversion.entries().is_empty()
@@ -230,10 +266,22 @@ impl C220FixpEngine {
         first_request: u32,
         command: C220FixpCommand,
     ) -> Result<C220FixpAdmission, C220FixpEngineError> {
-        if self.commands.contains_key(&id) {
+        if self.commands.contains_key(&id) || self.factor_commands.contains_key(&id) {
             return Err(C220FixpEngineError::DuplicateCommand(id));
         }
         if command.descriptor.is_disabled() {
+            self.commands.insert(
+                id,
+                C220FixpCommandState {
+                    command,
+                    admitted_tick: tick,
+                    executed_tick: None,
+                    write_dispatched_tick: None,
+                },
+            );
+            self.retirement_fifo.push_back(id);
+            self.command_retirement.push_back(id);
+            self.write_completions.insert(id, tick);
             return Ok(C220FixpAdmission::DisabledReady);
         }
         if self.resource_conflict(command) {
@@ -259,6 +307,7 @@ impl C220FixpEngine {
         );
         self.instruction_fifo.push_back(id);
         self.retirement_fifo.push_back(id);
+        self.command_retirement.push_back(id);
         Ok(C220FixpAdmission::Active)
     }
 
@@ -348,7 +397,7 @@ impl C220FixpEngine {
         &mut self,
         tick: u64,
     ) -> Result<C220FixpWriteProgress<C220FixpDispatchPacket>, C220FixpEngineError> {
-        Ok(self.write.generate(tick)?)
+        Ok(self.write.generate_shared(tick)?)
     }
 
     pub fn send_write(
@@ -360,6 +409,21 @@ impl C220FixpEngine {
         >,
     ) -> Result<C220FixpWriteProgress<C220FixpDispatchPacket>, C220FixpEngineError> {
         let result = self.write.send_shared(tick, interface, reader)?;
+        if let C220FixpWriteProgress::Advanced(C220FixpDispatchPacket::FactorRead {
+            operation, ..
+        }) = result
+            && operation.last_in_instruction
+        {
+            let id = operation.instruction_id;
+            if self.instruction_fifo.front() != Some(&id) {
+                return Err(C220FixpEngineError::CommandOrder(id));
+            }
+            self.factor_commands
+                .get_mut(&id)
+                .ok_or(C220FixpEngineError::UnknownCommand(id))?
+                .dispatched_tick = Some(tick);
+            self.instruction_fifo.pop_front();
+        }
         if let C220FixpWriteProgress::Advanced(C220FixpDispatchPacket::Write(fragment)) = result
             && fragment.last_in_instruction
         {
@@ -377,38 +441,145 @@ impl C220FixpEngine {
         Ok(result)
     }
 
-    /// Adds an already-generated physical factor read to the same FIFO as
-    /// converted writes. Instruction admission and functional commit belong
-    /// to the caller; enqueue does not mark the instruction complete.
-    pub fn enqueue_factor_read(
+    /// Queues one captured factor command without materializing its requests.
+    /// Functional effects, attached flags and ordered command retirement remain
+    /// the frontend's responsibility; transport completion does not free state.
+    pub fn admit_factor_batch(
         &mut self,
         tick: u64,
         port: crate::sim::c220::mte::interface::C220MteL1ReadPort,
-        operation: crate::sim::c220::mte::interface::C220MteL1ReadOperation<
-            crate::sim::c220::mte::factor::C220FactorReadPacket,
-        >,
-    ) -> Result<(), C220FixpEngineError> {
-        Ok(self
-            .write
-            .enqueue(tick, C220FixpDispatchPacket::FactorRead { port, operation })?)
+        cursor: crate::sim::c220::mte::factor::C220FactorRequestCursor,
+    ) -> Result<C220FixpAdmission, C220FixpEngineError> {
+        let id = cursor.instruction_id();
+        if self.commands.contains_key(&id) || self.factor_commands.contains_key(&id) {
+            return Err(C220FixpEngineError::DuplicateCommand(id));
+        }
+        if cursor.remaining() == 0 {
+            self.factor_commands.insert(
+                id,
+                C220FactorCommandState {
+                    load: cursor.load(),
+                    admitted_tick: tick,
+                    dispatched_tick: None,
+                    completed_tick: Some(tick),
+                },
+            );
+            self.command_retirement.push_back(id);
+            return Ok(C220FixpAdmission::DisabledReady);
+        }
+        if !self.retirement_fifo.is_empty() {
+            return Ok(C220FixpAdmission::ResourceConflict);
+        }
+        if let Some(blocked) = self.admission_backpressure() {
+            return Ok(blocked);
+        }
+        self.write.enqueue_factor_batch(tick, port, cursor)?;
+        self.factor_commands.insert(
+            id,
+            C220FactorCommandState {
+                load: cursor.load(),
+                admitted_tick: tick,
+                dispatched_tick: None,
+                completed_tick: None,
+            },
+        );
+        self.instruction_fifo.push_back(id);
+        self.command_retirement.push_back(id);
+        Ok(C220FixpAdmission::Active)
     }
 
-    /// Only the owner of the destination acknowledgment may call this method.
-    pub fn retire(&mut self, id: u64) -> Result<C220FixpCommandState, C220FixpEngineError> {
+    pub(crate) fn complete_factor_transport(
+        &mut self,
+        tick: u64,
+        id: u64,
+    ) -> Result<(), C220FixpEngineError> {
+        let state = self
+            .factor_commands
+            .get_mut(&id)
+            .ok_or(C220FixpEngineError::UnknownCommand(id))?;
+        if state.dispatched_tick.is_none() {
+            return Err(C220FixpEngineError::NotDispatched(id));
+        }
+        state.completed_tick.get_or_insert(tick);
+        Ok(())
+    }
+
+    /// Called after the frontend has applied functional effects and satisfied
+    /// its ordered retirement and synchronization checks.
+    pub fn retire_factor(
+        &mut self,
+        tick: u64,
+        id: u64,
+    ) -> Result<C220FactorCommandState, C220FixpEngineError> {
+        let state = self
+            .factor_commands
+            .get(&id)
+            .ok_or(C220FixpEngineError::UnknownCommand(id))?;
+        if state.completed_tick.is_none() {
+            return Err(C220FixpEngineError::FactorIncomplete(id));
+        }
+        if !self.can_retire_at(tick, id) || state.completed_tick.is_some_and(|done| done >= tick) {
+            return Err(C220FixpEngineError::RetirementOrder(id));
+        }
+        self.command_retirement.pop_front();
+        self.last_retirement_tick = Some(tick);
+        Ok(self
+            .factor_commands
+            .remove(&id)
+            .expect("validated factor command"))
+    }
+
+    pub(crate) fn complete_write_transport(
+        &mut self,
+        tick: u64,
+        id: u64,
+    ) -> Result<(), C220FixpEngineError> {
         let state = self
             .commands
             .get(&id)
             .ok_or(C220FixpEngineError::UnknownCommand(id))?;
-        if state.executed_tick.is_none() {
-            return Err(C220FixpEngineError::NotExecuted(id));
-        }
         if state.write_dispatched_tick.is_none() {
             return Err(C220FixpEngineError::NotDispatched(id));
         }
-        if self.retirement_fifo.front() != Some(&id) {
+        self.write_completions.entry(id).or_insert(tick);
+        Ok(())
+    }
+
+    /// Runs the ordinary-write retirement checkpoint once per core clock.
+    /// A factor at the head is committed by the functional-memory owner.
+    pub(crate) fn retire_ready_write(&mut self, tick: u64) -> Result<(), C220FixpEngineError> {
+        let Some(id) = self.command_retirement_head() else {
+            return Ok(());
+        };
+        if self.can_retire_at(tick, id)
+            && self
+                .write_completions
+                .get(&id)
+                .is_some_and(|&done| done < tick)
+        {
+            self.retire(id)?;
+            self.write_completions.remove(&id);
+            self.last_retirement_tick = Some(tick);
+        }
+        Ok(())
+    }
+
+    fn retire(&mut self, id: u64) -> Result<C220FixpCommandState, C220FixpEngineError> {
+        let state = self
+            .commands
+            .get(&id)
+            .ok_or(C220FixpEngineError::UnknownCommand(id))?;
+        if !state.command.descriptor.is_disabled() && state.executed_tick.is_none() {
+            return Err(C220FixpEngineError::NotExecuted(id));
+        }
+        if !state.command.descriptor.is_disabled() && state.write_dispatched_tick.is_none() {
+            return Err(C220FixpEngineError::NotDispatched(id));
+        }
+        if self.retirement_fifo.front() != Some(&id) || self.command_retirement_head() != Some(id) {
             return Err(C220FixpEngineError::RetirementOrder(id));
         }
         self.retirement_fifo.pop_front();
+        self.command_retirement.pop_front();
         Ok(self.commands.remove(&id).expect("validated command"))
     }
 }

@@ -17,6 +17,10 @@ use crate::sim::common::scalar::ScalarInstructionError;
 
 #[derive(Debug, Error)]
 pub enum C220CoreError {
+    #[error("factor loads require explicit read port and bandwidth configuration")]
+    FactorUnconfigured,
+    #[error(transparent)]
+    Factor(#[from] crate::sim::c220::mte::factor::C220FactorExecutionError),
     #[error("FIX requires explicit engine, factor-buffer and clock-stage configuration")]
     FixpUnconfigured,
     #[error("FIX L0C capacity differs from the core's shared L0C")]

@@ -48,6 +48,21 @@ impl C220ScalarTimingLane {
                     Some(resume_tick.map_or(retire_tick, |prior: u64| prior.max(retire_tick)));
             }
         };
+        if let Some(instruction) =
+            crate::isa::c220::mte::factor::C220FactorLoadInstruction::decode(word)
+        {
+            include(instruction.destination_register);
+            include(instruction.source_register);
+            include(instruction.descriptor_register);
+            return resume_tick;
+        }
+        if let Some(instruction) = crate::isa::c220::mte::fixp::C220FixpInstruction::decode(word) {
+            include(instruction.destination_register);
+            include(instruction.source_register);
+            include(instruction.shape_register);
+            include(instruction.control_register);
+            return resume_tick;
+        }
         if let Some(instruction) = C220CubeInstruction::decode(word) {
             include(instruction.xd);
             include(instruction.xn);
@@ -302,6 +317,8 @@ mod tests {
             assert_eq!(lane.dependency_tick(word, 4), None);
         }
         for word in [
+            (6 << 29) | (3 << 17) | (4 << 12) | (6 << 7),
+            (6 << 29) | (3 << 24) | (3 << 17) | (4 << 12) | (5 << 7) | (6 << 2),
             0x9c80_0003 | (3 << 17) | (4 << 12) | (6 << 7) | (5 << 2),
             0x8240_0700 | (3 << 17) | (6 << 12) | (5 << 2),
         ] {

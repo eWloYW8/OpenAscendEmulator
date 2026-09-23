@@ -96,7 +96,7 @@ mod tests {
         assert!(staging.take_ready(79, false).unwrap().is_none());
         let mut output = super::super::C220FixpNz2ndOutput::default();
         let mut stores = C220FixpStoreBuffer::default();
-        let policy = super::super::C220FixpNz2ndOutputPolicy::new(0, 4);
+        let policy = crate::sim::c220::mte::fixp::C220FixpExternalOutputPolicy::new(0, 4);
         for id in 1..8 {
             let tick = 84 + u64::from(id);
             let entry = output.receive(tick, &mut staging, policy).unwrap().unwrap();

@@ -49,6 +49,9 @@ impl C220Core {
         let pc = self.state.scalar().pc();
         let decoded_word = C220DecodedWord::decode(word);
         match decoded_word.kind {
+            C220DispatchKind::Factor(instruction) => {
+                return self.step_factor_at(tick, pc, word, instruction);
+            }
             C220DispatchKind::Fixp => return self.step_fixp_at(tick, pc, word),
             C220DispatchKind::Vector => {
                 return Ok(match self.vector.step_at(tick, word, &mut self.state)? {

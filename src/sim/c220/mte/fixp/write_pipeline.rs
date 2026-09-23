@@ -29,6 +29,10 @@ pub enum C220FixpWriteProgress<T = C220MteOutputFragment> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220FixpWritePipelineError {
+    #[error("FIX dispatch contains an empty request batch")]
+    EmptyBatch,
+    #[error("FIX dispatch contains a batch that has not been expanded")]
+    UnexpandedBatch,
     #[error("FIX write time reversed from {previous} to {requested}")]
     TimeReversed { previous: u64, requested: u64 },
     #[error("FIX write {phase} callback repeated at tick {tick}")]
@@ -113,6 +117,14 @@ impl<T: Copy> C220FixpWritePipeline<T> {
         &mut self,
         tick: u64,
     ) -> Result<C220FixpWriteProgress<T>, C220FixpWritePipelineError> {
+        self.generate_with(tick, |packet| Ok((packet, None)))
+    }
+
+    pub(super) fn generate_with(
+        &mut self,
+        tick: u64,
+        expand: impl FnOnce(T) -> Result<(T, Option<T>), C220FixpWritePipelineError>,
+    ) -> Result<C220FixpWriteProgress<T>, C220FixpWritePipelineError> {
         self.begin(tick, 1, "generate")?;
         let Some(head) = self.packets.front().copied() else {
             return Ok(C220FixpWriteProgress::Idle);
@@ -128,12 +140,17 @@ impl<T: Copy> C220FixpWritePipeline<T> {
         let ready_tick = tick
             .checked_add(1)
             .ok_or(C220FixpWritePipelineError::Overflow)?;
+        let (fragment, remainder) = expand(head.fragment)?;
         self.dispatch.push_back(C220FixpWriteEntry {
-            fragment: head.fragment,
+            fragment,
             ready_tick,
         });
-        self.packets.pop_front();
-        Ok(C220FixpWriteProgress::Advanced(head.fragment))
+        if let Some(remainder) = remainder {
+            self.packets.front_mut().expect("existing batch").fragment = remainder;
+        } else {
+            self.packets.pop_front();
+        }
+        Ok(C220FixpWriteProgress::Advanced(fragment))
     }
 
     pub(super) fn send_with(

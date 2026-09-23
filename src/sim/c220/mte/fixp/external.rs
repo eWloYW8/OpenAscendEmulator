@@ -5,8 +5,9 @@ use crate::sim::c220::memory::C220LocalBuffer;
 use crate::sim::c220::mte::uop::C220DmaUopMode;
 
 use super::{
-    C220FixpCommand, C220FixpExecutionError, C220FixpNz2ndInstructionPlan,
-    C220FixpNz2ndOutputPolicy, C220FixpNz2ndPlanError, C220FixpOutputFormat, C220FixpSliceResult,
+    C220FixpCommand, C220FixpExecutionError, C220FixpExternalOutputPolicy,
+    C220FixpNz2ndInstructionPlan, C220FixpNz2ndPlanError, C220FixpOutputFormat,
+    C220FixpSliceResult,
 };
 
 /// External-destination FIX operands and independent output/BIU controls.
@@ -86,14 +87,16 @@ impl C220FixpExternalCommand {
         C220DmaUopMode::from_mode_word(self.biu_mode_word)
     }
 
-    pub fn nz2nd_output_policy(self) -> Result<C220FixpNz2ndOutputPolicy, C220FixpExecutionError> {
+    pub fn nz2nd_output_policy(
+        self,
+    ) -> Result<C220FixpExternalOutputPolicy, C220FixpExecutionError> {
         self.command.layout()?;
         let format = C220FixpOutputFormat::from_conversion_mode(
             self.command.source_format,
             self.command.descriptor.conversion_mode(),
         )
         .expect("validated format");
-        Ok(C220FixpNz2ndOutputPolicy::new(
+        Ok(C220FixpExternalOutputPolicy::new(
             self.output_mode_word,
             format.storage_bytes(self.command.descriptor.destination_stride()),
         ))

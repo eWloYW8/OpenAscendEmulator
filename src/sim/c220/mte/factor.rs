@@ -5,6 +5,28 @@ use crate::sim::c220::mte::interface::{C220MteL1OutputDestination, C220MteL1Read
 use crate::sim::c220::numeric::fp16::c220_fp16_to_fp32_bits;
 use std::num::NonZeroU32;
 
+#[derive(Debug, thiserror::Error)]
+pub enum C220FactorExecutionError {
+    #[error(transparent)]
+    Local(#[from] C220LocalBufferError),
+    #[error(transparent)]
+    Ub(#[from] crate::memory::ub::UbMemoryError),
+}
+
+pub fn execute_c220_factor_load_from_memories(
+    l1: &C220LocalBuffer,
+    ub: &crate::memory::ub::UbMemory,
+    factors: &mut C220LocalBuffer,
+    load: C220FactorLoad,
+) -> Result<C220FactorLoadResult, C220FactorExecutionError> {
+    execute_factor_blocks(factors, load, |address| match load.source {
+        crate::isa::c220::mte::factor::C220FactorSource::L1 => {
+            Ok(l1.read_initialized_linear(address, 128)?)
+        }
+        crate::isa::c220::mte::factor::C220FactorSource::Ub => Ok(ub.read_known(address, 128)?),
+    })
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct C220FactorLoadResult {
     pub blocks: u32,
@@ -22,6 +44,105 @@ pub struct C220FactorReadPacket {
     pub data_bytes: u32,
     pub instruction_tail: bool,
 }
+
+/// Constant-size cursor over all physical requests of one captured command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220FactorRequestCursor {
+    load: C220FactorLoad,
+    instruction_id: u64,
+    access_width: NonZeroU32,
+    output_bandwidth: NonZeroU32,
+    next: u64,
+}
+
+impl C220FactorRequestCursor {
+    pub const fn instruction_id(&self) -> u64 {
+        self.instruction_id
+    }
+
+    pub const fn load(&self) -> C220FactorLoad {
+        self.load
+    }
+
+    pub const fn new(
+        load: C220FactorLoad,
+        instruction_id: u64,
+        access_width: NonZeroU32,
+        output_bandwidth: NonZeroU32,
+    ) -> Self {
+        Self {
+            load,
+            instruction_id,
+            access_width,
+            output_bandwidth,
+            next: 0,
+        }
+    }
+
+    pub fn remaining(&self) -> u64 {
+        u64::from(self.load.descriptor.burst_count())
+            * u64::from(self.load.descriptor.burst_blocks())
+            * u64::from(128_u32.div_ceil(self.access_width.get()))
+            - self.next
+    }
+}
+
+impl Iterator for C220FactorRequestCursor {
+    type Item = C220MteL1ReadOperation<C220FactorReadPacket>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining() == 0 {
+            return None;
+        }
+        let fragments = u64::from(128_u32.div_ceil(self.access_width.get()));
+        let block_index = self.next / fragments;
+        let offset = (self.next % fragments) as u32 * self.access_width.get();
+        let blocks = u64::from(self.load.descriptor.burst_blocks());
+        let burst = block_index / blocks;
+        let block = block_index % blocks;
+        let data_bytes = if self.load.descriptor.convert() {
+            64
+        } else {
+            128
+        };
+        let packet = C220FactorReadPacket {
+            source_address: self
+                .load
+                .source_address
+                .wrapping_add(u64::from(
+                    (burst as u32).wrapping_mul(self.load.descriptor.source_stride()),
+                ))
+                .wrapping_add(block * 128),
+            destination_address: self
+                .load
+                .destination_address
+                .wrapping_add(burst * self.load.descriptor.destination_stride())
+                .wrapping_add(block * u64::from(data_bytes)),
+            read_bytes: 128,
+            data_bytes,
+            instruction_tail: block_index + 1
+                == u64::from(self.load.descriptor.burst_count()) * blocks,
+        };
+        let bytes = (128 - offset).min(self.access_width.get());
+        self.next += 1;
+        Some(C220MteL1ReadOperation {
+            instruction_id: self.instruction_id,
+            access: C220L1Access {
+                address: packet.source_address.wrapping_add(u64::from(offset)),
+                bytes,
+            },
+            destination: C220MteL1OutputDestination::Fb,
+            output_address: packet.destination_address,
+            output_bytes: packet.data_bytes,
+            output_bandwidth: self.output_bandwidth,
+            completes_logical_uop: offset + bytes == 128,
+            last_in_instruction: packet.instruction_tail && offset + bytes == 128,
+            payload: packet,
+        })
+    }
+}
+
+impl std::iter::FusedIterator for C220FactorRequestCursor {}
 
 /// Packet data width describes transport, not the functional write width.
 pub fn c220_factor_read_packets(
@@ -50,28 +171,8 @@ pub fn c220_factor_l1_requests(
     instruction_id: u64,
     access_width: NonZeroU32,
     output_bandwidth: NonZeroU32,
-) -> impl Iterator<Item = C220MteL1ReadOperation<C220FactorReadPacket>> {
-    c220_factor_read_packets(load).flat_map(move |packet| {
-        let width = access_width.get();
-        (0..packet.read_bytes.div_ceil(width)).map(move |index| {
-            let offset = index * width;
-            let bytes = (packet.read_bytes - offset).min(width);
-            C220MteL1ReadOperation {
-                instruction_id,
-                access: C220L1Access {
-                    address: packet.source_address.wrapping_add(u64::from(offset)),
-                    bytes,
-                },
-                destination: C220MteL1OutputDestination::Fb,
-                output_address: packet.destination_address,
-                output_bytes: packet.data_bytes,
-                output_bandwidth,
-                completes_logical_uop: offset + bytes == packet.read_bytes,
-                last_in_instruction: packet.instruction_tail,
-                payload: packet,
-            }
-        })
-    })
+) -> C220FactorRequestCursor {
+    C220FactorRequestCursor::new(load, instruction_id, access_width, output_bandwidth)
 }
 
 /// Applies functional effects using the selected source buffer. Admission,
@@ -81,9 +182,19 @@ pub fn execute_c220_factor_load(
     factors: &mut C220LocalBuffer,
     load: C220FactorLoad,
 ) -> Result<C220FactorLoadResult, C220LocalBufferError> {
+    execute_factor_blocks(factors, load, |address| {
+        source.read_initialized_linear(address, 128)
+    })
+}
+
+fn execute_factor_blocks<E: From<C220LocalBufferError>>(
+    factors: &mut C220LocalBuffer,
+    load: C220FactorLoad,
+    mut read: impl FnMut(u64) -> Result<Vec<u8>, E>,
+) -> Result<C220FactorLoadResult, E> {
     let mut result = C220FactorLoadResult::default();
     for block in load.blocks() {
-        let input = source.read_initialized_linear(block.source_address, 128)?;
+        let input = read(block.source_address)?;
         let mut converted = [0_u8; 256];
         let output = if load.descriptor.convert() {
             for (input, output) in input.chunks_exact(2).zip(converted.chunks_exact_mut(4)) {
@@ -161,10 +272,11 @@ mod tests {
                     assert_eq!(pair[1].access.address, packet.source_address + 96);
                     assert!(!pair[0].completes_logical_uop);
                     assert!(pair[1].completes_logical_uop);
+                    assert!(!pair[0].last_in_instruction);
+                    assert_eq!(pair[1].last_in_instruction, packet.instruction_tail);
                     for request in pair {
                         assert_eq!(request.output_address, packet.destination_address);
                         assert_eq!(request.output_bytes, packet.data_bytes);
-                        assert_eq!(request.last_in_instruction, packet.instruction_tail);
                     }
                 }
                 let mut factors = C220LocalBuffer::new(4096);

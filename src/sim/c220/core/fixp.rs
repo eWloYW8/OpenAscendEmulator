@@ -10,6 +10,8 @@ pub(super) struct CoreFixp {
     pub engine: C220FixpEngine,
     pub factors: C220LocalBuffer,
     pub bindings: C220FixpSyncBindings,
+    pub factor_reads: Option<super::factor::C220FactorReadConfig>,
+    pub factor_outcomes: Vec<super::factor::C220FactorOutcome>,
     next_request: u64,
 }
 
@@ -37,6 +39,8 @@ impl C220Core {
             engine,
             factors,
             bindings: C220FixpSyncBindings::default(),
+            factor_reads: None,
+            factor_outcomes: Vec::new(),
             next_request: 0,
         });
         Ok(())
@@ -80,9 +84,7 @@ impl C220Core {
         if fixp.engine.is_idle() {
             fixp.next_request = 0;
         }
-        if fixp.next_request + reservation > u64::from(u32::MAX)
-            || (command.descriptor.is_disabled() && !fixp.engine.is_idle())
-        {
+        if fixp.next_request + reservation > u64::from(u32::MAX) {
             return Ok(C220CoreStep::Stalled(C220Stall {
                 tick,
                 pc,

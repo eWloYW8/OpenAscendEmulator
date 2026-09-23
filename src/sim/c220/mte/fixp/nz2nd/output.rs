@@ -1,16 +1,10 @@
-use std::{collections::VecDeque, num::NonZeroU32};
+use std::collections::VecDeque;
+#[cfg(test)]
+use std::num::NonZeroU32;
 
-use super::super::{C220FixpStoreBuffer, C220FixpStoreWrite};
+use super::super::{C220FixpExternalOutputPolicy, C220FixpStoreBuffer, C220FixpStoreWrite};
 use super::{C220FixpNz2ndStaging, C220FixpNz2ndStagingEntry, C220FixpNz2ndStagingError};
 use crate::sim::c220::mte::interface::C220MteOutputFragment;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220FixpNz2ndOutputPolicy {
-    /// Preferred large, medium, and minimum transaction sizes.
-    pub burst_sizes: [NonZeroU32; 3],
-    pub burst_control: u64,
-    pub row_stride_bytes: u32,
-}
 
 #[cfg(test)]
 mod tests {
@@ -64,7 +58,7 @@ mod tests {
             row_bytes: 512,
             row_offset: 0,
             ready_tick: 0,
-            policy: C220FixpNz2ndOutputPolicy::new(0, 512),
+            policy: C220FixpExternalOutputPolicy::new(0, 512),
         });
         let mut writes = crate::sim::c220::mte::fixp::C220FixpBiuWritePipeline::default();
         let write = pipeline
@@ -128,7 +122,7 @@ mod tests {
         use crate::sim::c220::mte::uop::C220DmaUopMode;
 
         for control in [0, 1, 3, 5, 7] {
-            let native = C220FixpNz2ndOutputPolicy::new(control, 1024);
+            let native = C220FixpExternalOutputPolicy::new(control, 1024);
             let downstream = C220DmaUopMode::from_mode_word(control);
             for address in [0, 16, 64, 128, 256, 384, 496, 512] {
                 for bytes in [1, 16, 127, 128, 129, 256, 384, 512, 700] {
@@ -138,7 +132,7 @@ mod tests {
             }
         }
 
-        let policy = C220FixpNz2ndOutputPolicy {
+        let policy = C220FixpExternalOutputPolicy {
             burst_sizes: [512, 256, 32].map(|n| NonZeroU32::new(n).unwrap()),
             burst_control: 0,
             row_stride_bytes: 1024,
@@ -183,76 +177,11 @@ mod tests {
         assert_eq!(policy.gathered_packet(16, 8, true), Some(8));
         assert_eq!(policy.gathered_packet(0, 512, false), Some(512));
         for (control, expected) in [(0, 512), (3, 256), (5, 32), (7, 700)] {
-            let restricted = C220FixpNz2ndOutputPolicy {
+            let restricted = C220FixpExternalOutputPolicy {
                 burst_control: control,
                 ..policy
             };
             assert_eq!(restricted.row_packet(0, 700), expected);
-        }
-    }
-}
-
-impl C220FixpNz2ndOutputPolicy {
-    /// Construct the C220 packet policy from the FIX burst-control word and
-    /// the destination row stride. The control word is not the BIU mode word.
-    pub const fn new(burst_control: u64, row_stride_bytes: u32) -> Self {
-        Self {
-            burst_sizes: [
-                NonZeroU32::new(512).unwrap(),
-                NonZeroU32::new(256).unwrap(),
-                NonZeroU32::new(128).unwrap(),
-            ],
-            burst_control,
-            row_stride_bytes,
-        }
-    }
-
-    fn mode(self) -> u8 {
-        if self.burst_control & 1 == 0 {
-            0
-        } else {
-            ((self.burst_control >> 1) & 3) as u8
-        }
-    }
-
-    fn row_packet(self, address: u64, remaining: u32) -> u32 {
-        let [large, medium, small] = self.burst_sizes.map(NonZeroU32::get);
-        let offset = (address % u64::from(small)) as u32;
-        if offset != 0 {
-            return remaining.min(small - offset);
-        }
-        for (size, max_mode) in [(large, 0), (medium, 1), (small, 2)] {
-            if self.mode() <= max_mode
-                && remaining >= size
-                && address.is_multiple_of(u64::from(size))
-            {
-                return size;
-            }
-        }
-        remaining
-    }
-
-    fn gathered_packet(self, address: u64, available: u32, closed: bool) -> Option<u32> {
-        let [large, medium, small] = self.burst_sizes.map(NonZeroU32::get);
-        let offset = (address % u64::from(small)) as u32;
-        let limit = if offset != 0 {
-            (small - offset).min(512)
-        } else if closed {
-            return Some(self.row_packet(address, available));
-        } else {
-            [(large, 0), (medium, 1), (small, 2)]
-                .into_iter()
-                .find(|&(size, max_mode)| {
-                    size <= 512
-                        && self.mode() <= max_mode
-                        && address.is_multiple_of(u64::from(size))
-                })
-                .map_or(512, |(size, _)| size)
-        };
-        if closed {
-            Some(available.min(limit))
-        } else {
-            (available >= limit).then_some(limit)
         }
     }
 }
@@ -268,7 +197,7 @@ pub struct C220FixpNz2ndBurst {
     pub gather: bool,
     pub row_bytes: u32,
     pub row_offset: u32,
-    pub policy: C220FixpNz2ndOutputPolicy,
+    pub policy: C220FixpExternalOutputPolicy,
     pub ready_tick: u64,
 }
 
@@ -306,7 +235,7 @@ impl C220FixpNz2ndOutput {
         &mut self,
         tick: u64,
         staging: &mut C220FixpNz2ndStaging,
-        policy: C220FixpNz2ndOutputPolicy,
+        policy: C220FixpExternalOutputPolicy,
     ) -> Result<Option<C220FixpNz2ndStagingEntry>, C220FixpNz2ndOutputError> {
         self.observe(tick)?;
         let ready_tick = tick

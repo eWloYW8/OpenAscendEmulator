@@ -141,6 +141,80 @@ mod tests {
             0x4000_u16.to_le_bytes().repeat(128)
         );
         assert!(core.pending_compute_drain().is_none());
+        let flag = crate::isa::c220::hflag::C220HardwareFlagInstruction::decode(
+            (2 << 29) | (15 << 21) | (3 << 15) | (10 << 10) | (2 << 7),
+        )
+        .unwrap()
+        .resolve(0, &[0; 32])
+        .unwrap();
+        core.hardware_flags.enqueue_mte_flag(0, flag, 500).unwrap();
+        core.configure_factor_reads(crate::sim::c220::core::C220FactorReadConfig {
+            port: crate::sim::c220::mte::interface::C220MteL1ReadPort::Port2,
+            access_width: NonZeroU32::new(32).unwrap(),
+            output_bandwidth: NonZeroU32::new(32).unwrap(),
+        })
+        .unwrap();
+        for ub in [false, true] {
+            let tick = if ub { 701 } else { 501 };
+            let machine = core.state.scalar_mut().machine_mut();
+            machine.set_xreg(1, 0).unwrap();
+            machine.set_xreg(2, 4096).unwrap();
+            machine.set_xreg(3, (1 << 16) | (1 << 4) | 8).unwrap();
+            let word = (6 << 29) | (1 << 17) | (2 << 12) | (3 << 7) | if ub { 1 << 22 } else { 0 };
+            assert!(matches!(
+                core.step_word_at(tick, word).unwrap(),
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::Factor { .. },
+                    ..
+                }
+            ));
+            let input = 0x4200_u16.to_le_bytes().repeat(64);
+            if ub {
+                let states: Vec<_> = input
+                    .iter()
+                    .copied()
+                    .map(crate::memory::sparse::MemoryByteState::Known)
+                    .collect();
+                core.state.ub.write_states(4096, &states).unwrap();
+            } else {
+                core.local_memory
+                    .l1_mut()
+                    .write_known_linear(4096, &input)
+                    .unwrap();
+            }
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_xreg(3, 0)
+                .unwrap();
+            assert!(matches!(
+                core.step_word_at(tick + 1, word).unwrap(),
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::Factor {
+                        admission: crate::sim::c220::mte::fixp::C220FixpAdmission::DisabledReady,
+                        ..
+                    },
+                    ..
+                }
+            ));
+            assert_eq!(core.fixp_engine().unwrap().factor_commands().len(), 2);
+            assert!(core.pending_compute_drain().is_some());
+            core.advance_to(tick + 199).unwrap();
+            assert!(core.fixp_engine().unwrap().is_idle());
+            assert_eq!(core.factor_outcomes().len(), 2);
+            assert_eq!(core.hardware_flags.pending_mte_flags().count(), 1);
+            let result = core.factor_outcomes()[0];
+            let empty = core.factor_outcomes()[1];
+            assert_eq!(empty.completed_tick, tick + 1);
+            assert_eq!(empty.retired_tick, result.retired_tick + 1);
+            assert_eq!(empty.result.blocks, 0);
+            assert!(result.retired_tick > result.completed_tick);
+            assert_eq!(result.result.output_bytes, 256);
+            assert_eq!(
+                core.fixp_factors().unwrap().read_known(0, 256).unwrap(),
+                3_f32.to_le_bytes().repeat(64)
+            );
+        }
     }
 
     fn matrix_core() -> C220Core {

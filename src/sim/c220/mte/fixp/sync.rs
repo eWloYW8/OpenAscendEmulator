@@ -251,6 +251,9 @@ mod tests {
             C220FixpAdmission::DisabledReady
         );
         assert_eq!(flags.count(2, C220MatrixMemory::L0c, 0), 0);
+        assert!(!engine.is_idle());
+        assert!(engine.instruction_fifo().is_empty());
+        engine.retire_ready_write(2).unwrap();
         assert!(engine.is_idle());
 
         for _ in 0..32 {
@@ -275,6 +278,8 @@ mod tests {
             C220FixpAdmission::DisabledReady
         );
         assert_eq!(flags.count(2, C220MatrixMemory::L0c, 1), 0);
+        assert!(!engine.is_idle());
+        engine.retire_ready_write(3).unwrap();
         assert!(engine.is_idle());
     }
 

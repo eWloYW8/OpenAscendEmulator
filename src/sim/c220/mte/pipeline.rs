@@ -1013,6 +1013,9 @@ impl C220MtePipeline {
         self.l1_fill_completions.clear();
         self.dma_completions.clear();
         self.trace.clear();
+        if let Some((engine, _, _)) = fixp.as_mut() {
+            engine.retire_ready_write(tick)?;
+        }
         if let Some(memory) = &mut self.timed_memory {
             memory.advance(tick)?;
         }
@@ -1065,7 +1068,7 @@ impl C220MtePipeline {
                     {
                         self.fixp_completions.push(entry.fragment.instruction_id);
                         if let Some((engine, _, _)) = fixp.as_mut() {
-                            engine.retire(entry.fragment.instruction_id)?;
+                            engine.complete_write_transport(tick, entry.fragment.instruction_id)?;
                         }
                     }
                     if outcome != C220FixpL1WriteEvent::Readiness {
@@ -1420,6 +1423,12 @@ impl C220MtePipeline {
                                     self.completions.push(output.fragment.instruction_id)
                                 }
                                 C220MteReadPayload::Factor(_) => {
+                                    if let Some((engine, _, _)) = fixp.as_mut() {
+                                        engine.complete_factor_transport(
+                                            tick,
+                                            output.fragment.instruction_id,
+                                        )?;
+                                    }
                                     self.fixp_completions.push(output.fragment.instruction_id)
                                 }
                             }

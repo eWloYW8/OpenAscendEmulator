@@ -60,12 +60,33 @@ fn factor_reads_share_l1_and_complete_on_fix_lane() {
     let mut l0c = C220L0c::new(131072, 12).unwrap();
     let mut l1 = C220LocalBuffer::new(4096);
     let factors = C220LocalBuffer::new(4096);
-    for request in c220_factor_l1_requests(load, 91, width, width) {
+    assert_eq!(
         engine
-            .enqueue_factor_read(0, C220MteL1ReadPort::Port2, request)
-            .unwrap();
-    }
+            .admit_factor_batch(
+                0,
+                C220MteL1ReadPort::Port2,
+                c220_factor_l1_requests(load, 91, width, width),
+            )
+            .unwrap(),
+        crate::sim::c220::mte::fixp::C220FixpAdmission::Active
+    );
     assert_eq!(pipeline.next_event_tick(), None);
+    assert_eq!(engine.instruction_fifo().front(), Some(&91));
+    assert_eq!(
+        engine
+            .admit_factor_batch(
+                0,
+                C220MteL1ReadPort::Port2,
+                c220_factor_l1_requests(load, 92, width, width)
+            )
+            .unwrap(),
+        crate::sim::c220::mte::fixp::C220FixpAdmission::InstructionFifoFull,
+    );
+    assert_eq!(engine.factor_commands().len(), 1);
+    assert!(matches!(
+        engine.retire_factor(0, 91),
+        Err(crate::sim::c220::mte::fixp::C220FixpEngineError::FactorIncomplete(91))
+    ));
     assert_eq!(pipeline.next_fixp_event_tick(&engine), Some(1));
     assert!(pipeline.fixp_completions().is_empty());
     let mut completions = Vec::new();
@@ -87,6 +108,10 @@ fn factor_reads_share_l1_and_complete_on_fix_lane() {
     }
     assert_eq!(completions, [91]);
     assert!(pipeline.is_idle());
+    assert!(!engine.is_idle());
+    assert!(engine.instruction_fifo().is_empty());
+    let state = engine.retire_factor(100, 91).unwrap();
+    assert!(state.dispatched_tick.unwrap() < state.completed_tick.unwrap());
     assert!(engine.is_idle());
 }
 
@@ -371,6 +396,7 @@ fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
         .unwrap();
     let mut executed = None;
     let mut retired = None;
+    let mut completed = None;
     let mut fifo_full = false;
     let mut released_before_response = false;
     let mut changed_activation = command;
@@ -408,7 +434,6 @@ fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
             assert!(dispatched <= tick);
             assert!(engine.instruction_fifo().is_empty());
             assert_eq!(engine.admission_backpressure(), None);
-            assert!(pipeline.fixp_completions().is_empty());
             assert_eq!(engine.retirement_fifo().front(), Some(&71));
             for changed in [changed_activation, changed_saturation] {
                 assert_eq!(
@@ -416,12 +441,16 @@ fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
                     C220FixpAdmission::ResourceConflict
                 );
             }
-            released_before_response = true;
+            released_before_response |= pipeline.fixp_completions().is_empty();
         }
         for &id in pipeline.fixp_completions() {
             assert_eq!(id, 71);
-            assert!(!engine.commands().contains_key(&id));
+            assert!(engine.commands().contains_key(&id));
             assert!(executed.unwrap() < tick);
+            completed = Some(tick);
+        }
+        if retired.is_none() && !engine.commands().contains_key(&71) {
+            assert!(completed.unwrap() < tick);
             retired = Some(tick);
         }
         if pipeline.last_events().iter().any(|event| matches!(event,

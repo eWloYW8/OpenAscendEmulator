@@ -7,6 +7,9 @@ impl C220Core {
         self.mte2.begin_advance();
         self.mte3.begin_advance();
         self.vector.begin_advance();
+        if let Some(fixp) = &mut self.fixp {
+            fixp.factor_outcomes.clear();
+        }
         loop {
             let event_tick = self
                 .cube
@@ -30,6 +33,7 @@ impl C220Core {
                 &mut self.local_memory,
                 &mut self.hardware_flags,
             )?;
+            self.retire_factor_at(event_tick)?;
             self.mte2.commit_ready_at(
                 event_tick,
                 &mut self.local_memory,
