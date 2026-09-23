@@ -36,6 +36,8 @@ pub enum C220FixpConversionReceive {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220FixpConversionError {
+    #[error(transparent)]
+    Sync(#[from] crate::sim::c220::sync::C220HardwareFlagTimingError),
     #[error("FIXP conversion time reversed from {previous} to {requested}")]
     TimeReversed { previous: u64, requested: u64 },
     #[error("FIXP conversion slice callback already ran at tick {0}")]
@@ -66,7 +68,7 @@ impl C220FixpConversionPipeline {
     ) -> Result<C220FixpConversionReceive, C220FixpConversionError> {
         self.check_time(tick)?;
         let mut result = C220FixpConversionReceive::AwaitingRead;
-        input.deliver_with(tick, |acknowledgment| {
+        input.deliver_with::<C220FixpConversionError>(tick, |acknowledgment| {
             let conversion_ticks =
                 c220_fixp_conversion_ticks(acknowledgment.operation.conversion_mode);
             if self.entries.len() > conversion_ticks as usize {
@@ -78,13 +80,14 @@ impl C220FixpConversionPipeline {
             }
             let ready_tick = tick
                 .checked_add(u64::from(conversion_ticks))
-                .ok_or(C220L0cError::TimeOverflow)?;
+                .ok_or(C220L0cError::TimeOverflow)
+                .map_err(C220MteL0cReadError::from)?;
             if acknowledgment.operation.last_in_instruction
                 && sync.blocked(C220FixpSyncRequest {
                     tick,
                     instruction_id: acknowledgment.operation.instruction_id,
                     point: C220FixpSyncPoint::ConversionSet,
-                })
+                })?
             {
                 result = C220FixpConversionReceive::HardwareSync {
                     retry_tick: ready_tick,

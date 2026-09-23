@@ -258,7 +258,7 @@ impl C220MteL0cReadInterface {
         tick: u64,
         downstream_ready: bool,
     ) -> Result<Option<C220MteL0cReadAcknowledgment>, C220MteL0cReadError> {
-        self.deliver_with(tick, |_| {
+        self.deliver_with::<C220MteL0cReadError>(tick, |_| {
             Ok(if downstream_ready {
                 C220MteL0cReadDelivery::Accept
             } else {
@@ -269,13 +269,11 @@ impl C220MteL0cReadInterface {
 
     /// Invoke the receiver only for a ready head. Deferred retries retain
     /// their queue credit until the receiver accepts them.
-    pub fn deliver_with(
+    pub fn deliver_with<E: From<C220MteL0cReadError>>(
         &mut self,
         tick: u64,
-        receiver: impl FnOnce(
-            &C220MteL0cReadAcknowledgment,
-        ) -> Result<C220MteL0cReadDelivery, C220MteL0cReadError>,
-    ) -> Result<Option<C220MteL0cReadAcknowledgment>, C220MteL0cReadError> {
+        receiver: impl FnOnce(&C220MteL0cReadAcknowledgment) -> Result<C220MteL0cReadDelivery, E>,
+    ) -> Result<Option<C220MteL0cReadAcknowledgment>, E> {
         self.begin_callback(tick, 2, "deliver")?;
         let Some(head) = self.acknowledgments.front_mut() else {
             return Ok(None);
@@ -433,7 +431,9 @@ mod tests {
         interface.receive(1, &mut memory).unwrap();
         assert_eq!(
             interface
-                .deliver_with(2, |_| Ok(C220MteL0cReadDelivery::DeferUntil(6)))
+                .deliver_with::<C220MteL0cReadError>(2, |_| Ok(C220MteL0cReadDelivery::DeferUntil(
+                    6
+                )))
                 .unwrap(),
             None
         );
@@ -445,7 +445,9 @@ mod tests {
         );
         assert_eq!(
             interface
-                .deliver_with(5, |_| panic!("receiver called before retry deadline"))
+                .deliver_with::<C220MteL0cReadError>(5, |_| panic!(
+                    "receiver called before retry deadline"
+                ))
                 .unwrap(),
             None
         );

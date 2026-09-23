@@ -39,8 +39,9 @@ impl C220Core {
                             C220MatrixMemory::L0a
                             | C220MatrixMemory::L0b
                             | C220MatrixMemory::BiasTable,
-                        ) => {
-                            self.hardware_flags.enqueue_mte_set(
+                        )
+                        | (C220HardwareFlagSourcePipe::Fix, C220MatrixMemory::L0c) => {
+                            self.hardware_flags.enqueue_mte_flag(
                                 self.next_instruction_id,
                                 step,
                                 tick,
@@ -92,6 +93,15 @@ impl C220Core {
                         }));
                     }
                     self.hardware_flags.consume_wait(step)?;
+                } else if instruction.source_pipe == C220HardwareFlagSourcePipe::Fix {
+                    if instruction.memory != C220MatrixMemory::L0c {
+                        return Err(C220CoreError::UnsupportedHardwareFlagCheckpoint {
+                            source_pipe: instruction.source_pipe,
+                            memory: instruction.memory,
+                        });
+                    }
+                    self.hardware_flags
+                        .enqueue_mte_flag(self.next_instruction_id, step, tick)?;
                 } else {
                     self.hardware_flags
                         .enqueue_cube_wait(self.next_instruction_id, step)?;

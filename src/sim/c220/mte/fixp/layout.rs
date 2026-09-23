@@ -1,3 +1,4 @@
+use super::{C220FixpOutputFormat, C220FixpSourceFormat};
 use crate::isa::c220::mte::fixp::C220FixpDescriptor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,6 +9,7 @@ pub struct C220FixpSlice {
     pub source_address: u64,
     pub destination_address: u64,
     pub lanes: u8,
+    pub output_format: C220FixpOutputFormat,
 }
 
 impl C220FixpSlice {
@@ -15,7 +17,7 @@ impl C220FixpSlice {
         self.lanes as u32 * 4
     }
     pub const fn destination_bytes(self) -> u32 {
-        self.lanes as u32 * 2
+        self.lanes as u32 * self.output_format.lane_bytes()
     }
 
     /// PReLU reads a full 16-lane slope block, including for a partial ND tail.
@@ -26,39 +28,56 @@ impl C220FixpSlice {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum C220FixpLayoutError {
-    #[error("FIX FP16 layout requires conversion mode 1, got {0}")]
-    ConversionMode(u8),
+    #[error("unsupported FIX conversion mode {mode} for {source_format:?} source")]
+    ConversionMode {
+        source_format: C220FixpSourceFormat,
+        mode: u8,
+    },
 }
 
-/// Lazy coordinate generation for FP32-to-FP16 FIX, independent of transport.
+/// Lazy coordinate generation for 32-bit-source FIX, independent of transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220FixpFp16Layout {
+pub struct C220FixpLayout {
     descriptor: C220FixpDescriptor,
     source: u64,
     destination: u64,
+    format: C220FixpOutputFormat,
 }
 
-impl C220FixpFp16Layout {
+impl C220FixpLayout {
     pub fn new(
         descriptor: C220FixpDescriptor,
+        source_format: C220FixpSourceFormat,
         source: u64,
         destination: u64,
     ) -> Result<Self, C220FixpLayoutError> {
-        if descriptor.conversion_mode() != 1 {
-            return Err(C220FixpLayoutError::ConversionMode(
-                descriptor.conversion_mode(),
-            ));
-        }
+        let format =
+            C220FixpOutputFormat::from_conversion_mode(source_format, descriptor.conversion_mode())
+                .ok_or(C220FixpLayoutError::ConversionMode {
+                    source_format,
+                    mode: descriptor.conversion_mode(),
+                })?;
         Ok(Self {
             descriptor,
             source,
             destination,
+            format,
         })
     }
 
     pub fn slices(self) -> impl Iterator<Item = C220FixpSlice> + Clone {
         let d = self.descriptor;
-        let blocks = u32::from(d.columns()).div_ceil(16);
+        let lane_bytes = self.format.lane_bytes();
+        let split = matches!(
+            self.format,
+            C220FixpOutputFormat::Fp32 | C220FixpOutputFormat::Int32
+        ) && d.channel_split()
+            && !d.nz_to_nd();
+        let blocks = if split {
+            u32::from(d.columns() / 16) * 2 + u32::from(d.columns() % 16 == 8)
+        } else {
+            u32::from(d.columns()).div_ceil(16)
+        };
         let nd_count = if d.is_disabled() {
             0
         } else if d.nz_to_nd() {
@@ -72,9 +91,10 @@ impl C220FixpFp16Layout {
                     let source_nd = u32::from(nd_index)
                         .wrapping_mul(1024)
                         .wrapping_mul(u32::from(d.source_nd_stride()));
-                    let source_block = block
+                    let source_block = (if split { block / 2 } else { block })
                         .wrapping_mul(64)
-                        .wrapping_mul(u32::from(d.source_stride()));
+                        .wrapping_mul(u32::from(d.source_stride()))
+                        .wrapping_add(if split { (block % 2) * 32 } else { 0 });
                     let source_address = self
                         .source
                         .wrapping_add(if d.nz_to_nd() {
@@ -89,24 +109,33 @@ impl C220FixpFp16Layout {
                             .wrapping_add(u64::from(
                                 u32::from(nd_index)
                                     .wrapping_mul(d.destination_nd_stride())
-                                    .wrapping_mul(2),
+                                    .wrapping_mul(lane_bytes),
                             ))
                             .wrapping_add(u64::from(
                                 u32::from(row)
                                     .wrapping_mul(d.destination_stride())
-                                    .wrapping_mul(2),
+                                    .wrapping_mul(lane_bytes),
                             ))
-                            .wrapping_add(u64::from(block) * 32)
+                            .wrapping_add(u64::from(block) * 16 * u64::from(lane_bytes))
                     } else {
                         self.destination
-                            .wrapping_add(u64::from(row) * 32)
+                            .wrapping_add(
+                                u64::from(row)
+                                    * if split {
+                                        32
+                                    } else {
+                                        16 * u64::from(lane_bytes)
+                                    },
+                            )
                             .wrapping_add(
                                 u64::from(block)
                                     * u64::from(d.destination_stride().wrapping_mul(32)),
                             )
                     };
                     let remainder = (d.columns() & 15) as u8;
-                    let lanes = if d.nz_to_nd() && block + 1 == blocks && remainder != 0 {
+                    let lanes = if split {
+                        8
+                    } else if d.nz_to_nd() && block + 1 == blocks && remainder != 0 {
                         remainder
                     } else {
                         16
@@ -118,6 +147,7 @@ impl C220FixpFp16Layout {
                         source_address,
                         destination_address,
                         lanes,
+                        output_format: self.format,
                     }
                 })
             })
@@ -136,7 +166,7 @@ mod tests {
             xm: (1 << 34) | 4,
             nd: (128 << 32) | (3 << 16) | 2,
         };
-        let ordinary: Vec<_> = C220FixpFp16Layout::new(d, 100, 200)
+        let ordinary: Vec<_> = C220FixpLayout::new(d, C220FixpSourceFormat::Fp32, 100, 200)
             .unwrap()
             .slices()
             .collect();
@@ -150,7 +180,7 @@ mod tests {
             (356, 1224, 16)
         );
         d.xm |= 1 << 43;
-        let nd: Vec<_> = C220FixpFp16Layout::new(d, 100, 200)
+        let nd: Vec<_> = C220FixpLayout::new(d, C220FixpSourceFormat::Fp32, 100, 200)
             .unwrap()
             .slices()
             .collect();
@@ -161,9 +191,44 @@ mod tests {
             (3172, 456)
         );
         assert_eq!(nd[5].slope_address(2), 2240);
+        d.xm &= !(31 << 34);
+        let fp32_nd: Vec<_> = C220FixpLayout::new(d, C220FixpSourceFormat::Fp32, 100, 200)
+            .unwrap()
+            .slices()
+            .collect();
+        assert_eq!(
+            (
+                fp32_nd[1].destination_address,
+                fp32_nd[1].destination_bytes()
+            ),
+            (264, 4)
+        );
+        assert_eq!(fp32_nd[4].destination_address, 712);
+        let mut split = d;
+        split.xt = (32 << 32) | (2 << 16) | (24 << 4);
+        split.xm = (split.xm & !(1 << 43)) | (1 << 42);
+        let split: Vec<_> = C220FixpLayout::new(split, C220FixpSourceFormat::Fp32, 100, 200)
+            .unwrap()
+            .slices()
+            .collect();
+        assert_eq!(split.len(), 6);
+        assert_eq!(
+            split
+                .iter()
+                .map(|s| (s.source_address, s.destination_address, s.lanes))
+                .collect::<Vec<_>>(),
+            [
+                (100, 200, 8),
+                (132, 1224, 8),
+                (356, 2248, 8),
+                (164, 232, 8),
+                (196, 1256, 8),
+                (420, 2280, 8)
+            ]
+        );
         d.nd = 0;
         assert_eq!(
-            C220FixpFp16Layout::new(d, 100, 200)
+            C220FixpLayout::new(d, C220FixpSourceFormat::Fp32, 100, 200)
                 .unwrap()
                 .slices()
                 .count(),

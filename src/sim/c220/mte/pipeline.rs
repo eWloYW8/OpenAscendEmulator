@@ -538,13 +538,8 @@ impl C220MtePipeline {
     pub fn send_fixp_output(
         &mut self,
         engine: &mut super::fixp::C220FixpEngine,
-        hardware_sync_blocked: bool,
     ) -> Result<super::fixp::C220FixpWriteProgress, C220MtePipelineError> {
-        Ok(engine.send_write(
-            self.events.tick(),
-            &mut self.fixp_write,
-            hardware_sync_blocked,
-        )?)
+        Ok(engine.send_write(self.events.tick(), &mut self.fixp_write)?)
     }
     pub fn l1_fill_completions(&self) -> &[u64] {
         &self.l1_fill_completions

@@ -72,7 +72,7 @@ struct C220QueuedHardwareWait {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct C220QueuedMteSet {
+struct C220QueuedMteFlag {
     instruction_id: u64,
     event: C220HardwareFlagEvent,
 }
@@ -85,28 +85,28 @@ pub struct C220HardwareFlagState {
     // The delivery process runs at most once per tick, across all notifications.
     notifications: BTreeSet<u64>,
     cube_waits: VecDeque<C220QueuedHardwareWait>,
-    mte_sets: Vec<C220QueuedMteSet>,
+    mte_flags: Vec<C220QueuedMteFlag>,
     saturated_sets: u64,
 }
 
 impl C220HardwareFlagState {
-    pub(in crate::sim::c220) fn enqueue_mte_set(
+    pub(in crate::sim::c220) fn enqueue_mte_flag(
         &mut self,
         instruction_id: u64,
         step: C220HardwareFlagStep,
         tick: u64,
     ) -> Result<(), C220HardwareFlagTimingError> {
-        if step.instruction.operation != C220HardwareFlagOperation::Set || step.instruction.trigger
-        {
+        if step.instruction.trigger {
             return Err(C220HardwareFlagTimingError::OperationMismatch);
         }
-        if self.mte_sets.iter().any(|pending| {
+        if self.mte_flags.iter().any(|pending| {
             pending.event.step.instruction.memory == step.instruction.memory
+                && pending.event.step.instruction.operation == step.instruction.operation
                 && pending.event.step.event_id == step.event_id
         }) {
             return Ok(());
         }
-        self.mte_sets.push(C220QueuedMteSet {
+        self.mte_flags.push(C220QueuedMteFlag {
             instruction_id,
             event: C220HardwareFlagEvent::capture_mte(step, tick),
         });
@@ -114,7 +114,13 @@ impl C220HardwareFlagState {
     }
 
     pub fn pending_mte_set_count(&self) -> usize {
-        self.mte_sets.len()
+        self.pending_mte_flags()
+            .filter(|event| event.step.instruction.operation == C220HardwareFlagOperation::Set)
+            .count()
+    }
+
+    pub fn pending_mte_flags(&self) -> impl Iterator<Item = C220HardwareFlagEvent> + '_ {
+        self.mte_flags.iter().map(|pending| pending.event)
     }
 
     pub(in crate::sim::c220) fn take_mte_sets(
@@ -122,10 +128,29 @@ impl C220HardwareFlagState {
         instruction_id: u64,
         memory: C220MatrixMemory,
     ) -> VecDeque<C220HardwareFlagEvent> {
+        self.take_mte_flags_matching(instruction_id, memory, Some(C220HardwareFlagOperation::Set))
+    }
+
+    pub(in crate::sim::c220) fn take_mte_flags(
+        &mut self,
+        instruction_id: u64,
+        memory: C220MatrixMemory,
+    ) -> VecDeque<C220HardwareFlagEvent> {
+        self.take_mte_flags_matching(instruction_id, memory, None)
+    }
+
+    fn take_mte_flags_matching(
+        &mut self,
+        instruction_id: u64,
+        memory: C220MatrixMemory,
+        operation: Option<C220HardwareFlagOperation>,
+    ) -> VecDeque<C220HardwareFlagEvent> {
         let mut attached = VecDeque::new();
-        self.mte_sets.retain(|pending| {
+        self.mte_flags.retain(|pending| {
             if pending.instruction_id < instruction_id
                 && pending.event.step.instruction.memory == memory
+                && operation
+                    .is_none_or(|operation| pending.event.step.instruction.operation == operation)
             {
                 attached.push_back(pending.event);
                 false
@@ -557,8 +582,8 @@ mod tests {
         let mut set = step(C220HardwareFlagOperation::Set);
         set.instruction.memory = C220MatrixMemory::BiasTable;
         let mut flags = C220HardwareFlagState::default();
-        flags.enqueue_mte_set(1, set, 5).unwrap();
-        flags.enqueue_mte_set(2, set, 6).unwrap();
+        flags.enqueue_mte_flag(1, set, 5).unwrap();
+        flags.enqueue_mte_flag(2, set, 6).unwrap();
         let event = flags
             .take_mte_sets(3, C220MatrixMemory::BiasTable)
             .pop_front()

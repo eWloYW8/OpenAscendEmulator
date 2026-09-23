@@ -1,4 +1,4 @@
-use super::{C220FixpExecutionError, C220FixpFp16Command, C220FixpSliceResult};
+use super::{C220FixpCommand, C220FixpExecutionError, C220FixpSliceResult};
 use crate::sim::c220::memory::C220LocalBuffer;
 use crate::sim::c220::mte::interface::C220MteL0cReadAcknowledgment;
 
@@ -36,7 +36,7 @@ impl C220FixpFunctionalState {
     pub fn accept_read(
         &mut self,
         acknowledgment: C220MteL0cReadAcknowledgment,
-        command: C220FixpFp16Command,
+        command: C220FixpCommand,
         l0c: &C220LocalBuffer,
         slopes: &C220LocalBuffer,
         l1: &mut C220LocalBuffer,
@@ -71,7 +71,8 @@ mod tests {
 
     #[test]
     fn final_read_uses_unit_snapshot_instead_of_later_live_l0c_values() {
-        let command = C220FixpFp16Command {
+        let command = C220FixpCommand {
+            source_format: crate::sim::c220::mte::fixp::C220FixpSourceFormat::Fp32,
             descriptor: C220FixpDescriptor {
                 xt: (8 << 16) | (16 << 4),
                 xm: 1 << 34,

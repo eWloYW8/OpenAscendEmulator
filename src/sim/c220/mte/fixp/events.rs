@@ -41,22 +41,24 @@ pub enum C220FixpEvent {
     SentWrite(C220FixpWriteProgress),
 }
 
-/// Gates are resolved separately: read dispatch, final conversion admission,
-/// and write dispatch need not observe the same synchronization condition.
+/// Read dispatch and final conversion admission have independent gates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct C220FixpGates {
     pub read_blocked: bool,
     pub conversion_blocked: bool,
-    pub write_blocked: bool,
 }
 
 impl C220FixpSync for C220FixpGates {
-    fn blocked(&mut self, request: C220FixpSyncRequest) -> bool {
-        match request.point {
-            C220FixpSyncPoint::ReadWait => self.read_blocked,
-            C220FixpSyncPoint::ConversionSet => self.conversion_blocked,
-            C220FixpSyncPoint::WriteWait => self.write_blocked,
-        }
+    fn blocked(
+        &mut self,
+        request: C220FixpSyncRequest,
+    ) -> Result<bool, crate::sim::c220::sync::C220HardwareFlagTimingError> {
+        Ok(match request.point {
+            C220FixpSyncPoint::ReadWait | C220FixpSyncPoint::DisabledWait => self.read_blocked,
+            C220FixpSyncPoint::ConversionSet | C220FixpSyncPoint::DisabledSet => {
+                self.conversion_blocked
+            }
+        })
     }
 }
 
@@ -138,11 +140,7 @@ impl C220FixpStageEvents {
             Slice => C220FixpEvent::Sliced(engine.slice(tick)?),
             Packetize => C220FixpEvent::Packetized(engine.packetize(tick)?),
             GenerateWrite => C220FixpEvent::GeneratedWrite(engine.generate_write(tick)?),
-            SendWrite => C220FixpEvent::SentWrite(engine.send_write(
-                tick,
-                resources.writer,
-                resources.gates,
-            )?),
+            SendWrite => C220FixpEvent::SentWrite(engine.send_write(tick, resources.writer)?),
         })
     }
 }

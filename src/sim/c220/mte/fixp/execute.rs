@@ -2,13 +2,15 @@ use crate::isa::c220::mte::fixp::{C220FixpDescriptor, C220FixpDestination, C220F
 use crate::sim::c220::memory::{C220LocalBuffer, C220LocalBufferError};
 
 use super::{
-    C220FixpActivation, C220FixpFp16Conversion, C220FixpFp16Error, C220FixpFp16Layout,
-    C220FixpFp16Result, C220FixpLayoutError, C220FixpSlice,
+    C220FixpActivation, C220FixpConversionResult, C220FixpFp16Conversion, C220FixpFp16Error,
+    C220FixpLaneStatus, C220FixpLayout, C220FixpLayoutError, C220FixpOutputFormat, C220FixpSlice,
+    C220FixpSourceFormat,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220FixpFp16Command {
+pub struct C220FixpCommand {
     pub descriptor: C220FixpDescriptor,
+    pub source_format: C220FixpSourceFormat,
     pub source_address: u64,
     pub destination_address: u64,
     pub control: u64,
@@ -19,7 +21,7 @@ pub struct C220FixpFp16Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220FixpSliceResult {
     pub coordinate: C220FixpSlice,
-    pub conversion: C220FixpFp16Result,
+    pub conversion: C220FixpConversionResult,
     pub slope_read_address: Option<u32>,
 }
 
@@ -27,9 +29,9 @@ pub struct C220FixpSliceResult {
 pub enum C220FixpExecutionError {
     #[error("word {0:#010x} is not an L0C FIX instruction")]
     Instruction(u32),
-    #[error("FIX FP16 L1 command does not support destination {0:?}")]
+    #[error("FIX L1 command does not support destination {0:?}")]
     Destination(C220FixpDestination),
-    #[error("FIX FP16 command requires FP32 source format, got {0}")]
+    #[error("unsupported FIX source format {0}")]
     SourceFormat(u8),
     #[error("FIX source register X{0} is unavailable")]
     MissingGpr(u8),
@@ -45,7 +47,7 @@ pub enum C220FixpExecutionError {
     Activation(u8),
 }
 
-impl C220FixpFp16Command {
+impl C220FixpCommand {
     /// Capture operands at admission. `control` is the instruction's captured
     /// CTRL value, not a later read of live scalar state.
     pub fn capture_l1(
@@ -59,11 +61,11 @@ impl C220FixpFp16Command {
         if instruction.destination != C220FixpDestination::L1 {
             return Err(C220FixpExecutionError::Destination(instruction.destination));
         }
-        if instruction.source_format != 0 {
-            return Err(C220FixpExecutionError::SourceFormat(
-                instruction.source_format,
-            ));
-        }
+        let source_format = match instruction.source_format {
+            0 => C220FixpSourceFormat::Fp32,
+            1 => C220FixpSourceFormat::Int32,
+            other => return Err(C220FixpExecutionError::SourceFormat(other)),
+        };
         let mut gpr =
             |register| read_gpr(register).ok_or(C220FixpExecutionError::MissingGpr(register));
         let destination_address = gpr(instruction.destination_register)?;
@@ -77,6 +79,7 @@ impl C220FixpFp16Command {
         let nd = spr(97)?;
         let command = Self {
             descriptor: C220FixpDescriptor { xt, xm, nd },
+            source_format,
             source_address,
             destination_address,
             control,
@@ -87,9 +90,10 @@ impl C220FixpFp16Command {
         Ok(command)
     }
 
-    pub fn layout(self) -> Result<C220FixpFp16Layout, C220FixpLayoutError> {
-        C220FixpFp16Layout::new(
+    pub fn layout(self) -> Result<C220FixpLayout, C220FixpLayoutError> {
+        C220FixpLayout::new(
             self.descriptor,
+            self.source_format,
             self.source_address,
             self.destination_address,
         )
@@ -106,7 +110,10 @@ impl C220FixpFp16Command {
         C220FixpExecutionError,
     > {
         let coordinates = self.layout()?.slices();
-        if self.descriptor.activation_mode() > 3 && !self.descriptor.is_disabled() {
+        if self.descriptor.conversion_mode() == 1
+            && self.descriptor.activation_mode() > 3
+            && !self.descriptor.is_disabled()
+        {
             return Err(C220FixpExecutionError::Activation(
                 self.descriptor.activation_mode(),
             ));
@@ -116,6 +123,46 @@ impl C220FixpFp16Command {
                 coordinate.source_address,
                 coordinate.source_bytes() as usize,
             )?;
+            if coordinate.output_format != C220FixpOutputFormat::Fp16 {
+                let mut bytes = Vec::with_capacity(coordinate.destination_bytes() as usize);
+                let mut lane_status = Vec::with_capacity(input.len() / 4);
+                for lane in input.chunks_exact(4) {
+                    let bits = u32::from_le_bytes([lane[0], lane[1], lane[2], lane[3]]);
+                    if coordinate.output_format == C220FixpOutputFormat::Int32 {
+                        let result = if self.descriptor.activation_mode() == 1 {
+                            (bits as i32).max(0) as u32
+                        } else {
+                            bits
+                        };
+                        bytes.extend_from_slice(&result.to_le_bytes());
+                        lane_status.push(C220FixpLaneStatus::Integer);
+                    } else if coordinate.output_format == C220FixpOutputFormat::Bf16 {
+                        let result = crate::sim::c220::numeric::fixp::c220_fixp_f32_to_bf16(
+                            bits,
+                            self.control,
+                            self.descriptor.activation_mode(),
+                        );
+                        bytes.extend_from_slice(&result.bits.to_le_bytes());
+                        lane_status.push(C220FixpLaneStatus::Bf16(result.status));
+                    } else {
+                        let result = crate::sim::c220::numeric::fixp::c220_fixp_f32_output(
+                            bits,
+                            self.descriptor.activation_mode(),
+                        );
+                        bytes.extend_from_slice(&result.bits.to_le_bytes());
+                        lane_status.push(C220FixpLaneStatus::Fp32(result.status));
+                    }
+                }
+                return Ok(C220FixpSliceResult {
+                    coordinate,
+                    conversion: C220FixpConversionResult {
+                        format: coordinate.output_format,
+                        bytes,
+                        lane_status,
+                    },
+                    slope_read_address: None,
+                });
+            }
             let slope_read_address = (self.descriptor.activation_mode() == 3)
                 .then(|| coordinate.slope_address(self.slope_base_block));
             let mut slope_words = [0; 16];
@@ -140,7 +187,7 @@ impl C220FixpFp16Command {
                 C220FixpFp16Conversion::new(self.control, activation).evaluate(&input)?;
             Ok(C220FixpSliceResult {
                 coordinate,
-                conversion,
+                conversion: conversion.into(),
                 slope_read_address,
             })
         }))
@@ -187,7 +234,7 @@ mod tests {
             97 => Some(1),
             _ => None,
         };
-        let command = C220FixpFp16Command::capture_l1(word, 1 << 48, gpr, spr).unwrap();
+        let command = C220FixpCommand::capture_l1(word, 1 << 48, gpr, spr).unwrap();
         assert_eq!(
             (command.source_address, command.destination_address),
             (256, 128)
@@ -197,14 +244,71 @@ mod tests {
             (0x34, 0x3f00_0000)
         );
         assert_eq!(command.control, 1 << 48);
+        let integer = C220FixpCommand::capture_l1(
+            word | 1,
+            0,
+            |r| if r == 4 { Some(0) } else { gpr(r) },
+            spr,
+        )
+        .unwrap();
+        assert_eq!(integer.source_format, C220FixpSourceFormat::Int32);
+        assert!(C220FixpCommand::capture_l1(word | 1, 0, gpr, spr).is_err());
         assert!(matches!(
-            C220FixpFp16Command::capture_l1(word ^ (1 << 24), 0, gpr, spr),
+            C220FixpCommand::capture_l1(word ^ (1 << 24), 0, gpr, spr),
             Err(C220FixpExecutionError::Destination(_))
         ));
         assert!(matches!(
-            C220FixpFp16Command::capture_l1(word, 0, gpr, |_| None),
+            C220FixpCommand::capture_l1(word, 0, gpr, |_| None),
             Err(C220FixpExecutionError::MissingSpr(64))
         ));
+    }
+
+    #[test]
+    fn integer_output_preserves_bits_and_uses_signed_relu() {
+        let lanes = [i32::MIN, -1, 0, 1, i32::MAX, 0x7fc0_0001, -42, 42];
+        let input: Vec<_> = lanes
+            .iter()
+            .cycle()
+            .take(16)
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        let mut l0c = C220LocalBuffer::new(64);
+        l0c.write_known_linear(0, &input).unwrap();
+        let slopes = C220LocalBuffer::new(0);
+        for activation in 0..8 {
+            let command = C220FixpCommand {
+                source_format: C220FixpSourceFormat::Int32,
+                descriptor: C220FixpDescriptor {
+                    xt: (1 << 16) | (16 << 4),
+                    xm: activation << 39,
+                    nd: 0,
+                },
+                source_address: 0,
+                destination_address: 0,
+                control: 1 << 48,
+                scalar_slope: 0,
+                slope_base_block: 0,
+            };
+            let result = command
+                .evaluate(&l0c, &slopes)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            let expected: Vec<_> = lanes
+                .iter()
+                .cycle()
+                .take(16)
+                .flat_map(|&x| if activation == 1 { x.max(0) } else { x }.to_le_bytes())
+                .collect();
+            assert_eq!(result.conversion.bytes, expected);
+            assert_eq!(result.conversion.format, C220FixpOutputFormat::Int32);
+            assert_eq!(
+                result.conversion.lane_status,
+                vec![C220FixpLaneStatus::Integer; 16]
+            );
+            assert_eq!(result.slope_read_address, None);
+        }
     }
 
     #[test]
@@ -223,7 +327,8 @@ mod tests {
             .write_known_linear(2112, &0.25_f32.to_le_bytes().repeat(16))
             .unwrap();
         l1.write_known_linear(0, &[0xaa; 40]).unwrap();
-        let command = C220FixpFp16Command {
+        let command = C220FixpCommand {
+            source_format: crate::sim::c220::mte::fixp::C220FixpSourceFormat::Fp32,
             descriptor: C220FixpDescriptor {
                 xt: (32 << 32) | (1 << 16) | (17 << 4),
                 xm: (1 << 43) | (3 << 39) | (1 << 34) | 4,
@@ -246,6 +351,19 @@ mod tests {
             l1.read_known(0, 34).unwrap(),
             0xbc00_u16.to_le_bytes().repeat(17)
         );
+        assert_eq!(l1.read_known(34, 6).unwrap(), [0xaa; 6]);
+        let mut bf16 = command;
+        bf16.descriptor.xm = (bf16.descriptor.xm & !(31 << 34)) | (16 << 34);
+        bf16.execute_to_l1(&l0c, &C220LocalBuffer::new(0), &mut l1, |slice| {
+            assert_eq!(slice.conversion.format, C220FixpOutputFormat::Bf16);
+            assert_eq!(slice.slope_read_address, None);
+        })
+        .unwrap();
+        assert_eq!(
+            l1.read_known(0, 32).unwrap(),
+            0xc000_u16.to_le_bytes().repeat(16)
+        );
+        assert_eq!(l1.read_known(32, 2).unwrap(), 0xc080_u16.to_le_bytes());
         assert_eq!(l1.read_known(34, 6).unwrap(), [0xaa; 6]);
     }
 }

@@ -26,6 +26,8 @@ pub enum C220FixpReadProgress {
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220FixpReadPipelineError {
+    #[error(transparent)]
+    Sync(#[from] crate::sim::c220::sync::C220HardwareFlagTimingError),
     #[error("FIX read time reversed from {previous} to {requested}")]
     TimeReversed { previous: u64, requested: u64 },
     #[error("FIX read {phase} callback repeated at tick {tick}")]
@@ -143,7 +145,7 @@ impl C220FixpReadPipeline {
             tick,
             instruction_id: entry.uop.operation.instruction_id,
             point: C220FixpSyncPoint::ReadWait,
-        }) {
+        })? {
             return Ok(C220FixpReadProgress::HardwareSync);
         }
         if !input.enqueue(tick, entry.uop.operation)? {
@@ -186,13 +188,14 @@ mod tests {
     use super::*;
     use crate::isa::c220::mte::fixp::C220FixpDescriptor;
     use crate::sim::c220::memory::C220L0c;
-    use crate::sim::c220::mte::fixp::C220FixpFp16Command;
+    use crate::sim::c220::mte::fixp::C220FixpCommand;
     use crate::sim::c220::mte::interface::C220MteL0cReadSend;
     use crate::sim::common::event::EventDispatcher;
 
     #[test]
     fn clock_events_retry_backpressure_without_dropping_or_duplicating_packets() {
-        let command = C220FixpFp16Command {
+        let command = C220FixpCommand {
+            source_format: crate::sim::c220::mte::fixp::C220FixpSourceFormat::Fp32,
             descriptor: C220FixpDescriptor {
                 xt: (64 << 16) | (16 << 4),
                 xm: 1 << 34,
@@ -255,7 +258,8 @@ mod tests {
 
     #[test]
     fn queue_delays_and_sync_blocking_preserve_the_generated_head() {
-        let command = C220FixpFp16Command {
+        let command = C220FixpCommand {
+            source_format: crate::sim::c220::mte::fixp::C220FixpSourceFormat::Fp32,
             descriptor: C220FixpDescriptor {
                 xt: (1 << 16) | (16 << 4),
                 xm: 1 << 34,

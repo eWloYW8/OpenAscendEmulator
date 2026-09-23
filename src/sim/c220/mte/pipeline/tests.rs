@@ -84,19 +84,29 @@ fn fixp_write_runs_on_shared_clock_and_retires_after_contended_response() {
 
 #[test]
 fn fixp_engine_executes_from_read_acceptance_and_drains_through_shared_l1() {
+    for conversion_mode in [0, 1, 16] {
+        run_fixp_output(conversion_mode, false);
+    }
+    run_fixp_output(0, true);
+}
+
+fn run_fixp_output(conversion_mode: u8, integer: bool) {
     use crate::isa::c220::mte::fixp::C220FixpDescriptor;
     use crate::sim::c220::memory::{C220L0c, C220LocalBuffer};
-    use crate::sim::c220::mte::fixp::{C220FixpEngine, C220FixpEngineConfig, C220FixpFp16Command};
+    use crate::sim::c220::mte::fixp::{C220FixpCommand, C220FixpEngine, C220FixpEngineConfig};
     use crate::sim::c220::mte::fixp::{C220FixpSyncPoint, C220FixpSyncRequest};
     #[derive(Default)]
     struct Sync {
         requests: Vec<C220FixpSyncRequest>,
     }
     impl C220FixpSync for Sync {
-        fn blocked(&mut self, request: C220FixpSyncRequest) -> bool {
+        fn blocked(
+            &mut self,
+            request: C220FixpSyncRequest,
+        ) -> Result<bool, crate::sim::c220::sync::C220HardwareFlagTimingError> {
             let first = !self.requests.iter().any(|r| r.point == request.point);
             self.requests.push(request);
-            first
+            Ok(first)
         }
     }
     let mut sync = Sync::default();
@@ -119,6 +129,7 @@ fn fixp_engine_executes_from_read_acceptance_and_drains_through_shared_l1() {
         },
     );
     let mut engine = C220FixpEngine::new(C220FixpEngineConfig {
+        instruction_fifo_depth: 1,
         read_bandwidth: 256,
         read_bank_count: 32,
         read_data_latency: 4,
@@ -131,10 +142,15 @@ fn fixp_engine_executes_from_read_acceptance_and_drains_through_shared_l1() {
         .unwrap();
     let slopes = C220LocalBuffer::new(4096);
     let mut l1 = C220LocalBuffer::new(1048576);
-    let command = C220FixpFp16Command {
+    let command = C220FixpCommand {
+        source_format: if integer {
+            crate::sim::c220::mte::fixp::C220FixpSourceFormat::Int32
+        } else {
+            crate::sim::c220::mte::fixp::C220FixpSourceFormat::Fp32
+        },
         descriptor: C220FixpDescriptor {
             xt: (8 << 16) | (16 << 4),
-            xm: 1 << 34,
+            xm: u64::from(conversion_mode) << 34,
             nd: 0,
         },
         source_address: 0,
@@ -143,7 +159,15 @@ fn fixp_engine_executes_from_read_acceptance_and_drains_through_shared_l1() {
         scalar_slope: 0,
         slope_base_block: 0,
     };
-    engine.admit(0, 71, 1, command).unwrap();
+    use crate::sim::c220::mte::fixp::C220FixpAdmission;
+    assert_eq!(
+        engine.admit(0, 71, 1, command).unwrap(),
+        C220FixpAdmission::Active
+    );
+    assert_eq!(
+        engine.admit(0, 72, 100, command).unwrap(),
+        C220FixpAdmission::ReadGenerationBusy
+    );
     use C220FixpStage::*;
     pipeline
         .bind_fixp_stages(&[
@@ -160,6 +184,17 @@ fn fixp_engine_executes_from_read_acceptance_and_drains_through_shared_l1() {
         .unwrap();
     let mut executed = None;
     let mut retired = None;
+    let mut fifo_full = false;
+    let mut released_before_response = false;
+    let mut changed_activation = command;
+    changed_activation.descriptor.xm |= 1 << 39;
+    let mut changed_saturation = command;
+    changed_saturation.control |= 1 << 48;
+    let mut changed_addresses = command;
+    changed_addresses.destination_address = 4096;
+    changed_addresses.scalar_slope = 1;
+    changed_addresses.control |= 1 << 47;
+    assert!(!engine.resource_conflict(changed_addresses));
     for tick in 0..100 {
         pipeline
             .advance_fixp(
@@ -173,6 +208,29 @@ fn fixp_engine_executes_from_read_acceptance_and_drains_through_shared_l1() {
                 &mut sync,
             )
             .unwrap();
+        if engine.admission_backpressure() == Some(C220FixpAdmission::InstructionFifoFull) {
+            assert_eq!(
+                engine.admit(tick, 72, 100, command).unwrap(),
+                C220FixpAdmission::InstructionFifoFull
+            );
+            fifo_full = true;
+        }
+        if let Some(state) = engine.commands().get(&71)
+            && let Some(dispatched) = state.write_dispatched_tick
+        {
+            assert!(dispatched <= tick);
+            assert!(engine.instruction_fifo().is_empty());
+            assert_eq!(engine.admission_backpressure(), None);
+            assert!(pipeline.fixp_completions().is_empty());
+            assert_eq!(engine.retirement_fifo().front(), Some(&71));
+            for changed in [changed_activation, changed_saturation] {
+                assert_eq!(
+                    engine.admit(tick, 72, 100, changed).unwrap(),
+                    C220FixpAdmission::ResourceConflict
+                );
+            }
+            released_before_response = true;
+        }
         for &id in pipeline.fixp_completions() {
             assert_eq!(id, 71);
             assert!(!engine.commands().contains_key(&id));
@@ -184,22 +242,29 @@ fn fixp_engine_executes_from_read_acceptance_and_drains_through_shared_l1() {
         )) {
             assert!(executed.replace(tick).is_none());
             assert!(retired.is_none());
-            assert_eq!(
-                l1.read_known(0, 256).unwrap(),
+            let expected = if conversion_mode == 0 {
+                1.5_f32.to_le_bytes().repeat(128)
+            } else if conversion_mode == 16 {
+                0x3fc0_u16.to_le_bytes().repeat(128)
+            } else {
                 0x3e00_u16.to_le_bytes().repeat(128)
-            );
+            };
+            assert_eq!(l1.read_known(0, expected.len()).unwrap(), expected);
         }
         if engine.is_idle() && pipeline.is_idle() {
             break;
         }
     }
     assert!(executed.is_some() && retired.is_some());
+    assert!(fifo_full && released_before_response);
     assert!(engine.is_idle() && pipeline.is_idle());
+    assert!(engine.retirement_fifo().is_empty());
+    assert!(!engine.resource_conflict(changed_activation));
+    assert!(!engine.resource_conflict(changed_saturation));
     assert!(sync.requests.iter().all(|r| r.instruction_id == 71));
     for (point, retry_delay) in [
         (C220FixpSyncPoint::ReadWait, 1),
         (C220FixpSyncPoint::ConversionSet, 4),
-        (C220FixpSyncPoint::WriteWait, 1),
     ] {
         let attempts: Vec<_> = sync.requests.iter().filter(|r| r.point == point).collect();
         assert!(attempts.len() >= 2);

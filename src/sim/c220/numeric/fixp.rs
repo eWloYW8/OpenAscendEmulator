@@ -1,4 +1,77 @@
 use super::fp16::{C220Fp16Mode, C220Fp16Outcome, C220Fp16Status};
+use crate::numeric::fp32::{Fp32ValueOutcome, Fp32ValueStatus};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220FixpBf16Outcome {
+    pub bits: u16,
+    pub status: Fp32ValueStatus,
+}
+
+/// Mode 16 rounds to BF16 before applying activation code 1. Other activation
+/// codes do not change the converted value or access slope operands.
+pub fn c220_fixp_f32_to_bf16(bits: u32, control: u64, activation: u8) -> C220FixpBf16Outcome {
+    let magnitude = bits & 0x7fff_ffff;
+    let sign = ((bits >> 16) as u16) & 0x8000;
+    let saturating = control & (1 << 48) == 0;
+    let limit = if saturating { 0x7f7f } else { 0x7f80 };
+    let mut status = Fp32ValueStatus::default();
+    let mut result = if magnitude > 0x7f80_0000 {
+        status.nan_operand = true;
+        if saturating { 0 } else { 0x7fff }
+    } else if magnitude == 0x7f80_0000 {
+        status.infinity_operand = true;
+        sign | limit
+    } else {
+        let rounded = (magnitude + 0x7fff + ((magnitude >> 16) & 1)) >> 16;
+        if rounded == 0x7f80 {
+            status.overflow = true;
+            sign | limit
+        } else {
+            status.underflow = rounded == 0 && magnitude != 0;
+            sign | rounded as u16
+        }
+    };
+    if activation == 1 {
+        let magnitude = result & 0x7fff;
+        status.nan_operand |= magnitude > 0x7f80;
+        status.infinity_operand |= magnitude == 0x7f80;
+        result = if magnitude > 0x7f80 {
+            0x7fff
+        } else if result & 0x8000 != 0 {
+            0
+        } else {
+            result
+        };
+    }
+    C220FixpBf16Outcome {
+        bits: result,
+        status,
+    }
+}
+
+/// Mode-zero FP32 output: only activation code 1 applies ReLU. Other codes
+/// preserve every input bit, including NaN payloads and signed zero.
+pub fn c220_fixp_f32_output(bits: u32, activation: u8) -> Fp32ValueOutcome {
+    let mut status = Fp32ValueStatus::default();
+    let result = if activation == 1 {
+        let magnitude = bits & 0x7fff_ffff;
+        status.nan_operand = magnitude > 0x7f80_0000;
+        status.infinity_operand = magnitude == 0x7f80_0000;
+        if status.nan_operand {
+            0x7fff_ffff
+        } else if bits >> 31 != 0 {
+            0
+        } else {
+            bits
+        }
+    } else {
+        bits
+    };
+    Fp32ValueOutcome {
+        bits: result,
+        status,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -108,6 +181,76 @@ fn round_significand(value: u32, shift: u32, negative: bool, mode: C220FixpRound
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bf16_rounds_before_relu_and_distinguishes_operand_from_range_status() {
+        for (input, saturated, unbounded, overflow, underflow) in [
+            (0, 0, 0, false, false),
+            (0x8000_0000, 0x8000, 0x8000, false, false),
+            (1, 0, 0, false, true),
+            (0x0000_8000, 0, 0, false, true),
+            (0x0000_8001, 1, 1, false, false),
+            (0x007f_8000, 0x0080, 0x0080, false, false),
+            (0x3f80_8000, 0x3f80, 0x3f80, false, false),
+            (0xbf81_8000, 0xbf82, 0xbf82, false, false),
+            (0x7f7f_7fff, 0x7f7f, 0x7f7f, false, false),
+            (0x7f7f_8000, 0x7f7f, 0x7f80, true, false),
+            (0xff7f_ffff, 0xff7f, 0xff80, true, false),
+            (0x7f80_0000, 0x7f7f, 0x7f80, false, false),
+            (0xff80_0000, 0xff7f, 0xff80, false, false),
+            (0xff80_0001, 0, 0x7fff, false, false),
+        ] {
+            for (control, converted) in [(0, saturated), (1 << 48, unbounded)] {
+                for activation in 0..8 {
+                    let result = c220_fixp_f32_to_bf16(input, control, activation);
+                    let expected = if activation == 1 && converted & 0x8000 != 0 {
+                        0
+                    } else {
+                        converted
+                    };
+                    assert_eq!(
+                        result.bits, expected,
+                        "input={input:#x}, control={control:#x}, activation={activation}"
+                    );
+                    assert_eq!(result.status.overflow, overflow);
+                    assert_eq!(result.status.underflow, underflow);
+                    assert_eq!(result.status.nan_operand, input & 0x7fff_ffff > 0x7f80_0000);
+                    assert_eq!(
+                        result.status.infinity_operand,
+                        input & 0x7fff_ffff == 0x7f80_0000
+                            || (activation == 1 && converted & 0x7fff == 0x7f80)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fp32_output_preserves_bits_except_explicit_relu() {
+        for (input, rectified) in [
+            (0x8000_0000, 0),
+            (0xff80_0000, 0),
+            (0x7f80_0000, 0x7f80_0000),
+            (0xff80_0001, 0x7fff_ffff),
+            (0x7fc0_1234, 0x7fff_ffff),
+            (0x8000_0001, 0),
+            (1, 1),
+            (0x3f80_0000, 0x3f80_0000),
+        ] {
+            for activation in 0..8 {
+                let result = c220_fixp_f32_output(input, activation);
+                assert_eq!(result.bits, if activation == 1 { rectified } else { input });
+                assert_eq!(
+                    result.status.nan_operand,
+                    activation == 1 && input & 0x7fff_ffff > 0x7f80_0000
+                );
+                assert_eq!(
+                    result.status.infinity_operand,
+                    activation == 1 && input & 0x7fff_ffff == 0x7f80_0000
+                );
+            }
+        }
+    }
 
     fn c220_fixp_f32_to_f16(bits: u32, rounding: C220FixpRoundMode) -> C220Fp16Outcome {
         super::c220_fixp_f32_to_f16(bits, rounding, C220Fp16Mode::Saturating)

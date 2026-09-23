@@ -371,12 +371,12 @@ mod tests {
         for _ in 0..crate::sim::c220::sync::C220_HARDWARE_FLAG_ALMOST_FULL {
             flags.schedule_set(set, 0).unwrap();
         }
-        flags.enqueue_mte_set(1, set, 0).unwrap();
+        flags.enqueue_mte_flag(1, set, 0).unwrap();
         let independent_set = C220HardwareFlagInstruction::decode(flag_word | 1)
             .unwrap()
             .resolve(0, &registers)
             .unwrap();
-        flags.enqueue_mte_set(1, independent_set, 0).unwrap();
+        flags.enqueue_mte_flag(1, independent_set, 0).unwrap();
         advance(&mut engine, &mut pipeline, 0, &mut memory, &mut flags).unwrap();
         let command = C220Mte1Command::Read(C220Mte1ReadTransfer::Load2d(transfer));
         let issue = engine

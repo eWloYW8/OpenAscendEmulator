@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use crate::sim::c220::sync::{C220HardwareFlagState, C220HardwareFlagTimingError};
+use std::collections::{BTreeMap, VecDeque};
 
 use super::*;
 use crate::sim::c220::memory::{C220L0c, C220LocalBuffer};
@@ -9,6 +10,7 @@ use crate::sim::c220::mte::interface::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220FixpEngineConfig {
+    pub instruction_fifo_depth: u32,
     pub read_bandwidth: u32,
     pub read_bank_count: u8,
     pub read_data_latency: u32,
@@ -17,19 +19,28 @@ pub struct C220FixpEngineConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220FixpCommandState {
-    pub command: C220FixpFp16Command,
+    pub command: C220FixpCommand,
     pub admitted_tick: u64,
     pub executed_tick: Option<u64>,
+    pub write_dispatched_tick: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220FixpEngineError {
+    #[error("FIX write command {0} is not the instruction FIFO head")]
+    CommandOrder(u64),
+    #[error("FIX command {0} is not the retirement FIFO head")]
+    RetirementOrder(u64),
+    #[error(transparent)]
+    Sync(#[from] C220HardwareFlagTimingError),
     #[error("FIX command identity {0} is already active")]
     DuplicateCommand(u64),
     #[error("FIX command identity {0} is not active")]
     UnknownCommand(u64),
     #[error("FIX command {0} cannot retire before functional execution")]
     NotExecuted(u64),
+    #[error("FIX command {0} cannot retire before its final write dispatch")]
+    NotDispatched(u64),
     #[error(transparent)]
     Generator(#[from] C220FixpReadGeneratorError),
     #[error(transparent)]
@@ -46,14 +57,27 @@ pub enum C220FixpEngineError {
     WritePipeline(#[from] C220FixpWritePipelineError),
 }
 
-/// Ordinary FP32-to-FP16 FIX-to-L1 execution from admitted command to write
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220FixpAdmission {
+    ResourceConflict,
+    ReadGenerationBusy,
+    InstructionFifoFull,
+    Active,
+    DisabledReady,
+    HardwareSync,
+}
+
+/// Ordinary 32-bit-source FIX-to-L1 execution from admitted command to write
 /// handoff. The owner supplies scheduler callbacks, hardware synchronization,
-/// shared memories and write acknowledgments. No global phase order or issue
-/// credit is inferred here. NZ2ND and other conversion modes fail explicitly.
+/// shared memories and write acknowledgments. Frontend queue timing and global
+/// phase order are external. Int32, FP32, FP16 and BF16 output are supported; NZ2ND timing
+/// and other conversion modes fail explicitly.
 #[derive(Debug, Clone)]
 pub struct C220FixpEngine {
     config: C220FixpEngineConfig,
     commands: BTreeMap<u64, C220FixpCommandState>,
+    instruction_fifo: VecDeque<u64>,
+    retirement_fifo: VecDeque<u64>,
     read: C220FixpReadPipeline,
     input: C220MteL0cReadInterface,
     functional: C220FixpFunctionalState,
@@ -63,6 +87,31 @@ pub struct C220FixpEngine {
 }
 
 impl C220FixpEngine {
+    /// Called at the frontend's decode/dispatch boundary after its queue
+    /// admission checks. DisabledReady still needs ordered frontend retirement.
+    pub fn admit_with_flags(
+        &mut self,
+        tick: u64,
+        id: u64,
+        first_request: u32,
+        command: C220FixpCommand,
+        bindings: &mut C220FixpSyncBindings,
+        flags: &mut C220HardwareFlagState,
+    ) -> Result<C220FixpAdmission, C220FixpEngineError> {
+        if self.commands.contains_key(&id) {
+            return Err(C220FixpEngineError::DuplicateCommand(id));
+        }
+        bindings.capture_pending(id, flags);
+        if command.descriptor.is_disabled() {
+            return Ok(if bindings.disabled_blocked(tick, id, flags)? {
+                C220FixpAdmission::HardwareSync
+            } else {
+                C220FixpAdmission::DisabledReady
+            });
+        }
+        self.admit(tick, id, first_request, command)
+    }
+
     pub fn new(config: C220FixpEngineConfig) -> Result<Self, C220FixpEngineError> {
         if config.read_bandwidth == 0 {
             return Err(C220FixpReadGeneratorError::ZeroBandwidth.into());
@@ -70,6 +119,8 @@ impl C220FixpEngine {
         Ok(Self {
             config,
             commands: BTreeMap::new(),
+            instruction_fifo: VecDeque::new(),
+            retirement_fifo: VecDeque::new(),
             read: C220FixpReadPipeline::default(),
             input: C220MteL0cReadInterface::new(config.read_bank_count, config.read_data_latency)?,
             functional: C220FixpFunctionalState::new(config.l0c_capacity),
@@ -81,6 +132,35 @@ impl C220FixpEngine {
 
     pub fn commands(&self) -> &BTreeMap<u64, C220FixpCommandState> {
         &self.commands
+    }
+    pub fn instruction_fifo(&self) -> &VecDeque<u64> {
+        &self.instruction_fifo
+    }
+
+    pub fn retirement_fifo(&self) -> &VecDeque<u64> {
+        &self.retirement_fifo
+    }
+
+    /// Configuration changes wait for retirement, not just write dispatch.
+    /// Addresses, shape and slope values do not select a different resource.
+    pub fn resource_conflict(&self, command: C220FixpCommand) -> bool {
+        !command.descriptor.is_disabled()
+            && self.retirement_fifo.back().is_some_and(|id| {
+                let previous = self.commands[id].command;
+                previous.descriptor.conversion_mode() != command.descriptor.conversion_mode()
+                    || previous.descriptor.activation_mode() != command.descriptor.activation_mode()
+                    || (previous.control ^ command.control) & (1 << 48) != 0
+            })
+    }
+
+    pub fn admission_backpressure(&self) -> Option<C220FixpAdmission> {
+        if self.read.generated_batches() != 0 {
+            Some(C220FixpAdmission::ReadGenerationBusy)
+        } else if self.instruction_fifo.len() >= self.config.instruction_fifo_depth as usize {
+            Some(C220FixpAdmission::InstructionFifoFull)
+        } else {
+            None
+        }
     }
     pub fn read_pipeline(&self) -> &C220FixpReadPipeline {
         &self.read
@@ -141,19 +221,28 @@ impl C220FixpEngine {
             && self.write.is_idle()
     }
 
-    /// Request IDs must be unique across outstanding commands. False means no
-    /// packets were generated and the admitting scheduler can retire directly.
+    /// Request IDs must be unique across outstanding commands. Callers that
+    /// have not resolved attached flags must use `admit_with_flags`.
     pub fn admit(
         &mut self,
         tick: u64,
         id: u64,
         first_request: u32,
-        command: C220FixpFp16Command,
-    ) -> Result<bool, C220FixpEngineError> {
+        command: C220FixpCommand,
+    ) -> Result<C220FixpAdmission, C220FixpEngineError> {
         if self.commands.contains_key(&id) {
             return Err(C220FixpEngineError::DuplicateCommand(id));
         }
-        if command.descriptor.activation_mode() > 3 && !command.descriptor.is_disabled() {
+        if command.descriptor.is_disabled() {
+            return Ok(C220FixpAdmission::DisabledReady);
+        }
+        if self.resource_conflict(command) {
+            return Ok(C220FixpAdmission::ResourceConflict);
+        }
+        if let Some(blocked) = self.admission_backpressure() {
+            return Ok(blocked);
+        }
+        if command.descriptor.conversion_mode() == 1 && command.descriptor.activation_mode() > 3 {
             return Err(
                 C220FixpExecutionError::Activation(command.descriptor.activation_mode()).into(),
             );
@@ -161,7 +250,7 @@ impl C220FixpEngine {
         let packets =
             C220FixpReadGenerator::new(command, id, first_request, self.config.read_bandwidth)?;
         if !self.read.submit(tick, packets)? {
-            return Ok(false);
+            return Ok(C220FixpAdmission::DisabledReady);
         }
         self.commands.insert(
             id,
@@ -169,9 +258,12 @@ impl C220FixpEngine {
                 command,
                 admitted_tick: tick,
                 executed_tick: None,
+                write_dispatched_tick: None,
             },
         );
-        Ok(true)
+        self.instruction_fifo.push_back(id);
+        self.retirement_fifo.push_back(id);
+        Ok(C220FixpAdmission::Active)
     }
 
     pub fn generate_read(
@@ -267,9 +359,23 @@ impl C220FixpEngine {
         &mut self,
         tick: u64,
         interface: &mut C220FixpL1WriteInterface,
-        sync: impl C220FixpSync,
     ) -> Result<C220FixpWriteProgress, C220FixpEngineError> {
-        Ok(self.write.send(tick, interface, sync)?)
+        let result = self.write.send(tick, interface)?;
+        if let C220FixpWriteProgress::Advanced(fragment) = result
+            && fragment.last_in_instruction
+        {
+            let id = fragment.instruction_id;
+            if self.instruction_fifo.front() != Some(&id) {
+                return Err(C220FixpEngineError::CommandOrder(id));
+            }
+            let state = self
+                .commands
+                .get_mut(&id)
+                .ok_or(C220FixpEngineError::UnknownCommand(id))?;
+            state.write_dispatched_tick = Some(tick);
+            self.instruction_fifo.pop_front();
+        }
+        Ok(result)
     }
 
     /// Only the owner of the destination acknowledgment may call this method.
@@ -281,6 +387,13 @@ impl C220FixpEngine {
         if state.executed_tick.is_none() {
             return Err(C220FixpEngineError::NotExecuted(id));
         }
+        if state.write_dispatched_tick.is_none() {
+            return Err(C220FixpEngineError::NotDispatched(id));
+        }
+        if self.retirement_fifo.front() != Some(&id) {
+            return Err(C220FixpEngineError::RetirementOrder(id));
+        }
+        self.retirement_fifo.pop_front();
         Ok(self.commands.remove(&id).expect("validated command"))
     }
 }

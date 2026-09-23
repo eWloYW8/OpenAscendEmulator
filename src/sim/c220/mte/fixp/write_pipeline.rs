@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 
 use super::{
     C220FixpL1Output, C220FixpL1OutputError, C220FixpL1WriteError, C220FixpL1WriteInterface,
-    C220FixpSync, C220FixpSyncPoint, C220FixpSyncRequest,
 };
 use crate::sim::c220::mte::interface::C220MteOutputFragment;
 
@@ -17,7 +16,6 @@ pub enum C220FixpWriteProgress {
     Idle,
     Delayed { ready_tick: u64 },
     QueueFull,
-    HardwareSync,
     Advanced(C220MteOutputFragment),
 }
 
@@ -109,7 +107,6 @@ impl C220FixpWritePipeline {
         &mut self,
         tick: u64,
         interface: &mut C220FixpL1WriteInterface,
-        mut sync: impl C220FixpSync,
     ) -> Result<C220FixpWriteProgress, C220FixpWritePipelineError> {
         self.begin(tick, 2, "send")?;
         let Some(head) = self.dispatch.front().copied() else {
@@ -119,13 +116,6 @@ impl C220FixpWritePipeline {
             return Ok(C220FixpWriteProgress::Delayed {
                 ready_tick: head.ready_tick,
             });
-        }
-        if sync.blocked(C220FixpSyncRequest {
-            tick,
-            instruction_id: head.fragment.instruction_id,
-            point: C220FixpSyncPoint::WriteWait,
-        }) {
-            return Ok(C220FixpWriteProgress::HardwareSync);
         }
         interface.enqueue(tick, head.fragment)?;
         self.dispatch.pop_front();

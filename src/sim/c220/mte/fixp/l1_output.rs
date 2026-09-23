@@ -157,14 +157,13 @@ mod tests {
         for tick in 0..10 {
             pipeline.packetize(tick, &mut output).unwrap();
             pipeline.generate(tick).unwrap();
-            pipeline.send(tick, &mut interface, true).unwrap();
         }
         assert!(output.bursts().is_empty());
         assert_eq!(pipeline.dispatch_queue().len(), 6);
         assert_eq!(pipeline.packets().len(), 3);
         assert!(interface.is_idle());
         for tick in 10..20 {
-            pipeline.send(tick, &mut interface, false).unwrap();
+            pipeline.send(tick, &mut interface).unwrap();
             pipeline.generate(tick).unwrap();
         }
         assert!(pipeline.is_idle());
