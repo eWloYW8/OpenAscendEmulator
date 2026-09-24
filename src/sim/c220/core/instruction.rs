@@ -52,6 +52,7 @@ pub enum C220CoreInstruction {
     Scalar {
         step: ScalarProgramStep,
         timing: Option<C220ScalarTimingTicket>,
+        spr_timing: Option<crate::sim::c220::scalar::spr::C220ScalarSprTimingTicket>,
     },
     Barrier(ScalarProgramStep),
     Mte1 {

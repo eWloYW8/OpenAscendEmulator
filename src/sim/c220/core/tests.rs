@@ -1624,6 +1624,13 @@ fn scalar_conversion_retires_after_two_ticks_and_blocks_dependent_conversion() {
     assert_eq!((ticket.issue_tick, ticket.retire_tick), (10, 12));
     assert_eq!(ticket.execution_stage, 2);
     assert_eq!(core.scalar_timing().pending_xreg_retirement(8), Some(12));
+    for word in [
+        (2 << 29) | (8 << 12),
+        (2 << 29) | (1 << 21) | (8 << 12),
+        0x4800_0000 | (8 << 5) | 8,
+    ] {
+        assert_eq!(core.scalar_timing().dependency_tick(word, 11), None);
+    }
 
     let C220CoreStep::Stalled(stall) = core.step_word_at(11, 0x0210_8583).unwrap() else {
         panic!("dependent conversion should wait");
@@ -1637,6 +1644,28 @@ fn scalar_conversion_retires_after_two_ticks_and_blocks_dependent_conversion() {
     };
     assert_eq!(move_stall.cause, C220StallCause::ScalarDependency);
     assert_eq!(move_stall.resume_tick, 12);
+
+    for word in [
+        (3 << 29) | (2 << 27) | (2 << 23) | (1 << 17) | (8 << 12) | (3 << 7) | 8,
+        (3 << 29) | (1 << 17) | (2 << 12) | (8 << 7),
+        (2 << 29) | (5 << 21) | (1 << 17) | (1 << 10) | (8 << 2),
+        (2 << 29) | (15 << 21) | (3 << 15) | (10 << 10) | (2 << 7) | (2 << 5) | 8,
+        (2 << 29) | (1 << 17) | (8 << 12),
+        (2 << 29) | (1 << 21) | (1 << 17) | (8 << 12),
+        0x4800_0000 | (4 << 21),
+        0x4800_0000 | (1 << 16) | 8,
+        0x4800_0000 | (1 << 17) | (8 << 5),
+        (2 << 29) | (1 << 21) | (3 << 18) | (8 << 12),
+        (2 << 29) | (1 << 21) | (3 << 18) | (1 << 17) | (8 << 12),
+    ] {
+        let C220CoreStep::Stalled(stall) = core.step_word_at(11, word).unwrap() else {
+            panic!("pending scalar operand must block dispatch");
+        };
+        assert_eq!(stall.cause, C220StallCause::ScalarDependency);
+        assert_eq!(stall.resume_tick, 12);
+        assert_eq!(core.state().scalar().pc(), 0x4004);
+        assert_eq!(core.queued_fixp_commands(), 0);
+    }
 
     assert!(matches!(
         core.step_word_at(11, 0x0216_b583).unwrap(),
@@ -1657,6 +1686,114 @@ fn scalar_conversion_retires_after_two_ticks_and_blocks_dependent_conversion() {
         C220CoreStep::Executed { .. }
     ));
     assert_eq!(core.scalar_timing().pending_xreg_retirement(8), Some(15));
+    let branch_pc = core.state().scalar().pc();
+    let offset = core.state().scalar().machine().xregs()[8];
+    assert!(matches!(
+        core.step_word_at(15, (2 << 29) | (1 << 17) | (8 << 12))
+            .unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(core.state().scalar().pc(), branch_pc + offset * 4);
+    let multiply_add = (6 << 17) | (1 << 12) | (2 << 7) | 4;
+    let C220CoreStep::Executed {
+        instruction:
+            C220CoreInstruction::Scalar {
+                timing: Some(ticket),
+                ..
+            },
+        ..
+    } = core.step_word_at(16, multiply_add).unwrap()
+    else {
+        panic!("multiply-add should issue with fixed timing");
+    };
+    assert_eq!((ticket.retire_tick, ticket.execution_stage), (19, 3));
+    let add = (6 << 17) | (1 << 12) | (2 << 7) | 1;
+    assert!(matches!(
+        core.step_word_at(17, add).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(core.scalar_timing().pending_xreg_retirement(6), Some(19));
+    let read_result = 0x0200_0800 | (7 << 17) | (6 << 12);
+    let C220CoreStep::Stalled(stall) = core.step_word_at(18, read_result).unwrap() else {
+        panic!("earlier writer must remain pending");
+    };
+    assert_eq!(stall.resume_tick, 19);
+    assert!(matches!(
+        core.step_word_at(19, read_result).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(core.scalar_timing().pending_xreg_retirement(7), Some(20));
+    let divide = (9 << 17) | (1 << 12) | (1 << 7) | 5;
+    assert!(matches!(
+        core.step_word_at(20, divide).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(core.state().scalar().machine().xregs()[9], 1);
+    assert_eq!(core.scalar_timing().pending_xreg_retirement(9), Some(40));
+    let sqrt = 0x0200_0000 | (10 << 17) | (1 << 12);
+    assert!(matches!(
+        core.step_word_at(21, sqrt).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(core.scalar_timing().pending_xreg_retirement(9), Some(36));
+    assert_eq!(core.scalar_timing().pending_xreg_retirement(10), Some(40));
+    assert_eq!(core.scalar_timing().variable_retirements().count(), 2);
+    let read_divide = 0x0200_0800 | (12 << 17) | (9 << 12);
+    let C220CoreStep::Stalled(stall) = core.step_word_at(35, read_divide).unwrap() else {
+        panic!("division must await a retirement event");
+    };
+    assert_eq!(stall.resume_tick, 36);
+    assert!(matches!(
+        core.step_word_at(36, read_divide).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(core.state().scalar().machine().xregs()[12], 1);
+    assert_eq!(core.scalar_timing().variable_retirements().count(), 1);
+    let read_sqrt = 0x0200_0800 | (13 << 17) | (10 << 12);
+    let C220CoreStep::Stalled(stall) = core.step_word_at(39, read_sqrt).unwrap() else {
+        panic!("second FIFO entry must await the remaining event");
+    };
+    assert_eq!(stall.resume_tick, 40);
+    assert!(matches!(
+        core.step_word_at(40, read_sqrt).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(core.scalar_timing().variable_retirements().count(), 0);
+    let write_condition = 0x0200_0900 | (11 << 17) | (1 << 12);
+    let condition_step = core.step_word_at(41, write_condition).unwrap();
+    let C220CoreStep::Executed {
+        instruction:
+            C220CoreInstruction::Scalar {
+                spr_timing: Some(ticket),
+                ..
+            },
+        ..
+    } = condition_step
+    else {
+        panic!("ordinary scalar SPR write needs a retirement ticket: {condition_step:?}");
+    };
+    assert_eq!((ticket.destination_spr, ticket.retire_tick), (11, 42));
+    assert_eq!(core.state().scalar().machine().spr_value(11), Some(0));
+    let read_condition = 0x0200_0880 | (14 << 17) | (11 << 12);
+    for word in [write_condition, read_condition] {
+        assert_eq!(core.scalar_timing().dependency_tick(word, 41), Some(42));
+        let C220CoreStep::Stalled(stall) = core.step_word_at(41, word).unwrap() else {
+            panic!("SPR read and overwrite must await its commit");
+        };
+        assert_eq!(stall.resume_tick, 42);
+    }
+    assert!(matches!(
+        core.step_word_at(42, read_condition).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(core.state().scalar().machine().xregs()[14], 0);
+    assert_eq!(core.scalar_timing().pending_spr_retirement(11), None);
+    let write_control = 0x0200_0900 | (3 << 17) | (1 << 12);
+    assert!(matches!(
+        core.step_word_at(43, write_control).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(core.scalar_timing().pending_spr_retirement(3), None);
 }
 
 #[test]

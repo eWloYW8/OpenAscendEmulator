@@ -1,4 +1,5 @@
 mod execute;
+pub mod spr;
 use crate::architecture::Architecture;
 use crate::isa::c220::scalar::{C220ScalarConversion, C220ScalarConversionHint};
 use crate::isa::c220::vector::C220MovemaskHint;

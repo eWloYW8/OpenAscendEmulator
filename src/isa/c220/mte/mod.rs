@@ -6,7 +6,10 @@ pub mod load2d;
 pub mod load2d_sparse;
 pub mod load2d_transpose;
 pub mod out_to_l1;
+mod registers;
 pub mod set2d;
+
+pub use registers::read_register_mask;
 
 use burst::BurstLayout;
 

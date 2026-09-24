@@ -1,9 +1,8 @@
 use super::decode::{C220DecodedWord, C220DispatchKind};
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
 use crate::architecture::Architecture;
-use crate::isa::c220::scalar::C220ScalarConversionHint;
 use crate::isa::flow::{FlagOperation, PipelineBarrierScope, PipelineBarrierStep};
-use crate::sim::c220::scalar::timing::C220ScalarTimingTicket;
+use crate::sim::c220::scalar::timing::C220ScalarTimingRule;
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 use crate::sim::c220::state::C220ExecutionError;
 use crate::sim::c220::vector::dispatch::VectorStep;
@@ -150,11 +149,22 @@ impl C220Core {
                 C220CoreInstruction::Barrier(self.step_barrier_word(word)?)
             }
             _ => {
-                let timing = if let Some(hint) = C220ScalarConversionHint::from_word(word) {
-                    Some(
-                        C220ScalarTimingTicket::for_conversion(tick, hint)
-                            .ok_or(C220CoreError::TimeOverflow)?,
-                    )
+                let spr_timing = crate::sim::c220::scalar::spr::write_destination(word)
+                    .filter(|register| *register != 3)
+                    .map(|destination_spr| {
+                        Ok::<_, C220CoreError>(
+                            crate::sim::c220::scalar::spr::C220ScalarSprTimingTicket {
+                                destination_spr,
+                                issue_tick: tick,
+                                retire_tick: tick
+                                    .checked_add(1)
+                                    .ok_or(C220CoreError::TimeOverflow)?,
+                            },
+                        )
+                    })
+                    .transpose()?;
+                let timing = if let Some(rule) = C220ScalarTimingRule::decode(word) {
+                    Some(rule.ticket(tick).ok_or(C220CoreError::TimeOverflow)?)
                 } else {
                     None
                 };
@@ -164,7 +174,14 @@ impl C220Core {
                 if let Some(ticket) = timing {
                     self.scalar_timing.issue(ticket);
                 }
-                C220CoreInstruction::Scalar { step, timing }
+                if let Some(ticket) = spr_timing {
+                    self.scalar_timing.issue_spr(ticket);
+                }
+                C220CoreInstruction::Scalar {
+                    step,
+                    timing,
+                    spr_timing,
+                }
             }
         };
         Ok(C220CoreStep::Executed { tick, instruction })
