@@ -22,6 +22,7 @@ pub enum C220Mte3Callback {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte3FrontendEvent {
     Dispatched { instruction_id: u64, tick: u64 },
+    ExternalFixpBlocked { instruction_id: u64, tick: u64 },
     Generator(C220DmaEventOutcome),
 }
 
@@ -84,6 +85,7 @@ pub struct C220Mte3Frontend {
     generator: C220DmaFrontend,
     output: Option<C220DmaGenerated>,
     hardware_sync_blocked: bool,
+    external_fixp_pending: bool,
     last_retirement_tick: Option<u64>,
     biu_retirement: bool,
 }
@@ -149,6 +151,14 @@ impl C220Mte3Frontend {
         self.commands.len()
     }
 
+    /// Dispatched commands occupy retirement even before their record delay
+    /// expires. Commands still waiting for dispatch do not occupy this queue.
+    pub fn retirement_pending(&self) -> bool {
+        self.records
+            .iter()
+            .any(|pending| pending.record.dispatch_tick.is_some())
+    }
+
     pub fn generator(&self) -> &C220DmaFrontend {
         &self.generator
     }
@@ -173,6 +183,10 @@ impl C220Mte3Frontend {
 
     pub fn set_hardware_sync_blocked(&mut self, blocked: bool) {
         self.hardware_sync_blocked = blocked;
+    }
+
+    pub(in crate::sim::c220::mte) fn set_external_fixp_pending(&mut self, pending: bool) {
+        self.external_fixp_pending = pending;
     }
 
     pub fn acknowledge(
@@ -329,6 +343,12 @@ impl C220Mte3Events {
                     return Ok(None);
                 };
                 let disabled = command.requests.clone().next().is_none();
+                if !disabled && frontend.external_fixp_pending {
+                    return Ok(Some(C220Mte3FrontendEvent::ExternalFixpBlocked {
+                        instruction_id: command.instruction_id,
+                        tick: events.tick(),
+                    }));
+                }
                 if !disabled && !frontend.generator.can_issue() {
                     return Ok(None);
                 }
@@ -434,6 +454,7 @@ mod tests {
                     ));
                 }
                 events.notify_at(clock, tick);
+                frontend.set_external_fixp_pending(tick < 6);
                 while let Some(invocation) = events.next_callback() {
                     callbacks
                         .handle(invocation.callback, &mut events, &mut frontend)
@@ -443,9 +464,12 @@ mod tests {
                     assert_eq!(frontend.records().next().unwrap().dispatch_tick, None);
                 }
                 if tick == 3 {
-                    assert_eq!(frontend.records().next().unwrap().dispatch_tick, Some(3));
+                    assert_eq!(frontend.records().next().unwrap().dispatch_tick, None);
                 }
-                if tick < 7 {
+                if tick == 6 {
+                    assert_eq!(frontend.records().next().unwrap().dispatch_tick, Some(6));
+                }
+                if tick < 10 {
                     assert!(frontend.output().is_none());
                 }
                 if tick == 15 {

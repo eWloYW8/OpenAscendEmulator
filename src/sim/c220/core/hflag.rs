@@ -16,13 +16,16 @@ impl C220Core {
         instruction: C220HardwareFlagInstruction,
     ) -> Result<C220CoreStep, C220CoreError> {
         let step = instruction.resolve(pc, self.state.scalar().machine().xregs())?;
-        if instruction.trigger
-            && instruction.source_pipe == C220HardwareFlagSourcePipe::Mte1
-            && self
+        let trigger_blocked = match instruction.source_pipe {
+            C220HardwareFlagSourcePipe::Mte1 => self
                 .mte_pipeline
                 .as_ref()
-                .is_some_and(|p| !p.selected_generator_idle())
-        {
+                .is_some_and(|p| !p.selected_generator_idle()),
+            C220HardwareFlagSourcePipe::Fix => self
+                .fixp_engine()
+                .is_some_and(|engine| !engine.hardware_flag_trigger_ready()),
+        };
+        if instruction.trigger && trigger_blocked {
             return Ok(C220CoreStep::Stalled(C220Stall {
                 tick,
                 pc,

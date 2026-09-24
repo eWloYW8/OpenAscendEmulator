@@ -16,6 +16,7 @@ fn factor_reads_share_l1_and_complete_on_fix_lane() {
     let mut pipeline = C220MtePipeline::new(
         0,
         C220MtePipelineConfig {
+            core_kind: crate::sim::c220::device::C220CoreKind::Cube,
             l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
             read_width: width,
             output_bandwidths: C220Mte1ReadBandwidths {
@@ -123,6 +124,7 @@ fn mte3_output_and_biu_split_use_independent_captured_modes() {
     let mut pipeline = C220MtePipeline::new(
         0,
         C220MtePipelineConfig {
+            core_kind: crate::sim::c220::device::C220CoreKind::Cube,
             l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
             read_width: width,
             output_bandwidths: C220Mte1ReadBandwidths {
@@ -186,6 +188,7 @@ fn fixp_write_runs_on_shared_clock_and_retires_after_contended_response() {
     let mut pipeline = C220MtePipeline::new(
         0,
         C220MtePipelineConfig {
+            core_kind: crate::sim::c220::device::C220CoreKind::Cube,
             l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
             read_width: width,
             output_bandwidths: C220Mte1ReadBandwidths {
@@ -294,6 +297,7 @@ fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
     let mut pipeline = C220MtePipeline::new(
         0,
         C220MtePipelineConfig {
+            core_kind: crate::sim::c220::device::C220CoreKind::Cube,
             l1: C220L1Geometry::new(32, 16, 2, 9).unwrap(),
             read_width: width,
             output_bandwidths: C220Mte1ReadBandwidths {
@@ -505,6 +509,7 @@ fn biu_write_waits_for_dbid_and_all_source_packets_before_data_transport() {
     let mut pipeline = C220MtePipeline::new(
         0,
         C220MtePipelineConfig {
+            core_kind: crate::sim::c220::device::C220CoreKind::Cube,
             l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
             read_width: width,
             output_bandwidths: C220Mte1ReadBandwidths {
@@ -584,6 +589,7 @@ fn ub_reads_share_vector_banks_and_wait_for_matching_response_tags() {
 
     let width = NonZeroU32::new(32).unwrap();
     let config = C220MtePipelineConfig {
+        core_kind: crate::sim::c220::device::C220CoreKind::Cube,
         l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
         read_width: width,
         output_bandwidths: C220Mte1ReadBandwidths {
@@ -648,6 +654,7 @@ fn ub_reads_share_vector_banks_and_wait_for_matching_response_tags() {
 fn l1_fill_contends_with_load2d_and_completes_after_write_response() {
     let width = NonZeroU32::new(32).unwrap();
     let config = C220MtePipelineConfig {
+        core_kind: crate::sim::c220::device::C220CoreKind::Cube,
         l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
         read_width: width,
         output_bandwidths: C220Mte1ReadBandwidths {

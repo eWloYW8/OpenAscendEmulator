@@ -85,6 +85,7 @@ fn native_mte3_write_path(mode: u8) {
     .unwrap();
     let width = NonZeroU32::new(32).unwrap();
     core.configure_mte_pipeline(C220MtePipelineConfig {
+        core_kind: crate::sim::c220::device::C220CoreKind::Vector0,
         l1: C220L1Geometry::new(32, 4, 1, 0).unwrap(),
         read_width: width,
         output_bandwidths: C220Mte1ReadBandwidths {

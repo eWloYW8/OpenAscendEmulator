@@ -226,6 +226,7 @@ mod tests {
             C220FixpAtomicConfig, C220FixpEngineConfig, C220FixpRuntimeStage::*,
         };
         use crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteConfig;
+        use crate::sim::c220::schedule::{C220Stall, C220StallCause};
         let mut core = matrix_core();
         core.advance_to(300).unwrap();
         core.memory = MappedMemory::bind(
@@ -349,6 +350,7 @@ mod tests {
         ));
         assert_eq!(core.state.scalar().pc(), pc + 8);
         assert!(core.pending_compute_drain().is_some());
+        assert!(core.fixp_engine().unwrap().hardware_flag_trigger_ready());
         core.state
             .scalar_mut()
             .machine_mut()
@@ -375,8 +377,39 @@ mod tests {
         let mut responses = std::collections::VecDeque::new();
         let mut sent_bytes = 0;
         let mut last_response = None;
+        let mut trigger_blocked = false;
+        let mut trigger_released = false;
+        let trigger_word = (2 << 29) | (15 << 21) | (1 << 19) | (3 << 15) | (10 << 10) | (2 << 7);
         for tick in 403..900 {
             core.advance_to(tick).unwrap();
+            let engine = core.fixp_engine().unwrap();
+            if !engine.hardware_flag_trigger_ready() {
+                let pc = core.state.scalar().pc();
+                for word in [trigger_word, trigger_word | (1 << 5)] {
+                    let instruction =
+                        crate::isa::c220::hflag::C220HardwareFlagInstruction::decode(word).unwrap();
+                    assert!(matches!(
+                        core.step_hardware_flag_at(tick, pc, instruction).unwrap(),
+                        C220CoreStep::Stalled(C220Stall {
+                            cause: C220StallCause::HardwareFlagDependency,
+                            ..
+                        })
+                    ));
+                    assert_eq!(core.state.scalar().pc(), pc);
+                }
+                trigger_blocked = true;
+            } else if !trigger_released && engine.instruction_fifo().is_empty() {
+                assert!(!core.fixp_runtime().unwrap().is_idle());
+                let instruction =
+                    crate::isa::c220::hflag::C220HardwareFlagInstruction::decode(trigger_word)
+                        .unwrap();
+                assert!(matches!(
+                    core.step_hardware_flag_at(tick, core.state.scalar().pc(), instruction)
+                        .unwrap(),
+                    C220CoreStep::Executed { .. }
+                ));
+                trigger_released = true;
+            }
             if let Some(command) = core.take_biu_write_command_at(tick).unwrap() {
                 core.receive_external_fixp_dbid_at(tick, command.command.tag)
                     .unwrap();
@@ -397,6 +430,7 @@ mod tests {
             }
         }
         assert_eq!(sent_bytes, 128);
+        assert!(trigger_blocked && trigger_released);
         assert!(core.fixp_runtime().unwrap().is_idle());
         assert!(core.pending_compute_drain().is_none());
         assert_eq!(core.memory.read_known_at(4096, 128).unwrap(), [1; 128]);
@@ -435,6 +469,10 @@ mod tests {
             crate::isa::c220::mte::fixp::C220FixpDestination::L1
         );
         let mut nz_bytes = 0;
+        assert_eq!(
+            core.fixp_engine().unwrap().outstanding_external_commands(),
+            0
+        );
         for tick in 1002..1500 {
             core.advance_to(tick).unwrap();
             if let Some(command) = core.take_biu_write_command_at(tick).unwrap() {
@@ -513,6 +551,7 @@ mod tests {
         )
         .unwrap();
         core.configure_mte_pipeline(C220MtePipelineConfig {
+            core_kind: crate::sim::c220::device::C220CoreKind::Cube,
             l1: C220L1Geometry::new(32, 4, 1, 0).unwrap(),
             read_width: NonZeroU32::new(256).unwrap(),
             output_bandwidths: C220Mte1ReadBandwidths {

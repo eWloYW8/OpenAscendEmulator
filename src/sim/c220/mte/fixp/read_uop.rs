@@ -121,7 +121,7 @@ impl Iterator for C220FixpReadGenerator {
         let source_row_bytes = 16 * self.command.source_format.lane_bytes();
         let column_bytes = u32::from(d.rows())
             * if partial_singleton {
-                32
+                source_row_bytes / 2
             } else {
                 source_row_bytes
             };
@@ -137,13 +137,17 @@ impl Iterator for C220FixpReadGenerator {
         let boundary = self.bandwidth - (address as u32 % self.bandwidth);
         let data_bytes = (column_bytes - self.source_offset).min(boundary);
         let output_bytes = if singleton {
-            data_bytes / 4
+            if partial_singleton {
+                data_bytes / 4
+            } else {
+                data_bytes.wrapping_mul(32) / source_row_bytes / 2
+            }
         } else if split {
             data_bytes / 2
         } else if d.conversion_mode() == 0 {
             data_bytes
         } else if int4 && !merge {
-            data_bytes.wrapping_mul(8) / 64
+            data_bytes.wrapping_mul(8) / source_row_bytes
         } else {
             data_bytes.wrapping_mul(32) / source_row_bytes
         };
@@ -290,5 +294,20 @@ mod tests {
             C220FixpReadGenerator::new(fp32, 8, 30, 1),
             Err(C220FixpReadGeneratorError::ZeroBandwidth)
         ));
+        let mut half = command;
+        half.source_format = super::super::C220FixpSourceFormat::Fp16;
+        for (mode, columns, expected) in [
+            (8, 16, vec![(64, 32)]),
+            (8, 33, vec![(64, 64), (64, 64), (32, 8)]),
+            (21, 16, vec![(64, 16)]),
+        ] {
+            half.descriptor.xt = (64 << 32) | (2 << 16) | (columns << 4);
+            half.descriptor.xm = (mode << 34) | 32;
+            let sizes: Vec<_> = C220FixpReadGenerator::new(half, 10, 0, 256)
+                .unwrap()
+                .map(|uop| (uop.operation.data_bytes, uop.operation.output_bytes))
+                .collect();
+            assert_eq!(sizes, expected);
+        }
     }
 }

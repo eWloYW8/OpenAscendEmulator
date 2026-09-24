@@ -149,8 +149,11 @@ impl C220Core {
         if fixp.engine.is_idle() {
             fixp.next_request = 0;
         }
-        let pending_mte3 =
-            self.mte3.pending_commands().next().is_some() || !self.mte3.dma_commands.is_empty();
+        let pending_mte3 = self.mte3.pending_commands().next().is_some()
+            || self
+                .mte_pipeline
+                .as_ref()
+                .is_some_and(|pipeline| pipeline.mte3_frontend().retirement_pending());
         let admission =
             if destination == C220FixpDestination::External && !d.is_disabled() && pending_mte3 {
                 fixp.bindings

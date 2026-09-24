@@ -11,10 +11,16 @@ pub enum C220FixpNz2ndReadError {
     NotNzToNd,
     #[error("NZ2ND read bandwidth must be a nonzero multiple of 64 bytes")]
     Bandwidth,
-    #[error("NZ2ND source address must be aligned to a 64-byte row")]
+    #[error("NZ2ND source address must align to a physical 16-lane row")]
     SourceAlignment,
-    #[error("FP16-source NZ2ND timing is not implemented")]
-    Fp16Source,
+    #[error(
+        "NZ2ND read cannot complete whole timing rows at ND {nd_index}, row {row}: {data_bytes} bytes"
+    )]
+    IncompleteTimingRow {
+        nd_index: u32,
+        row: u32,
+        data_bytes: u32,
+    },
 }
 
 /// Lazy row-block traversal. Every column in a block uses the byte count
@@ -45,19 +51,19 @@ impl C220FixpNz2ndReadGenerator {
         bandwidth: u32,
     ) -> Result<Self, C220FixpNz2ndReadError> {
         command.layout()?;
-        if command.source_format == super::super::C220FixpSourceFormat::Fp16 {
-            return Err(C220FixpNz2ndReadError::Fp16Source);
-        }
         if !command.descriptor.nz_to_nd() {
             return Err(C220FixpNz2ndReadError::NotNzToNd);
         }
         if bandwidth == 0 || !bandwidth.is_multiple_of(64) {
             return Err(C220FixpNz2ndReadError::Bandwidth);
         }
-        if !command.source_address.is_multiple_of(64) {
+        if !command
+            .source_address
+            .is_multiple_of(u64::from(16 * command.source_format.lane_bytes()))
+        {
             return Err(C220FixpNz2ndReadError::SourceAlignment);
         }
-        Ok(Self {
+        let generator = Self {
             command,
             instruction_id,
             next_id: first_id,
@@ -72,24 +78,57 @@ impl C220FixpNz2ndReadGenerator {
             column: 0,
             columns: u32::from(command.descriptor.columns()).div_ceil(16),
             part: 0,
-        })
+        };
+        generator.validate_row_progress()?;
+        Ok(generator)
     }
 
     fn source_address(&self, column: u32) -> u64 {
+        self.source_address_at(self.nd, self.row, column)
+    }
+
+    fn source_address_at(&self, nd: u32, row: u32, column: u32) -> u64 {
         let d = self.command.descriptor;
+        let source_row_bytes = 16 * self.command.source_format.lane_bytes();
         self.command
             .source_address
             .wrapping_add(u64::from(
-                self.nd
-                    .wrapping_mul(1024)
+                nd.wrapping_mul(16 * source_row_bytes)
                     .wrapping_mul(u32::from(d.source_nd_stride())),
             ))
-            .wrapping_add(u64::from(self.row) * 64)
+            .wrapping_add(u64::from(row) * u64::from(source_row_bytes))
             .wrapping_add(u64::from(
                 column
-                    .wrapping_mul(64)
+                    .wrapping_mul(source_row_bytes)
                     .wrapping_mul(u32::from(d.source_stride())),
             ))
+    }
+
+    fn validate_row_progress(&self) -> Result<(), C220FixpNz2ndReadError> {
+        if self.command.source_format.lane_bytes() == 4 {
+            return Ok(());
+        }
+        // Source addresses use physical lane widths, but timing consumes
+        // 64-byte rows. A partial timing row loses byte-count progress without
+        // advancing the corresponding row count and cannot finish the command.
+        for nd_index in 0..self.nd_count {
+            let mut row = 0;
+            while row < u32::from(self.command.descriptor.rows()) {
+                let address = self.source_address_at(nd_index, row, 0);
+                let boundary = self.bandwidth - address as u32 % self.bandwidth;
+                let data_bytes =
+                    ((u32::from(self.command.descriptor.rows()) - row) * 64).min(boundary);
+                if !data_bytes.is_multiple_of(64) {
+                    return Err(C220FixpNz2ndReadError::IncompleteTimingRow {
+                        nd_index,
+                        row,
+                        data_bytes,
+                    });
+                }
+                row += data_bytes / 64;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -266,5 +305,54 @@ mod tests {
             C220FixpNz2ndReadGenerator::new(command, 7, 0, 65),
             Err(C220FixpNz2ndReadError::Bandwidth)
         ));
+        command.source_format = C220FixpSourceFormat::Fp16;
+        command.source_address = 0;
+        command.descriptor.xt = (32 << 32) | (3 << 16) | (24 << 4);
+        command.descriptor.xm = (1 << 43) | (6 << 34) | 16;
+        command.descriptor.nd = (2 << 16) | 2;
+        let half: Vec<_> = C220FixpNz2ndReadGenerator::new(command, 7, 0, 128)
+            .unwrap()
+            .map(|uop| {
+                let op = uop.operation;
+                (op.request.fragments.address, op.data_bytes, op.output_bytes)
+            })
+            .collect();
+        assert_eq!(
+            half,
+            [
+                (0, 128, 64),
+                (512, 128, 64),
+                (64, 64, 32),
+                (576, 64, 32),
+                (1024, 128, 64),
+                (1536, 128, 64),
+                (1088, 64, 32),
+                (1600, 64, 32),
+            ]
+        );
+        command.descriptor.xt = (32 << 32) | (4 << 16) | (24 << 4);
+        assert!(matches!(
+            C220FixpNz2ndReadGenerator::new(command, 7, 0, 128),
+            Err(C220FixpNz2ndReadError::IncompleteTimingRow {
+                nd_index: 0,
+                row: 3,
+                data_bytes: 32,
+            })
+        ));
+        command.source_address = 32;
+        command.descriptor.xt = (32 << 32) | (1 << 16) | (16 << 4);
+        let first = C220FixpNz2ndReadGenerator::new(command, 7, 0, 128)
+            .unwrap()
+            .next()
+            .unwrap()
+            .operation;
+        assert_eq!(
+            (
+                first.request.fragments.address,
+                first.data_bytes,
+                first.output_bytes
+            ),
+            (32, 64, 32)
+        );
     }
 }

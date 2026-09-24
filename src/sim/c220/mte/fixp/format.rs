@@ -34,17 +34,15 @@ pub enum C220FixpOutputFormat {
 impl C220FixpOutputFormat {
     pub const fn from_conversion_mode(source: C220FixpSourceFormat, mode: u8) -> Option<Self> {
         match (source, mode) {
-            (_, 6) => Some(Self::Fp16),
-            (C220FixpSourceFormat::Fp16, _) => None,
+            (_, 1 | 6 | 10 | 11) => Some(Self::Fp16),
+            (_, 12 | 13) => Some(Self::Int16),
+            (_, 16) => Some(Self::Bf16),
             (C220FixpSourceFormat::Int32, 0) => Some(Self::Int32),
             (C220FixpSourceFormat::Fp32, 0) => Some(Self::Fp32),
-            // Nonzero conversion modes select the interpretation of 32-bit
-            // source lanes, independently of the instruction's source tag.
+            // Quantization modes interpret complete 32-bit words independently
+            // of the instruction's physical source lane width and type tag.
             (_, 8 | 9 | 23 | 24) => Some(Self::Bits8),
             (_, 21 | 22 | 25 | 26) => Some(Self::Int4),
-            (_, 12 | 13) => Some(Self::Int16),
-            (_, 1 | 10 | 11) => Some(Self::Fp16),
-            (_, 16) => Some(Self::Bf16),
             _ => None,
         }
     }
@@ -79,6 +77,16 @@ pub struct C220FixpConversionResult {
     pub bytes: Vec<u8>,
     /// Diagnostic status, without an implicit architectural register write.
     pub lane_status: Vec<C220FixpLaneStatus>,
+}
+
+impl C220FixpConversionResult {
+    pub(super) fn complete_output(mut self, lanes: u8) -> Self {
+        self.bytes
+            .resize(self.format.storage_bytes(u32::from(lanes)) as usize, 0);
+        self.lane_status
+            .resize(usize::from(lanes), C220FixpLaneStatus::Cleared);
+        self
+    }
 }
 
 impl From<C220FixpFp16Result> for C220FixpConversionResult {

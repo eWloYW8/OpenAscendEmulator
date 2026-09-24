@@ -24,11 +24,11 @@ impl C220MtePipeline {
         self.connect_fixp_biu(biu)
     }
     pub fn external_fixp_admission_blocked(&self, command: C220FixpExternalCommand) -> bool {
-        !command.command.descriptor.is_disabled() && self.mte3.records().next().is_some()
+        !command.command.descriptor.is_disabled() && self.mte3.retirement_pending()
     }
 
     /// The frontend resolves attached synchronization before using this entry.
-    /// Pending MTE3 records block even after their transport queues drain.
+    /// Dispatched MTE3 records block even after their transport queues drain.
     pub fn admit_external_fixp(
         &mut self,
         engine: &mut C220FixpRuntime,

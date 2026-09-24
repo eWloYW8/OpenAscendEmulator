@@ -81,6 +81,7 @@ use crate::sim::common::event::{EventDispatcher, EventError, EventId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220MtePipelineConfig {
+    pub core_kind: crate::sim::c220::device::C220CoreKind,
     pub l1: C220L1Geometry,
     pub read_width: NonZeroU32,
     pub output_bandwidths: C220Mte1ReadBandwidths,
@@ -298,6 +299,7 @@ pub struct C220MtePipeline {
     dma_events: C220DmaEvents,
     mte3_events: C220Mte3Events,
     mte3: C220Mte3Frontend,
+    core_kind: crate::sim::c220::device::C220CoreKind,
     biu_events: C220BiuReadEvents,
     biu_return_events: C220BiuReturnEvents,
     ub_write_events: [C220UbWriteEvents; 2],
@@ -423,6 +425,7 @@ impl C220MtePipeline {
             biu_read: None,
             biu_returns: None,
             biu_subcore: C220BiuSubcore::Vector0,
+            core_kind: config.core_kind,
             biu_output: None,
             dma_tails: Vec::new(),
             biu_bus_reads: None,
@@ -1138,6 +1141,13 @@ impl C220MtePipeline {
                     }
                 }
                 Callback::Mte3(phase) => {
+                    let outstanding_fixp = external_fixp.as_ref().map_or(0, |(engine, _, _)| {
+                        engine.shared_engine().outstanding_external_commands()
+                    });
+                    self.mte3.set_external_fixp_pending(
+                        self.core_kind == crate::sim::c220::device::C220CoreKind::Cube
+                            && outstanding_fixp != 0,
+                    );
                     if let Some(outcome) =
                         self.mte3_events
                             .handle(phase, &mut self.events, &mut self.mte3)?

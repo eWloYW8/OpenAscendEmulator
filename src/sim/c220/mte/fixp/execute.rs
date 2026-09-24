@@ -234,6 +234,7 @@ impl C220FixpCommand {
                     }
                 }
                 if coordinate.output_format == C220FixpOutputFormat::Int4 {
+                    bytes.resize(usize::from(coordinate.lanes), 0);
                     for index in 0..bytes.len() / 2 {
                         bytes[index] = (bytes[2 * index] & 15) | ((bytes[2 * index + 1] & 15) << 4);
                     }
@@ -245,7 +246,8 @@ impl C220FixpCommand {
                         format: coordinate.output_format,
                         bytes,
                         lane_status,
-                    },
+                    }
+                    .complete_output(coordinate.lanes),
                     factors: operands,
                 });
             }
@@ -260,11 +262,14 @@ impl C220FixpCommand {
                 },
                 other => return Err(C220FixpExecutionError::Activation(other)),
             };
-            let conversion =
-                C220FixpFp16Conversion::new(self.control, activation).evaluate(&input)?;
+            // The converter consumes complete 32-bit words, even when the
+            // source storage uses 16-bit lanes. Remaining output lanes stay zero.
+            let conversion = C220FixpFp16Conversion::new(self.control, activation)
+                .evaluate(&input[..input.len() / 4 * 4])?;
             Ok(C220FixpSliceResult {
                 coordinate,
-                conversion: conversion.into(),
+                conversion: C220FixpConversionResult::from(conversion)
+                    .complete_output(coordinate.lanes),
                 factors: operands,
             })
         }))
@@ -817,5 +822,34 @@ mod tests {
         );
         assert_eq!(l1.read_known(32, 2).unwrap(), 0xc080_u16.to_le_bytes());
         assert_eq!(l1.read_known(34, 6).unwrap(), [0xaa; 6]);
+
+        let mut half = bf16;
+        half.source_format = C220FixpSourceFormat::Fp16;
+        half.descriptor.xm &= !(7 << 39);
+        l0c.write_known_linear(0, &3.5_f32.to_le_bytes().repeat(8))
+            .unwrap();
+        l0c.write_known_linear(128, &0x3c00_u16.to_le_bytes())
+            .unwrap();
+        for (mode, expected) in [(1, 0x4300_u16), (16, 0x4060_u16)] {
+            half.descriptor.xm = (half.descriptor.xm & !(31 << 34)) | (mode << 34);
+            let mut source_bytes = Vec::new();
+            half.execute_to_l1(&l0c, &C220LocalBuffer::new(0), &mut l1, |slice| {
+                source_bytes.push(slice.coordinate.source_bytes());
+                let converted = slice.coordinate.source_bytes() as usize / 4;
+                assert!(
+                    slice.conversion.lane_status[converted..]
+                        .iter()
+                        .all(|status| *status == C220FixpLaneStatus::Cleared)
+                );
+            })
+            .unwrap();
+            assert_eq!(source_bytes, [32, 2]);
+            assert_eq!(
+                l1.read_known(0, 16).unwrap(),
+                expected.to_le_bytes().repeat(8)
+            );
+            assert_eq!(l1.read_known(16, 18).unwrap(), [0; 18]);
+            assert_eq!(l1.read_known(34, 6).unwrap(), [0xaa; 6]);
+        }
     }
 }

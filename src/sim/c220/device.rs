@@ -1,6 +1,14 @@
 use std::fmt;
 use std::str::FromStr;
 
+/// Execution context, independent of the selected BIU transport route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220CoreKind {
+    Cube,
+    Vector0,
+    Vector1,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum C220Device {
     #[default]

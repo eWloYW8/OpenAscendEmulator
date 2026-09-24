@@ -339,6 +339,7 @@ mod tests {
         let mut pipeline = C220MtePipeline::new(
             0,
             C220MtePipelineConfig {
+                core_kind: crate::sim::c220::device::C220CoreKind::Cube,
                 l1: C220L1Geometry::new(32, 4, 1, 0).unwrap(),
                 read_width: width,
                 output_bandwidths: C220Mte1ReadBandwidths {

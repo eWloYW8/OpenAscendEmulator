@@ -137,6 +137,18 @@ impl C220FixpEngine {
     pub fn commands(&self) -> &BTreeMap<u64, C220FixpCommandState> {
         &self.commands
     }
+
+    /// Enabled external-destination commands retain their scheduler credit
+    /// until ordered retirement, even after their writes have been dispatched.
+    pub fn outstanding_external_commands(&self) -> usize {
+        self.commands
+            .values()
+            .filter(|state| {
+                state.destination == crate::isa::c220::mte::fixp::C220FixpDestination::External
+                    && !state.command.descriptor.is_disabled()
+            })
+            .count()
+    }
     pub fn factor_commands(&self) -> &BTreeMap<u64, C220FactorCommandState> {
         &self.factor_commands
     }
@@ -160,6 +172,12 @@ impl C220FixpEngine {
     }
     pub fn instruction_fifo(&self) -> &VecDeque<u64> {
         &self.instruction_fifo
+    }
+
+    /// Triggered hardware flags observe the two write-generation queues,
+    /// not pending reads, command FIFO occupancy or response retirement.
+    pub fn hardware_flag_trigger_ready(&self) -> bool {
+        self.datapath.write.is_idle()
     }
 
     pub fn retirement_fifo(&self) -> &VecDeque<u64> {
