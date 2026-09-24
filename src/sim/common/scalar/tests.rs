@@ -910,6 +910,45 @@ fn c310_post_index_store_can_alias_its_data_register() {
 }
 
 #[test]
+fn c220_immediate_post_index_aliases_commit_loaded_data_last() {
+    for dtype in 0..4 {
+        for offset in [-2048_i16, -1, 0, 2047] {
+            let mut machine = ScalarMachine::new(Architecture::Dav2201, [0; 32], 0);
+            machine.set_xreg(5, 0x3000).unwrap();
+            let mut bus = TestBus::new(0x3000);
+            bus.bytes[..8].copy_from_slice(&0xfedc_ba98_7654_3210_u64.to_le_bytes());
+            let word =
+                (19 << 24) | (dtype << 22) | (5 << 17) | (5 << 12) | (offset as u16 as u32 & 0xfff);
+            let before = machine.clone();
+            bus.fail = true;
+            assert!(matches!(
+                machine.execute_memory_word(0x100, word, &mut bus),
+                Err(ScalarMemoryExecutionError::Backend(_))
+            ));
+            assert_eq!(machine, before);
+            bus.fail = false;
+            let step = machine.execute_memory_word(0x100, word, &mut bus).unwrap();
+            let width = 1_usize << dtype;
+            let mut expected = [0; 8];
+            expected[..width].copy_from_slice(&bus.bytes[..width]);
+            assert_eq!(step.effective_address, 0x3000);
+            assert_eq!(step.prior_data_value, 0x3000);
+            assert_eq!(
+                step.updated_base,
+                Some(0x3000_u64.wrapping_add(offset as i64 as u64))
+            );
+            assert_eq!(machine.xregs()[5], u64::from_le_bytes(expected));
+
+            machine.set_xreg(5, 0x3000).unwrap();
+            let store = (word & !(0x1f << 24)) | (20 << 24);
+            let step = machine.execute_memory_word(0x104, store, &mut bus).unwrap();
+            assert_eq!(&bus.bytes[..width], &0x3000_u64.to_le_bytes()[..width]);
+            assert_eq!(machine.xregs()[5], step.updated_base.unwrap());
+        }
+    }
+}
+
+#[test]
 fn memory_backend_error_and_aliased_post_index_do_not_change_registers() {
     let mut machine = ScalarMachine::new(Architecture::Dav3510, [7; 32], 0x55);
     let before = machine.clone();

@@ -12,6 +12,7 @@ use crate::sim::common::scalar::{ScalarMachine, ScalarMachineError, ScalarStep};
 
 pub(crate) mod address;
 pub(crate) mod bus;
+pub mod lsu;
 pub mod timing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -21,7 +21,8 @@ impl ScalarMachine {
         else {
             return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
         };
-        if post_index
+        if self.architecture != Architecture::Dav2201
+            && post_index
             && matches!(operation, ScalarLoadStoreOperation::Load)
             && data_register == base_register
         {
@@ -58,11 +59,11 @@ impl ScalarMachine {
                 prior_data_value
             }
         };
-        if matches!(operation, ScalarLoadStoreOperation::Load) {
-            self.xregs[usize::from(data_register)] = data_value;
-        }
         if let Some(updated_base) = effect.updated_base {
             self.xregs[usize::from(base_register)] = updated_base;
+        }
+        if matches!(operation, ScalarLoadStoreOperation::Load) {
+            self.xregs[usize::from(data_register)] = data_value;
         }
         Ok(ScalarMemoryStep {
             pc,
