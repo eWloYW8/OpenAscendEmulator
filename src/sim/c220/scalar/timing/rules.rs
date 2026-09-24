@@ -4,14 +4,17 @@ use super::{
 };
 use crate::architecture::Architecture;
 use crate::isa::c220::scalar::C220ScalarConversionHint;
-use crate::isa::scalar::{ScalarInstruction, ScalarKey0Operation, ScalarKey8Operation};
+use crate::isa::scalar::{
+    ScalarBitCountOperation, ScalarInstruction, ScalarKey0Operation, ScalarKey7Operation,
+    ScalarKey8Operation,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220ScalarTimingRule {
     pub class: C220ScalarTimingClass,
     pub latency_ticks: u64,
     pub execution_stage: u8,
-    pub source_register: u8,
+    pub source_register: Option<u8>,
     pub destination_register: u8,
 }
 
@@ -22,11 +25,29 @@ impl C220ScalarTimingRule {
                 class: C220ScalarTimingClass::Fixed,
                 latency_ticks: SCALAR_CONVERSION_LATENCY_TICKS,
                 execution_stage: SCALAR_CONVERSION_EXECUTION_STAGE,
-                source_register: hint.source_register,
+                source_register: Some(hint.source_register),
                 destination_register: hint.destination_register,
             });
         }
         let instruction = ScalarInstruction::from_word(Architecture::Dav2201, word)?;
+        if let ScalarInstruction::ScalarKey2BitCount {
+            operation,
+            source_register,
+            destination_register,
+        } = instruction
+        {
+            return Some(Self {
+                class: C220ScalarTimingClass::Fixed,
+                latency_ticks: match operation {
+                    ScalarBitCountOperation::Zeros | ScalarBitCountOperation::Ones => 2,
+                    ScalarBitCountOperation::LeadingZeros
+                    | ScalarBitCountOperation::LeadingSignBits => 1,
+                },
+                execution_stage: 1,
+                source_register: Some(source_register),
+                destination_register,
+            });
+        }
         if let ScalarInstruction::ScalarKey2IntegerSqrt {
             dtype_field,
             source_register,
@@ -37,7 +58,7 @@ impl C220ScalarTimingRule {
                 class: C220ScalarTimingClass::Variable,
                 latency_ticks: if dtype_field == 2 { 18 } else { 15 },
                 execution_stage: if dtype_field == 0 { 10 } else { 18 },
-                source_register,
+                source_register: Some(source_register),
                 destination_register,
             });
         }
@@ -97,13 +118,41 @@ impl C220ScalarTimingRule {
             },
             latency_ticks,
             execution_stage,
-            source_register: first_source_register,
+            source_register: Some(first_source_register),
             destination_register,
         })
     }
 
     fn register_operation(instruction: ScalarInstruction) -> Option<Self> {
         let (source_register, destination_register, execution_stage) = match instruction {
+            ScalarInstruction::ScalarKey2MoveFromSpr {
+                destination_register,
+                ..
+            }
+            | ScalarInstruction::ScalarKey7 {
+                operation: ScalarKey7Operation::MoveImmediate,
+                destination_register,
+                ..
+            } => (None, destination_register, 1),
+            ScalarInstruction::ScalarKey7 {
+                operation: ScalarKey7Operation::MoveKeep,
+                destination_register,
+                ..
+            }
+            | ScalarInstruction::ScalarMoveX8Immediate {
+                destination_register,
+                ..
+            } => (Some(destination_register), destination_register, 1),
+            ScalarInstruction::ScalarCompareRegister {
+                first_source_register,
+                destination_register,
+                ..
+            }
+            | ScalarInstruction::ScalarSelect {
+                first_source_register,
+                destination_register,
+                ..
+            } => (Some(first_source_register), destination_register, 1),
             ScalarInstruction::ScalarKey2MoveRegister {
                 source_register,
                 destination_register,
@@ -148,7 +197,7 @@ impl C220ScalarTimingRule {
                 source_register,
                 destination_register,
                 ..
-            } => (source_register, destination_register, 1),
+            } => (Some(source_register), destination_register, 1),
             ScalarInstruction::ScalarKey2ShiftLeft {
                 destination_register,
                 ..
@@ -160,14 +209,14 @@ impl C220ScalarTimingRule {
             | ScalarInstruction::ScalarKey2InsertImmediate {
                 destination_register,
                 ..
-            } => (destination_register, destination_register, 1),
+            } => (Some(destination_register), destination_register, 1),
             ScalarInstruction::ScalarKey8 {
                 operation,
                 source_register,
                 destination_register: Some(destination_register),
                 ..
             } => (
-                source_register,
+                Some(source_register),
                 destination_register,
                 if operation == ScalarKey8Operation::MultiplyImmediate {
                     2
@@ -203,6 +252,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bit_counts_wait_for_sources_and_retire_at_their_own_latency() {
+        use crate::sim::c220::scalar::timing::C220ScalarTimingLane;
+
+        for (opcode, latency) in [(0x0300, 2), (0x0340, 2), (0x0480, 1), (0x0500, 1)] {
+            let word = 0x0200_0000 | (1 << 17) | (2 << 12) | opcode;
+            let rule = C220ScalarTimingRule::decode(word).unwrap();
+            assert_eq!((rule.latency_ticks, rule.execution_stage), (latency, 1));
+            assert_eq!(rule.class, C220ScalarTimingClass::Fixed);
+            let mut lane = C220ScalarTimingLane::default();
+            let producer = C220ScalarTimingRule::decode(0x0204_0300).unwrap();
+            lane.issue(producer.ticket(10).unwrap());
+            assert_eq!(lane.dependency_tick(word, 11), Some(12));
+            lane.advance_to(12);
+            assert_eq!(lane.dependency_tick(word, 12), None);
+            lane.issue(rule.ticket(12).unwrap());
+            assert_eq!(lane.pending_xreg_retirement(1), Some(12 + latency));
+            lane.advance_to(12 + latency);
+            assert_eq!(lane.pending_xreg_retirement(1), None);
+        }
+    }
+
+    #[test]
     fn register_timing_distinguishes_retirement_from_execution_stage() {
         for (opcode, stage) in [
             (0x0200_0800, 1),
@@ -215,11 +286,27 @@ mod tests {
         ] {
             let word = opcode | (1 << 17) | (2 << 12);
             let rule = C220ScalarTimingRule::decode(word).unwrap();
-            assert_eq!((rule.source_register, rule.destination_register), (2, 1));
+            assert_eq!(
+                (rule.source_register, rule.destination_register),
+                (Some(2), 1)
+            );
             let ticket = rule.ticket(10).unwrap();
             assert_eq!((ticket.retire_tick, ticket.execution_stage), (11, stage));
             assert_eq!(rule.ticket(u64::MAX), None);
         }
         assert_eq!(C220ScalarTimingRule::decode(0x08c0_0000), None);
+        for (word, source) in [
+            (0x0702_1234, None),
+            (0x0703_1234, Some(1)),
+            (0x1002_1234, Some(1)),
+            (0x0202_b880, None),
+            ((1 << 17) | (2 << 12) | (3 << 7) | 9, Some(2)),
+            ((1 << 17) | (2 << 12) | (3 << 7) | 15, Some(2)),
+        ] {
+            let rule = C220ScalarTimingRule::decode(word).unwrap();
+            assert_eq!(rule.source_register, source);
+            assert_eq!(rule.destination_register, 1);
+            assert_eq!((rule.latency_ticks, rule.execution_stage), (1, 1));
+        }
     }
 }

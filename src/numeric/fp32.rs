@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+mod fma;
+pub use fma::evaluate_fp32_fused_multiply_add;
+
 const SIGN_BIT: u32 = 0x8000_0000;
 const ABS_MASK: u32 = 0x7fff_ffff;
 const INFINITY_BITS: u32 = 0x7f80_0000;

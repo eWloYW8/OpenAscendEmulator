@@ -1,4 +1,22 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220ScalarSprImmediate {
+    pub destination_spr: u16,
+    pub immediate: u16,
+}
+
+impl C220ScalarSprImmediate {
+    pub const fn decode(word: u32) -> Option<Self> {
+        if word >> 29 != 0 || ((word >> 24) & 0x1f) != 18 {
+            return None;
+        }
+        Some(Self {
+            destination_spr: ((word >> 17) & 0x7f) as u16,
+            immediate: word as u16,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220ScalarConversion {
     F32ToS32Truncate,
     S32ToF32,

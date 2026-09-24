@@ -1,4 +1,5 @@
 use super::*;
+use crate::isa::scalar::ScalarBitCountOperation;
 
 impl ScalarMachine {
     pub fn execute_word(&mut self, pc: u64, word: u32) -> Result<ScalarStep, ScalarMachineError> {
@@ -204,6 +205,39 @@ impl ScalarMachine {
                     Some(prior),
                     second_source_register,
                     second_source_value,
+                    value,
+                    false,
+                    self.spr2,
+                )
+            }
+            ScalarInstruction::ScalarKey2BitCount {
+                operation,
+                destination_register,
+                source_register,
+            } => {
+                let source_value = self.xregs[usize::from(source_register)];
+                let value = match operation {
+                    ScalarBitCountOperation::Zeros => u64::from(source_value.count_zeros()),
+                    ScalarBitCountOperation::Ones => u64::from(source_value.count_ones()),
+                    ScalarBitCountOperation::LeadingZeros => {
+                        u64::from(source_value.leading_zeros())
+                    }
+                    ScalarBitCountOperation::LeadingSignBits => {
+                        if source_value == 0 || source_value == u64::MAX {
+                            u64::MAX
+                        } else if source_value >> 63 != 0 {
+                            u64::from(source_value.leading_ones() - 1)
+                        } else {
+                            u64::from(source_value.leading_zeros() - 1)
+                        }
+                    }
+                };
+                (
+                    destination_register,
+                    Some(source_register),
+                    Some(source_value),
+                    None,
+                    None,
                     value,
                     false,
                     self.spr2,

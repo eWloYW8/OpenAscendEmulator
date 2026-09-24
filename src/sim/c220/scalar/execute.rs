@@ -10,6 +10,18 @@ impl C220State {
         word: u32,
         fallback: &mut B,
     ) -> Result<ScalarProgramStep, ScalarInstructionError<C220ScalarBusError<B::Error>>> {
+        if super::float::supports(word) {
+            let pc = self.scalar.pc();
+            let result = super::execute_fp32_word(self.scalar.machine_mut(), pc, word)?;
+            self.scalar.advance_sequential();
+            return Ok(ScalarProgramStep {
+                pc,
+                word,
+                next_pc: self.scalar.pc(),
+                instruction: ScalarInstructionStep::Register(result.step),
+                halted_after: false,
+            });
+        }
         if super::spr::write_destination(word).is_some() {
             let pc = self.scalar.pc();
             let step = super::spr::execute_write(self.scalar.machine_mut(), pc, word)?;

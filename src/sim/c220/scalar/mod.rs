@@ -1,4 +1,6 @@
 mod execute;
+mod float;
+pub use float::{C220ScalarFp32Outcome, execute_fp32_word};
 pub mod spr;
 use crate::architecture::Architecture;
 use crate::isa::c220::scalar::{C220ScalarConversion, C220ScalarConversionHint};

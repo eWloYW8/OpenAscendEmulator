@@ -2,6 +2,14 @@ use crate::architecture::Architecture;
 use crate::isa::class::AicClass;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarBitCountOperation {
+    Zeros,
+    Ones,
+    LeadingZeros,
+    LeadingSignBits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarKey8Operation {
     AddImmediate,
     MultiplyImmediate,
@@ -233,6 +241,11 @@ pub enum ScalarInstruction {
         destination_register: u8,
         source_register: u8,
         find_set: bool,
+    },
+    ScalarKey2BitCount {
+        operation: ScalarBitCountOperation,
+        destination_register: u8,
+        source_register: u8,
     },
     ScalarKey2Insert {
         destination_register: u8,
@@ -589,20 +602,7 @@ impl ScalarInstruction {
                 })
             }
             AicClass::Scalar
-                if (matches!(architecture, Architecture::Dav3510)
-                    || matches!(
-                        (architecture, word),
-                        (Architecture::Dav2201, 0x02de_d380)
-                            | (Architecture::Dav2201, 0x02d6_9380)
-                            | (Architecture::Dav2201, 0x02d8_b380)
-                            | (Architecture::Dav2201, 0x02da_9380)
-                            | (Architecture::Dav2201, 0x02d6_8380)
-                            | (Architecture::Dav2201, 0x02de_b380)
-                            | (Architecture::Dav2201, 0x02da_a380)
-                            | (Architecture::Dav2201, 0x02da_b380)
-                            | (Architecture::Dav2201, 0x02dc_d380)
-                            | (Architecture::Dav2201, 0x02e0_f380)
-                    ))
+                if (matches!(architecture, Architecture::Dav3510) || word & 0x30 == 0)
                     && ((word >> 24) & 0x1f) == 2
                     && ((word >> 7) & 0x1f) == 7 =>
             {
@@ -612,7 +612,32 @@ impl ScalarInstruction {
                     find_set: word & 0x40 != 0,
                 })
             }
-            AicClass::Scalar if ((word >> 24) & 0x1f) == 2 && ((word >> 7) & 0x1f) == 8 => {
+            AicClass::Scalar
+                if matches!(architecture, Architecture::Dav2201)
+                    && ((word >> 24) & 0x1f) == 2
+                    && matches!((word >> 7) & 0x1f, 6 | 9 | 10) =>
+            {
+                let opcode = (word >> 7) & 0x1f;
+                let extended_mask = if opcode == 6 { 0x30 } else { 0x60 };
+                if word & extended_mask != 0 {
+                    return None;
+                }
+                Some(Self::ScalarKey2BitCount {
+                    operation: match opcode {
+                        6 if word & 0x40 != 0 => ScalarBitCountOperation::Ones,
+                        6 => ScalarBitCountOperation::Zeros,
+                        9 => ScalarBitCountOperation::LeadingZeros,
+                        _ => ScalarBitCountOperation::LeadingSignBits,
+                    },
+                    destination_register: ((word >> 17) & 0x1f) as u8,
+                    source_register: ((word >> 12) & 0x1f) as u8,
+                })
+            }
+            AicClass::Scalar
+                if ((word >> 24) & 0x1f) == 2
+                    && ((word >> 7) & 0x1f) == 8
+                    && (matches!(architecture, Architecture::Dav3510) || word & 0x30 == 0) =>
+            {
                 Some(Self::ScalarKey2BitSet {
                     destination_register: ((word >> 17) & 0x1f) as u8,
                     source_register: ((word >> 12) & 0x1f) as u8,

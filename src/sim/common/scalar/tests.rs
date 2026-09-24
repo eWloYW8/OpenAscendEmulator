@@ -1278,7 +1278,7 @@ fn observed_c220_mov_spr_xn_writes_full_width_ctrl_value() {
     machine.set_xreg(19, 0x0100_0000_0000_0000).unwrap();
     let first = machine.execute_spr_word(0x1131_2644, 0x0207_3900).unwrap();
     assert_eq!(first.destination_spr, 3);
-    assert_eq!(first.source_register, 19);
+    assert_eq!(first.source_register, Some(19));
     assert_eq!(first.source_value, 0x0100_0000_0000_0000);
     assert_eq!(first.prior_destination_value, None);
     assert_eq!(machine.spr_value(3), Some(0x0100_0000_0000_0000));
@@ -1943,6 +1943,80 @@ fn c310_integer_compare_register_writes_result_after_reading_both_sources() {
             Err(ScalarMachineError::UnsupportedWord { .. })
         ));
         assert_eq!(machine, before);
+    }
+}
+
+#[test]
+fn c220_bit_counts_preserve_flags_and_handle_uniform_inputs() {
+    for (source, expected) in [
+        (0, [64, 0, 64, u64::MAX]),
+        (u64::MAX, [0, 64, 0, u64::MAX]),
+        (1, [63, 1, 63, 62]),
+        (u64::MAX - 1, [1, 63, 0, 62]),
+        (1_u64 << 63, [63, 1, 0, 0]),
+        ((1_u64 << 63) - 1, [1, 63, 1, 0]),
+        (0x5555_5555_5555_5555, [32, 32, 1, 0]),
+    ] {
+        for (opcode, expected) in [0x0300, 0x0340, 0x0480, 0x0500].into_iter().zip(expected) {
+            for destination in [0, 7, 31] {
+                let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+                machine.set_xreg(7, source).unwrap();
+                let prior_spr2 = machine.spr2();
+                let word = 0x0200_0000 | (destination << 17) | (7 << 12) | opcode;
+                let step = machine.execute_word(0, word).unwrap();
+                assert_eq!(step.source_value, Some(source));
+                assert_eq!(step.value, expected);
+                assert_eq!(machine.xregs()[destination as usize], expected);
+                assert_eq!(machine.spr2(), prior_spr2);
+                assert!(!step.signed_overflow);
+            }
+        }
+    }
+    for (opcode, extensions) in [
+        (0x0300, [0x10, 0x20]),
+        (0x0380, [0x10, 0x20]),
+        (0x0400, [0x10, 0x20]),
+        (0x0480, [0x40, 0x20]),
+        (0x0500, [0x40, 0x20]),
+    ] {
+        for extension in extensions {
+            let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+            let before = machine.clone();
+            assert!(
+                machine
+                    .execute_word(0, 0x0200_0000 | opcode | extension)
+                    .is_err()
+            );
+            assert_eq!(machine, before);
+        }
+    }
+}
+
+#[test]
+fn c220_find_first_supports_all_general_register_pairs() {
+    for destination in 0_u8..32 {
+        for source in 0_u8..32 {
+            for (value, find_set, expected) in [
+                (0, true, u64::MAX),
+                (u64::MAX, false, u64::MAX),
+                (1_u64 << 63, true, 63),
+                (!(1_u64 << 63), false, 63),
+                (0b1110, true, 1),
+                (0b1111, false, 4),
+            ] {
+                let word = 0x0200_0380
+                    | (u32::from(destination) << 17)
+                    | (u32::from(source) << 12)
+                    | if find_set { 0x40 } else { 0 };
+                let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+                machine.set_xreg(source, value).unwrap();
+                let step = machine.execute_word(0, word).unwrap();
+                assert_eq!(step.destination_register, destination);
+                assert_eq!(step.source_register, Some(source));
+                assert_eq!(step.value, expected);
+                assert_eq!(machine.xregs()[usize::from(destination)], expected);
+            }
+        }
     }
 }
 

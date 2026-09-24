@@ -1657,6 +1657,7 @@ fn scalar_conversion_retires_after_two_ticks_and_blocks_dependent_conversion() {
         0x4800_0000 | (1 << 17) | (8 << 5),
         (2 << 29) | (1 << 21) | (3 << 18) | (8 << 12),
         (2 << 29) | (1 << 21) | (3 << 18) | (1 << 17) | (8 << 12),
+        0x1000_0000 | (8 << 17) | 7,
     ] {
         let C220CoreStep::Stalled(stall) = core.step_word_at(11, word).unwrap() else {
             panic!("pending scalar operand must block dispatch");
@@ -1787,6 +1788,7 @@ fn scalar_conversion_retires_after_two_ticks_and_blocks_dependent_conversion() {
         C220CoreStep::Executed { .. }
     ));
     assert_eq!(core.state().scalar().machine().xregs()[14], 0);
+    assert_eq!(core.scalar_timing().pending_xreg_retirement(14), Some(43));
     assert_eq!(core.scalar_timing().pending_spr_retirement(11), None);
     let write_control = 0x0200_0900 | (3 << 17) | (1 << 12);
     assert!(matches!(
@@ -1794,6 +1796,66 @@ fn scalar_conversion_retires_after_two_ticks_and_blocks_dependent_conversion() {
         C220CoreStep::Executed { .. }
     ));
     assert_eq!(core.scalar_timing().pending_spr_retirement(3), None);
+    for (tick, register, immediate, value) in [(44, 11, 0xffff, 1), (45, 90, 0xabcd, 0xcd)] {
+        let word = 0x1200_0000 | (register << 17) | immediate;
+        let C220CoreStep::Executed {
+            instruction:
+                C220CoreInstruction::Scalar {
+                    step,
+                    spr_timing: Some(ticket),
+                    ..
+                },
+            ..
+        } = core.step_word_at(tick, word).unwrap()
+        else {
+            panic!("immediate SPR write should issue");
+        };
+        let crate::sim::common::scalar::ScalarInstructionStep::SprWrite(write) = step.instruction
+        else {
+            panic!("expected SPR write result");
+        };
+        assert_eq!(write.source_register, None);
+        assert_eq!(write.source_value, u64::from(immediate));
+        assert_eq!(write.value, value);
+        assert_eq!(ticket.retire_tick, tick + 1);
+        assert_eq!(
+            core.state().scalar().machine().spr_value(register as u16),
+            Some(value)
+        );
+        assert_eq!(
+            core.scalar_timing().dependency_tick(word, tick),
+            Some(tick + 1)
+        );
+    }
+    let machine = core.state.scalar_mut().machine_mut();
+    machine.set_xreg(1, u64::from(1.5_f32.to_bits())).unwrap();
+    machine.set_xreg(2, u64::from(2.0_f32.to_bits())).unwrap();
+    for (tick, opcode, expected) in [(46, 1, 3.5_f32), (51, 2, 1.5), (56, 3, 3.0), (61, 4, 9.0)] {
+        let word = 0x0082_1100 | opcode;
+        let C220CoreStep::Executed {
+            instruction:
+                C220CoreInstruction::Scalar {
+                    timing: Some(ticket),
+                    ..
+                },
+            ..
+        } = core.step_word_at(tick, word).unwrap()
+        else {
+            panic!("FP32 operation should issue");
+        };
+        assert_eq!(ticket.retire_tick, tick + 5);
+        assert_eq!(ticket.execution_stage, 3);
+        assert_eq!(
+            core.state().scalar().machine().xregs()[1],
+            u64::from(expected.to_bits())
+        );
+        let before = core.state().scalar().machine().clone();
+        let C220CoreStep::Stalled(stall) = core.step_word_at(tick + 1, word).unwrap() else {
+            panic!("dependent FP32 operation must await retirement");
+        };
+        assert_eq!(stall.resume_tick, tick + 5);
+        assert_eq!(core.state().scalar().machine(), &before);
+    }
 }
 
 #[test]

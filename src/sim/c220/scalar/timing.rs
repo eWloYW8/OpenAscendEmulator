@@ -36,7 +36,7 @@ pub struct C220ScalarTimingTicket {
     /// Scheduled notification time. Variable-class notifications retire the FIFO head.
     pub retire_tick: u64,
     pub execution_stage: u8,
-    pub source_register: u8,
+    pub source_register: Option<u8>,
     pub destination_register: u8,
 }
 
@@ -76,6 +76,11 @@ impl C220ScalarTimingLane {
         let mut resume_tick = spr
             .and_then(|register| self.pending_spr_retirement(register))
             .filter(|retirement| *retirement > tick);
+        if let Some(instruction) = crate::isa::c220::scalar::C220ScalarSprImmediate::decode(word) {
+            return self
+                .pending_spr_retirement(instruction.destination_spr)
+                .filter(|retirement| *retirement > tick);
+        }
         let mut include = |register: u8| {
             if let Some(retire_tick) = self
                 .pending_xreg_retirement(register)
@@ -298,6 +303,9 @@ impl C220ScalarTimingLane {
             | ScalarInstruction::ScalarKey2FindFirst {
                 source_register, ..
             }
+            | ScalarInstruction::ScalarKey2BitCount {
+                source_register, ..
+            }
             | ScalarInstruction::ScalarKey8 {
                 source_register, ..
             } => include(source_register),
@@ -332,14 +340,17 @@ impl C220ScalarTimingLane {
             ScalarInstruction::ScalarKey2InsertImmediate {
                 destination_register,
                 ..
+            }
+            | ScalarInstruction::ScalarMoveX8Immediate {
+                destination_register,
+                ..
             } => include(destination_register),
             ScalarInstruction::ScalarKey7 {
                 operation: ScalarKey7Operation::MoveKeep,
                 destination_register,
                 ..
             } => include(destination_register),
-            ScalarInstruction::ScalarMoveX8Immediate { .. }
-            | ScalarInstruction::ScalarKey2MoveFromSpr { .. }
+            ScalarInstruction::ScalarKey2MoveFromSpr { .. }
             | ScalarInstruction::ScalarKey7 { .. } => {}
         }
         resume_tick
@@ -404,7 +415,7 @@ impl C220ScalarTimingTicket {
             issue_tick,
             retire_tick: issue_tick.checked_add(SCALAR_CONVERSION_LATENCY_TICKS)?,
             execution_stage: SCALAR_CONVERSION_EXECUTION_STAGE,
-            source_register: hint.source_register,
+            source_register: Some(hint.source_register),
             destination_register: hint.destination_register,
         })
     }
@@ -460,7 +471,7 @@ mod tests {
             issue_tick: 0,
             retire_tick: 4,
             execution_stage: 2,
-            source_register: 1,
+            source_register: Some(1),
             destination_register: 6,
         });
         for opcode in [0x9700_0000, 0x9700_0001] {
@@ -505,7 +516,7 @@ mod tests {
                     issue_tick: 0,
                     retire_tick: 4,
                     execution_stage: 2,
-                    source_register: 0,
+                    source_register: Some(0),
                     destination_register: register,
                 });
                 assert_eq!(

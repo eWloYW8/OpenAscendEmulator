@@ -1,4 +1,5 @@
 use crate::architecture::Architecture;
+use crate::isa::c220::scalar::C220ScalarSprImmediate;
 use crate::isa::scalar::ScalarInstruction;
 use crate::sim::common::scalar::{ScalarMachine, ScalarMachineError, ScalarSprStep};
 
@@ -15,6 +16,13 @@ pub(crate) const fn scalar_write_mask(register: u16) -> Option<u64> {
 }
 
 pub(crate) fn write_destination(word: u32) -> Option<u16> {
+    if let Some(instruction) = C220ScalarSprImmediate::decode(word) {
+        if instruction.destination_spr == 3 {
+            return None;
+        }
+        scalar_write_mask(instruction.destination_spr)?;
+        return Some(instruction.destination_spr);
+    }
     let ScalarInstruction::ScalarKey2MoveToSpr {
         encoded_destination_spr,
         ..
@@ -31,16 +39,24 @@ pub(crate) fn execute_write(
     pc: u64,
     word: u32,
 ) -> Result<ScalarSprStep, ScalarMachineError> {
-    let Some(ScalarInstruction::ScalarKey2MoveToSpr {
-        encoded_destination_spr,
-        source_register,
-    }) = ScalarInstruction::from_word(Architecture::Dav2201, word)
-    else {
-        return Err(ScalarMachineError::UnsupportedWord { pc, word });
-    };
+    let encoded_destination_spr =
+        write_destination(word).ok_or(ScalarMachineError::UnsupportedWord { pc, word })?;
+    let (source_register, source_value) =
+        if let Some(instruction) = C220ScalarSprImmediate::decode(word) {
+            (None, u64::from(instruction.immediate))
+        } else if let Some(ScalarInstruction::ScalarKey2MoveToSpr {
+            source_register, ..
+        }) = ScalarInstruction::from_word(Architecture::Dav2201, word)
+        {
+            (
+                Some(source_register),
+                machine.xregs()[usize::from(source_register)],
+            )
+        } else {
+            return Err(ScalarMachineError::UnsupportedWord { pc, word });
+        };
     let mask = scalar_write_mask(encoded_destination_spr)
         .ok_or(ScalarMachineError::UnsupportedWord { pc, word })?;
-    let source_value = machine.xregs()[usize::from(source_register)];
     let prior_destination_value = machine.spr_value(encoded_destination_spr);
     let value = source_value & mask;
     machine.set_spr_value(encoded_destination_spr, value)?;

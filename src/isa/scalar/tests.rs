@@ -1048,7 +1048,7 @@ fn scalar_compare_uses_two_sources_and_a_three_bit_condition() {
 }
 
 #[test]
-fn captured_find_first_decodes_registers_and_match_bit() {
+fn find_first_decodes_registers_and_match_bit() {
     assert_eq!(
         ScalarInstruction::from_word(Architecture::Dav2201, 0x02d6_9380),
         Some(ScalarInstruction::ScalarKey2FindFirst {
@@ -1115,7 +1115,11 @@ fn captured_find_first_decodes_registers_and_match_bit() {
     );
     assert_eq!(
         ScalarInstruction::from_word(Architecture::Dav2201, 0x02de_d3c0),
-        None
+        Some(ScalarInstruction::ScalarKey2FindFirst {
+            destination_register: 15,
+            source_register: 13,
+            find_set: true,
+        })
     );
     assert_eq!(
         ScalarInstruction::from_word(Architecture::Dav3510, 0x02d6_0380),
@@ -1135,6 +1139,14 @@ fn captured_find_first_decodes_registers_and_match_bit() {
     );
     assert_eq!(
         ScalarInstruction::from_word(Architecture::Dav2201, 0x02d6_0380),
+        Some(ScalarInstruction::ScalarKey2FindFirst {
+            destination_register: 11,
+            source_register: 0,
+            find_set: false,
+        })
+    );
+    assert_eq!(
+        ScalarInstruction::from_word(Architecture::Dav2201, 0x02d6_0390),
         None
     );
 }

@@ -57,7 +57,7 @@ pub struct ScalarSprStep {
     pub word: u32,
     pub destination_spr: u16,
     pub prior_destination_value: Option<u64>,
-    pub source_register: u8,
+    pub source_register: Option<u8>,
     pub source_value: u64,
     pub value: u64,
 }
@@ -717,7 +717,7 @@ impl ScalarMachine {
             word,
             destination_spr: encoded_destination_spr,
             prior_destination_value,
-            source_register,
+            source_register: Some(source_register),
             source_value,
             value,
         })
