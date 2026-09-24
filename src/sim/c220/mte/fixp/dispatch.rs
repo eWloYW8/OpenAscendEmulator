@@ -27,6 +27,21 @@ pub enum C220FixpDispatchPacket {
 pub type C220FixpDispatchPipeline = C220FixpWritePipeline<C220FixpDispatchPacket>;
 
 impl C220FixpDispatchPipeline {
+    pub fn packetize_l1_shared(
+        &mut self,
+        tick: u64,
+        output: &mut C220FixpExternalOutput,
+    ) -> Result<Option<C220MteOutputFragment>, C220FixpWritePipelineError> {
+        self.begin(tick, 0, "packetize")?;
+        tick.checked_add(1)
+            .ok_or(C220FixpWritePipelineError::Overflow)?;
+        let packet = output.take_l1_write(tick, true)?;
+        if let Some(packet) = packet {
+            self.enqueue(tick, C220FixpDispatchPacket::Write(packet))?;
+        }
+        Ok(packet)
+    }
+
     pub fn enqueue_factor_batch(
         &mut self,
         tick: u64,

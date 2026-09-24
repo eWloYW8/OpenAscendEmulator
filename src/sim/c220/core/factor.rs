@@ -2,10 +2,11 @@ use std::num::NonZeroU32;
 
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
 use crate::isa::c220::mte::factor::{C220FactorLoad, C220FactorLoadInstruction};
+use crate::sim::c220::memory::C220LocalBuffer;
 use crate::sim::c220::mte::factor::{
     C220FactorLoadResult, c220_factor_l1_requests, execute_c220_factor_load_from_memories,
 };
-use crate::sim::c220::mte::fixp::C220FixpAdmission;
+use crate::sim::c220::mte::fixp::{C220FixpAdmission, C220FixpEngine};
 use crate::sim::c220::mte::interface::C220MteL1ReadPort;
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 
@@ -31,18 +32,25 @@ impl C220Core {
         &mut self,
         config: C220FactorReadConfig,
     ) -> Result<(), C220CoreError> {
-        let fixp = self.fixp.as_mut().ok_or(C220CoreError::FixpUnconfigured)?;
+        let fixp = factor_context(&mut self.fixp, &mut self.external_fixp)
+            .ok_or(C220CoreError::FixpUnconfigured)?;
         if !fixp.engine.is_idle() {
             return Err(C220CoreError::MtePipelineBusy);
         }
-        fixp.factor_reads = Some(config);
+        *fixp.factor_reads = Some(config);
         Ok(())
     }
 
     pub fn factor_outcomes(&self) -> &[C220FactorOutcome] {
         self.fixp
             .as_ref()
-            .map_or(&[], |fixp| fixp.factor_outcomes.as_slice())
+            .map(|fixp| fixp.factor_outcomes.as_slice())
+            .or_else(|| {
+                self.external_fixp
+                    .as_ref()
+                    .map(|fixp| fixp.factor_outcomes.as_slice())
+            })
+            .unwrap_or(&[])
     }
 
     pub(super) fn step_factor_at(
@@ -53,7 +61,8 @@ impl C220Core {
         instruction: C220FactorLoadInstruction,
     ) -> Result<C220CoreStep, C220CoreError> {
         let load = instruction.capture(self.state.scalar().machine().xregs());
-        let fixp = self.fixp.as_mut().ok_or(C220CoreError::FixpUnconfigured)?;
+        let fixp = factor_context(&mut self.fixp, &mut self.external_fixp)
+            .ok_or(C220CoreError::FixpUnconfigured)?;
         let config = fixp.factor_reads.ok_or(C220CoreError::FactorUnconfigured)?;
         let id = self.next_instruction_id;
         let admission = fixp.engine.admit_factor_batch(
@@ -86,7 +95,7 @@ impl C220Core {
     }
 
     pub(super) fn retire_factor_at(&mut self, tick: u64) -> Result<(), C220CoreError> {
-        let Some(fixp) = &mut self.fixp else {
+        let Some(fixp) = factor_context(&mut self.fixp, &mut self.external_fixp) else {
             return Ok(());
         };
         let Some(id) = fixp.engine.command_retirement_head() else {
@@ -105,7 +114,7 @@ impl C220Core {
         let result = execute_c220_factor_load_from_memories(
             self.local_memory.l1(),
             self.state.ub(),
-            &mut fixp.factors,
+            fixp.factors,
             state.load,
         )?;
         fixp.engine.retire_factor(tick, id)?;
@@ -118,5 +127,33 @@ impl C220Core {
             result,
         });
         Ok(())
+    }
+}
+
+struct FactorContext<'a> {
+    engine: &'a mut C220FixpEngine,
+    factors: &'a mut C220LocalBuffer,
+    factor_reads: &'a mut Option<C220FactorReadConfig>,
+    factor_outcomes: &'a mut Vec<C220FactorOutcome>,
+}
+
+fn factor_context<'a>(
+    local: &'a mut Option<super::fixp::CoreFixp>,
+    external: &'a mut Option<super::external_fixp::CoreExternalFixp>,
+) -> Option<FactorContext<'a>> {
+    if let Some(fixp) = local {
+        Some(FactorContext {
+            engine: &mut fixp.engine,
+            factors: &mut fixp.factors,
+            factor_reads: &mut fixp.factor_reads,
+            factor_outcomes: &mut fixp.factor_outcomes,
+        })
+    } else {
+        external.as_mut().map(|fixp| FactorContext {
+            engine: fixp.engine.shared_engine_mut(),
+            factors: &mut fixp.factors,
+            factor_reads: &mut fixp.factor_reads,
+            factor_outcomes: &mut fixp.factor_outcomes,
+        })
     }
 }

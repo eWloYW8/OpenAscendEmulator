@@ -16,6 +16,7 @@ pub enum C220CoreInstruction {
         pc: u64,
         word: u32,
         command: crate::sim::c220::mte::fixp::C220FixpExternalCommand,
+        destination: crate::isa::c220::mte::fixp::C220FixpDestination,
         admission: crate::sim::c220::mte::fixp::C220FixpAdmission,
     },
     Factor {

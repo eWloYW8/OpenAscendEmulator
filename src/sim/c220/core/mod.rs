@@ -25,7 +25,7 @@ mod dispatch;
 mod external_fixp;
 mod factor;
 mod fixp;
-pub use external_fixp::C220CoreExternalFixpConfig;
+pub use external_fixp::C220CoreFixpConfig;
 pub use factor::{C220FactorOutcome, C220FactorReadConfig};
 mod hflag;
 mod mte1;

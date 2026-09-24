@@ -118,14 +118,20 @@ impl Iterator for C220FixpReadGenerator {
         let group_start = self.column_block / group_columns * group_columns;
         let singleton = merge && group_start + 1 == self.column_blocks;
         let partial_singleton = singleton && !d.columns().is_multiple_of(16);
-        let column_bytes = u32::from(d.rows()) * if partial_singleton { 32 } else { 64 };
+        let source_row_bytes = 16 * self.command.source_format.lane_bytes();
+        let column_bytes = u32::from(d.rows())
+            * if partial_singleton {
+                32
+            } else {
+                source_row_bytes
+            };
         let address = self
             .command
             .source_address
             .wrapping_add(u64::from(
                 self.column_block
                     .wrapping_mul(u32::from(d.source_stride()))
-                    .wrapping_mul(64),
+                    .wrapping_mul(source_row_bytes),
             ))
             .wrapping_add(u64::from(self.source_offset));
         let boundary = self.bandwidth - (address as u32 % self.bandwidth);
@@ -139,7 +145,7 @@ impl Iterator for C220FixpReadGenerator {
         } else if int4 && !merge {
             data_bytes.wrapping_mul(8) / 64
         } else {
-            data_bytes.wrapping_mul(32) / 64
+            data_bytes.wrapping_mul(32) / source_row_bytes
         };
         let begins_unit = address.is_multiple_of(1024) || self.source_offset == 0;
         let end_of_burst = self.source_offset + data_bytes == column_bytes;

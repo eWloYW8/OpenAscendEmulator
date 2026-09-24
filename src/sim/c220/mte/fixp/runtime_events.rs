@@ -3,7 +3,7 @@ use crate::memory::mapped::MappedMemory;
 use crate::sim::c220::memory::{C220L0c, C220LocalBuffer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum C220FixpExternalStage {
+pub enum C220FixpRuntimeStage {
     GenerateRead,
     SendRead,
     SendL0c,
@@ -18,7 +18,7 @@ pub enum C220FixpExternalStage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum C220FixpExternalEvent {
+pub enum C220FixpRuntimeEvent {
     Retired {
         tick: u64,
         instruction_id: u64,
@@ -27,21 +27,22 @@ pub enum C220FixpExternalEvent {
     Read(C220FixpEvent),
     Transposed(C220FixpTransposeProgress),
     Aligned(Option<C220FixpNz2ndStagingEntry>),
-    Packetized(Option<C220FixpBiuWrite>),
+    Packetized(Option<C220FixpDispatchPacket>),
     GeneratedWrite(C220FixpWriteProgress<C220FixpDispatchPacket>),
     SentWrite(C220FixpWriteProgress<C220FixpDispatchPacket>),
 }
 
-pub struct C220FixpExternalMemory<'a> {
+pub struct C220FixpRuntimeMemory<'a> {
     pub l0c: &'a mut C220L0c,
+    pub l1: &'a mut C220LocalBuffer,
     pub slopes: &'a C220LocalBuffer,
     pub external: &'a mut MappedMemory,
     pub atomics: C220FixpAtomicConfig,
 }
 
-impl C220FixpExternalEngine {
-    pub fn stage_ready_tick(&self, stage: C220FixpExternalStage, tick: u64) -> Option<u64> {
-        use C220FixpExternalStage::*;
+impl C220FixpRuntime {
+    pub fn stage_ready_tick(&self, stage: C220FixpRuntimeStage, tick: u64) -> Option<u64> {
+        use C220FixpRuntimeStage::*;
         match stage {
             GenerateRead => self.read_pipeline().generated_ready_tick(),
             SendRead => self

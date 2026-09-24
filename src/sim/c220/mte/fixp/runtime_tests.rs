@@ -1,6 +1,8 @@
 use super::*;
 use crate::isa::c220::mte::fixp::C220FixpDescriptor;
+use crate::memory::mapped::MappedMemory;
 use crate::memory::{region::MemoryRegion, sparse::SparseMemory};
+use crate::sim::c220::memory::C220LocalBuffer;
 use crate::sim::c220::memory::l1::C220L1Geometry;
 use crate::sim::c220::mte::{
     interface::biu_write::command::C220BiuWriteConfig, mte1::frontend::C220Mte1ReadBandwidths,
@@ -13,10 +15,10 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
     let cases = [0, 1, 8, 9, 10, 11, 12, 13, 21, 22, 23, 24, 25, 26]
         .into_iter()
         .map(|mode| (mode, true, false))
-        .chain([(0, false, false), (0, false, true)]);
+        .chain([(0, false, false), (0, false, true), (6, false, false)]);
     for (conversion, nz2nd, split) in cases {
         let int4 = matches!(conversion, 21 | 22 | 25 | 26);
-        use C220FixpExternalStage::*;
+        use C220FixpRuntimeStage::*;
         let width = NonZeroU32::new(32).unwrap();
         let mut pipeline = C220MtePipeline::new(
             0,
@@ -42,7 +44,7 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
                 source_bandwidth: width,
             })
             .unwrap();
-        let mut engine = C220FixpExternalEngine::new(
+        let mut engine = C220FixpRuntime::new(
             C220FixpEngineConfig {
                 instruction_fifo_depth: 1,
                 read_bandwidth: 128,
@@ -79,7 +81,10 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
         }
         let mut memory = MappedMemory::bind(
             SparseMemory::new(
-                vec![MemoryRegion::new(4096, vec![0; 4096]).unwrap()],
+                vec![
+                    MemoryRegion::new(4096, vec![if conversion == 6 { 0xa5 } else { 0 }; 4096])
+                        .unwrap(),
+                ],
                 4096,
                 4096,
             ),
@@ -106,7 +111,9 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
                         | 2,
                     nd: 1,
                 },
-                source_format: if matches!(conversion, 8..=13 | 21 | 22) {
+                source_format: if conversion == 6 {
+                    C220FixpSourceFormat::Fp16
+                } else if matches!(conversion, 8..=13 | 21 | 22) {
                     C220FixpSourceFormat::Int32
                 } else {
                     C220FixpSourceFormat::Fp32
@@ -128,6 +135,25 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
             biu_mode_word: 0,
             output_mode_word: 0,
         };
+        if conversion == 6 {
+            let slices: Vec<_> = operands.command.layout().unwrap().slices().collect();
+            assert_eq!(
+                slices
+                    .iter()
+                    .map(|slice| slice.source_address)
+                    .collect::<Vec<_>>(),
+                [0, 64, 32, 96]
+            );
+            assert!(slices.iter().all(|slice| slice.source_bytes() == 32));
+            let reads: Vec<_> = C220FixpReadGenerator::new(operands.command, 7, 0, 128)
+                .unwrap()
+                .map(|uop| {
+                    let op = uop.operation;
+                    (op.request.fragments.address, op.data_bytes, op.output_bytes)
+                })
+                .collect();
+            assert_eq!(reads, [(0, 64, 64), (64, 64, 64)]);
+        }
         use crate::isa::c220::mte::{C220DmaMovDescriptor, CAPTURED_C220_MOV_UB_TO_OUT_WORD};
         pipeline
             .issue_mte3_dma(
@@ -204,13 +230,15 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
         let mut disabled_retired = None;
         let mut executed = None;
         let mut sent_bytes = 0;
+        let mut l1 = C220LocalBuffer::new(131072);
         for tick in 4..512 {
             pipeline
                 .advance_external_fixp(
                     tick,
                     &mut engine,
-                    C220FixpExternalMemory {
+                    C220FixpRuntimeMemory {
                         l0c: &mut l0c,
+                        l1: &mut l1,
                         slopes: &slopes,
                         external: &mut memory,
                         atomics: C220FixpAtomicConfig::default(),
@@ -220,7 +248,7 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
                 .unwrap();
             for event in pipeline.last_events() {
                 if let crate::sim::c220::mte::pipeline::C220MtePipelineEvent::FixpExternal(
-                    C220FixpExternalEvent::Retired {
+                    C220FixpRuntimeEvent::Retired {
                         tick,
                         instruction_id,
                         state,
@@ -239,7 +267,7 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
                     }
                 }
                 if let crate::sim::c220::mte::pipeline::C220MtePipelineEvent::FixpExternal(
-                    C220FixpExternalEvent::Read(C220FixpEvent::ReceivedL0c {
+                    C220FixpRuntimeEvent::Read(C220FixpEvent::ReceivedL0c {
                         functional: Some(event),
                         ..
                     }),
@@ -284,18 +312,25 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
         if !nz2nd {
             let blocks = if split { 3 } else { 2 };
             let lanes = if split { 16 } else { 32 };
-            assert_eq!(sent_bytes, blocks * lanes * 4);
+            let lane_bytes = if conversion == 6 { 2 } else { 4 };
+            assert_eq!(sent_bytes, blocks * lanes * lane_bytes);
             for block in 0..blocks {
                 let address = 4096 + u64::from(block) * 1024;
                 assert_eq!(
-                    memory.read_known_at(address, lanes as usize * 4).unwrap(),
-                    1_f32.to_le_bytes().repeat(lanes as usize)
+                    memory
+                        .read_known_at(address, (lanes * lane_bytes) as usize)
+                        .unwrap(),
+                    if conversion == 6 {
+                        vec![0; (lanes * lane_bytes) as usize]
+                    } else {
+                        1_f32.to_le_bytes().repeat(lanes as usize)
+                    }
                 );
                 assert_eq!(
                     memory
-                        .read_known_at(address + u64::from(lanes) * 4, 32)
+                        .read_known_at(address + u64::from(lanes * lane_bytes), 32)
                         .unwrap(),
-                    [0; 32]
+                    [if conversion == 6 { 0xa5 } else { 0 }; 32]
                 );
             }
             assert!(engine.staging().is_idle());

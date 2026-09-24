@@ -18,7 +18,7 @@ use crate::sim::common::scalar::ScalarInstructionError;
 #[derive(Debug, Error)]
 pub enum C220CoreError {
     #[error(transparent)]
-    ExternalFixp(#[from] crate::sim::c220::mte::fixp::C220FixpExternalEngineError),
+    ExternalFixp(#[from] crate::sim::c220::mte::fixp::C220FixpRuntimeError),
     #[error("factor loads require explicit read port and bandwidth configuration")]
     FactorUnconfigured,
     #[error(transparent)]

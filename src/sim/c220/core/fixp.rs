@@ -47,7 +47,11 @@ impl C220Core {
     }
 
     pub fn fixp_engine(&self) -> Option<&C220FixpEngine> {
-        self.fixp.as_ref().map(|fixp| &fixp.engine)
+        self.fixp.as_ref().map(|fixp| &fixp.engine).or_else(|| {
+            self.external_fixp
+                .as_ref()
+                .map(|fixp| fixp.engine.shared_engine())
+        })
     }
 
     pub fn fixp_sync_bindings(&self) -> Option<&C220FixpSyncBindings> {
@@ -95,7 +99,20 @@ impl C220Core {
             |register| machine.xregs().get(usize::from(register)).copied(),
             |register| machine.spr_value(u16::from(register)),
         )?;
-        let fixp = self.fixp.as_mut().ok_or(C220CoreError::FixpUnconfigured)?;
+        if command.descriptor.nz_to_nd() && self.external_fixp.is_some() {
+            return self.step_external_fixp_at(tick, pc, word);
+        }
+        let (engine, bindings, next_request) = if let Some(fixp) = &mut self.fixp {
+            (&mut fixp.engine, &mut fixp.bindings, &mut fixp.next_request)
+        } else if let Some(fixp) = &mut self.external_fixp {
+            (
+                fixp.engine.shared_engine_mut(),
+                &mut fixp.bindings,
+                &mut fixp.next_request,
+            )
+        } else {
+            return Err(C220CoreError::FixpUnconfigured);
+        };
         let reservation = if command.descriptor.is_disabled() {
             0
         } else {
@@ -107,10 +124,10 @@ impl C220Core {
                 required: reservation,
             });
         }
-        if fixp.engine.is_idle() {
-            fixp.next_request = 0;
+        if engine.is_idle() {
+            *next_request = 0;
         }
-        if fixp.next_request + reservation > u64::from(u32::MAX) {
+        if *next_request + reservation > u64::from(u32::MAX) {
             return Ok(C220CoreStep::Stalled(C220Stall {
                 tick,
                 pc,
@@ -118,12 +135,12 @@ impl C220Core {
                 cause: C220StallCause::FixpDependency,
             }));
         }
-        let admission = fixp.engine.admit_with_flags(
+        let admission = engine.admit_with_flags(
             tick,
             self.next_instruction_id,
-            fixp.next_request as u32,
+            *next_request as u32,
             command,
-            &mut fixp.bindings,
+            bindings,
             &mut self.hardware_flags,
         )?;
         if !matches!(
@@ -138,7 +155,7 @@ impl C220Core {
             }));
         }
         self.state.commit_c220_sequential_issue();
-        fixp.next_request += reservation;
+        *next_request += reservation;
         Ok(C220CoreStep::Executed {
             tick,
             instruction: C220CoreInstruction::Fixp {

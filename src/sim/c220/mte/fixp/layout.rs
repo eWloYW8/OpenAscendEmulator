@@ -9,12 +9,13 @@ pub struct C220FixpSlice {
     pub source_address: u64,
     pub destination_address: u64,
     pub lanes: u8,
+    pub source_lane_bytes: u32,
     pub output_format: C220FixpOutputFormat,
 }
 
 impl C220FixpSlice {
     pub const fn source_bytes(self) -> u32 {
-        self.lanes as u32 * 4
+        self.lanes as u32 * self.source_lane_bytes
     }
     pub const fn destination_bytes(self) -> u32 {
         self.output_format.storage_bytes(self.lanes as u32)
@@ -40,13 +41,14 @@ pub enum C220FixpLayoutError {
     },
 }
 
-/// Lazy coordinate generation for 32-bit-source FIX, independent of transport.
+/// Lazy FIX coordinate generation, independent of transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220FixpLayout {
     descriptor: C220FixpDescriptor,
     source: u64,
     destination: u64,
     format: C220FixpOutputFormat,
+    source_format: C220FixpSourceFormat,
 }
 
 impl C220FixpLayout {
@@ -67,12 +69,14 @@ impl C220FixpLayout {
             source,
             destination,
             format,
+            source_format,
         })
     }
 
     pub fn slices(self) -> impl Iterator<Item = C220FixpSlice> + Clone {
         let d = self.descriptor;
         let format = self.format;
+        let source_row_bytes = 16 * self.source_format.lane_bytes();
         let split = matches!(
             self.format,
             C220FixpOutputFormat::Fp32 | C220FixpOutputFormat::Int32
@@ -101,10 +105,10 @@ impl C220FixpLayout {
             (0..d.rows()).flat_map(move |row| {
                 (0..blocks).map(move |block| {
                     let source_nd = u32::from(nd_index)
-                        .wrapping_mul(1024)
+                        .wrapping_mul(16 * source_row_bytes)
                         .wrapping_mul(u32::from(d.source_nd_stride()));
                     let source_block = (if split { block / 2 } else { block })
-                        .wrapping_mul(64)
+                        .wrapping_mul(source_row_bytes)
                         .wrapping_mul(u32::from(d.source_stride()))
                         .wrapping_add(if split { (block % 2) * 32 } else { 0 });
                     let source_address = self
@@ -114,7 +118,7 @@ impl C220FixpLayout {
                         } else {
                             0
                         })
-                        .wrapping_add(u64::from(row) * 64)
+                        .wrapping_add(u64::from(row) * u64::from(source_row_bytes))
                         .wrapping_add(u64::from(source_block));
                     let destination_address = if d.nz_to_nd() {
                         self.destination
@@ -172,6 +176,7 @@ impl C220FixpLayout {
                         source_address,
                         destination_address,
                         lanes,
+                        source_lane_bytes: self.source_format.lane_bytes(),
                         output_format: self.format,
                     }
                 })

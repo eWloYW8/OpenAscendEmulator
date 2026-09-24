@@ -78,6 +78,7 @@ impl C220FixpCommand {
         let source_format = match instruction.source_format {
             0 => C220FixpSourceFormat::Fp32,
             1 => C220FixpSourceFormat::Int32,
+            2 => C220FixpSourceFormat::Fp16,
             other => return Err(C220FixpExecutionError::SourceFormat(other)),
         };
         let mut gpr =
@@ -143,6 +144,17 @@ impl C220FixpCommand {
                 coordinate.source_bytes() as usize,
             )?;
             let operands = self.read_factor_operands(coordinate, slopes)?;
+            if self.descriptor.conversion_mode() == 6 {
+                return Ok(C220FixpSliceResult {
+                    coordinate,
+                    conversion: C220FixpConversionResult {
+                        format: coordinate.output_format,
+                        bytes: vec![0; coordinate.destination_bytes() as usize],
+                        lane_status: vec![C220FixpLaneStatus::Cleared; coordinate.lanes as usize],
+                    },
+                    factors: operands,
+                });
+            }
             if self.descriptor.conversion_mode() != 1 {
                 let activation = self.descriptor.activation_mode();
                 let factors = &operands.dequant;
@@ -169,13 +181,10 @@ impl C220FixpCommand {
                         } else {
                             C220FixpQuantizedWidth::Bits8
                         };
-                        let result = match self.source_format {
-                            C220FixpSourceFormat::Int32 => {
-                                c220_fixp_requantize(bits as i32, factors[index], activation, width)
-                            }
-                            C220FixpSourceFormat::Fp32 => {
-                                c220_fixp_quantize_f32(bits, factors[index], activation, width)
-                            }
+                        let result = if matches!(self.descriptor.conversion_mode(), 23..=26) {
+                            c220_fixp_quantize_f32(bits, factors[index], activation, width)
+                        } else {
+                            c220_fixp_requantize(bits as i32, factors[index], activation, width)
                         };
                         bytes.push(result.bits);
                         lane_status.push(C220FixpLaneStatus::Requant(result));
@@ -301,6 +310,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn conversion_modes_interpret_source_bits_independently_of_source_tag() {
+        let mut l0c = C220LocalBuffer::new(64);
+        let mut factors = C220LocalBuffer::new(4096);
+        let input: Vec<_> = [-2_f32, 2.0, 0.5, 1.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        l0c.write_known_linear(0, &input.repeat(4)).unwrap();
+        factors
+            .write_known_linear(0, &u64::from(0.5_f32.to_bits()).to_le_bytes().repeat(16))
+            .unwrap();
+        factors
+            .write_known_linear(2048, &0.25_f32.to_le_bytes().repeat(16))
+            .unwrap();
+        for mode in [1, 6, 8, 9, 10, 11, 12, 13, 16, 21, 22, 23, 24, 25, 26] {
+            let command = C220FixpCommand {
+                descriptor: C220FixpDescriptor {
+                    xt: (1 << 16) | (16 << 4),
+                    xm: (mode << 34) | 1,
+                    nd: 1,
+                },
+                source_format: C220FixpSourceFormat::Fp32,
+                source_address: 0,
+                destination_address: 0,
+                control: 1 << 48,
+                scalar_slope: 0.25_f32.to_bits(),
+                scalar_dequant: u64::from(0.5_f32.to_bits()),
+                slope_base_block: 0,
+                dequant_base_block: 0,
+            };
+            let integer_tag = C220FixpCommand {
+                source_format: C220FixpSourceFormat::Int32,
+                ..command
+            };
+            let evaluate = |command: C220FixpCommand| {
+                command
+                    .evaluate(&l0c, &factors)
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            assert_eq!(evaluate(command), evaluate(integer_tag), "mode {mode}");
+            let reads = |command| {
+                super::super::C220FixpReadGenerator::new(command, 1, 0, 64)
+                    .unwrap()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(reads(command), reads(integer_tag), "mode {mode}");
+        }
+    }
+
+    #[test]
     fn instruction_capture_binds_operands_and_rejects_other_destinations() {
         let word = (6 << 29) | (3 << 24) | (1 << 17) | (2 << 12) | (3 << 7) | (4 << 2);
         let gpr = |r| match r {
@@ -359,7 +420,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(integer.source_format, C220FixpSourceFormat::Int32);
-        assert!(C220FixpCommand::capture_l1(word | 1, 0, gpr, spr).is_err());
+        let tagged_integer = C220FixpCommand::capture_l1(word | 1, 0, gpr, spr).unwrap();
+        assert_eq!(tagged_integer.source_format, C220FixpSourceFormat::Int32);
+        assert_eq!(tagged_integer.descriptor.conversion_mode(), 1);
+        let half = C220FixpCommand::capture_l1(
+            word | 2,
+            0,
+            |r| if r == 4 { Some(6 << 34) } else { gpr(r) },
+            spr,
+        )
+        .unwrap();
+        assert_eq!(half.source_format, C220FixpSourceFormat::Fp16);
+        assert_eq!(
+            half.layout()
+                .unwrap()
+                .slices()
+                .next()
+                .unwrap()
+                .source_bytes(),
+            32
+        );
+        assert!(matches!(
+            C220FixpCommand::capture_l1(word | 3, 0, gpr, spr),
+            Err(C220FixpExecutionError::SourceFormat(3))
+        ));
         assert!(matches!(
             C220FixpCommand::capture_l1(word ^ (1 << 24), 0, gpr, spr),
             Err(C220FixpExecutionError::Destination(_))

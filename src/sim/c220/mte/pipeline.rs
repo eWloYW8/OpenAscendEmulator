@@ -8,11 +8,11 @@ use super::fixp::{
     C220FixpSliceResult, C220FixpStage, C220FixpStageEvents, C220FixpSync,
 };
 use super::fixp::{
-    C220FixpExternalEngine, C220FixpExternalEvent, C220FixpExternalMemory, C220FixpExternalStage,
-};
-use super::fixp::{
     C220FixpL1WriteCallback, C220FixpL1WriteError, C220FixpL1WriteEvent, C220FixpL1WriteEvents,
     C220FixpL1WriteInterface,
+};
+use super::fixp::{
+    C220FixpRuntime, C220FixpRuntimeEvent, C220FixpRuntimeMemory, C220FixpRuntimeStage,
 };
 use super::interface::biu_read::returns::{
     C220BiuReadBeat, C220BiuReadReturns, C220BiuReturnCallback, C220BiuReturnError,
@@ -111,7 +111,7 @@ enum Callback {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220MtePipelineEvent {
-    FixpExternal(C220FixpExternalEvent),
+    FixpExternal(C220FixpRuntimeEvent),
     FixpExternalStored {
         slice: C220FixpSliceResult,
         bytes: Vec<u8>,
@@ -153,7 +153,7 @@ pub enum C220MtePipelineEvent {
 #[derive(Debug, thiserror::Error)]
 pub enum C220MtePipelineError {
     #[error(transparent)]
-    FixpExternal(Box<super::fixp::C220FixpExternalEngineError>),
+    FixpExternal(Box<super::fixp::C220FixpRuntimeError>),
     #[error("external FIX event binding requires each of the eleven stages exactly once")]
     InvalidExternalFixpStages,
     #[error(transparent)]
@@ -282,7 +282,7 @@ mod write;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220MtePipeline {
     fixp_events: Vec<C220FixpStageEvents>,
-    external_fixp_events: Vec<C220FixpStageEvents<C220FixpExternalStage>>,
+    external_fixp_events: Vec<C220FixpStageEvents<C220FixpRuntimeStage>>,
     fixp_write: C220FixpL1WriteInterface,
     fixp_write_events: C220FixpL1WriteEvents,
     fixp_completions: Vec<u64>,
@@ -980,8 +980,8 @@ impl C220MtePipeline {
             &mut dyn C220FixpSync,
         )>,
         mut external_fixp: Option<(
-            &mut C220FixpExternalEngine,
-            C220FixpExternalMemory<'_>,
+            &mut C220FixpRuntime,
+            C220FixpRuntimeMemory<'_>,
             &mut dyn C220FixpSync,
         )>,
     ) -> Result<(), C220MtePipelineError> {
@@ -1019,15 +1019,25 @@ impl C220MtePipeline {
             engine.retire_ready_write(tick)?;
         }
         if let Some((engine, _, _)) = external_fixp.as_mut()
-            && let Some((instruction_id, state)) = engine.retire_ready_write(tick)?
+            && let Some(retired) = engine.retire_ready_write(tick)?
         {
-            self.trace.push(C220MtePipelineEvent::FixpExternal(
-                C220FixpExternalEvent::Retired {
+            self.trace.push(match retired.external {
+                Some(operands) => {
+                    C220MtePipelineEvent::FixpExternal(C220FixpRuntimeEvent::Retired {
+                        tick,
+                        instruction_id: retired.instruction_id,
+                        state: super::fixp::C220FixpExternalCommandState {
+                            operands,
+                            lifecycle: retired.lifecycle,
+                        },
+                    })
+                }
+                None => C220MtePipelineEvent::Fixp(C220FixpEvent::Retired {
                     tick,
-                    instruction_id,
-                    state,
-                },
-            ));
+                    instruction_id: retired.instruction_id,
+                    state: retired.lifecycle,
+                }),
+            });
         }
         if let Some(memory) = &mut self.timed_memory {
             memory.advance(tick)?;
@@ -1084,6 +1094,9 @@ impl C220MtePipeline {
                     {
                         self.fixp_completions.push(entry.fragment.instruction_id);
                         if let Some((engine, _, _)) = fixp.as_mut() {
+                            engine.complete_write_transport(tick, entry.fragment.instruction_id)?;
+                        }
+                        if let Some((engine, _, _)) = external_fixp.as_mut() {
                             engine.complete_write_transport(tick, entry.fragment.instruction_id)?;
                         }
                     }
@@ -1441,6 +1454,12 @@ impl C220MtePipeline {
                                 C220MteReadPayload::Factor(_) => {
                                     if let Some((engine, _, _)) = fixp.as_mut() {
                                         engine.complete_factor_transport(
+                                            tick,
+                                            output.fragment.instruction_id,
+                                        )?;
+                                    }
+                                    if let Some((engine, _, _)) = external_fixp.as_mut() {
+                                        engine.shared_engine_mut().complete_factor_transport(
                                             tick,
                                             output.fragment.instruction_id,
                                         )?;

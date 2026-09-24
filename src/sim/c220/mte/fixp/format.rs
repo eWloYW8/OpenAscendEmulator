@@ -7,6 +7,16 @@ use super::C220FixpFp16Result;
 pub enum C220FixpSourceFormat {
     Fp32,
     Int32,
+    Fp16,
+}
+
+impl C220FixpSourceFormat {
+    pub const fn lane_bytes(self) -> u32 {
+        match self {
+            Self::Fp32 | Self::Int32 => 4,
+            Self::Fp16 => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,16 +34,17 @@ pub enum C220FixpOutputFormat {
 impl C220FixpOutputFormat {
     pub const fn from_conversion_mode(source: C220FixpSourceFormat, mode: u8) -> Option<Self> {
         match (source, mode) {
-            (C220FixpSourceFormat::Fp32, 23 | 24) => Some(Self::Bits8),
-            (C220FixpSourceFormat::Fp32, 25 | 26) => Some(Self::Int4),
-            (C220FixpSourceFormat::Int32, 21 | 22) => Some(Self::Int4),
-            (C220FixpSourceFormat::Int32, 8 | 9) => Some(Self::Bits8),
+            (_, 6) => Some(Self::Fp16),
+            (C220FixpSourceFormat::Fp16, _) => None,
             (C220FixpSourceFormat::Int32, 0) => Some(Self::Int32),
-            (C220FixpSourceFormat::Int32, 12 | 13) => Some(Self::Int16),
-            (C220FixpSourceFormat::Int32, 10 | 11) => Some(Self::Fp16),
             (C220FixpSourceFormat::Fp32, 0) => Some(Self::Fp32),
-            (C220FixpSourceFormat::Fp32, 1) => Some(Self::Fp16),
-            (C220FixpSourceFormat::Fp32, 16) => Some(Self::Bf16),
+            // Nonzero conversion modes select the interpretation of 32-bit
+            // source lanes, independently of the instruction's source tag.
+            (_, 8 | 9 | 23 | 24) => Some(Self::Bits8),
+            (_, 21 | 22 | 25 | 26) => Some(Self::Int4),
+            (_, 12 | 13) => Some(Self::Int16),
+            (_, 1 | 10 | 11) => Some(Self::Fp16),
+            (_, 16) => Some(Self::Bf16),
             _ => None,
         }
     }
@@ -51,6 +62,8 @@ impl C220FixpOutputFormat {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220FixpLaneStatus {
+    /// Output is cleared without applying a numerical conversion.
+    Cleared,
     Requant(crate::sim::c220::numeric::requant::C220FixpRequantOutcome),
     Integer,
     Int16(crate::sim::c220::numeric::fixp::C220FixpInt16Status),

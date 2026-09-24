@@ -26,6 +26,11 @@ pub enum C220FixpCallback {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220FixpEvent {
+    Retired {
+        tick: u64,
+        instruction_id: u64,
+        state: C220FixpCommandState,
+    },
     Readiness,
     GeneratedRead(C220FixpReadProgress),
     SentRead(C220FixpReadProgress),

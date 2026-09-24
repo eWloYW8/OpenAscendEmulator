@@ -13,6 +13,8 @@ pub enum C220FixpNz2ndReadError {
     Bandwidth,
     #[error("NZ2ND source address must be aligned to a 64-byte row")]
     SourceAlignment,
+    #[error("FP16-source NZ2ND timing is not implemented")]
+    Fp16Source,
 }
 
 /// Lazy row-block traversal. Every column in a block uses the byte count
@@ -43,6 +45,9 @@ impl C220FixpNz2ndReadGenerator {
         bandwidth: u32,
     ) -> Result<Self, C220FixpNz2ndReadError> {
         command.layout()?;
+        if command.source_format == super::super::C220FixpSourceFormat::Fp16 {
+            return Err(C220FixpNz2ndReadError::Fp16Source);
+        }
         if !command.descriptor.nz_to_nd() {
             return Err(C220FixpNz2ndReadError::NotNzToNd);
         }

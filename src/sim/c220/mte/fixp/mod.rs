@@ -8,6 +8,9 @@ pub use external_output::C220FixpExternalOutputPolicy;
 mod atomic;
 pub use atomic::C220FixpAtomicConfig;
 mod conversion;
+mod datapath;
+mod resource;
+pub use resource::C220FixpResourceKey;
 mod events;
 mod execute;
 mod operands;
@@ -25,16 +28,13 @@ pub use format::{
 mod fp16;
 mod functional;
 pub use functional::{C220FixpFunctionalEvent, C220FixpFunctionalState};
-mod external_events;
 mod l1_output;
 mod l1_write;
 mod layout;
 mod nz2nd;
-pub use external_events::{C220FixpExternalEvent, C220FixpExternalMemory, C220FixpExternalStage};
-mod external_runtime;
-pub use external_runtime::{
-    C220FixpExternalCommandState, C220FixpExternalEngine, C220FixpExternalEngineError,
-};
+mod runtime_events;
+pub use runtime_events::{C220FixpRuntimeEvent, C220FixpRuntimeMemory, C220FixpRuntimeStage};
+mod runtime;
 pub use nz2nd::{
     C220FixpNz2ndInstructionPlan, C220FixpNz2ndPlanError, C220FixpNz2ndReadError,
     C220FixpNz2ndReadGenerator, C220FixpNz2ndStaging, C220FixpNz2ndStagingEntry,
@@ -43,12 +43,15 @@ pub use nz2nd::{
     C220FixpNz2ndWriteUop, C220FixpTransposeBuffer, C220FixpTransposeError,
     C220FixpTransposeProgress, C220FixpTransposeSlot,
 };
+pub use runtime::{
+    C220FixpExternalCommandState, C220FixpRetiredCommand, C220FixpRuntime, C220FixpRuntimeError,
+};
+mod engine;
 mod read_pipeline;
 mod read_uop;
-mod runtime;
 mod store;
 mod sync;
-pub use runtime::{
+pub use engine::{
     C220FactorCommandState, C220FixpAdmission, C220FixpCommandState, C220FixpEngine,
     C220FixpEngineConfig, C220FixpEngineError,
 };

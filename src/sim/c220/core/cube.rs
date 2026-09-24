@@ -220,10 +220,10 @@ mod tests {
     #[test]
     fn external_fixp_core_waits_for_transport_before_retirement() {
         use crate::memory::region::MemoryRegion;
-        use crate::sim::c220::core::C220CoreExternalFixpConfig;
+        use crate::sim::c220::core::C220CoreFixpConfig;
         use crate::sim::c220::memory::C220LocalBuffer;
         use crate::sim::c220::mte::fixp::{
-            C220FixpAtomicConfig, C220FixpEngineConfig, C220FixpExternalStage::*,
+            C220FixpAtomicConfig, C220FixpEngineConfig, C220FixpRuntimeStage::*,
         };
         use crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteConfig;
         let mut core = matrix_core();
@@ -237,8 +237,8 @@ mod tests {
             &[4096],
         )
         .unwrap();
-        core.configure_external_fixp(
-            C220CoreExternalFixpConfig {
+        core.configure_fixp_runtime(
+            C220CoreFixpConfig {
                 engine: C220FixpEngineConfig {
                     instruction_fifo_depth: 1,
                     read_bandwidth: 256,
@@ -271,12 +271,34 @@ mod tests {
             },
         )
         .unwrap();
+        core.configure_factor_reads(crate::sim::c220::core::C220FactorReadConfig {
+            port: crate::sim::c220::mte::interface::C220MteL1ReadPort::Port2,
+            access_width: NonZeroU32::new(32).unwrap(),
+            output_bandwidth: NonZeroU32::new(32).unwrap(),
+        })
+        .unwrap();
+        core.local_memory
+            .l1_mut()
+            .write_known_linear(8192, &0x3f00_0000_u64.to_le_bytes().repeat(16))
+            .unwrap();
+        let factor_word = (6 << 29) | (1 << 17) | (2 << 12) | (3 << 7);
+        let machine = core.state.scalar_mut().machine_mut();
+        for (register, value) in [(1, 0), (2, 8192), (3, (1 << 16) | (1 << 4))] {
+            machine.set_xreg(register, value).unwrap();
+        }
+        assert!(matches!(
+            core.step_word_at(301, factor_word).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Factor { .. },
+                ..
+            }
+        ));
         let machine = core.state.scalar_mut().machine_mut();
         for (register, value) in [
             (1, 4096),
             (2, 0),
             (3, (8 << 32) | (8 << 16) | (16 << 4)),
-            (4, 1 << 34),
+            (4, 23 << 34),
         ] {
             machine.set_xreg(register, value).unwrap();
         }
@@ -291,18 +313,69 @@ mod tests {
         let pc = core.state.scalar().pc();
         let word = (6 << 29) | (2 << 24) | (1 << 17) | (2 << 12) | (3 << 7) | (4 << 2);
         assert!(matches!(
-            core.step_word_at(301, word).unwrap(),
+            core.step_word_at(302, word).unwrap(),
+            C220CoreStep::Stalled(_)
+        ));
+        assert_eq!(core.state.scalar().pc(), pc);
+        core.advance_to(350).unwrap();
+        assert_eq!(core.factor_outcomes().len(), 1);
+        assert_eq!(
+            core.fixp_factors().unwrap().read_known(0, 128).unwrap(),
+            0x3f00_0000_u64.to_le_bytes().repeat(16)
+        );
+        assert!(matches!(
+            core.step_word_at(351, word | (1 << 24)).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Fixp { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            core.step_word_at(352, word).unwrap(),
+            C220CoreStep::Stalled(_)
+        ));
+        core.advance_to(400).unwrap();
+        assert_eq!(
+            core.local_memory.l1().read_known(4096, 128).unwrap(),
+            [1; 128]
+        );
+        assert!(core.fixp_engine().unwrap().is_idle());
+        assert!(matches!(
+            core.step_word_at(401, word).unwrap(),
             C220CoreStep::Executed {
                 instruction: C220CoreInstruction::FixpExternal { .. },
                 ..
             }
         ));
-        assert_eq!(core.state.scalar().pc(), pc + 4);
+        assert_eq!(core.state.scalar().pc(), pc + 8);
         assert!(core.pending_compute_drain().is_some());
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(3, 0)
+            .unwrap();
+        assert!(matches!(
+            core.step_word_at(402, factor_word).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Factor {
+                    admission: crate::sim::c220::mte::fixp::C220FixpAdmission::DisabledReady,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            core.fixp_runtime()
+                .unwrap()
+                .shared_engine()
+                .command_retirement_queue()
+                .len(),
+            2
+        );
         let mut responses = std::collections::VecDeque::new();
         let mut sent_bytes = 0;
         let mut last_response = None;
-        for tick in 302..700 {
+        for tick in 403..900 {
             core.advance_to(tick).unwrap();
             if let Some(command) = core.take_biu_write_command_at(tick).unwrap() {
                 core.receive_external_fixp_dbid_at(tick, command.command.tag)
@@ -313,23 +386,90 @@ mod tests {
                 responses.push_back((tick + 10, data.source.request.tag));
             }
             if let Some((_, tag)) = responses.pop_front_if(|(ready, _)| *ready <= tick) {
-                assert!(!core.external_fixp_engine().unwrap().is_idle());
+                assert!(!core.fixp_runtime().unwrap().is_idle());
                 core.receive_external_fixp_response_at(tick, tag).unwrap();
-                assert!(!core.external_fixp_engine().unwrap().is_idle());
+                assert!(!core.fixp_runtime().unwrap().is_idle());
                 last_response = Some(tick);
             }
-            if core.external_fixp_engine().unwrap().is_idle() {
-                assert!(tick > last_response.unwrap());
+            if core.fixp_runtime().unwrap().is_idle() {
+                assert!(tick > last_response.unwrap() + 1);
                 break;
             }
         }
-        assert_eq!(sent_bytes, 256);
-        assert!(core.external_fixp_engine().unwrap().is_idle());
+        assert_eq!(sent_bytes, 128);
+        assert!(core.fixp_runtime().unwrap().is_idle());
         assert!(core.pending_compute_drain().is_none());
+        assert_eq!(core.memory.read_known_at(4096, 128).unwrap(), [1; 128]);
+        assert_eq!(core.memory.read_known_at(4224, 128).unwrap(), [0; 128]);
+        core.advance_to(1000).unwrap();
+        core.local_memory
+            .l1_mut()
+            .write_known_linear(8192, &[0; 128])
+            .unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        for (register, value) in [
+            (1, 8192),
+            (2, 0),
+            (3, (32 << 32) | (2 << 16) | (17 << 4)),
+            (4, (1 << 43) | (1 << 34) | 2),
+        ] {
+            machine.set_xreg(register, value).unwrap();
+        }
+        machine.set_spr_value(97, 1).unwrap();
+        assert!(matches!(
+            core.step_word_at(1001, word | (1 << 24)).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::FixpExternal {
+                    destination: crate::isa::c220::mte::fixp::C220FixpDestination::L1,
+                    ..
+                },
+                ..
+            }
+        ));
         assert_eq!(
-            core.memory.read_known_at(4096, 256).unwrap(),
-            0x4000_u16.to_le_bytes().repeat(128)
+            core.fixp_engine()
+                .unwrap()
+                .active_resource_key()
+                .unwrap()
+                .destination,
+            crate::isa::c220::mte::fixp::C220FixpDestination::L1
         );
+        let mut nz_bytes = 0;
+        for tick in 1002..1500 {
+            core.advance_to(tick).unwrap();
+            if let Some(command) = core.take_biu_write_command_at(tick).unwrap() {
+                core.receive_external_fixp_dbid_at(tick, command.command.tag)
+                    .unwrap();
+            }
+            if let Some(data) = core.take_biu_write_data_at(tick).unwrap() {
+                nz_bytes += data.source.request.bytes;
+                core.receive_external_fixp_response_at(tick, data.source.request.tag)
+                    .unwrap();
+                assert!(!core.fixp_runtime().unwrap().is_idle());
+            }
+            if core.fixp_runtime().unwrap().is_idle() {
+                break;
+            }
+        }
+        assert!(core.fixp_runtime().unwrap().is_idle());
+        assert_eq!(nz_bytes, 68);
+        for row in 0..2 {
+            assert_eq!(
+                core.local_memory
+                    .l1()
+                    .read_known(8192 + row * 64, 34)
+                    .unwrap(),
+                0x4000_u16.to_le_bytes().repeat(17)
+            );
+            assert_eq!(
+                core.local_memory
+                    .l1()
+                    .read_known(8226 + row * 64, 30)
+                    .unwrap(),
+                [0; 30]
+            );
+        }
+        assert_eq!(core.memory.read_known_at(4096, 128).unwrap(), [1; 128]);
     }
 
     fn matrix_core() -> C220Core {

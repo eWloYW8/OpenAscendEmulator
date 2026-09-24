@@ -5,7 +5,7 @@ use crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteConfig;
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220CoreExternalFixpConfig {
+pub struct C220CoreFixpConfig {
     pub engine: C220FixpEngineConfig,
     pub main_transpose_slots: u32,
     pub total_transpose_slots: usize,
@@ -13,21 +13,23 @@ pub struct C220CoreExternalFixpConfig {
 }
 
 pub(super) struct CoreExternalFixp {
-    pub engine: C220FixpExternalEngine,
+    pub engine: C220FixpRuntime,
     pub factors: C220LocalBuffer,
     pub bindings: C220FixpSyncBindings,
     pub atomics: C220FixpAtomicConfig,
-    next_request: u64,
+    pub factor_reads: Option<super::factor::C220FactorReadConfig>,
+    pub factor_outcomes: Vec<super::factor::C220FactorOutcome>,
+    pub(super) next_request: u64,
 }
 
 impl C220Core {
-    /// Select external FIX execution. L1/factor and external configurations
-    /// are currently exclusive; they must not create duplicate hardware credit.
-    pub fn configure_external_fixp(
+    /// Configure L1, external and factor FIX execution with one shared engine.
+    /// Replaces selecting the L1-only configuration; do not configure both.
+    pub fn configure_fixp_runtime(
         &mut self,
-        config: C220CoreExternalFixpConfig,
+        config: C220CoreFixpConfig,
         factors: C220LocalBuffer,
-        stages: &[C220FixpExternalStage],
+        stages: &[C220FixpRuntimeStage],
         biu: C220BiuWriteConfig,
     ) -> Result<(), C220CoreError> {
         if self.fixp.is_some() || self.external_fixp.is_some() {
@@ -36,7 +38,7 @@ impl C220Core {
         if config.engine.l0c_capacity != self.local_memory.l0c().buffer().capacity() {
             return Err(C220CoreError::FixpCapacityMismatch);
         }
-        let engine = C220FixpExternalEngine::new(
+        let engine = C220FixpRuntime::new(
             config.engine,
             config.main_transpose_slots,
             config.total_transpose_slots,
@@ -45,18 +47,20 @@ impl C220Core {
             .mte_pipeline
             .as_mut()
             .ok_or(C220CoreError::MteUnconfigured)?;
-        pipeline.configure_external_fixp(stages, biu)?;
+        pipeline.configure_fixp_runtime(stages, biu)?;
         self.external_fixp = Some(CoreExternalFixp {
             engine,
             factors,
             bindings: C220FixpSyncBindings::default(),
             atomics: config.atomics,
+            factor_reads: None,
+            factor_outcomes: Vec::new(),
             next_request: 0,
         });
         Ok(())
     }
 
-    pub fn external_fixp_engine(&self) -> Option<&C220FixpExternalEngine> {
+    pub fn fixp_runtime(&self) -> Option<&C220FixpRuntime> {
         self.external_fixp.as_ref().map(|fixp| &fixp.engine)
     }
 
@@ -107,9 +111,14 @@ impl C220Core {
         pc: u64,
         word: u32,
     ) -> Result<C220CoreStep, C220CoreError> {
+        use crate::isa::c220::mte::fixp::{C220FixpDestination, C220FixpInstruction};
+        let destination = C220FixpInstruction::decode(word)
+            .ok_or(C220FixpExecutionError::Instruction(word))?
+            .destination;
         let machine = self.state.scalar().machine();
-        let command = C220FixpExternalCommand::capture(
+        let command = C220FixpExternalCommand::capture_destination(
             word,
+            destination,
             machine
                 .spr_value(3)
                 .ok_or(C220FixpExecutionError::MissingSpr(3))?,
@@ -142,25 +151,35 @@ impl C220Core {
         }
         let pending_mte3 =
             self.mte3.pending_commands().next().is_some() || !self.mte3.dma_commands.is_empty();
-        let admission = if !d.is_disabled() && pending_mte3 {
-            fixp.bindings
-                .capture_pending(self.next_instruction_id, &mut self.hardware_flags);
-            C220FixpAdmission::Mte3RetirementPending
-        } else if fixp.next_request + reservation > u64::from(u32::MAX) {
-            C220FixpAdmission::ReadGenerationBusy
-        } else {
-            self.mte_pipeline
-                .as_mut()
-                .ok_or(C220CoreError::MteUnconfigured)?
-                .admit_external_fixp_with_flags(
-                    &mut fixp.engine,
+        let admission =
+            if destination == C220FixpDestination::External && !d.is_disabled() && pending_mte3 {
+                fixp.bindings
+                    .capture_pending(self.next_instruction_id, &mut self.hardware_flags);
+                C220FixpAdmission::Mte3RetirementPending
+            } else if fixp.next_request + reservation > u64::from(u32::MAX) {
+                C220FixpAdmission::ReadGenerationBusy
+            } else if destination == C220FixpDestination::L1 {
+                fixp.engine.admit_l1_nz2nd_with_flags(
+                    tick,
                     self.next_instruction_id,
                     (fixp.next_request as u32, fixp.next_request as u32),
                     command,
                     &mut fixp.bindings,
                     &mut self.hardware_flags,
                 )?
-        };
+            } else {
+                self.mte_pipeline
+                    .as_mut()
+                    .ok_or(C220CoreError::MteUnconfigured)?
+                    .admit_external_fixp_with_flags(
+                        &mut fixp.engine,
+                        self.next_instruction_id,
+                        (fixp.next_request as u32, fixp.next_request as u32),
+                        command,
+                        &mut fixp.bindings,
+                        &mut self.hardware_flags,
+                    )?
+            };
         if !matches!(
             admission,
             C220FixpAdmission::Active | C220FixpAdmission::DisabledReady
@@ -181,6 +200,7 @@ impl C220Core {
                 pc,
                 word,
                 command,
+                destination,
                 admission,
             },
         })

@@ -10,6 +10,9 @@ impl C220Core {
         if let Some(fixp) = &mut self.fixp {
             fixp.factor_outcomes.clear();
         }
+        if let Some(fixp) = &mut self.external_fixp {
+            fixp.factor_outcomes.clear();
+        }
         loop {
             let event_tick = self
                 .cube
@@ -61,11 +64,13 @@ impl C220Core {
                     )?;
                 } else if let Some(fixp) = &mut self.external_fixp {
                     self.hardware_flags.advance_to(event_tick)?;
+                    let (l0c, l1) = self.local_memory.fixp_destinations_mut();
                     pipeline.advance_external_fixp(
                         event_tick,
                         &mut fixp.engine,
-                        crate::sim::c220::mte::fixp::C220FixpExternalMemory {
-                            l0c: self.local_memory.l0c_mut(),
+                        crate::sim::c220::mte::fixp::C220FixpRuntimeMemory {
+                            l0c,
+                            l1,
                             slopes: &fixp.factors,
                             external: &mut self.memory,
                             atomics: fixp.atomics,

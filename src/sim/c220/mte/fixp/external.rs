@@ -59,11 +59,29 @@ impl C220FixpExternalCommand {
         control: u64,
         isa_instance_index: u32,
         read_gpr: impl FnMut(u8) -> Option<u64>,
+        read_spr: impl FnMut(u8) -> Option<u64>,
+    ) -> Result<Self, C220FixpExecutionError> {
+        Self::capture_destination(
+            word,
+            C220FixpDestination::External,
+            control,
+            isa_instance_index,
+            read_gpr,
+            read_spr,
+        )
+    }
+
+    pub(crate) fn capture_destination(
+        word: u32,
+        destination: C220FixpDestination,
+        control: u64,
+        isa_instance_index: u32,
+        read_gpr: impl FnMut(u8) -> Option<u64>,
         mut read_spr: impl FnMut(u8) -> Option<u64>,
     ) -> Result<Self, C220FixpExecutionError> {
         let command = C220FixpCommand::capture_destination(
             word,
-            C220FixpDestination::External,
+            destination,
             control,
             read_gpr,
             &mut read_spr,

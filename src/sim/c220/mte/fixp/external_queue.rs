@@ -330,7 +330,7 @@ pub struct C220FixpExternalWriteBatch {
     pub primary: C220FixpStoreWrite,
 }
 
-/// Shared external-memory packetization for column and NZ2ND output. Address
+/// Shared L1/external packetization for column and NZ2ND output. Address
 /// holes between rows are retained; downstream transaction credit and write
 /// acknowledgments remain the responsibility of the external interface.
 #[derive(Debug, Clone, Default)]
@@ -341,6 +341,40 @@ pub struct C220FixpExternalOutput {
 }
 
 impl C220FixpExternalOutput {
+    pub fn take_l1_write(
+        &mut self,
+        tick: u64,
+        destination_ready: bool,
+    ) -> Result<Option<C220MteOutputFragment>, C220FixpExternalOutputError> {
+        self.observe(tick)?;
+        if self.packet_tick == Some(tick) {
+            return Err(C220FixpExternalOutputError::RepeatedPacket(tick));
+        }
+        self.packet_tick = Some(tick);
+        let Some(head) = self.bursts.front_mut() else {
+            return Ok(None);
+        };
+        if !destination_ready || head.ready_tick > tick || (!head.closed && head.bytes < 256) {
+            return Ok(None);
+        }
+        let bytes = head.bytes.min(256);
+        let finished = head.closed && head.bytes == bytes;
+        let fragment = C220MteOutputFragment {
+            instruction_id: head.instruction_id,
+            request_id: head.request_id,
+            destination_address: head.address,
+            bytes,
+            last_in_uop: true,
+            last_in_instruction: finished && head.last_in_instruction,
+        };
+        head.bytes -= bytes;
+        head.address = head.address.wrapping_add(u64::from(bytes));
+        if finished {
+            self.bursts.pop_front();
+        }
+        Ok(Some(fragment))
+    }
+
     pub fn receive_columns(
         &mut self,
         tick: u64,
