@@ -1830,7 +1830,15 @@ fn scalar_conversion_retires_after_two_ticks_and_blocks_dependent_conversion() {
     let machine = core.state.scalar_mut().machine_mut();
     machine.set_xreg(1, u64::from(1.5_f32.to_bits())).unwrap();
     machine.set_xreg(2, u64::from(2.0_f32.to_bits())).unwrap();
-    for (tick, opcode, expected) in [(46, 1, 3.5_f32), (51, 2, 1.5), (56, 3, 3.0), (61, 4, 9.0)] {
+    for (tick, opcode, expected, latency, stage) in [
+        (46, 1, 3.5_f32, 5, 3),
+        (51, 2, 1.5, 5, 3),
+        (56, 3, 3.0, 5, 3),
+        (61, 4, 9.0, 5, 3),
+        (66, 5, 4.5, 14, 14),
+        (80, 8, 2.0, 1, 1),
+        (81, 7, 2.0, 1, 1),
+    ] {
         let word = 0x0082_1100 | opcode;
         let C220CoreStep::Executed {
             instruction:
@@ -1843,19 +1851,90 @@ fn scalar_conversion_retires_after_two_ticks_and_blocks_dependent_conversion() {
         else {
             panic!("FP32 operation should issue");
         };
-        assert_eq!(ticket.retire_tick, tick + 5);
-        assert_eq!(ticket.execution_stage, 3);
+        assert_eq!(ticket.retire_tick, tick + latency);
+        assert_eq!(ticket.execution_stage, stage);
+        assert_eq!(
+            ticket.class,
+            if opcode == 5 {
+                crate::sim::c220::scalar::timing::C220ScalarTimingClass::Variable
+            } else {
+                crate::sim::c220::scalar::timing::C220ScalarTimingClass::Fixed
+            }
+        );
         assert_eq!(
             core.state().scalar().machine().xregs()[1],
             u64::from(expected.to_bits())
         );
         let before = core.state().scalar().machine().clone();
+        if latency == 1 {
+            assert_eq!(
+                core.scalar_timing().pending_xreg_retirement(1),
+                Some(tick + 1)
+            );
+            continue;
+        }
         let C220CoreStep::Stalled(stall) = core.step_word_at(tick + 1, word).unwrap() else {
             panic!("dependent FP32 operation must await retirement");
         };
-        assert_eq!(stall.resume_tick, tick + 5);
+        assert_eq!(stall.resume_tick, tick + latency);
         assert_eq!(core.state().scalar().machine(), &before);
     }
+    core.state
+        .scalar_mut()
+        .machine_mut()
+        .set_xreg(1, u64::from(4.0_f32.to_bits()))
+        .unwrap();
+    for (tick, opcode, expected, latency) in [
+        (82, 0, 2.0_f32, 18),
+        (100, 0x80, -2.0, 1),
+        (101, 0x100, 2.0, 1),
+    ] {
+        let word = 0x0282_1000 | opcode;
+        let C220CoreStep::Executed {
+            instruction:
+                C220CoreInstruction::Scalar {
+                    timing: Some(ticket),
+                    ..
+                },
+            ..
+        } = core.step_word_at(tick, word).unwrap()
+        else {
+            panic!("unary FP32 operation should execute");
+        };
+        assert_eq!(ticket.retire_tick, tick + latency);
+        assert_eq!(ticket.execution_stage, latency as u8);
+        assert_eq!(
+            core.state().scalar().machine().xregs()[1],
+            u64::from(expected.to_bits())
+        );
+        if opcode == 0 {
+            let C220CoreStep::Stalled(stall) = core.step_word_at(83, 0x0282_1080).unwrap() else {
+                panic!("negate should wait for square root");
+            };
+            assert_eq!(stall.resume_tick, 100);
+        }
+    }
+    assert!(matches!(
+        core.step_word_at(102, 0x0086_110f).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(core.state().scalar().machine().xregs()[3], 1);
+    assert_eq!(core.scalar_timing().pending_xreg_retirement(3), Some(103));
+    assert!(matches!(
+        core.step_word_at(103, 0x0080_111e).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(core.scalar_timing().pending_drain_tick(), Some(104));
+    assert_eq!(core.scalar_timing().pending_spr_retirement(11), None);
+    assert_eq!(core.state().scalar().machine().spr_value(11), Some(0));
+    assert!(matches!(
+        core.step_word_at(104, 0x0088_1109).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(
+        core.state().scalar().machine().xregs()[4],
+        u64::from(2.0_f32.to_bits())
+    );
 }
 
 #[test]

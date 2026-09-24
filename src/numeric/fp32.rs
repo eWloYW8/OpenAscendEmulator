@@ -339,8 +339,7 @@ fn evaluate_fp32_quotient(first_bits: u32, second_bits: u32) -> Fp32ValueOutcome
     let first = f32::from_bits(first_bits);
     let second = f32::from_bits(second_bits);
     let quotient = first / second;
-    let exact = (first as f64) / (second as f64);
-    status.overflow = exact.abs() >= f32::MAX as f64;
+    status.overflow = quotient.is_infinite();
     status.underflow = first_abs != 0 && quotient == 0.0;
     Fp32ValueOutcome {
         bits: quotient.to_bits(),

@@ -81,6 +81,112 @@ fn captured_indexed_loads_scale_offset_and_preserve_machine_on_read_failure() {
 }
 
 #[test]
+fn c220_indexed_stores_snapshot_sources_before_base_writeback() {
+    for dtype in 0..4 {
+        let width = 1_usize << dtype;
+        for post_index in [false, true] {
+            for source in [1, 20, 22] {
+                let word = 0x0100_0020
+                    | (dtype << 22)
+                    | (source << 17)
+                    | (20 << 12)
+                    | (22 << 7)
+                    | if post_index { 8 } else { 0 };
+                assert!(ScalarInstruction::from_word(Architecture::Dav3510, word).is_none());
+                for extension in [1, 2, 4] {
+                    assert!(
+                        ScalarInstruction::from_word(Architecture::Dav2201, word | extension)
+                            .is_none()
+                    );
+                }
+                let mut machine = ScalarMachine::new(Architecture::Dav2201, [0; 32], 0);
+                machine.set_xreg(1, 0xfedc_ba98_7654_3210).unwrap();
+                machine.set_xreg(20, 0x1010).unwrap();
+                machine.set_xreg(22, u64::MAX).unwrap();
+                let before = machine.clone();
+                let expected = machine.xregs()[source as usize].to_le_bytes();
+                let mut bus = TestBus::new(0x1000);
+                bus.fail = true;
+                assert!(machine.execute_instruction(0, word, &mut bus).is_err());
+                assert_eq!(machine, before);
+                assert_eq!(bus.accesses, 0);
+                bus.fail = false;
+                let ScalarInstructionStep::IndexedStore(step) =
+                    machine.execute_instruction(0, word, &mut bus).unwrap()
+                else {
+                    panic!("expected indexed store");
+                };
+                let adjusted = 0x1010 - width as u64;
+                let address = if post_index { 0x1010 } else { adjusted };
+                let start = (address - 0x1000) as usize;
+                assert_eq!(&bus.bytes[start..start + width], &expected[..width]);
+                assert_eq!(step.effective_address, address);
+                assert_eq!(step.updated_base, post_index.then_some(adjusted));
+                assert_eq!(step.bytes, expected);
+                assert_eq!(
+                    machine.xregs()[20],
+                    if post_index { adjusted } else { 0x1010 }
+                );
+                assert_eq!(machine.xregs()[22], u64::MAX);
+            }
+        }
+    }
+}
+
+#[test]
+fn c220_indexed_loads_handle_post_index_aliases_and_wrapping_offsets() {
+    for dtype in 0..4 {
+        let width = 1_usize << dtype;
+        for post_index in [false, true] {
+            for destination in [1, 20, 22] {
+                let word = 0x0100_0000
+                    | (dtype << 22)
+                    | (destination << 17)
+                    | (20 << 12)
+                    | (22 << 7)
+                    | if post_index { 8 } else { 0 };
+                let mut machine = ScalarMachine::new(Architecture::Dav2201, [0; 32], 0);
+                machine.set_xreg(20, 0x1010).unwrap();
+                machine.set_xreg(22, u64::MAX).unwrap();
+                let before = machine.clone();
+                let mut bus = TestBus::new(0x1000);
+                bus.bytes.fill(0xa7);
+                bus.fail = true;
+                assert!(machine.execute_instruction(0, word, &mut bus).is_err());
+                assert_eq!(machine, before);
+                bus.fail = false;
+                let ScalarInstructionStep::IndexedLoad(step) =
+                    machine.execute_instruction(0, word, &mut bus).unwrap()
+                else {
+                    panic!("expected indexed load");
+                };
+                let adjusted = 0x1010 - width as u64;
+                assert_eq!(
+                    step.effective_address,
+                    if post_index { 0x1010 } else { adjusted }
+                );
+                assert_eq!(step.updated_base, post_index.then_some(adjusted));
+                let mut expected = [0; 8];
+                expected[..width].fill(0xa7);
+                let value = u64::from_le_bytes(expected);
+                assert_eq!(step.value, value);
+                assert_eq!(machine.xregs()[destination as usize], value);
+                assert_eq!(
+                    machine.xregs()[20],
+                    if destination == 20 {
+                        value
+                    } else if post_index {
+                        adjusted
+                    } else {
+                        0x1010
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn c310_indexed_loads_scale_offsets_by_width() {
     for (dtype, width_bytes) in [(0, 1_u8), (1, 2), (2, 4), (3, 8)] {
         let word = 0x0103_4b00 | (dtype << 22);
@@ -222,6 +328,60 @@ fn c310_indexed_immediate_stores_scale_offsets_and_write_selected_width() {
             assert_eq!(bus.bytes[start + usize::from(width_bytes)], 0xa5);
             assert_eq!(machine, before);
             assert_eq!(bus.accesses, 1);
+        }
+    }
+}
+
+#[test]
+fn c220_indexed_immediate_stores_support_widths_post_index_and_wrapping() {
+    for dtype in 0..4 {
+        let width = 1_usize << dtype;
+        for value in 0..3 {
+            for post_index in [false, true] {
+                let word = 0x0e00_1100 | (dtype << 22) | value | if post_index { 4 } else { 0 };
+                let mut machine = ScalarMachine::new(Architecture::Dav2201, [0; 32], 0);
+                machine.set_xreg(1, 0x1000).unwrap();
+                machine.set_xreg(2, u64::MAX).unwrap();
+                let before = machine.clone();
+                let mut bus = TestBus::new(0x1000 - width as u64);
+                bus.bytes.fill(0xa5);
+                bus.fail = true;
+                assert!(
+                    machine
+                        .execute_indexed_immediate_store_word(0, word, &mut bus)
+                        .is_err()
+                );
+                assert_eq!(machine, before);
+                bus.fail = false;
+                let step = machine
+                    .execute_indexed_immediate_store_word(0, word, &mut bus)
+                    .unwrap();
+                let start = if post_index { width } else { 0 };
+                let expected_base = 0x1000 - width as u64;
+                assert_eq!(
+                    step.effective_address,
+                    if post_index { 0x1000 } else { expected_base }
+                );
+                assert_eq!(step.updated_base, post_index.then_some(expected_base));
+                assert_eq!(
+                    machine.xregs()[1],
+                    if post_index { expected_base } else { 0x1000 }
+                );
+                for index in 0..32 {
+                    let expected = if (start..start + width).contains(&index) {
+                        if value == 2 {
+                            0xff
+                        } else if value == 1 && index == start {
+                            1
+                        } else {
+                            0
+                        }
+                    } else {
+                        0xa5
+                    };
+                    assert_eq!(bus.bytes[index], expected);
+                }
+            }
         }
     }
 }

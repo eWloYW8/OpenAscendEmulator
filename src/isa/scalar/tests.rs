@@ -189,15 +189,17 @@ fn captured_indexed_scalar_loads_decode_on_supported_architectures() {
                 destination_register: destination,
                 base_register: base,
                 offset_register: offset,
+                post_index: false,
             })
         );
         assert_eq!(
             ScalarInstruction::from_word(other, word),
-            (other == Architecture::Dav3510).then_some(ScalarInstruction::ScalarIndexedLoad {
+            Some(ScalarInstruction::ScalarIndexedLoad {
                 width_bytes: 1,
                 destination_register: destination,
                 base_register: base,
                 offset_register: offset,
+                post_index: false,
             })
         );
         assert_eq!(ScalarInstruction::from_word(architecture, word | 1), None);
@@ -216,11 +218,12 @@ fn c310_indexed_loads_decode_supported_widths_and_reject_control_bits() {
                 destination_register: 1,
                 base_register: 20,
                 offset_register: 22,
+                post_index: false,
             })
         );
         assert_eq!(
             ScalarInstruction::from_word(Architecture::Dav2201, encoded),
-            None
+            ScalarInstruction::from_word(Architecture::Dav3510, encoded)
         );
     }
     for changed in [word | 1, word | 2, word | 4, word | 8, word | 0x10] {
@@ -291,29 +294,28 @@ fn captured_indexed_immediate_stores_decode_on_supported_architectures() {
                 base_register: base,
                 offset_register: offset,
                 value: ScalarStoreImmediateValue::One,
+                post_index: false,
             })
         );
         assert_eq!(
             ScalarInstruction::from_word(other, word),
-            (other == Architecture::Dav3510).then_some(
-                ScalarInstruction::ScalarIndexedImmediateStore {
-                    width_bytes: 1,
-                    base_register: base,
-                    offset_register: offset,
-                    value: ScalarStoreImmediateValue::One,
-                }
-            )
+            Some(ScalarInstruction::ScalarIndexedImmediateStore {
+                width_bytes: 1,
+                base_register: base,
+                offset_register: offset,
+                value: ScalarStoreImmediateValue::One,
+                post_index: false,
+            })
         );
         assert_eq!(
             ScalarInstruction::from_word(architecture, word ^ 1),
-            (architecture == Architecture::Dav3510).then_some(
-                ScalarInstruction::ScalarIndexedImmediateStore {
-                    width_bytes: 1,
-                    base_register: base,
-                    offset_register: offset,
-                    value: ScalarStoreImmediateValue::Zero,
-                }
-            )
+            Some(ScalarInstruction::ScalarIndexedImmediateStore {
+                width_bytes: 1,
+                base_register: base,
+                offset_register: offset,
+                value: ScalarStoreImmediateValue::Zero,
+                post_index: false,
+            })
         );
     }
 }
@@ -335,11 +337,18 @@ fn c310_indexed_immediate_stores_decode_width_and_value() {
                     base_register: 20,
                     offset_register: 22,
                     value,
+                    post_index: false,
                 })
             );
             assert_eq!(
                 ScalarInstruction::from_word(Architecture::Dav2201, encoded),
-                None
+                Some(ScalarInstruction::ScalarIndexedImmediateStore {
+                    width_bytes,
+                    base_register: 20,
+                    offset_register: 22,
+                    value,
+                    post_index: false,
+                })
             );
         }
     }

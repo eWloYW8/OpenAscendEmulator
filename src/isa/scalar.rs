@@ -101,17 +101,26 @@ impl ZeroExtendWidth {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarInstruction {
+    ScalarIndexedStore {
+        width_bytes: u8,
+        source_register: u8,
+        base_register: u8,
+        offset_register: u8,
+        post_index: bool,
+    },
     ScalarIndexedLoad {
         width_bytes: u8,
         destination_register: u8,
         base_register: u8,
         offset_register: u8,
+        post_index: bool,
     },
     ScalarIndexedImmediateStore {
         width_bytes: u8,
         base_register: u8,
         offset_register: u8,
         value: ScalarStoreImmediateValue,
+        post_index: bool,
     },
     ScalarPairLoad {
         dtype_field: u8,
@@ -305,39 +314,39 @@ impl ScalarInstruction {
     pub const fn from_word(architecture: Architecture, word: u32) -> Option<Self> {
         match AicClass::from_word(word) {
             AicClass::Scalar
-                if matches!(architecture, Architecture::Dav3510)
+                if matches!(architecture, Architecture::Dav2201)
                     && ((word >> 24) & 0x1f) == 1
-                    && word & 0x7f == 0 =>
+                    && word & 0x77 == 0x20 =>
+            {
+                Some(Self::ScalarIndexedStore {
+                    width_bytes: 1 << ((word >> 22) & 3),
+                    source_register: ((word >> 17) & 0x1f) as u8,
+                    base_register: ((word >> 12) & 0x1f) as u8,
+                    offset_register: ((word >> 7) & 0x1f) as u8,
+                    post_index: word & 8 != 0,
+                })
+            }
+            AicClass::Scalar
+                if ((word >> 24) & 0x1f) == 1
+                    && word
+                        & if matches!(architecture, Architecture::Dav2201) {
+                            0x77
+                        } else {
+                            0x7f
+                        }
+                        == 0 =>
             {
                 Some(Self::ScalarIndexedLoad {
                     width_bytes: 1 << ((word >> 22) & 3),
                     destination_register: ((word >> 17) & 0x1f) as u8,
                     base_register: ((word >> 12) & 0x1f) as u8,
                     offset_register: ((word >> 7) & 0x1f) as u8,
+                    post_index: word & 8 != 0,
                 })
             }
             AicClass::Scalar
-                if matches!(
-                    (architecture, word),
-                    (Architecture::Dav2201, 0x011c_b600)
-                        | (Architecture::Dav2201, 0x0118_9500)
-                        | (Architecture::Dav2201, 0x0120_8780)
-                        | (Architecture::Dav2201, 0x0122_d700)
-                        | (Architecture::Dav2201, 0x0124_a880)
-                        | (Architecture::Dav2201, 0x0126_f800)
-                ) =>
-            {
-                Some(Self::ScalarIndexedLoad {
-                    width_bytes: 1,
-                    destination_register: ((word >> 17) & 0x1f) as u8,
-                    base_register: ((word >> 12) & 0x1f) as u8,
-                    offset_register: ((word >> 7) & 0x1f) as u8,
-                })
-            }
-            AicClass::Scalar
-                if matches!(architecture, Architecture::Dav3510)
-                    && ((word >> 24) & 0x1f) == 14
-                    && word & 0x7c == 0
+                if ((word >> 24) & 0x1f) == 14
+                    && (matches!(architecture, Architecture::Dav2201) || word & 0x7c == 0)
                     && word & 3 != 3 =>
             {
                 Some(Self::ScalarIndexedImmediateStore {
@@ -349,24 +358,7 @@ impl ScalarInstruction {
                         1 => ScalarStoreImmediateValue::One,
                         _ => ScalarStoreImmediateValue::Ones,
                     },
-                })
-            }
-            AicClass::Scalar
-                if matches!(
-                    (architecture, word),
-                    (Architecture::Dav2201, 0x0e00_b601)
-                        | (Architecture::Dav2201, 0x0e00_9501)
-                        | (Architecture::Dav2201, 0x0e00_8781)
-                        | (Architecture::Dav2201, 0x0e00_d701)
-                        | (Architecture::Dav2201, 0x0e00_a881)
-                        | (Architecture::Dav2201, 0x0e00_f801)
-                ) =>
-            {
-                Some(Self::ScalarIndexedImmediateStore {
-                    width_bytes: 1,
-                    base_register: ((word >> 12) & 0x1f) as u8,
-                    offset_register: ((word >> 7) & 0x1f) as u8,
-                    value: ScalarStoreImmediateValue::One,
+                    post_index: matches!(architecture, Architecture::Dav2201) && word & 4 != 0,
                 })
             }
             AicClass::Scalar

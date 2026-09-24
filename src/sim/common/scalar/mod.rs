@@ -91,6 +91,7 @@ pub enum ScalarInstructionStep {
     PairLoad(ScalarPairLoadStep),
     PairStore(ScalarPairStoreStep),
     IndexedLoad(ScalarIndexedLoadStep),
+    IndexedStore(ScalarIndexedStoreStep),
     IndexedImmediateStore(ScalarIndexedImmediateStoreStep),
     Flow(ScalarFlowStep),
     CacheHint(ScalarCacheHintStep),
@@ -172,6 +173,22 @@ pub struct ScalarMemoryStep {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScalarIndexedStoreStep {
+    pub pc: u64,
+    pub word: u32,
+    pub effective_address: u64,
+    pub width_bytes: u8,
+    pub source_register: u8,
+    pub value: u64,
+    pub base_register: u8,
+    pub base_value: u64,
+    pub updated_base: Option<u64>,
+    pub offset_register: u8,
+    pub offset_value: u64,
+    pub bytes: [u8; 8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarIndexedLoadStep {
     pub pc: u64,
     pub word: u32,
@@ -182,6 +199,7 @@ pub struct ScalarIndexedLoadStep {
     pub value: u64,
     pub base_register: u8,
     pub base_value: u64,
+    pub updated_base: Option<u64>,
     pub offset_register: u8,
     pub offset_value: u64,
     pub bytes: [u8; 8],
@@ -195,6 +213,7 @@ pub struct ScalarIndexedImmediateStoreStep {
     pub width_bytes: u8,
     pub base_register: u8,
     pub base_value: u64,
+    pub updated_base: Option<u64>,
     pub offset_register: u8,
     pub offset_value: u64,
     pub value: ScalarStoreImmediateValue,
@@ -867,6 +886,11 @@ impl ScalarMachine {
             Some(ScalarInstruction::ScalarIndexedLoad { .. }) => Ok(
                 ScalarInstructionStep::IndexedLoad(self.execute_indexed_load_word(pc, word, bus)?),
             ),
+            Some(ScalarInstruction::ScalarIndexedStore { .. }) => {
+                Ok(ScalarInstructionStep::IndexedStore(
+                    self.execute_indexed_store_word(pc, word, bus)?,
+                ))
+            }
             Some(ScalarInstruction::ScalarIndexedImmediateStore { .. }) => {
                 Ok(ScalarInstructionStep::IndexedImmediateStore(
                     self.execute_indexed_immediate_store_word(pc, word, bus)?,

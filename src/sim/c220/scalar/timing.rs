@@ -37,12 +37,13 @@ pub struct C220ScalarTimingTicket {
     pub retire_tick: u64,
     pub execution_stage: u8,
     pub source_register: Option<u8>,
-    pub destination_register: u8,
+    pub destination_register: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct C220ScalarTimingLane {
     pending_xreg_retirement: [Option<u64>; SCALAR_X_REGISTER_COUNT],
+    pending_no_xreg_retirement: Option<u64>,
     variable_instructions: VecDeque<C220ScalarTimingTicket>,
     variable_events: Vec<u64>,
     pending_spr_retirement: BTreeMap<u16, u64>,
@@ -50,6 +51,12 @@ pub struct C220ScalarTimingLane {
 
 impl C220ScalarTimingLane {
     pub fn advance_to(&mut self, tick: u64) {
+        if self
+            .pending_no_xreg_retirement
+            .is_some_and(|retirement| retirement <= tick)
+        {
+            self.pending_no_xreg_retirement = None;
+        }
         self.pending_spr_retirement
             .retain(|_, retirement| *retirement > tick);
         let ready = self.variable_events.partition_point(|event| *event <= tick);
@@ -92,8 +99,9 @@ impl C220ScalarTimingLane {
         };
         if let Some(rule) = C220ScalarTimingRule::decode(word)
             && rule.class == C220ScalarTimingClass::Variable
+            && let Some(destination) = rule.destination_register
         {
-            include(rule.destination_register);
+            include(destination);
         }
         if let Some(mut mask) = crate::isa::c220::mte::read_register_mask(word) {
             while mask != 0 {
@@ -204,6 +212,16 @@ impl C220ScalarTimingLane {
         }
         let hint = ScalarInstruction::from_word(Architecture::Dav2201, word)?;
         match hint {
+            ScalarInstruction::ScalarIndexedStore {
+                source_register,
+                base_register,
+                offset_register,
+                ..
+            } => {
+                include(source_register);
+                include(base_register);
+                include(offset_register);
+            }
             ScalarInstruction::ScalarIndexedLoad {
                 base_register,
                 offset_register,
@@ -365,7 +383,11 @@ impl C220ScalarTimingLane {
             self.variable_instructions.push_back(ticket);
             return;
         }
-        let pending = &mut self.pending_xreg_retirement[usize::from(ticket.destination_register)];
+        let pending = if let Some(destination) = ticket.destination_register {
+            &mut self.pending_xreg_retirement[usize::from(destination)]
+        } else {
+            &mut self.pending_no_xreg_retirement
+        };
         *pending = Some(pending.map_or(ticket.retire_tick, |prior| prior.max(ticket.retire_tick)));
     }
 
@@ -385,7 +407,7 @@ impl C220ScalarTimingLane {
             .flatten()
             .into_iter()
             .chain(self.variable_retirements().filter_map(|(ticket, tick)| {
-                (ticket.destination_register == register).then_some(tick)
+                (ticket.destination_register == Some(register)).then_some(tick)
             }))
             .max()
     }
@@ -404,6 +426,7 @@ impl C220ScalarTimingLane {
             .copied()
             .chain(self.variable_events.iter().copied())
             .chain(self.pending_spr_retirement.values().copied())
+            .chain(self.pending_no_xreg_retirement)
             .max()
     }
 }
@@ -416,7 +439,7 @@ impl C220ScalarTimingTicket {
             retire_tick: issue_tick.checked_add(SCALAR_CONVERSION_LATENCY_TICKS)?,
             execution_stage: SCALAR_CONVERSION_EXECUTION_STAGE,
             source_register: Some(hint.source_register),
-            destination_register: hint.destination_register,
+            destination_register: Some(hint.destination_register),
         })
     }
 }
@@ -472,7 +495,7 @@ mod tests {
             retire_tick: 4,
             execution_stage: 2,
             source_register: Some(1),
-            destination_register: 6,
+            destination_register: Some(6),
         });
         for opcode in [0x9700_0000, 0x9700_0001] {
             let word = opcode | (3 << 17) | (4 << 12) | (6 << 7) | (5 << 2);
@@ -517,7 +540,7 @@ mod tests {
                     retire_tick: 4,
                     execution_stage: 2,
                     source_register: Some(0),
-                    destination_register: register,
+                    destination_register: Some(register),
                 });
                 assert_eq!(
                     lane.dependency_tick(word, 1),

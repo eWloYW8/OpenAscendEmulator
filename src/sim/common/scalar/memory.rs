@@ -81,6 +81,55 @@ impl ScalarMachine {
         })
     }
 
+    pub fn execute_indexed_store_word<B: ScalarMemoryBus>(
+        &mut self,
+        pc: u64,
+        word: u32,
+        bus: &mut B,
+    ) -> Result<ScalarIndexedStoreStep, ScalarMemoryExecutionError<B::Error>> {
+        let Some(ScalarInstruction::ScalarIndexedStore {
+            width_bytes,
+            source_register,
+            base_register,
+            offset_register,
+            post_index,
+        }) = ScalarInstruction::from_word(self.architecture, word)
+        else {
+            return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
+        };
+        let value = self.xregs[usize::from(source_register)];
+        let base_value = self.xregs[usize::from(base_register)];
+        let offset_value = self.xregs[usize::from(offset_register)];
+        let indexed_address =
+            base_value.wrapping_add(offset_value.wrapping_mul(u64::from(width_bytes)));
+        let effective_address = if post_index {
+            base_value
+        } else {
+            indexed_address
+        };
+        let updated_base = post_index.then_some(indexed_address);
+        let bytes = value.to_le_bytes();
+        bus.write(effective_address, &bytes[..usize::from(width_bytes)])
+            .map_err(ScalarMemoryExecutionError::Backend)?;
+        if let Some(updated_base) = updated_base {
+            self.xregs[usize::from(base_register)] = updated_base;
+        }
+        Ok(ScalarIndexedStoreStep {
+            pc,
+            word,
+            effective_address,
+            width_bytes,
+            source_register,
+            value,
+            base_register,
+            base_value,
+            updated_base,
+            offset_register,
+            offset_value,
+            bytes,
+        })
+    }
+
     pub fn execute_indexed_load_word<B: ScalarMemoryBus>(
         &mut self,
         pc: u64,
@@ -92,18 +141,29 @@ impl ScalarMachine {
             destination_register,
             base_register,
             offset_register,
+            post_index,
         }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
         };
         let base_value = self.xregs[usize::from(base_register)];
         let offset_value = self.xregs[usize::from(offset_register)];
-        let effective_address = base_value.wrapping_add(offset_value * u64::from(width_bytes));
+        let indexed_address =
+            base_value.wrapping_add(offset_value.wrapping_mul(u64::from(width_bytes)));
+        let effective_address = if post_index {
+            base_value
+        } else {
+            indexed_address
+        };
+        let updated_base = post_index.then_some(indexed_address);
         let mut bytes = [0_u8; 8];
         bus.read(effective_address, &mut bytes[..usize::from(width_bytes)])
             .map_err(ScalarMemoryExecutionError::Backend)?;
         let value = u64::from_le_bytes(bytes);
         let prior_destination_value = self.xregs[usize::from(destination_register)];
+        if let Some(updated_base) = updated_base {
+            self.xregs[usize::from(base_register)] = updated_base;
+        }
         self.xregs[usize::from(destination_register)] = value;
         Ok(ScalarIndexedLoadStep {
             pc,
@@ -115,6 +175,7 @@ impl ScalarMachine {
             value,
             base_register,
             base_value,
+            updated_base,
             offset_register,
             offset_value,
             bytes,
@@ -132,13 +193,21 @@ impl ScalarMachine {
             base_register,
             offset_register,
             value,
+            post_index,
         }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
         };
         let base_value = self.xregs[usize::from(base_register)];
         let offset_value = self.xregs[usize::from(offset_register)];
-        let effective_address = base_value.wrapping_add(offset_value * u64::from(width_bytes));
+        let indexed_address =
+            base_value.wrapping_add(offset_value.wrapping_mul(u64::from(width_bytes)));
+        let effective_address = if post_index {
+            base_value
+        } else {
+            indexed_address
+        };
+        let updated_base = post_index.then_some(indexed_address);
         let mut bytes = [0_u8; 8];
         match value {
             ScalarStoreImmediateValue::Zero => {}
@@ -147,6 +216,9 @@ impl ScalarMachine {
         }
         bus.write(effective_address, &bytes[..usize::from(width_bytes)])
             .map_err(ScalarMemoryExecutionError::Backend)?;
+        if let Some(updated_base) = updated_base {
+            self.xregs[usize::from(base_register)] = updated_base;
+        }
         Ok(ScalarIndexedImmediateStoreStep {
             pc,
             word,
@@ -154,6 +226,7 @@ impl ScalarMachine {
             width_bytes,
             base_register,
             base_value,
+            updated_base,
             offset_register,
             offset_value,
             value,

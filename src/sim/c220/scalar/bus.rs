@@ -13,7 +13,7 @@ pub enum C220ScalarBusError<E: std::error::Error + 'static> {
     #[error("scalar address range overflows u64")]
     AddressOverflow,
     #[error(
-        "scalar address range at {address:#x} with {bytes} bytes crosses the UB alias boundary"
+        "scalar address range at {address:#x} with {bytes} bytes crosses an address mapping boundary"
     )]
     AliasBoundary { address: u64, bytes: usize },
     #[error("scalar local-address roots are unavailable")]
@@ -68,7 +68,11 @@ impl<'a, B: ScalarMemoryBus> C220ScalarBus<'a, B> {
         let start = classify_c220_scalar_address(address, spr67, spr68);
         let last = classify_c220_scalar_address(end - 1, spr67, spr68);
         match (start, last) {
-            (C220ScalarRoute::Hbm, C220ScalarRoute::Hbm) => Ok(ScalarBusRoute::Fallback(address)),
+            (C220ScalarRoute::Hbm(mapped), C220ScalarRoute::Hbm(last))
+                if mapped.checked_add(length - 1) == Some(last) =>
+            {
+                Ok(ScalarBusRoute::Fallback(mapped))
+            }
             (C220ScalarRoute::Ub(offset), C220ScalarRoute::Ub(_))
                 if length <= C220_UB_BYTES.saturating_sub(offset) =>
             {
@@ -132,5 +136,47 @@ impl<B: ScalarMemoryBus> ScalarMemoryBus for C220ScalarBus<'_, B> {
         self.fallback
             .synchronize_barrier(step)
             .map_err(C220ScalarBusError::Fallback)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+
+    #[derive(Default)]
+    struct AddressBus(Vec<u64>);
+
+    impl ScalarMemoryBus for AddressBus {
+        type Error = Infallible;
+
+        fn read(&mut self, address: u64, destination: &mut [u8]) -> Result<(), Self::Error> {
+            self.0.push(address);
+            destination.fill(0x71);
+            Ok(())
+        }
+
+        fn write(&mut self, address: u64, _: &[u8]) -> Result<(), Self::Error> {
+            self.0.push(address);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn external_routes_translate_addresses_before_access() {
+        let mut ub = UbMemory::new(32, 32);
+        let mut fallback = AddressBus::default();
+        let root = 0x2_000000;
+        let external_root = 0x6_000000;
+        let mut bus = C220ScalarBus::new(&mut ub, &mut fallback, Some((root, external_root)));
+        let mut bytes = [0; 8];
+        bus.read(0xabcd_0000_0100_0080, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x71; 8]);
+        bus.write(root + 0x100080, &bytes).unwrap();
+        assert!(matches!(
+            bus.read(0xfffffffffffc, &mut bytes),
+            Err(C220ScalarBusError::AliasBoundary { .. })
+        ));
+        assert_eq!(fallback.0, [0x1000080, external_root + 0x80]);
     }
 }

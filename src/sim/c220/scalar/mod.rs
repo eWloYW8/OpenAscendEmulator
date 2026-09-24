@@ -1,4 +1,6 @@
+mod compare;
 mod execute;
+pub use compare::{C220ScalarFp32CompareOutcome, execute_fp32_compare_word};
 mod float;
 pub use float::{C220ScalarFp32Outcome, execute_fp32_word};
 pub mod spr;
