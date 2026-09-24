@@ -152,9 +152,7 @@ impl C220FixpRuntime {
         (destination, operands): (C220FixpDestination, C220FixpExternalCommand),
     ) -> Result<C220FixpAdmission, C220FixpRuntimeError> {
         let (first_read, first_write) = first_requests;
-        if self.shared.commands().contains_key(&id)
-            || self.shared.factor_commands().contains_key(&id)
-        {
+        if self.shared.contains_command(id) {
             return Err(C220FixpEngineError::DuplicateCommand(id).into());
         }
         let command = operands.command;

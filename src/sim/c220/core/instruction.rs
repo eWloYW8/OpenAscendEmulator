@@ -11,6 +11,22 @@ use crate::sim::common::scalar::ScalarProgramStep;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220CoreInstruction {
+    FixpBarrier {
+        barrier: super::C220FixpBarrier,
+        completed_tick: Option<u64>,
+    },
+    FixpQueued {
+        instruction_id: u64,
+        pc: u64,
+        word: u32,
+        /// Earliest transfer from the issue queue to the command scheduler.
+        ready_tick: u64,
+    },
+    FixpScheduled {
+        instruction_id: u64,
+        /// Earliest command dispatch; resource dependencies may delay it.
+        ready_tick: u64,
+    },
     FixpExternal {
         instruction_id: u64,
         pc: u64,

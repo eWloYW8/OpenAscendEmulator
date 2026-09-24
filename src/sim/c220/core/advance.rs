@@ -7,6 +7,7 @@ impl C220Core {
         self.mte2.begin_advance();
         self.mte3.begin_advance();
         self.vector.begin_advance();
+        self.fixp_frontend.outcomes.clear();
         if let Some(fixp) = &mut self.fixp {
             fixp.factor_outcomes.clear();
         }
@@ -42,13 +43,16 @@ impl C220Core {
                 &mut self.hardware_flags,
             )?;
             self.retire_factor_at(event_tick)?;
+            if let Some(engine) = self.fixp_engine_mut() {
+                engine.retire_ready_control(event_tick);
+            }
             self.mte2.commit_ready_at(
                 event_tick,
                 &mut self.local_memory,
                 &mut self.state.ub,
                 &self.memory,
             )?;
-            if let Some(pipeline) = &mut self.mte_pipeline {
+            while let Some(pipeline) = &mut self.mte_pipeline {
                 if let Some(fixp) = &mut self.fixp {
                     self.hardware_flags.advance_to(event_tick)?;
                     let (l0c, l1) = self.local_memory.fixp_destinations_mut();
@@ -80,6 +84,14 @@ impl C220Core {
                 } else {
                     pipeline.advance(event_tick)?;
                 }
+                if pipeline.fixp_issue_pending() {
+                    self.transfer_fixp_issue_at(event_tick)?;
+                    continue;
+                }
+                if pipeline.fixp_dispatch_pending() {
+                    self.dispatch_fixp_head_at(event_tick)?;
+                    continue;
+                }
                 self.mte1
                     .observe_completions(event_tick, pipeline.mte1_completions());
                 self.mte2
@@ -90,7 +102,9 @@ impl C220Core {
                 for id in pipeline.take_dma_completions() {
                     self.mte2.complete_dma(id)?;
                 }
+                break;
             }
+            self.release_fixp_barriers_at(event_tick);
             self.cube.advance_event(
                 event_tick,
                 &mut self.local_memory,

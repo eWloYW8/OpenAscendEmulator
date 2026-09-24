@@ -1,7 +1,7 @@
 use std::num::NonZeroU32;
 
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
-use crate::isa::c220::mte::factor::{C220FactorLoad, C220FactorLoadInstruction};
+use crate::isa::c220::mte::factor::C220FactorLoad;
 use crate::sim::c220::memory::C220LocalBuffer;
 use crate::sim::c220::mte::factor::{
     C220FactorLoadResult, c220_factor_l1_requests, execute_c220_factor_load_from_memories,
@@ -32,6 +32,9 @@ impl C220Core {
         &mut self,
         config: C220FactorReadConfig,
     ) -> Result<(), C220CoreError> {
+        if self.queued_fixp_commands() != 0 {
+            return Err(C220CoreError::MtePipelineBusy);
+        }
         let fixp = factor_context(&mut self.fixp, &mut self.external_fixp)
             .ok_or(C220CoreError::FixpUnconfigured)?;
         if !fixp.engine.is_idle() {
@@ -53,18 +56,20 @@ impl C220Core {
             .unwrap_or(&[])
     }
 
-    pub(super) fn step_factor_at(
+    pub(super) fn dispatch_factor_at(
         &mut self,
         tick: u64,
-        pc: u64,
-        word: u32,
-        instruction: C220FactorLoadInstruction,
+        issue: super::fixp_frontend::FixpIssue,
+        load: C220FactorLoad,
     ) -> Result<C220CoreStep, C220CoreError> {
-        let load = instruction.capture(self.state.scalar().machine().xregs());
+        let super::fixp_frontend::FixpIssue {
+            instruction_id: id,
+            pc,
+            word,
+        } = issue;
         let fixp = factor_context(&mut self.fixp, &mut self.external_fixp)
             .ok_or(C220CoreError::FixpUnconfigured)?;
         let config = fixp.factor_reads.ok_or(C220CoreError::FactorUnconfigured)?;
-        let id = self.next_instruction_id;
         let admission = fixp.engine.admit_factor_batch(
             tick,
             config.port,
@@ -81,7 +86,6 @@ impl C220Core {
                 cause: C220StallCause::FixpDependency,
             }));
         }
-        self.state.commit_c220_sequential_issue();
         Ok(C220CoreStep::Executed {
             tick,
             instruction: C220CoreInstruction::Factor {

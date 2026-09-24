@@ -146,6 +146,10 @@ impl Iterator for C220FixpReadGenerator {
             data_bytes / 2
         } else if d.conversion_mode() == 0 {
             data_bytes
+        } else if matches!(d.conversion_mode(), 17 | 18) {
+            data_bytes.wrapping_mul(16) / source_row_bytes
+        } else if matches!(d.conversion_mode(), 19 | 20) {
+            0
         } else if int4 && !merge {
             data_bytes.wrapping_mul(8) / source_row_bytes
         } else {
@@ -300,6 +304,10 @@ mod tests {
             (8, 16, vec![(64, 32)]),
             (8, 33, vec![(64, 64), (64, 64), (32, 8)]),
             (21, 16, vec![(64, 16)]),
+            (17, 33, vec![(64, 32), (64, 32), (64, 32)]),
+            (18, 33, vec![(64, 32), (64, 32), (64, 32)]),
+            (19, 64, vec![(64, 0); 4]),
+            (20, 64, vec![(64, 0); 4]),
         ] {
             half.descriptor.xt = (64 << 32) | (2 << 16) | (columns << 4);
             half.descriptor.xm = (mode << 34) | 32;

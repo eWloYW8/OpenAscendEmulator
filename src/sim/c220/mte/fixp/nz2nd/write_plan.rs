@@ -66,6 +66,14 @@ mod tests {
                 .bytes,
             36
         );
+        command.descriptor.xt = (1024 << 32) | (1 << 16) | (1024 << 4);
+        for mode in [19, 20, 21, 22] {
+            command.descriptor.xm = (1 << 43) | (mode << 34);
+            assert_eq!(
+                C220FixpNz2ndWritePlanner::new(command, 1).unwrap().gather(),
+                mode <= 20
+            );
+        }
     }
 }
 
@@ -118,6 +126,8 @@ impl C220FixpNz2ndWritePlanner {
                 .expect("validated layout");
         let column_bytes = if d.conversion_mode() == 0 && d.channel_split() {
             32
+        } else if matches!(d.conversion_mode(), 19 | 20) {
+            0
         } else {
             format.storage_bytes(16)
         };

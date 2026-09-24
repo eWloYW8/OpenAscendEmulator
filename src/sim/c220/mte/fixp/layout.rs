@@ -82,8 +82,8 @@ impl C220FixpLayout {
             C220FixpOutputFormat::Fp32 | C220FixpOutputFormat::Int32
         ) && d.channel_split()
             && !d.nz_to_nd();
-        let byte_merge = self.format == C220FixpOutputFormat::Bits8 && !d.nz_to_nd();
-        let nibble_merge = self.format == C220FixpOutputFormat::Int4
+        let byte_merge = matches!(d.conversion_mode(), 8 | 9 | 23 | 24) && !d.nz_to_nd();
+        let nibble_merge = matches!(d.conversion_mode(), 21 | 22 | 25 | 26)
             && !d.nz_to_nd()
             && d.columns().is_multiple_of(64);
         let merged_blocks = u32::from(d.columns() / 32) * 2;

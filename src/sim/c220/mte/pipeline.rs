@@ -90,6 +90,10 @@ pub struct C220MtePipelineConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Callback {
+    FixpIssueProbe,
+    FixpIssueTransfer,
+    FixpCommandProbe,
+    FixpCommandDispatch,
     FixpExternal(usize, C220FixpCallback),
     Fixp(usize, C220FixpCallback),
     FixpWrite(C220FixpL1WriteCallback),
@@ -153,6 +157,10 @@ pub enum C220MtePipelineEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220MtePipelineError {
+    #[error("MTE cycle {active} must finish before advancing to {requested}")]
+    UnfinishedCycle { active: u64, requested: u64 },
+    #[error("FIX frontend must resolve its pending dispatch before resuming the MTE cycle")]
+    FixpDispatchPending,
     #[error(transparent)]
     FixpExternal(Box<super::fixp::C220FixpRuntimeError>),
     #[error("external FIX event binding requires each of the eleven stages exactly once")]
@@ -340,12 +348,56 @@ pub struct C220MtePipeline {
     dma_completions: Vec<u64>,
     trace: Vec<C220MtePipelineEvent>,
     last_advance: Option<u64>,
+    active_cycle: Option<u64>,
+    fixp_command_valid: EventId,
+    fixp_command_ready: Option<u64>,
+    fixp_head_is_convert: bool,
+    fixp_dispatch_pending: bool,
+    fixp_issue_valid: EventId,
+    fixp_issue_ready: Option<u64>,
+    fixp_issue_pending: bool,
 }
 
 impl C220MtePipeline {
+    pub(crate) fn set_fixp_issue_head(&mut self, ready: Option<u64>) {
+        self.fixp_issue_ready = ready;
+    }
+
+    pub(crate) fn fixp_issue_pending(&self) -> bool {
+        self.fixp_issue_pending
+    }
+
+    pub(crate) fn finish_fixp_issue(&mut self) {
+        self.fixp_issue_pending = false;
+    }
+
+    pub(crate) fn set_fixp_command_head(&mut self, ready: Option<u64>, is_convert: bool) {
+        self.fixp_command_ready = ready;
+        self.fixp_head_is_convert = is_convert;
+    }
+
+    pub(crate) fn fixp_dispatch_pending(&self) -> bool {
+        self.fixp_dispatch_pending
+    }
+
+    pub(crate) fn finish_fixp_dispatch(&mut self) {
+        self.fixp_dispatch_pending = false;
+    }
+
     pub fn new(tick: u64, config: C220MtePipelineConfig) -> Self {
         let mut events = EventDispatcher::new(tick);
         let clock = events.add_event();
+        let fixp_issue_valid = events.add_event();
+        let issue_probe = events.add_process(Callback::FixpIssueProbe, false);
+        let issue_transfer = events.add_process(Callback::FixpIssueTransfer, false);
+        events.subscribe(clock, issue_probe);
+        events.subscribe(fixp_issue_valid, issue_transfer);
+        let mte3_events = C220Mte3Events::register(&mut events, clock, Callback::Mte3);
+        let fixp_command_valid = events.add_event();
+        let probe = events.add_process(Callback::FixpCommandProbe, false);
+        let dispatch = events.add_process(Callback::FixpCommandDispatch, false);
+        events.subscribe(clock, probe);
+        events.subscribe(fixp_command_valid, dispatch);
         let memory_events = C220L1Events::register(&mut events, clock, Callback::Memory);
         let fixp_write_events =
             C220FixpL1WriteEvents::register(&mut events, clock, Callback::FixpWrite);
@@ -362,7 +414,6 @@ impl C220MtePipeline {
         let set2d_events = C220Set2dEvents::register(&mut events, clock, Callback::Set2d);
         let set2d_l1_events = C220Set2dEvents::register(&mut events, clock, Callback::Set2dL1);
         let dma_events = C220DmaEvents::register(&mut events, clock, Callback::Dma);
-        let mte3_events = C220Mte3Events::register(&mut events, clock, Callback::Mte3);
         let biu_events = C220BiuReadEvents::register(&mut events, clock, Callback::BiuRead);
         let biu_return_events =
             C220BiuReturnEvents::register(&mut events, clock, Callback::BiuReturn);
@@ -440,6 +491,14 @@ impl C220MtePipeline {
             dma_completions: Vec::new(),
             trace: Vec::new(),
             last_advance: None,
+            active_cycle: None,
+            fixp_command_valid,
+            fixp_command_ready: None,
+            fixp_head_is_convert: false,
+            fixp_dispatch_pending: false,
+            fixp_issue_valid,
+            fixp_issue_ready: None,
+            fixp_issue_pending: false,
         }
     }
 
@@ -465,7 +524,10 @@ impl C220MtePipeline {
         self.selected_generator
     }
     pub fn is_idle(&self) -> bool {
-        self.fixp_write.is_idle()
+        self.fixp_command_ready.is_none()
+            && self.fixp_issue_ready.is_none()
+            && self.active_cycle.is_none()
+            && self.fixp_write.is_idle()
             && self.biu_cube_source.is_idle()
             && self.fixp_stores.is_empty()
             && self.generators.iter().all(C220Mte1ReadFrontend::is_idle)
@@ -996,65 +1058,96 @@ impl C220MtePipeline {
         if self.last_advance == Some(tick) {
             return Ok(());
         }
-        let active = !self.is_idle()
-            || fixp
-                .as_ref()
-                .is_some_and(|(engine, _, _)| !engine.is_idle())
-            || external_fixp
-                .as_ref()
-                .is_some_and(|(engine, _, _)| !engine.is_idle());
-        if active
-            && let Some(expected) = self.events.tick().checked_add(1)
-            && tick > expected
-        {
-            return Err(C220MtePipelineError::SkippedTick {
-                expected,
-                requested: tick,
-            });
-        }
-        self.events.advance_to(tick)?;
-        self.completions.clear();
-        self.fixp_completions.clear();
-        self.l1_fill_completions.clear();
-        self.dma_completions.clear();
-        self.trace.clear();
-        if let Some((engine, _, _)) = fixp.as_mut() {
-            engine.retire_ready_write(tick)?;
-        }
-        if let Some((engine, _, _)) = external_fixp.as_mut()
-            && let Some(retired) = engine.retire_ready_write(tick)?
-        {
-            self.trace.push(match retired.external {
-                Some(operands) => {
-                    C220MtePipelineEvent::FixpExternal(C220FixpRuntimeEvent::Retired {
+        if let Some(active) = self.active_cycle {
+            if active != tick {
+                return Err(C220MtePipelineError::UnfinishedCycle {
+                    active,
+                    requested: tick,
+                });
+            }
+            if self.fixp_dispatch_pending || self.fixp_issue_pending {
+                return Err(C220MtePipelineError::FixpDispatchPending);
+            }
+        } else {
+            let active = !self.is_idle()
+                || fixp
+                    .as_ref()
+                    .is_some_and(|(engine, _, _)| !engine.is_idle())
+                || external_fixp
+                    .as_ref()
+                    .is_some_and(|(engine, _, _)| !engine.is_idle());
+            if active
+                && let Some(expected) = self.events.tick().checked_add(1)
+                && tick > expected
+            {
+                return Err(C220MtePipelineError::SkippedTick {
+                    expected,
+                    requested: tick,
+                });
+            }
+            self.events.advance_to(tick)?;
+            self.completions.clear();
+            self.fixp_completions.clear();
+            self.l1_fill_completions.clear();
+            self.dma_completions.clear();
+            self.trace.clear();
+            if let Some((engine, _, _)) = fixp.as_mut() {
+                engine.retire_ready_write(tick)?;
+            }
+            if let Some((engine, _, _)) = external_fixp.as_mut()
+                && let Some(retired) = engine.retire_ready_write(tick)?
+            {
+                self.trace.push(match retired.external {
+                    Some(operands) => {
+                        C220MtePipelineEvent::FixpExternal(C220FixpRuntimeEvent::Retired {
+                            tick,
+                            instruction_id: retired.instruction_id,
+                            state: super::fixp::C220FixpExternalCommandState {
+                                operands,
+                                lifecycle: retired.lifecycle,
+                            },
+                        })
+                    }
+                    None => C220MtePipelineEvent::Fixp(C220FixpEvent::Retired {
                         tick,
                         instruction_id: retired.instruction_id,
-                        state: super::fixp::C220FixpExternalCommandState {
-                            operands,
-                            lifecycle: retired.lifecycle,
-                        },
-                    })
-                }
-                None => C220MtePipelineEvent::Fixp(C220FixpEvent::Retired {
-                    tick,
-                    instruction_id: retired.instruction_id,
-                    state: retired.lifecycle,
-                }),
-            });
-        }
-        if let Some(memory) = &mut self.timed_memory {
-            memory.advance(tick)?;
-        }
-        self.advance_biu_bus_returns(tick)?;
-        if let Some((engine, _, _)) = external_fixp.as_mut() {
-            for &id in &self.fixp_completions {
-                engine.complete_write_transport(tick, id)?;
+                        state: retired.lifecycle,
+                    }),
+                });
             }
+            if let Some(memory) = &mut self.timed_memory {
+                memory.advance(tick)?;
+            }
+            self.advance_biu_bus_returns(tick)?;
+            if let Some((engine, _, _)) = external_fixp.as_mut() {
+                for &id in &self.fixp_completions {
+                    engine.complete_write_transport(tick, id)?;
+                }
+            }
+            self.advance_biu_read_returns(tick)?;
+            self.events.notify_at(self.clock, tick);
+            self.active_cycle = Some(tick);
         }
-        self.advance_biu_read_returns(tick)?;
-        self.events.notify_at(self.clock, tick);
         while let Some(invocation) = self.events.next_callback() {
             match invocation.callback {
+                Callback::FixpIssueProbe => {
+                    if self.fixp_issue_ready.is_some_and(|ready| ready <= tick) {
+                        self.events.notify_at(self.fixp_issue_valid, tick);
+                    }
+                }
+                Callback::FixpIssueTransfer => {
+                    self.fixp_issue_pending = true;
+                    return Ok(());
+                }
+                Callback::FixpCommandProbe => {
+                    if self.fixp_command_ready.is_some_and(|ready| ready <= tick) {
+                        self.events.notify_at(self.fixp_command_valid, tick);
+                    }
+                }
+                Callback::FixpCommandDispatch => {
+                    self.fixp_dispatch_pending = true;
+                    return Ok(());
+                }
                 Callback::FixpExternal(index, phase) => {
                     let (engine, memory, gates) = external_fixp
                         .as_mut()
@@ -1146,7 +1239,7 @@ impl C220MtePipeline {
                     });
                     self.mte3.set_external_fixp_pending(
                         self.core_kind == crate::sim::c220::device::C220CoreKind::Cube
-                            && outstanding_fixp != 0,
+                            && (outstanding_fixp != 0 || self.fixp_head_is_convert),
                     );
                     if let Some(outcome) =
                         self.mte3_events
@@ -1492,6 +1585,7 @@ impl C220MtePipeline {
         self.advance_biu_bus_inputs(tick)?;
         self.advance_biu_read_inputs(tick)?;
         self.last_advance = Some(tick);
+        self.active_cycle = None;
         Ok(())
     }
 }

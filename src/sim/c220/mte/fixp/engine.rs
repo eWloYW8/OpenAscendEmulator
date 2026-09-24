@@ -37,6 +37,8 @@ pub struct C220FactorCommandState {
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220FixpEngineError {
+    #[error("FIX control retirement time overflowed")]
+    ControlTimeOverflow,
     #[error("FIX write command {0} is not the instruction FIFO head")]
     CommandOrder(u64),
     #[error("FIX command {0} is not the retirement FIFO head")]
@@ -89,6 +91,7 @@ pub struct C220FixpEngine {
     pub(super) datapath: super::datapath::C220FixpDatapath,
     pub(super) commands: BTreeMap<u64, C220FixpCommandState>,
     factor_commands: BTreeMap<u64, C220FactorCommandState>,
+    control_commands: BTreeMap<u64, u64>,
     instruction_fifo: VecDeque<u64>,
     retirement_fifo: VecDeque<u64>,
     command_retirement: VecDeque<u64>,
@@ -109,7 +112,7 @@ impl C220FixpEngine {
         bindings: &mut C220FixpSyncBindings,
         flags: &mut C220HardwareFlagState,
     ) -> Result<C220FixpAdmission, C220FixpEngineError> {
-        if self.commands.contains_key(&id) || self.factor_commands.contains_key(&id) {
+        if self.contains_command(id) {
             return Err(C220FixpEngineError::DuplicateCommand(id));
         }
         bindings.capture_pending(id, flags);
@@ -124,6 +127,7 @@ impl C220FixpEngine {
             config,
             commands: BTreeMap::new(),
             factor_commands: BTreeMap::new(),
+            control_commands: BTreeMap::new(),
             instruction_fifo: VecDeque::new(),
             retirement_fifo: VecDeque::new(),
             command_retirement: VecDeque::new(),
@@ -151,6 +155,40 @@ impl C220FixpEngine {
     }
     pub fn factor_commands(&self) -> &BTreeMap<u64, C220FactorCommandState> {
         &self.factor_commands
+    }
+
+    pub fn control_commands(&self) -> &BTreeMap<u64, u64> {
+        &self.control_commands
+    }
+
+    pub(super) fn contains_command(&self, id: u64) -> bool {
+        self.commands.contains_key(&id)
+            || self.factor_commands.contains_key(&id)
+            || self.control_commands.contains_key(&id)
+    }
+
+    pub(crate) fn admit_control(&mut self, tick: u64, id: u64) -> Result<(), C220FixpEngineError> {
+        if self.contains_command(id) {
+            return Err(C220FixpEngineError::DuplicateCommand(id));
+        }
+        let ready = tick
+            .checked_add(1)
+            .ok_or(C220FixpEngineError::ControlTimeOverflow)?;
+        self.control_commands.insert(id, ready);
+        self.command_retirement.push_back(id);
+        Ok(())
+    }
+
+    pub(crate) fn retire_ready_control(&mut self, tick: u64) -> Option<u64> {
+        let id = self.command_retirement_head()?;
+        let ready = *self.control_commands.get(&id)?;
+        if tick < ready || !self.can_retire_at(tick, id) {
+            return None;
+        }
+        self.control_commands.remove(&id);
+        self.command_retirement.pop_front();
+        self.last_retirement_tick = Some(tick);
+        Some(id)
     }
     pub fn command_retirement_head(&self) -> Option<u64> {
         self.command_retirement.front().copied()
@@ -284,6 +322,7 @@ impl C220FixpEngine {
     pub fn is_idle(&self) -> bool {
         self.commands.is_empty()
             && self.factor_commands.is_empty()
+            && self.control_commands.is_empty()
             && self.datapath.is_idle()
             && self.output.bursts().is_empty()
     }
@@ -297,7 +336,7 @@ impl C220FixpEngine {
         first_request: u32,
         command: C220FixpCommand,
     ) -> Result<C220FixpAdmission, C220FixpEngineError> {
-        if self.commands.contains_key(&id) || self.factor_commands.contains_key(&id) {
+        if self.contains_command(id) {
             return Err(C220FixpEngineError::DuplicateCommand(id));
         }
         if command.descriptor.is_disabled() {
@@ -527,7 +566,7 @@ impl C220FixpEngine {
         cursor: crate::sim::c220::mte::factor::C220FactorRequestCursor,
     ) -> Result<C220FixpAdmission, C220FixpEngineError> {
         let id = cursor.instruction_id();
-        if self.commands.contains_key(&id) || self.factor_commands.contains_key(&id) {
+        if self.contains_command(id) {
             return Err(C220FixpEngineError::DuplicateCommand(id));
         }
         if cursor.remaining() == 0 {

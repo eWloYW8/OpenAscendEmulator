@@ -1,8 +1,8 @@
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
 use crate::sim::c220::memory::C220LocalBuffer;
 use crate::sim::c220::mte::fixp::{
-    C220FixpAdmission, C220FixpCommand, C220FixpEngine, C220FixpEngineConfig,
-    C220FixpExecutionError, C220FixpStage, C220FixpSyncBindings,
+    C220FixpAdmission, C220FixpCommand, C220FixpEngine, C220FixpEngineConfig, C220FixpStage,
+    C220FixpSyncBindings,
 };
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 
@@ -21,6 +21,7 @@ impl C220Core {
     pub fn configure_fixp_l1(
         &mut self,
         config: C220FixpEngineConfig,
+        frontend: super::C220FixpFrontendConfig,
         factors: C220LocalBuffer,
         stages: &[C220FixpStage],
     ) -> Result<(), C220CoreError> {
@@ -43,6 +44,7 @@ impl C220Core {
             factor_outcomes: Vec::new(),
             next_request: 0,
         });
+        self.fixp_frontend.config = Some(frontend);
         Ok(())
     }
 
@@ -51,6 +53,14 @@ impl C220Core {
             self.external_fixp
                 .as_ref()
                 .map(|fixp| fixp.engine.shared_engine())
+        })
+    }
+
+    pub(super) fn fixp_engine_mut(&mut self) -> Option<&mut C220FixpEngine> {
+        self.fixp.as_mut().map(|fixp| &mut fixp.engine).or_else(|| {
+            self.external_fixp
+                .as_mut()
+                .map(|fixp| fixp.engine.shared_engine_mut())
         })
     }
 
@@ -75,33 +85,17 @@ impl C220Core {
             .or_else(|| self.external_fixp.as_mut().map(|fixp| &mut fixp.factors))
     }
 
-    pub(super) fn step_fixp_at(
+    pub(super) fn dispatch_fixp_l1_at(
         &mut self,
         tick: u64,
-        pc: u64,
-        word: u32,
+        issue: super::fixp_frontend::FixpIssue,
+        command: C220FixpCommand,
     ) -> Result<C220CoreStep, C220CoreError> {
-        if crate::isa::c220::mte::fixp::C220FixpInstruction::decode(word).is_some_and(
-            |instruction| {
-                instruction.destination
-                    == crate::isa::c220::mte::fixp::C220FixpDestination::External
-            },
-        ) {
-            return self.step_external_fixp_at(tick, pc, word);
-        }
-        let machine = self.state.scalar().machine();
-        let control = machine
-            .spr_value(3)
-            .ok_or(C220FixpExecutionError::MissingSpr(3))?;
-        let command = C220FixpCommand::capture_l1(
+        let super::fixp_frontend::FixpIssue {
+            instruction_id,
+            pc,
             word,
-            control,
-            |register| machine.xregs().get(usize::from(register)).copied(),
-            |register| machine.spr_value(u16::from(register)),
-        )?;
-        if command.descriptor.nz_to_nd() && self.external_fixp.is_some() {
-            return self.step_external_fixp_at(tick, pc, word);
-        }
+        } = issue;
         let (engine, bindings, next_request) = if let Some(fixp) = &mut self.fixp {
             (&mut fixp.engine, &mut fixp.bindings, &mut fixp.next_request)
         } else if let Some(fixp) = &mut self.external_fixp {
@@ -137,7 +131,7 @@ impl C220Core {
         }
         let admission = engine.admit_with_flags(
             tick,
-            self.next_instruction_id,
+            instruction_id,
             *next_request as u32,
             command,
             bindings,
@@ -154,12 +148,11 @@ impl C220Core {
                 cause: C220StallCause::FixpDependency,
             }));
         }
-        self.state.commit_c220_sequential_issue();
         *next_request += reservation;
         Ok(C220CoreStep::Executed {
             tick,
             instruction: C220CoreInstruction::Fixp {
-                instruction_id: self.next_instruction_id,
+                instruction_id,
                 pc,
                 word,
                 command,

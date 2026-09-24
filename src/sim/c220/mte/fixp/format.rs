@@ -39,6 +39,8 @@ impl C220FixpOutputFormat {
             (_, 16) => Some(Self::Bf16),
             (C220FixpSourceFormat::Int32, 0) => Some(Self::Int32),
             (C220FixpSourceFormat::Fp32, 0) => Some(Self::Fp32),
+            (_, 17 | 18) => Some(Self::Bits8),
+            (_, 19 | 20) => Some(Self::Int4),
             // Quantization modes interpret complete 32-bit words independently
             // of the instruction's physical source lane width and type tag.
             (_, 8 | 9 | 23 | 24) => Some(Self::Bits8),

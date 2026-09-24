@@ -58,6 +58,24 @@ fn fixp_command_keeps_store_identity_across_transport_splits() {
         commands.push(8, invalid),
         Err(C220BiuWriteCommandError::InvalidSource)
     ));
+
+    let mut empty = input;
+    empty.generated.request.bytes = 0;
+    let mut commands = C220BiuWriteCommands::new(C220BiuWriteConfig {
+        outstanding: NonZeroU32::new(2).unwrap(),
+        weights: [1; 3],
+        source_bandwidth: NonZeroU32::new(32).unwrap(),
+    });
+    assert!(commands.push(0, empty).unwrap());
+    for tick in 0..6 {
+        let cycle = commands.advance(tick).unwrap();
+        assert_eq!(cycle.empty_input, (tick == 3).then_some(empty));
+        assert!(cycle.sent.is_none());
+        assert!(commands.take_request(tick).unwrap().is_none());
+    }
+    assert!(commands.is_idle());
+    assert_eq!(commands.free_tag_count(), 2);
+    assert_eq!(commands.reserved_tag(), None);
 }
 
 #[test]

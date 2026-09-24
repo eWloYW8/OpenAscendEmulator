@@ -16,6 +16,10 @@ pub enum C220StallCause {
     VectorDependency,
     CubeDependency,
     FixpDependency,
+    FixpIssueQueueFull,
+    FixpCommandQueueFull,
+    FixpOutstandingLimit,
+    FixpBarrier,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

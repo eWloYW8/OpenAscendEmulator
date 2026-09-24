@@ -144,7 +144,7 @@ impl C220FixpCommand {
                 coordinate.source_bytes() as usize,
             )?;
             let operands = self.read_factor_operands(coordinate, slopes)?;
-            if self.descriptor.conversion_mode() == 6 {
+            if matches!(self.descriptor.conversion_mode(), 6 | 17..=20) {
                 return Ok(C220FixpSliceResult {
                     coordinate,
                     conversion: C220FixpConversionResult {
@@ -329,7 +329,9 @@ mod tests {
         factors
             .write_known_linear(2048, &0.25_f32.to_le_bytes().repeat(16))
             .unwrap();
-        for mode in [1, 6, 8, 9, 10, 11, 12, 13, 16, 21, 22, 23, 24, 25, 26] {
+        for mode in [
+            1, 6, 8, 9, 10, 11, 12, 13, 16, 17, 18, 21, 22, 23, 24, 25, 26,
+        ] {
             let command = C220FixpCommand {
                 descriptor: C220FixpDescriptor {
                     xt: (1 << 16) | (16 << 4),
@@ -363,6 +365,80 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             assert_eq!(reads(command), reads(integer_tag), "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn cleared_quantization_modes_keep_columns_separate_and_clip_nd_tails() {
+        let mut l0c = C220LocalBuffer::new(1024);
+        l0c.write_known_linear(0, &[0xff; 1024]).unwrap();
+        let factors = C220LocalBuffer::new(0);
+        for mode in 17_u64..=20 {
+            let divisor = if mode >= 19 { 2 } else { 1 };
+            for source_format in [
+                C220FixpSourceFormat::Fp32,
+                C220FixpSourceFormat::Int32,
+                C220FixpSourceFormat::Fp16,
+            ] {
+                for nz_to_nd in [false, true] {
+                    let command = C220FixpCommand {
+                        descriptor: C220FixpDescriptor {
+                            xt: (64 << 32) | (2 << 16) | (33 << 4),
+                            xm: (mode << 34) | (3 << 39) | (u64::from(nz_to_nd) << 43) | 2,
+                            nd: 1,
+                        },
+                        source_format,
+                        source_address: 0,
+                        destination_address: 0,
+                        control: 0,
+                        scalar_slope: u32::MAX,
+                        scalar_dequant: u64::MAX,
+                        slope_base_block: u8::MAX,
+                        dequant_base_block: u8::MAX,
+                    };
+                    let mut output = C220LocalBuffer::new(8192);
+                    output.write_known_linear(0, &[0xaa; 8192]).unwrap();
+                    let mut slices = Vec::new();
+                    command
+                        .execute_to_l1(&l0c, &factors, &mut output, |slice| {
+                            assert_eq!(slice.factors.slope_read_address, None);
+                            assert_eq!(slice.factors.dequant_read_address, None);
+                            assert!(
+                                slice
+                                    .conversion
+                                    .lane_status
+                                    .iter()
+                                    .all(|s| *s == C220FixpLaneStatus::Cleared)
+                            );
+                            slices.push(slice.coordinate);
+                        })
+                        .unwrap();
+                    assert_eq!(slices.len(), 6);
+                    for (index, slice) in slices.into_iter().enumerate() {
+                        let row = index / 3;
+                        let column = index % 3;
+                        let address = if nz_to_nd {
+                            (row * 64 + column * 16) / divisor
+                        } else {
+                            row * 16 / divisor + column * 2048
+                        };
+                        let bytes = (if nz_to_nd && column == 2 { 1 } else { 16 }) / divisor as u32;
+                        assert_eq!(slice.destination_address, address as u64);
+                        assert_eq!(slice.destination_bytes(), bytes);
+                        assert_eq!(
+                            slice.source_address,
+                            ((row + column * 2) * 16) as u64
+                                * u64::from(source_format.lane_bytes())
+                        );
+                        assert_eq!(
+                            output.read_known(address as u64, bytes as usize).unwrap(),
+                            vec![0; bytes as usize]
+                        );
+                    }
+                    let untouched = (if nz_to_nd { 33 } else { 32 }) / divisor as u64;
+                    assert_eq!(output.read_known(untouched, 1).unwrap(), [0xaa]);
+                }
+            }
         }
     }
 

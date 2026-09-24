@@ -12,28 +12,37 @@ use std::num::NonZeroU32;
 
 #[test]
 fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
-    let cases = [0, 1, 8, 9, 10, 11, 12, 13, 21, 22, 23, 24, 25, 26]
-        .into_iter()
-        .map(|mode| (mode, true, false))
-        .chain([
-            (0, false, false),
-            (0, false, true),
-            (6, false, false),
-            (6, true, false),
-        ])
-        .map(|(mode, nz2nd, split)| (mode, nz2nd, split, mode == 6))
-        .chain(
-            [1, 8, 9, 10, 11, 12, 13, 16, 21, 22, 23, 24, 25, 26]
-                .map(|mode| (mode, true, false, true)),
-        );
+    let cases = [
+        0, 1, 8, 9, 10, 11, 12, 13, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    ]
+    .into_iter()
+    .map(|mode| (mode, true, false))
+    .chain([
+        (0, false, false),
+        (0, false, true),
+        (6, false, false),
+        (6, true, false),
+        (17, false, false),
+        (18, false, false),
+        (19, false, false),
+        (20, false, false),
+    ])
+    .map(|(mode, nz2nd, split)| (mode, nz2nd, split, mode == 6))
+    .chain(
+        [
+            1, 8, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+        ]
+        .map(|mode| (mode, true, false, true)),
+    );
     for (conversion, nz2nd, split, half_source) in cases {
+        let cleared = matches!(conversion, 6 | 17..=20);
         use crate::sim::c220::device::C220CoreKind;
         let core_kind = match conversion {
             1 => C220CoreKind::Vector0,
             8 => C220CoreKind::Vector1,
             _ => C220CoreKind::Cube,
         };
-        let int4 = matches!(conversion, 21 | 22 | 25 | 26);
+        let int4 = matches!(conversion, 19..=22 | 25 | 26);
         use C220FixpRuntimeStage::*;
         let width = NonZeroU32::new(32).unwrap();
         let mut pipeline = C220MtePipeline::new(
@@ -98,10 +107,7 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
         }
         let mut memory = MappedMemory::bind(
             SparseMemory::new(
-                vec![
-                    MemoryRegion::new(4096, vec![if conversion == 6 { 0xa5 } else { 0 }; 4096])
-                        .unwrap(),
-                ],
+                vec![MemoryRegion::new(4096, vec![if cleared { 0xa5 } else { 0 }; 4096]).unwrap()],
                 4096,
                 4096,
             ),
@@ -396,6 +402,21 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
                 }
             }
         }
+        if matches!(conversion, 19 | 20) && !nz2nd {
+            assert!(retired.is_none() && disabled_retired.is_none());
+            assert!(executed.is_some());
+            assert_eq!(sent_bytes, 0);
+            assert_eq!(engine.retirement_fifo().len(), 2);
+            assert_eq!(engine.shared_engine().outstanding_external_commands(), 1);
+            assert_eq!(pipeline.fixp_store_buffer().len(), 2);
+            assert!(engine.commands()[&7].write_dispatched_tick.is_some());
+            assert_eq!(engine.write_completion_tick(7), None);
+            for address in [4096, 5120] {
+                assert_eq!(memory.read_known_at(address, 16).unwrap(), [0; 16]);
+                assert_eq!(memory.read_known_at(address + 16, 16).unwrap(), [0xa5; 16]);
+            }
+            continue;
+        }
         let (tick, state) = retired.expect("external instruction must retire");
         assert_eq!(disabled_retired, Some(tick + 1));
         assert_eq!(state.lifecycle.executed_tick, executed);
@@ -407,7 +428,11 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
         if !nz2nd {
             let blocks = if split { 3 } else { 2 };
             let lanes = if split { 16 } else { 32 };
-            let lane_bytes = if conversion == 6 { 2 } else { 4 };
+            let lane_bytes = match conversion {
+                6 => 2,
+                17 | 18 => 1,
+                _ => 4,
+            };
             assert_eq!(sent_bytes, blocks * lanes * lane_bytes);
             for block in 0..blocks {
                 let address = 4096 + u64::from(block) * 1024;
@@ -415,7 +440,7 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
                     memory
                         .read_known_at(address, (lanes * lane_bytes) as usize)
                         .unwrap(),
-                    if conversion == 6 {
+                    if cleared {
                         vec![0; (lanes * lane_bytes) as usize]
                     } else {
                         1_f32.to_le_bytes().repeat(lanes as usize)
@@ -425,22 +450,27 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
                     memory
                         .read_known_at(address + u64::from(lanes * lane_bytes), 32)
                         .unwrap(),
-                    [if conversion == 6 { 0xa5 } else { 0 }; 32]
+                    [if cleared { 0xa5 } else { 0 }; 32]
                 );
             }
             assert!(engine.staging().is_idle());
             continue;
         }
         if int4 {
-            assert_eq!(sent_bytes, 2);
+            assert_eq!(sent_bytes, if cleared { 66 } else { 2 });
             for row in 0..2 {
-                let expected = if half_source {
+                let expected = if cleared {
+                    [0; 9]
+                } else if half_source {
                     [0x11, 0x11, 0x11, 0x11, 0, 0, 0, 0, 1]
                 } else {
                     [0x11; 9]
                 };
                 assert_eq!(memory.read_known_at(4096 + row * 16, 9).unwrap(), expected);
-                assert_eq!(memory.read_known_at(4105 + row * 16, 7).unwrap(), [0; 7]);
+                assert_eq!(
+                    memory.read_known_at(4105 + row * 16, 7).unwrap(),
+                    [if cleared { 0xa5 } else { 0 }; 7]
+                );
             }
             continue;
         }
@@ -448,6 +478,8 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
             1_f32.to_le_bytes().to_vec()
         } else if conversion == 6 {
             vec![0; 2]
+        } else if matches!(conversion, 17 | 18) {
+            vec![0]
         } else if conversion == 16 {
             0x3f80_u16.to_le_bytes().to_vec()
         } else if matches!(conversion, 8 | 9 | 23 | 24) {
@@ -461,6 +493,8 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
             sent_bytes as usize,
             if matches!(conversion, 8 | 9 | 23 | 24) {
                 2
+            } else if matches!(conversion, 17 | 18) {
+                66
             } else {
                 34 * lane.len()
             }
@@ -481,7 +515,7 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
                 memory
                     .read_known_at(address + 17 * lane.len() as u64, 15 * lane.len())
                     .unwrap(),
-                vec![if conversion == 6 { 0xa5 } else { 0 }; 15 * lane.len()]
+                vec![if cleared { 0xa5 } else { 0 }; 15 * lane.len()]
             );
         }
     }

@@ -47,12 +47,16 @@ impl C220Core {
             }));
         }
         let pc = self.state.scalar().pc();
+        if let Some(barrier) = PipelineBarrierStep::decode(Architecture::Dav2201, pc, word)
+            .filter(|barrier| barrier.scope == PipelineBarrierScope::Fix)
+        {
+            return self.step_fixp_barrier_at(tick, barrier);
+        }
         let decoded_word = C220DecodedWord::decode(word);
         match decoded_word.kind {
-            C220DispatchKind::Factor(instruction) => {
-                return self.step_factor_at(tick, pc, word, instruction);
+            C220DispatchKind::Factor(_) | C220DispatchKind::Fixp => {
+                return self.step_fixp_at(tick, pc, word);
             }
-            C220DispatchKind::Fixp => return self.step_fixp_at(tick, pc, word),
             C220DispatchKind::Vector => {
                 return Ok(match self.vector.step_at(tick, word, &mut self.state)? {
                     VectorStep::Issued(instruction) => C220CoreStep::Executed {
@@ -65,7 +69,13 @@ impl C220Core {
             C220DispatchKind::Mte1 => return self.step_mte1_at(tick, pc, word),
             C220DispatchKind::Mte2 => return self.step_mte2_at(tick, pc, word),
             C220DispatchKind::HardwareFlag(instruction) => {
-                return self.step_hardware_flag_at(tick, pc, instruction);
+                return if instruction.source_pipe
+                    == crate::isa::c220::hflag::C220HardwareFlagSourcePipe::Fix
+                {
+                    self.step_fixp_at(tick, pc, word)
+                } else {
+                    self.step_hardware_flag_at(tick, pc, instruction)
+                };
             }
             _ => {}
         }

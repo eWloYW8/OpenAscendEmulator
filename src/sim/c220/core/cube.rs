@@ -86,6 +86,10 @@ mod tests {
                 read_data_latency: 4,
                 l0c_capacity: core.local_memory.l0c().buffer().capacity(),
             },
+            super::super::C220FixpFrontendConfig {
+                issue_queue_depth: NonZeroU32::new(2).unwrap(),
+                outstanding_limit: NonZeroU32::new(2).unwrap(),
+            },
             C220LocalBuffer::new(4096),
             &[
                 GenerateRead,
@@ -121,18 +125,32 @@ mod tests {
         assert!(matches!(
             core.step_word_at(301, word).unwrap(),
             super::super::C220CoreStep::Executed {
-                instruction: C220CoreInstruction::Fixp {
+                instruction: C220CoreInstruction::FixpQueued {
                     instruction_id: 6,
                     ..
                 },
                 ..
             }
         ));
+        for tick in 302..=304 {
+            assert!(matches!(
+                core.step_word_at(tick, word).unwrap(),
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::FixpQueued { .. },
+                    ..
+                }
+            ));
+            assert!(core.fixp_engine().unwrap().commands().is_empty());
+        }
+        assert_eq!(core.queued_fixp_commands(), 4);
+        assert_eq!(core.fixp_issue_queue_len(), 2);
+        assert_eq!(core.fixp_command_queue_len(), 2);
+        assert_eq!(core.outstanding_fixp_commands(), 2);
         assert!(matches!(
-            core.step_word_at(302, word).unwrap(),
-            super::super::C220CoreStep::Stalled(_)
+            core.step_word_at(305, word).unwrap(),
+            C220CoreStep::Stalled(_)
         ));
-        assert_eq!(core.state.scalar().pc(), pc + 4);
+        assert_eq!(core.state.scalar().pc(), pc + 16);
         assert!(core.pending_compute_drain().is_some());
         core.advance_to(500).unwrap();
         assert!(core.fixp_engine().unwrap().is_idle());
@@ -164,7 +182,7 @@ mod tests {
             assert!(matches!(
                 core.step_word_at(tick, word).unwrap(),
                 C220CoreStep::Executed {
-                    instruction: C220CoreInstruction::Factor { .. },
+                    instruction: C220CoreInstruction::FixpQueued { .. },
                     ..
                 }
             ));
@@ -190,14 +208,11 @@ mod tests {
             assert!(matches!(
                 core.step_word_at(tick + 1, word).unwrap(),
                 C220CoreStep::Executed {
-                    instruction: C220CoreInstruction::Factor {
-                        admission: crate::sim::c220::mte::fixp::C220FixpAdmission::DisabledReady,
-                        ..
-                    },
+                    instruction: C220CoreInstruction::FixpQueued { .. },
                     ..
                 }
             ));
-            assert_eq!(core.fixp_engine().unwrap().factor_commands().len(), 2);
+            assert_eq!(core.queued_fixp_commands(), 2);
             assert!(core.pending_compute_drain().is_some());
             core.advance_to(tick + 199).unwrap();
             assert!(core.fixp_engine().unwrap().is_idle());
@@ -205,7 +220,7 @@ mod tests {
             assert_eq!(core.hardware_flags.pending_mte_flags().count(), 1);
             let result = core.factor_outcomes()[0];
             let empty = core.factor_outcomes()[1];
-            assert_eq!(empty.completed_tick, tick + 1);
+            assert_eq!(empty.completed_tick, tick + 5);
             assert_eq!(empty.retired_tick, result.retired_tick + 1);
             assert_eq!(empty.result.blocks, 0);
             assert!(result.retired_tick > result.completed_tick);
@@ -215,6 +230,107 @@ mod tests {
                 3_f32.to_le_bytes().repeat(64)
             );
         }
+        let flag_word = (2 << 29) | (15 << 21) | (3 << 15) | (10 << 10) | (2 << 7) | 1;
+        let flag_id = core.next_instruction_id;
+        assert!(matches!(
+            core.step_word_at(901, flag_word).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::FixpQueued {
+                    ready_tick: 902,
+                    ..
+                },
+                ..
+            }
+        ));
+        core.advance_to(903).unwrap();
+        assert!(core.fixp_engine().unwrap().control_commands().is_empty());
+        core.advance_to(905).unwrap();
+        assert_eq!(core.queued_fixp_commands(), 0);
+        assert_eq!(
+            core.fixp_engine().unwrap().control_commands().get(&flag_id),
+            Some(&906)
+        );
+        assert!(core.pending_compute_drain().is_some());
+        core.advance_to(906).unwrap();
+        assert!(core.fixp_engine().unwrap().is_idle());
+        assert!(core.pending_compute_drain().is_none());
+        let empty_factor = (6 << 29) | (1 << 17) | (2 << 12) | (3 << 7);
+        let predecessor = core.next_instruction_id;
+        assert!(matches!(
+            core.step_word_at(907, empty_factor).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        for tick in [908, 909] {
+            assert!(matches!(core.step_word_at(tick, 0x40e0_2800).unwrap(),
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::FixpBarrier { barrier, completed_tick: None },
+                    ..
+                } if barrier.predecessor == Some(predecessor)
+            ));
+        }
+        assert_eq!(core.pending_fixp_barriers().len(), 2);
+        assert_eq!(core.queued_fixp_commands(), 1);
+        assert_eq!(core.outstanding_fixp_commands(), 1);
+        assert!(matches!(
+            core.step_word_at(910, empty_factor).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        assert!(matches!(
+            core.step_word_at(911, 0x4140_0000).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Scalar { .. },
+                ..
+            }
+        ));
+        assert_eq!(core.fixp_issue_queue_len(), 1);
+        assert!(core.fixp_frontend_outcomes().iter().any(|event| matches!(
+            event,
+            C220CoreStep::Stalled(crate::sim::c220::schedule::C220Stall {
+                cause: crate::sim::c220::schedule::C220StallCause::FixpBarrier,
+                ..
+            })
+        )));
+        core.advance_to(912).unwrap();
+        assert_eq!(core.pending_fixp_barriers().len(), 0);
+        assert_eq!(core.fixp_issue_queue_len(), 0);
+        assert_eq!(
+            core.fixp_frontend_outcomes()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    C220CoreStep::Executed {
+                        instruction: C220CoreInstruction::FixpBarrier {
+                            completed_tick: Some(912),
+                            ..
+                        },
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        assert!(core.fixp_frontend_outcomes().iter().any(|event| matches!(
+            event,
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::FixpScheduled {
+                    ready_tick: 915,
+                    ..
+                },
+                ..
+            }
+        )));
+        core.advance_to(916).unwrap();
+        assert!(core.fixp_engine().unwrap().is_idle());
+        assert!(matches!(
+            core.step_word_at(917, 0x40e0_2800).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::FixpBarrier {
+                    completed_tick: Some(917),
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -240,6 +356,10 @@ mod tests {
         .unwrap();
         core.configure_fixp_runtime(
             C220CoreFixpConfig {
+                frontend: super::super::C220FixpFrontendConfig {
+                    issue_queue_depth: NonZeroU32::new(2).unwrap(),
+                    outstanding_limit: NonZeroU32::new(1).unwrap(),
+                },
                 engine: C220FixpEngineConfig {
                     instruction_fifo_depth: 1,
                     read_bandwidth: 256,
@@ -287,13 +407,25 @@ mod tests {
         for (register, value) in [(1, 0), (2, 8192), (3, (1 << 16) | (1 << 4))] {
             machine.set_xreg(register, value).unwrap();
         }
+        let issue_pc = core.state.scalar().pc();
+        let captured = core.capture_fixp_command(issue_pc, factor_word).unwrap();
+        let captured_id = captured.issue.instruction_id;
+        core.next_instruction_id += 1;
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(2, 0).unwrap();
+        machine.set_xreg(3, 0).unwrap();
+        core.advance_to(301).unwrap();
         assert!(matches!(
-            core.step_word_at(301, factor_word).unwrap(),
+            core.dispatch_captured_fixp_at(301, captured).unwrap(),
             C220CoreStep::Executed {
-                instruction: C220CoreInstruction::Factor { .. },
+                instruction: C220CoreInstruction::Factor { instruction_id, .. },
                 ..
-            }
+            } if instruction_id == captured_id
         ));
+        assert_eq!(core.state.scalar().pc(), issue_pc);
+        assert_eq!(core.next_instruction_id, captured_id + 1);
+        core.state.commit_c220_sequential_issue();
+        core.clock.finish(301).unwrap();
         let machine = core.state.scalar_mut().machine_mut();
         for (register, value) in [
             (1, 4096),
@@ -313,11 +445,6 @@ mod tests {
             .unwrap();
         let pc = core.state.scalar().pc();
         let word = (6 << 29) | (2 << 24) | (1 << 17) | (2 << 12) | (3 << 7) | (4 << 2);
-        assert!(matches!(
-            core.step_word_at(302, word).unwrap(),
-            C220CoreStep::Stalled(_)
-        ));
-        assert_eq!(core.state.scalar().pc(), pc);
         core.advance_to(350).unwrap();
         assert_eq!(core.factor_outcomes().len(), 1);
         assert_eq!(
@@ -327,14 +454,11 @@ mod tests {
         assert!(matches!(
             core.step_word_at(351, word | (1 << 24)).unwrap(),
             C220CoreStep::Executed {
-                instruction: C220CoreInstruction::Fixp { .. },
+                instruction: C220CoreInstruction::FixpQueued { .. },
                 ..
             }
         ));
-        assert!(matches!(
-            core.step_word_at(352, word).unwrap(),
-            C220CoreStep::Stalled(_)
-        ));
+        assert_eq!(core.state.scalar().pc(), pc + 4);
         core.advance_to(400).unwrap();
         assert_eq!(
             core.local_memory.l1().read_known(4096, 128).unwrap(),
@@ -344,7 +468,7 @@ mod tests {
         assert!(matches!(
             core.step_word_at(401, word).unwrap(),
             C220CoreStep::Executed {
-                instruction: C220CoreInstruction::FixpExternal { .. },
+                instruction: C220CoreInstruction::FixpQueued { .. },
                 ..
             }
         ));
@@ -359,21 +483,11 @@ mod tests {
         assert!(matches!(
             core.step_word_at(402, factor_word).unwrap(),
             C220CoreStep::Executed {
-                instruction: C220CoreInstruction::Factor {
-                    admission: crate::sim::c220::mte::fixp::C220FixpAdmission::DisabledReady,
-                    ..
-                },
+                instruction: C220CoreInstruction::FixpQueued { .. },
                 ..
             }
         ));
-        assert_eq!(
-            core.fixp_runtime()
-                .unwrap()
-                .shared_engine()
-                .command_retirement_queue()
-                .len(),
-            2
-        );
+        assert_eq!(core.queued_fixp_commands(), 2);
         let mut responses = std::collections::VecDeque::new();
         let mut sent_bytes = 0;
         let mut last_response = None;
@@ -398,8 +512,20 @@ mod tests {
                     assert_eq!(core.state.scalar().pc(), pc);
                 }
                 trigger_blocked = true;
-            } else if !trigger_released && engine.instruction_fifo().is_empty() {
+            } else if !trigger_released
+                && engine.instruction_fifo().is_empty()
+                && engine.outstanding_external_commands() != 0
+            {
                 assert!(!core.fixp_runtime().unwrap().is_idle());
+                assert_eq!(core.fixp_issue_queue_len(), 1);
+                assert_eq!(core.outstanding_fixp_commands(), 1);
+                assert!(core.fixp_frontend_outcomes().iter().any(|outcome| matches!(
+                    outcome,
+                    C220CoreStep::Stalled(C220Stall {
+                        cause: C220StallCause::FixpOutstandingLimit,
+                        ..
+                    })
+                )));
                 let instruction =
                     crate::isa::c220::hflag::C220HardwareFlagInstruction::decode(trigger_word)
                         .unwrap();
@@ -424,7 +550,7 @@ mod tests {
                 assert!(!core.fixp_runtime().unwrap().is_idle());
                 last_response = Some(tick);
             }
-            if core.fixp_runtime().unwrap().is_idle() {
+            if core.fixp_runtime().unwrap().is_idle() && core.queued_fixp_commands() == 0 {
                 assert!(tick > last_response.unwrap() + 1);
                 break;
             }
@@ -453,13 +579,11 @@ mod tests {
         assert!(matches!(
             core.step_word_at(1001, word | (1 << 24)).unwrap(),
             C220CoreStep::Executed {
-                instruction: C220CoreInstruction::FixpExternal {
-                    destination: crate::isa::c220::mte::fixp::C220FixpDestination::L1,
-                    ..
-                },
+                instruction: C220CoreInstruction::FixpQueued { .. },
                 ..
             }
         ));
+        core.advance_to(1005).unwrap();
         assert_eq!(
             core.fixp_engine()
                 .unwrap()
@@ -473,7 +597,7 @@ mod tests {
             core.fixp_engine().unwrap().outstanding_external_commands(),
             0
         );
-        for tick in 1002..1500 {
+        for tick in 1006..1500 {
             core.advance_to(tick).unwrap();
             if let Some(command) = core.take_biu_write_command_at(tick).unwrap() {
                 core.receive_external_fixp_dbid_at(tick, command.command.tag)

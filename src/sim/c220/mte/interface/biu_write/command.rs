@@ -104,6 +104,8 @@ pub struct C220BiuWriteCommandCycle {
     pub eligible: [bool; 3],
     pub selected: Option<C220BiuSubcore>,
     pub split_blocked: bool,
+    /// Selected input consumed without producing a transaction or response.
+    pub empty_input: Option<C220BiuWriteInput>,
     pub sent: Option<C220BiuWriteCommand>,
     pub stall: Option<C220BiuWriteCommandStall>,
 }
@@ -116,8 +118,6 @@ pub enum C220BiuWriteCommandError {
     RepeatedTick(u64),
     #[error("BIU write command time overflowed")]
     TimeOverflow,
-    #[error("BIU write input is empty")]
-    EmptyInput,
     #[error(
         "Cube writes require a store token and no UB gather stride; vector writes cannot carry store tokens"
     )]
@@ -238,9 +238,6 @@ impl C220BiuWriteCommands {
         {
             return Err(C220BiuWriteCommandError::InvalidSource);
         }
-        if input.generated.request.bytes == 0 {
-            return Err(C220BiuWriteCommandError::EmptyInput);
-        }
         if !self.can_push(input.subcore) {
             return Ok(false);
         }
@@ -272,6 +269,7 @@ impl C220BiuWriteCommands {
             eligible,
             selected: None,
             split_blocked,
+            empty_input: None,
             sent: None,
             stall: None,
         };
@@ -297,11 +295,15 @@ impl C220BiuWriteCommands {
                 let (_, input) = self.inputs[core as usize]
                     .pop_front()
                     .expect("eligible input");
-                self.splits.push_back(Split {
-                    ready_tick: next,
-                    input,
-                    offset: 0,
-                });
+                if input.generated.request.bytes == 0 {
+                    result.empty_input = Some(input);
+                } else {
+                    self.splits.push_back(Split {
+                        ready_tick: next,
+                        input,
+                        offset: 0,
+                    });
+                }
             }
         }
         if let Some(head) = self.splits.front().copied() {

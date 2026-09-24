@@ -25,8 +25,12 @@ mod dispatch;
 mod external_fixp;
 mod factor;
 mod fixp;
+mod fixp_barrier;
+mod fixp_frontend;
 pub use external_fixp::C220CoreFixpConfig;
 pub use factor::{C220FactorOutcome, C220FactorReadConfig};
+pub use fixp_barrier::C220FixpBarrier;
+pub use fixp_frontend::C220FixpFrontendConfig;
 mod hflag;
 mod mte1;
 mod mte2;
@@ -110,6 +114,7 @@ pub struct C220Core {
     mte_pipeline: Option<C220MtePipeline>,
     fixp: Option<fixp::CoreFixp>,
     external_fixp: Option<external_fixp::CoreExternalFixp>,
+    fixp_frontend: fixp_frontend::FixpFrontend,
     hardware_flags: C220HardwareFlagState,
     mte3: Mte3Engine,
     cube: CubeEngine,
@@ -155,6 +160,7 @@ impl C220Core {
             mte_pipeline: None,
             fixp: None,
             external_fixp: None,
+            fixp_frontend: fixp_frontend::FixpFrontend::default(),
             hardware_flags: C220HardwareFlagState::default(),
             mte3: Mte3Engine::new(timing.mte3),
             cube: CubeEngine::new(cube_config)?,

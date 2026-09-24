@@ -16,6 +16,21 @@ impl C220Core {
         instruction: C220HardwareFlagInstruction,
     ) -> Result<C220CoreStep, C220CoreError> {
         let step = instruction.resolve(pc, self.state.scalar().machine().xregs())?;
+        let result = self.dispatch_hardware_flag_at(tick, self.next_instruction_id, step)?;
+        if matches!(result, C220CoreStep::Executed { .. }) {
+            self.state.commit_c220_sequential_issue();
+        }
+        Ok(result)
+    }
+
+    pub(super) fn dispatch_hardware_flag_at(
+        &mut self,
+        tick: u64,
+        instruction_id: u64,
+        step: crate::isa::c220::hflag::C220HardwareFlagStep,
+    ) -> Result<C220CoreStep, C220CoreError> {
+        let instruction = step.instruction;
+        let pc = step.pc;
         let trigger_blocked = match instruction.source_pipe {
             C220HardwareFlagSourcePipe::Mte1 => self
                 .mte_pipeline
@@ -44,11 +59,8 @@ impl C220Core {
                             | C220MatrixMemory::BiasTable,
                         )
                         | (C220HardwareFlagSourcePipe::Fix, C220MatrixMemory::L0c) => {
-                            self.hardware_flags.enqueue_mte_flag(
-                                self.next_instruction_id,
-                                step,
-                                tick,
-                            )?;
+                            self.hardware_flags
+                                .enqueue_mte_flag(instruction_id, step, tick)?;
                         }
                         (source_pipe, memory) => {
                             return Err(C220CoreError::UnsupportedHardwareFlagCheckpoint {
@@ -104,19 +116,18 @@ impl C220Core {
                         });
                     }
                     self.hardware_flags
-                        .enqueue_mte_flag(self.next_instruction_id, step, tick)?;
+                        .enqueue_mte_flag(instruction_id, step, tick)?;
                 } else {
                     self.hardware_flags
-                        .enqueue_cube_wait(self.next_instruction_id, step)?;
+                        .enqueue_cube_wait(instruction_id, step)?;
                 }
                 None
             }
         };
-        self.state.commit_c220_sequential_issue();
         Ok(C220CoreStep::Executed {
             tick,
             instruction: C220CoreInstruction::HardwareFlag {
-                instruction_id: self.next_instruction_id,
+                instruction_id,
                 step,
                 token_ready_tick,
             },
