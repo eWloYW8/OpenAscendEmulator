@@ -1,5 +1,6 @@
 use super::*;
 use crate::sim::c220::scalar::C220StoreOperands;
+use crate::sim::c220::scalar::lsu::commit::C220StoreResponse;
 use crate::sim::c220::scalar::lsu::scheduler::C220LsuStoreValue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +15,12 @@ pub struct C220CoreStoreCompletion {
     pub issue: C220CoreStoreIssue,
     pub data: C220LsuStoreValue,
     pub retire_tick: u64,
+    /// A later transport notification for an already retired store instruction.
+    /// It does not represent another memory write.
+    pub repeated_notification: bool,
+    /// Cache completions in operand order, including an earlier half whose
+    /// notification was consumed before the whole instruction could retire.
+    pub responses: [Option<C220StoreResponse>; 2],
 }
 
 impl C220Core {
@@ -48,8 +55,10 @@ impl C220Core {
         let operands = C220StoreOperands::capture(self.state.scalar().machine(), pc, word)
             .map_err(crate::sim::common::scalar::ScalarInstructionError::from)?;
         if operands.second_source_operand.is_some()
-            && (operands.requires_pair_split()
-                || (operands.effective_address & 63) + operands.bytes().len() as u64 > 64)
+            && (operands.effective_address & 63) + operands.bytes().len() as u64 > 64
+            && !operands
+                .effective_address
+                .is_multiple_of(u64::from(operands.width_bytes))
         {
             return Err(C220CoreError::UnsupportedTimedLsuAccess);
         }

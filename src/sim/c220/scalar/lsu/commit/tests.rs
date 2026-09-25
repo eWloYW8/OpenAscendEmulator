@@ -3,6 +3,95 @@ use crate::sim::c220::scalar::C220ScalarMappedAddress;
 use crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory;
 
 #[test]
+fn split_store_notifications_observe_shared_completion_count() {
+    use crate::sim::c220::scalar::C220StoreOperands;
+    use crate::sim::c220::scalar::lsu::scheduler::C220LsuStorePath;
+    for early in [false, true] {
+        for reverse in [false, true] {
+            let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+            machine.set_xreg(5, 0x1038).unwrap();
+            let operands = C220StoreOperands::capture(
+                &machine,
+                0,
+                (9 << 24) | (3 << 22) | (7 << 17) | (5 << 12) | (8 << 7) | 1,
+            )
+            .unwrap();
+            let mut lane = C220LsuCommitLane::new(C220LoadCommitMode::Retirement);
+            lane.admit_store_pair(0, C220LsuRequestId(0), C220LsuRequestId(1), operands)
+                .unwrap();
+            assert_eq!(lane.pending_count(), 1);
+            let mut data = [
+                C220LsuStoreValue {
+                    request: C220LsuRequestId(0),
+                    tick: 2,
+                    operands,
+                    mapped: C220ScalarMappedAddress {
+                        address: 0x1038,
+                        memory: C220LsuMemory::External,
+                        stack: false,
+                    },
+                    path: C220LsuStorePath::Cache,
+                    part: C220LsuPairPart::First,
+                },
+                C220LsuStoreValue {
+                    request: C220LsuRequestId(1),
+                    tick: 2,
+                    operands,
+                    mapped: C220ScalarMappedAddress {
+                        address: 0x1040,
+                        memory: C220LsuMemory::External,
+                        stack: false,
+                    },
+                    path: C220LsuStorePath::Refill,
+                    part: C220LsuPairPart::Second,
+                },
+            ];
+            if reverse {
+                data.reverse();
+            }
+            lane.complete_store_at(2, data[0]).unwrap();
+            assert!(lane.complete_store_at(2, data[0]).is_err());
+            let tick = if early {
+                assert!(lane.retire_next_at(3, &mut machine).unwrap().is_none());
+                assert_eq!(lane.pending_count(), 1);
+                4
+            } else {
+                2
+            };
+            data[1].tick = tick;
+            lane.complete_store_at(tick, data[1]).unwrap();
+            let Some(C220LsuRetirement::Store {
+                first_request,
+                repeated_notification,
+                final_notification,
+                ..
+            }) = lane.retire_next_at(tick + 1, &mut machine).unwrap()
+            else {
+                panic!("store retirement");
+            };
+            assert_eq!(first_request, C220LsuRequestId(0));
+            assert!(!repeated_notification);
+            assert_eq!(final_notification, early);
+            let next = lane.retire_next_at(tick + 2, &mut machine).unwrap();
+            if early {
+                assert!(next.is_none());
+            } else {
+                assert!(matches!(
+                    next,
+                    Some(C220LsuRetirement::Store {
+                        repeated_notification: true,
+                        final_notification: true,
+                        ..
+                    })
+                ));
+            }
+            assert_eq!(lane.pending_count(), 0);
+            assert_eq!(lane.retirement_occupancy(), 0);
+        }
+    }
+}
+
+#[test]
 fn split_responses_share_state_but_consume_individual_notifications() {
     for mode in [
         C220LoadCommitMode::DataBypass,

@@ -101,7 +101,7 @@ impl CoreLsu {
                 (issue.instruction_id, request, None)
             }
             DispatchedLsu::Store(issue) => {
-                let Some(request) = self.scheduler.admit_store(
+                let Some((request, second)) = self.scheduler.admit_store(
                     tick,
                     issue.operands,
                     mapped,
@@ -110,8 +110,12 @@ impl CoreLsu {
                 else {
                     return Ok(());
                 };
+                if let Some(second) = second {
+                    self.commits
+                        .admit_store_pair(tick, request, second, issue.operands)?;
+                }
                 self.stores.insert(request, issue);
-                (issue.instruction_id, request, None)
+                (issue.instruction_id, request, second)
             }
         };
         self.ingress.pop_front();

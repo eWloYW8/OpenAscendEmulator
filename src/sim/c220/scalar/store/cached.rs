@@ -159,13 +159,4 @@ impl C220StoreOperands {
         };
         &self.bytes[..usize::from(self.width_bytes) * count]
     }
-
-    pub fn requires_pair_split(&self) -> bool {
-        self.second_source_operand.is_some()
-            && self.effective_address >> 6
-                != self
-                    .effective_address
-                    .wrapping_add(u64::from(self.width_bytes))
-                    >> 6
-    }
 }

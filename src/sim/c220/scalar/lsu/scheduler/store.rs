@@ -1,5 +1,5 @@
 use super::super::cache::{C220CacheLocation, C220DataCache};
-use super::super::store_buffer::{C220LsuCompletion, C220LsuMemory};
+use super::super::store_buffer::{C220LsuCompletion, C220LsuMemory, C220LsuPairPart};
 use super::*;
 use crate::sim::c220::scalar::{C220ScalarMappedAddress, C220StoreOperands};
 
@@ -17,6 +17,7 @@ pub struct C220LsuStoreValue {
     pub operands: C220StoreOperands,
     pub mapped: C220ScalarMappedAddress,
     pub path: C220LsuStorePath,
+    pub part: C220LsuPairPart,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,18 @@ pub(super) struct PendingStore {
     partition_address: u64,
     offset: usize,
     lookup: Option<Option<C220CacheLocation>>,
+    part: C220LsuPairPart,
+}
+
+impl PendingStore {
+    fn bytes(&self) -> &[u8] {
+        let width = usize::from(self.operands.width_bytes);
+        match self.part {
+            C220LsuPairPart::Both => self.operands.bytes(),
+            C220LsuPairPart::First => &self.operands.bytes()[..width],
+            C220LsuPairPart::Second => &self.operands.bytes()[width..],
+        }
+    }
 }
 
 impl C220LsuRequestScheduler {
@@ -36,14 +49,18 @@ impl C220LsuRequestScheduler {
         operands: C220StoreOperands,
         mapped: C220ScalarMappedAddress,
         partition_stack: bool,
-    ) -> Result<Option<C220LsuRequestId>, C220LsuSchedulerError> {
+    ) -> Result<Option<(C220LsuRequestId, Option<C220LsuRequestId>)>, C220LsuSchedulerError> {
         let size = self.stores.line_bytes() as u64;
         let address = mapped.address & 0x0000_ffff_ffff_ffff;
         let offset = (address % size) as usize;
+        let width = usize::from(operands.width_bytes);
+        let second_address = address.wrapping_add(width as u64);
+        let split = operands.second_source_operand.is_some() && address >> 6 != second_address >> 6;
+        let bytes = if split { width } else { operands.bytes().len() };
         if ![1, 2, 4, 8].contains(&operands.width_bytes)
-            || operands.requires_pair_split()
             || mapped.memory != C220LsuMemory::External
-            || offset + operands.bytes().len() > size as usize
+            || offset + bytes > size as usize
+            || (split && second_address % size + width as u64 > size)
         {
             return Err(C220LsuSchedulerError::UnsupportedStoreAccess);
         }
@@ -51,13 +68,20 @@ impl C220LsuRequestScheduler {
             address: address / size * size,
             memory: mapped.memory,
         };
-        let Some((id, _)) = self.admit(
+        let second_line = C220LsuLineKey {
+            address: second_address / size * size,
+            memory: mapped.memory,
+        };
+        let Some((id, second)) = self.admit(
             tick,
             C220LsuRequest {
                 line,
                 access: C220LsuAccess::Store,
             },
-            None,
+            split.then_some(C220LsuRequest {
+                line: second_line,
+                access: C220LsuAccess::Store,
+            }),
         )?
         else {
             return Ok(None);
@@ -71,9 +95,32 @@ impl C220LsuRequestScheduler {
                 partition_address: mapped.cache_address(partition_stack),
                 offset,
                 lookup: None,
+                part: if split {
+                    C220LsuPairPart::First
+                } else {
+                    C220LsuPairPart::Both
+                },
             },
         );
-        Ok(Some(id))
+        if let Some(second) = second {
+            let mapped = C220ScalarMappedAddress {
+                address: second_address,
+                ..mapped
+            };
+            self.pending_stores.insert(
+                second,
+                PendingStore {
+                    operands,
+                    mapped,
+                    line: second_line,
+                    partition_address: mapped.cache_address(partition_stack),
+                    offset: (second_address % size) as usize,
+                    lookup: None,
+                    part: C220LsuPairPart::Second,
+                },
+            );
+        }
+        Ok(Some((id, second)))
     }
 
     pub fn take_store_values(&mut self) -> Vec<C220LsuStoreValue> {
@@ -138,7 +185,7 @@ impl C220LsuRequestScheduler {
                     pending.line,
                     id,
                     pending.offset,
-                    pending.operands.bytes(),
+                    pending.bytes(),
                     pending.lookup.expect("validated lookup").is_some(),
                 )?;
                 let next = tick.checked_add(1).ok_or(EventError::TimeOverflow)?;
@@ -209,6 +256,7 @@ impl C220LsuRequestScheduler {
                     operands: pending.operands,
                     mapped: pending.mapped,
                     path,
+                    part: pending.part,
                 }));
         }
     }

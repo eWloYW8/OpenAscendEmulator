@@ -79,14 +79,15 @@ fn captured_stores_coalesce_and_complete_through_cache_or_refill() {
             memory: C220LsuMemory::External,
             stack: false,
         };
-        let a = scheduler
+        let (a, a_second) = scheduler
             .admit_store(0, first, mapped(first), false)
             .unwrap()
             .unwrap();
-        let b = scheduler
+        let (b, b_second) = scheduler
             .admit_store(0, second, mapped(second), false)
             .unwrap()
             .unwrap();
+        assert_eq!((a_second, b_second), (None, None));
         machine.set_xreg(5, u64::MAX).unwrap();
         machine.set_xreg(6, u64::MAX).unwrap();
         let hazards = C220LsuExternalHazards {

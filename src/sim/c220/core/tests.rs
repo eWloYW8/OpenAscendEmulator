@@ -412,7 +412,8 @@ fn run_core_stores(core: &mut C220Core, mut tick: u64) {
             C220CoreStep::Executed { .. }
         ));
         tick += 2;
-        for (offset, dtype) in [(56, 3), (61, 1)] {
+        {
+            let (offset, dtype) = (61, 1);
             core.state
                 .scalar_mut()
                 .machine_mut()
@@ -428,6 +429,66 @@ fn run_core_stores(core: &mut C220Core, mut tick: u64) {
             assert_eq!(core.pending_store_instructions().count(), 0);
             tick += 1;
         }
+    }
+    core.take_lsu_admissions();
+    for _ in 0..2 {
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(5, 0x2038).unwrap();
+        machine.set_xreg(9, 0x1122_3344).unwrap();
+        machine.set_xreg(10, 0xaabb_ccdd).unwrap();
+        let word = (9 << 24) | (3 << 22) | (10 << 17) | (5 << 12) | (9 << 7) | 1;
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Store(issue),
+            ..
+        } = core.step_word_at(tick, word).unwrap()
+        else {
+            panic!("split store issue");
+        };
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(9, 0)
+            .unwrap();
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(10, 0)
+            .unwrap();
+        let mut completed = Vec::new();
+        let end = (tick + 1..tick + 150)
+            .find(|&now| {
+                core.advance_to(now).unwrap();
+                completed.extend(core.take_store_completions());
+                core.pending_store_instructions().count() == 0
+                    && core.lsu_retirement_occupancy() == 0
+            })
+            .expect("split store drains");
+        assert!((1..=2).contains(&completed.len()));
+        assert!(completed.iter().all(|done| done.issue == issue));
+        assert!(
+            completed
+                .iter()
+                .all(|done| done.responses.iter().all(Option::is_some))
+        );
+        assert!(!completed[0].repeated_notification);
+        if completed.len() == 2 {
+            assert!(completed[1].repeated_notification);
+            assert_eq!(completed[1].retire_tick, completed[0].retire_tick + 1);
+        }
+        let admissions = core.take_lsu_admissions();
+        assert_eq!(admissions.len(), 1);
+        assert!(admissions[0].second_request.is_some());
+        let cache = core.data_cache().unwrap();
+        for (address, offset, expected) in
+            [(0x2000, 56, 0xaabb_ccdd_u64), (0x2040, 0, 0x1122_3344_u64)]
+        {
+            let location = cache.find_way(address, C220LsuMemory::External).unwrap();
+            assert_eq!(
+                &cache.line(location).unwrap()[offset..offset + 8],
+                &expected.to_le_bytes()
+            );
+        }
+        tick = end + 2;
     }
 }
 

@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, VecDeque};
 
 mod data;
+mod store;
 pub use data::C220LoadResponse;
+pub use store::C220StoreResponse;
+use store::PendingStorePair;
 #[cfg(test)]
 mod tests;
 
@@ -73,6 +76,10 @@ pub enum C220LsuRetirement {
     Store {
         data: C220LsuStoreValue,
         retire_tick: u64,
+        first_request: C220LsuRequestId,
+        final_notification: bool,
+        repeated_notification: bool,
+        responses: [Option<C220StoreResponse>; 2],
     },
     DirectStore {
         request: C220LsuRequestId,
@@ -103,6 +110,8 @@ pub struct C220LsuCommitLane {
     requests: BTreeMap<C220LsuRequestId, C220LoadId>,
     owners: BTreeMap<u8, C220LoadId>,
     retirements: VecDeque<(u64, RetirementToken)>,
+    store_pairs: BTreeMap<C220LsuRequestId, PendingStorePair>,
+    store_pair_requests: BTreeMap<C220LsuRequestId, C220LsuRequestId>,
 }
 
 impl C220LsuCommitLane {
@@ -114,6 +123,8 @@ impl C220LsuCommitLane {
             requests: BTreeMap::new(),
             owners: BTreeMap::new(),
             retirements: VecDeque::new(),
+            store_pairs: BTreeMap::new(),
+            store_pair_requests: BTreeMap::new(),
         }
     }
 
@@ -123,10 +134,17 @@ impl C220LsuCommitLane {
 
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+            + self.store_pairs.len()
             + self
                 .retirements
                 .iter()
-                .filter(|(_, token)| !matches!(token, RetirementToken::Load(_)))
+                .filter(|(_, token)| match token {
+                    RetirementToken::Load(_) => false,
+                    RetirementToken::Store(data) => {
+                        !self.store_pair_requests.contains_key(&data.request)
+                    }
+                    RetirementToken::DirectStore { .. } => true,
+                })
                 .count()
     }
 
@@ -140,22 +158,6 @@ impl C220LsuCommitLane {
         if self.retirements.len() == 64 {
             return Err(C220LsuCommitError::RetirementFull);
         }
-        Ok(())
-    }
-
-    pub fn complete_store_at(
-        &mut self,
-        tick: u64,
-        data: C220LsuStoreValue,
-    ) -> Result<(), C220LsuCommitError> {
-        self.check_retirement_send(tick)?;
-        if data.tick > tick {
-            return Err(C220LsuCommitError::InvalidRequest);
-        }
-        self.check_store_request(data.request)?;
-        self.retirements
-            .push_back((tick + 1, RetirementToken::Store(data)));
-        self.tick = tick;
         Ok(())
     }
 
@@ -181,6 +183,7 @@ impl C220LsuCommitLane {
 
     fn check_store_request(&self, request: C220LsuRequestId) -> Result<(), C220LsuCommitError> {
         if self.requests.contains_key(&request)
+            || self.store_pair_requests.contains_key(&request)
             || self.retirements.iter().any(|(_, token)| match token {
                 RetirementToken::Store(data) => data.request == request,
                 RetirementToken::DirectStore {
@@ -267,9 +270,11 @@ impl C220LsuCommitLane {
             .ok_or(C220LsuCommitError::InvalidRequest)?;
         if pending.admission.is_some()
             || self.requests.contains_key(&request)
+            || self.store_pair_requests.contains_key(&request)
             || second_request.is_some_and(|second| {
                 second == request
                     || self.requests.contains_key(&second)
+                    || self.store_pair_requests.contains_key(&second)
                     || pending.operands.second_destination.is_none()
             })
         {
@@ -306,10 +311,7 @@ impl C220LsuCommitLane {
             RetirementToken::Store(data) => {
                 self.retirements.pop_front();
                 self.tick = tick;
-                return Ok(Some(C220LsuRetirement::Store {
-                    data,
-                    retire_tick: tick,
-                }));
+                return Ok(self.retire_store(tick, data));
             }
             RetirementToken::DirectStore {
                 request,

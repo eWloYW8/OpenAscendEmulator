@@ -96,7 +96,7 @@ pub enum C220LsuSchedulerError {
     CacheRequired,
     #[error("load has not completed its tag lookup")]
     MissingLoadLookup,
-    #[error("store stages require an external single-line cache access")]
+    #[error("store operands must fit their external cache-line requests")]
     UnsupportedStoreAccess,
     #[error("store buffer request has no captured cache lookup")]
     MissingStoreLookup,

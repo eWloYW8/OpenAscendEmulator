@@ -27,12 +27,25 @@ impl CoreLsu {
                     .completions
                     .push(C220CoreLoadCompletion { issue, retirement });
             }
-            Some(C220LsuRetirement::Store { data, retire_tick }) => {
-                let issue = self.stores.remove(&data.request).expect("issued store");
+            Some(C220LsuRetirement::Store {
+                data,
+                retire_tick,
+                first_request,
+                final_notification,
+                repeated_notification,
+                responses,
+            }) => {
+                let issue = if final_notification {
+                    self.stores.remove(&first_request).expect("issued store")
+                } else {
+                    self.stores[&first_request]
+                };
                 self.store_completions.push(C220CoreStoreCompletion {
                     issue,
                     data,
                     retire_tick,
+                    repeated_notification,
+                    responses,
                 });
             }
             Some(C220LsuRetirement::DirectStore {
