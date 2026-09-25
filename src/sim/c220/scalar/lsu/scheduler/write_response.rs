@@ -167,6 +167,12 @@ impl C220LsuRequestScheduler {
         let completion =
             self.stores
                 .complete_ub_write(key, write_allocate, backing_line, &mut self.misses)?;
+        self.resolve_load_values(
+            self.writes.tick(),
+            key,
+            &completion.notifications,
+            &completion.line,
+        );
         self.writes.finish_response(id)?;
         Ok(completion)
     }

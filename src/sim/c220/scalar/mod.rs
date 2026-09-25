@@ -1,7 +1,9 @@
 mod compare;
 mod execute;
+mod load;
 mod store;
 pub use compare::{C220ScalarFp32CompareOutcome, execute_fp32_compare_word};
+pub use load::C220LoadOperands;
 pub use store::C220DirectStoreOperands;
 mod float;
 pub use float::{C220ScalarFp32Outcome, execute_fp32_word};

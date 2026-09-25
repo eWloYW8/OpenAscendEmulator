@@ -66,8 +66,21 @@ impl C220DataCache {
     }
 
     pub fn lookup(&mut self, address: u64, memory: C220LsuMemory) -> Option<C220CacheLocation> {
+        self.lookup_partitioned(address, address, memory)
+    }
+
+    pub fn lookup_partitioned(
+        &mut self,
+        address: u64,
+        partition_address: u64,
+        memory: C220LsuMemory,
+    ) -> Option<C220CacheLocation> {
         let index = self.layout.index(address);
-        let way = self.sets[index as usize].lookup(address, self.layout.tag(address), memory)?;
+        let way = self.sets[index as usize].lookup(
+            partition_address,
+            self.layout.tag(address),
+            memory,
+        )?;
         Some(C220CacheLocation { index, way })
     }
 

@@ -25,7 +25,10 @@ mod tests;
 
 mod direct_store;
 use direct_store::PendingDirectStore;
+mod load;
 mod read;
+use load::PendingLoad;
+pub use load::{C220LsuLoadPath, C220LsuLoadValue};
 mod response;
 mod write_response;
 pub use response::C220LsuReadCompletion;
@@ -81,6 +84,10 @@ pub enum C220LsuSchedulerError {
     UnexpectedReadResponse,
     #[error("external read response requires an allocated cache line")]
     MissingCacheLine,
+    #[error("load stages require the attached cache data path")]
+    LoadCacheRequired,
+    #[error("load has not completed its tag lookup")]
+    MissingLoadLookup,
     #[error("read response requires a fetching store entry")]
     UnexpectedStoreResponse,
     #[error(transparent)]
@@ -109,6 +116,8 @@ pub struct C220LsuRequestScheduler {
     direct_event: EventId,
     pub writes: C220LsuWriteQueue,
     pub reads: C220LsuReadQueue,
+    pending_loads: BTreeMap<C220LsuRequestId, PendingLoad>,
+    load_values: Vec<C220LsuLoadValue>,
     eviction_data: BTreeMap<u64, Vec<u8>>,
 }
 
@@ -142,6 +151,8 @@ impl C220LsuRequestScheduler {
             stores,
             writes,
             reads,
+            pending_loads: BTreeMap::new(),
+            load_values: Vec::new(),
             direct_events,
             direct_event,
             eviction_data: BTreeMap::new(),
@@ -234,6 +245,22 @@ impl C220LsuRequestScheduler {
     }
 
     pub fn advance(
+        &mut self,
+        stage: C220LsuStage,
+        tick: u64,
+        external: C220LsuExternalHazards,
+    ) -> Result<C220LsuStageOutcome, C220LsuSchedulerError> {
+        if self
+            .pipeline
+            .head(stage)
+            .is_some_and(|head| self.pending_loads.contains_key(&head.request))
+        {
+            return Err(C220LsuSchedulerError::LoadCacheRequired);
+        }
+        self.advance_impl(stage, tick, external)
+    }
+
+    fn advance_impl(
         &mut self,
         stage: C220LsuStage,
         tick: u64,

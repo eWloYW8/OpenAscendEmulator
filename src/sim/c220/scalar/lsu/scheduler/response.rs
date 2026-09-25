@@ -176,6 +176,7 @@ impl C220LsuRequestScheduler {
             }
         }
         self.misses.remove(key);
+        self.resolve_load_values(self.reads.tick(), key, &notifications, &load_line);
         Ok(C220LsuReadCompletion {
             key,
             load_line,
@@ -228,6 +229,7 @@ impl C220LsuRequestScheduler {
             self.misses.remove(key);
             None
         };
+        self.resolve_load_values(self.reads.tick(), key, &notifications, &load_line);
         Ok(C220LsuReadCompletion {
             key,
             load_line,

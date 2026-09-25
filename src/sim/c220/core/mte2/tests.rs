@@ -392,22 +392,21 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
         address: 0x2fc0,
         memory: C220LsuMemory::External,
     };
-    let load = lsu
-        .admit(
-            0,
-            C220LsuRequest {
-                line,
-                access: C220LsuAccess::Load,
-            },
-            None,
-        )
-        .unwrap()
-        .unwrap()
-        .0;
-    let read = lsu
-        .enqueue_load_miss(line, load, line.address)
-        .unwrap()
-        .unwrap();
+    use crate::sim::c220::scalar::lsu::C220LsuStage;
+    use crate::sim::c220::scalar::{C220LoadOperands, C220ScalarMappedAddress};
+    let mut load_machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+    load_machine.set_xreg(5, line.address + 8).unwrap();
+    load_machine.set_xreg(7, u64::MAX).unwrap();
+    let operands = C220LoadOperands::capture(&load_machine, 0x4000, 0x03ce_5000).unwrap();
+    let mapped = C220ScalarMappedAddress {
+        address: operands.effective_address,
+        memory: line.memory,
+        stack: false,
+    };
+    let load = lsu.admit_load(0, operands, mapped, false).unwrap().unwrap();
+    load_machine.set_xreg(5, 0).unwrap();
+    assert_eq!(lsu.pending_load(load), Some(&operands));
+    let mut read = None;
     let mut cache = C220DataCache::new(
         C220CacheAddressLayout::new(6, 0, 6, u64::MAX).unwrap(),
         64,
@@ -434,10 +433,7 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
             response_latency: 1,
         })
         .unwrap();
-    let cache_tag = C220MemoryReadId::DataCache {
-        port: cache_port,
-        transaction: read.sequence(),
-    };
+    let mut cache_tag = None;
     let mut cache_completed = false;
     assert!(
         matches!(core.step_word_at(0, word).unwrap(), C220CoreStep::Executed {
@@ -452,8 +448,27 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
     for tick in 1..250 {
         core.advance_to(tick).unwrap();
         core.advance_to(tick).unwrap();
-        if tick == 1 {
-            let request = lsu.reads.dispatch_clock(tick, false, true).unwrap()[0];
+        let external = C220LsuExternalHazards {
+            maintenance_active: false,
+            maintenance_draining: false,
+        };
+        for stage in [C220LsuStage::M2, C220LsuStage::M1, C220LsuStage::M0] {
+            lsu.advance_with_cache(stage, tick, external, &mut cache)
+                .unwrap();
+        }
+        if let Some(request) = lsu
+            .reads
+            .dispatch_clock(tick, false, true)
+            .unwrap()
+            .first()
+            .copied()
+        {
+            assert_eq!(tick, 4);
+            read = Some(request.id);
+            cache_tag = Some(C220MemoryReadId::DataCache {
+                port: cache_port,
+                transaction: request.id.sequence(),
+            });
             assert!(core.send_cache_read_at(tick, cache_port, request).unwrap());
             core.memory
                 .write_known_at(line.address, &[0x31; 64])
@@ -463,7 +478,7 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
             .commit_cache_read_at(tick, cache_port, &mut lsu, &mut cache)
             .unwrap()
         {
-            assert_eq!(completed, read);
+            assert_eq!(Some(completed), read);
             assert_eq!(result.notifications, [C220LsuCompletion::Load(load)]);
             assert_eq!(
                 result.load_line,
@@ -472,6 +487,17 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
             assert_eq!(cache.line(refill.location).unwrap(), result.load_line);
             assert_eq!(lsu.reads.outstanding(), 0);
             assert!(lsu.misses.entries().is_empty());
+            let values = lsu.take_load_values();
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].request, load);
+            assert_eq!(values[0].operands, operands);
+            assert_eq!(values[0].tick, tick);
+            assert_eq!(values[0].path, C220LsuLoadPath::Refill);
+            assert_eq!(
+                values[0].value,
+                u64::from_le_bytes(result.load_line[8..16].try_into().unwrap())
+            );
+            assert_eq!(load_machine.xregs()[7], u64::MAX);
             assert!(!cache_completed);
             cache_completed = true;
         }
@@ -484,7 +510,7 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
             .read_admissions()
         {
             let request = admission.request;
-            if request.tag == cache_tag {
+            if Some(request.tag) == cache_tag {
                 continue;
             }
             assert!(matches!(
@@ -518,6 +544,59 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
     );
     assert_eq!(admitted_bytes, plan.bytes);
     assert!(cache_completed);
+    for path in [
+        C220LsuLoadPath::Cache,
+        C220LsuLoadPath::CacheAndStore,
+        C220LsuLoadPath::StoreForward,
+    ] {
+        let tick = lsu.reads.tick() + 1;
+        let mut mapped = mapped;
+        let mut operands = operands;
+        if path == C220LsuLoadPath::StoreForward {
+            mapped.address += 64;
+            operands.effective_address += 64;
+        }
+        let key = C220LsuLineKey {
+            address: mapped.address / 64 * 64,
+            memory: mapped.memory,
+        };
+        let request = lsu
+            .admit_load(tick, operands, mapped, false)
+            .unwrap()
+            .unwrap();
+        let mut expected = if path == C220LsuLoadPath::StoreForward {
+            [0xbb; 8]
+        } else {
+            let location = cache.find_way(line.address, line.memory).unwrap();
+            cache.line(location).unwrap()[8..16].try_into().unwrap()
+        };
+        if path == C220LsuLoadPath::CacheAndStore {
+            lsu.stores.store(key, load, 11, &[0xaa], true).unwrap();
+            expected[0] = 0;
+        } else if path == C220LsuLoadPath::StoreForward {
+            lsu.stores.store(key, load, 8, &[0xbb; 8], false).unwrap();
+        }
+        let external = C220LsuExternalHazards {
+            maintenance_active: false,
+            maintenance_draining: false,
+        };
+        for delta in 1..=3 {
+            for stage in [C220LsuStage::M2, C220LsuStage::M1, C220LsuStage::M0] {
+                lsu.advance_with_cache(stage, tick + delta, external, &mut cache)
+                    .unwrap();
+            }
+            if delta < 3 {
+                assert!(lsu.take_load_values().is_empty());
+            }
+        }
+        let values = lsu.take_load_values();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].request, request);
+        assert_eq!(values[0].path, path);
+        assert_eq!(values[0].tick, tick + 3);
+        assert_eq!(values[0].value, u64::from_le_bytes(expected));
+        assert_eq!(lsu.reads.requests().count(), 0);
+    }
     for segment in plan.descriptor_segments().unwrap() {
         let expected: Vec<_> = (0..segment.bytes)
             .map(

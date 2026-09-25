@@ -83,6 +83,10 @@ impl C220LsuReadQueue {
         self.outstanding
     }
 
+    pub const fn tick(&self) -> u64 {
+        self.tick
+    }
+
     pub fn requests(&self) -> impl Iterator<Item = &C220LsuReadRequest> {
         self.requests.values()
     }
