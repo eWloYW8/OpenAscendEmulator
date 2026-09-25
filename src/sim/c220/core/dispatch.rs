@@ -37,6 +37,14 @@ impl C220Core {
         if let Some(stall) = gate {
             return Ok(C220CoreStep::Stalled(stall));
         }
+        if self.device_flags.is_blocked() {
+            return Ok(C220CoreStep::Stalled(C220Stall {
+                tick,
+                pc: self.state.scalar().pc(),
+                resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+                cause: C220StallCause::DeviceFlagDependency,
+            }));
+        }
         if let Some(resume_tick) = self.load_dependency_tick(word, tick) {
             return Ok(C220CoreStep::Stalled(C220Stall {
                 tick,
@@ -46,6 +54,11 @@ impl C220Core {
             }));
         }
         let pc = self.state.scalar().pc();
+        if let Some(instruction) =
+            crate::isa::c220::control::C220WaitDeviceFlagInstruction::decode(word)
+        {
+            return self.step_wait_device_flag_at(tick, pc, instruction);
+        }
         if let Some(instruction) =
             crate::isa::c220::control::C220SetCrossCoreInstruction::decode(word)
         {

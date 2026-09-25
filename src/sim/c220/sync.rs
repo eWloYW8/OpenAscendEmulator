@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 mod cross_core;
 pub use cross_core::{C220CrossCoreReception, C220DeviceSync};
+mod device_flags;
+pub use device_flags::{C220DeviceFlagDelivery, C220DeviceFlagState};
 
 use thiserror::Error;
 

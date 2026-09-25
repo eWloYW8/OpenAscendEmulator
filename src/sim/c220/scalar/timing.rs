@@ -132,6 +132,16 @@ impl C220ScalarTimingLane {
             return resume_tick;
         }
         if let Some(instruction) =
+            crate::isa::c220::control::C220WaitDeviceFlagInstruction::decode(word)
+        {
+            if let crate::isa::c220::control::C220DeviceFlagSource::Register(register) =
+                instruction.source
+            {
+                include(register);
+            }
+            return resume_tick;
+        }
+        if let Some(instruction) =
             crate::isa::c220::control::C220SetCrossCoreInstruction::decode(word)
         {
             include(instruction.source_register);
@@ -619,6 +629,19 @@ mod tests {
             source_register: Some(1),
             destination_register: Some(6),
         });
+        let device_wait = (2 << 29) | (15 << 21) | (1 << 18) | 6;
+        assert_eq!(lane.dependency_tick(device_wait, 1), Some(4));
+        assert_eq!(lane.dependency_tick(device_wait | (2 << 18), 1), None);
+        assert_eq!(
+            lane.dependency_tick_with_loads(device_wait, 4, |r| r == 6),
+            Some(5)
+        );
+        assert!(
+            crate::isa::c220::control::C220WaitDeviceFlagInstruction::decode(
+                device_wait | (1 << 27)
+            )
+            .is_none()
+        );
         for opcode in [0x9700_0000, 0x9700_0001] {
             let word = opcode | (3 << 17) | (4 << 12) | (6 << 7) | (5 << 2);
             assert_eq!(lane.dependency_tick(word, 1), Some(4));

@@ -3086,6 +3086,84 @@ fn vabs_uses_modeled_five_tick_execution_stage() {
         Err(C220CoreError::Mte3FrontendRequired)
     ));
     assert_eq!(timed.state.scalar().pc(), pc + 4);
+
+    let mut waiting = make_core();
+    waiting.step_word_at(0, word).unwrap();
+    let wait = (2 << 29) | (15 << 21) | (3 << 18) | 255;
+    let wait_pc = waiting.state.scalar().pc();
+    let wait_id = waiting.next_instruction_id();
+    for tick in [1, 2] {
+        assert!(matches!(
+            waiting.step_word_at(tick, wait).unwrap(),
+            C220CoreStep::Stalled(C220Stall {
+                cause: C220StallCause::DeviceFlagDependency,
+                ..
+            })
+        ));
+    }
+    assert_eq!(waiting.state.scalar().pc(), wait_pc);
+    assert_eq!(waiting.next_instruction_id(), wait_id);
+    assert_eq!(waiting.device_flags().waiting_for(), Some(255));
+    assert!(waiting.receive_device_flag(7).dispatch_unblocked);
+    assert_eq!(waiting.device_flags().waiting_for(), Some(255));
+    assert!(matches!(
+        waiting.step_word_at(3, wait).unwrap(),
+        C220CoreStep::Stalled(_)
+    ));
+    assert_eq!(waiting.device_flags().count(7), 1);
+    let visible = waiting.vector_pipeline().pending_visibility_tick().unwrap();
+    waiting.advance_to(visible).unwrap();
+    assert_eq!(
+        waiting.state().ub().read_known(0x100, 4).unwrap(),
+        1.0_f32.to_le_bytes()
+    );
+    assert!(waiting.device_flags().is_blocked());
+    waiting.receive_device_flag(255);
+    waiting.receive_device_flag(255);
+    assert!(matches!(waiting.step_word_at(visible + 1, wait).unwrap(),
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::WaitDeviceFlag { instruction_id, pc, flag_id: 255, remaining: 1, .. }, ..
+        } if instruction_id == wait_id && pc == wait_pc
+    ));
+    waiting
+        .state
+        .scalar_mut()
+        .machine_mut()
+        .set_xreg(6, (1_u64 << 32) | 255)
+        .unwrap();
+    let register_wait = (2 << 29) | (15 << 21) | (1 << 18) | 6;
+    assert!(matches!(
+        waiting.step_word_at(visible + 2, register_wait).unwrap(),
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::WaitDeviceFlag {
+                flag_id: 255,
+                remaining: 0,
+                ..
+            },
+            ..
+        }
+    ));
+    for count in 2..=15 {
+        assert_eq!(waiting.receive_device_flag(7).count, count);
+    }
+    assert!(matches!(
+        waiting.step_word_at(visible + 3, wait).unwrap(),
+        C220CoreStep::Stalled(_)
+    ));
+    let overflow = waiting.receive_device_flag(7);
+    assert_eq!(overflow.count, 16);
+    assert!(overflow.overflow);
+    assert!(!overflow.dispatch_unblocked);
+    waiting.reset_device_flag_counters();
+    assert!(waiting.device_flags().all_consumed());
+    assert!(waiting.device_flags().is_blocked());
+    waiting.receive_device_flag(255);
+    assert!(matches!(
+        waiting.step_word_at(visible + 4, wait).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert!(waiting.device_flags().all_consumed());
+    assert_eq!(waiting.device_flags().waiting_for(), None);
 }
 
 #[test]

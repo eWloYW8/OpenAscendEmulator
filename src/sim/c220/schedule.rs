@@ -9,6 +9,7 @@ pub enum C220StallCause {
     Mte1Dependency,
     MtePhysicalDependency,
     HardwareFlagDependency,
+    DeviceFlagDependency,
     Mte2IssueRate,
     Mte2Dependency,
     Mte3IssueRate,

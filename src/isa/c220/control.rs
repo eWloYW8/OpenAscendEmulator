@@ -26,6 +26,29 @@ impl C220SetCrossCoreInstruction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220DeviceFlagSource {
+    Register(u8),
+    Immediate(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220WaitDeviceFlagInstruction {
+    pub word: u32,
+    pub source: C220DeviceFlagSource,
+}
+
+impl C220WaitDeviceFlagInstruction {
+    pub const fn decode(word: u32) -> Option<Self> {
+        let source = match special_flow_form(word) {
+            Some(1) => C220DeviceFlagSource::Register((word & 31) as u8),
+            Some(3) => C220DeviceFlagSource::Immediate(word as u8),
+            _ => return None,
+        };
+        Some(Self { word, source })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220ControlElement {
     Byte,
     Half,

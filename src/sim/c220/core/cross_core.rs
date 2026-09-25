@@ -4,6 +4,59 @@ use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 use crate::sim::c220::sync::{C220CrossCoreReception, C220DeviceSync};
 
 impl C220Core {
+    pub fn device_flags(&self) -> &crate::sim::c220::sync::C220DeviceFlagState {
+        &self.device_flags
+    }
+
+    /// Deliver an already-routed notification at the core's current clock boundary.
+    pub fn receive_device_flag(
+        &mut self,
+        flag_id: u8,
+    ) -> crate::sim::c220::sync::C220DeviceFlagDelivery {
+        self.device_flags.receive(flag_id)
+    }
+
+    pub fn reset_device_flag_counters(&mut self) {
+        self.device_flags.reset_counters();
+    }
+
+    pub(super) fn step_wait_device_flag_at(
+        &mut self,
+        tick: u64,
+        pc: u64,
+        instruction: crate::isa::c220::control::C220WaitDeviceFlagInstruction,
+    ) -> Result<C220CoreStep, C220CoreError> {
+        if self.state.scalar().is_halted() {
+            return Err(crate::sim::c220::state::C220ExecutionError::ProgramEnded { pc }.into());
+        }
+        let flag_id = match instruction.source {
+            crate::isa::c220::control::C220DeviceFlagSource::Immediate(value) => u32::from(value),
+            crate::isa::c220::control::C220DeviceFlagSource::Register(register) => {
+                self.state.scalar().machine().xregs()[usize::from(register)] as u32
+            }
+        };
+        let retry_tick = tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?;
+        if !self.device_flags.try_wait(flag_id) {
+            return Ok(C220CoreStep::Stalled(C220Stall {
+                tick,
+                pc,
+                resume_tick: retry_tick,
+                cause: C220StallCause::DeviceFlagDependency,
+            }));
+        }
+        self.state.commit_c220_sequential_issue();
+        Ok(C220CoreStep::Executed {
+            tick,
+            instruction: C220CoreInstruction::WaitDeviceFlag {
+                instruction_id: self.next_instruction_id,
+                pc,
+                instruction,
+                flag_id,
+                remaining: self.device_flags.count(flag_id),
+            },
+        })
+    }
+
     pub fn last_mte3_cross_core_outcomes(&self) -> &[C220CrossCoreReception] {
         &self.mte3.cross_core_outcomes
     }

@@ -11,6 +11,13 @@ use crate::sim::common::scalar::ScalarProgramStep;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220CoreInstruction {
+    WaitDeviceFlag {
+        instruction_id: u64,
+        pc: u64,
+        instruction: crate::isa::c220::control::C220WaitDeviceFlagInstruction,
+        flag_id: u32,
+        remaining: u32,
+    },
     Mte3CrossCore(crate::sim::c220::mte::mte3::frontend::C220Mte3Record),
     CrossCore(crate::sim::c220::sync::C220CrossCoreReception),
     Preload(super::C220CorePreloadIssue),
