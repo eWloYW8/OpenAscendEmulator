@@ -6,6 +6,107 @@ use super::super::store_buffer::{C220LsuMemory, C220LsuStoreConfig};
 use super::*;
 
 #[test]
+fn maintenance_write_samples_live_data_and_retries_before_resetting_tags() {
+    let mut scheduler = C220LsuRequestScheduler::new(
+        2,
+        2,
+        2,
+        2,
+        C220LsuMissBuffer::new(C220LsuMissConfig {
+            line_bytes: 64,
+            main_entries: 2,
+            sub_entries: 2,
+        })
+        .unwrap(),
+        C220LsuStoreBuffer::new(C220LsuStoreConfig {
+            line_bytes: 64,
+            main_entries: 2,
+            sub_entries: 2,
+            timeout_ticks: 1,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let mut cache = C220DataCache::new(
+        C220CacheAddressLayout::new(6, 0, 6, u64::MAX).unwrap(),
+        64,
+        vec![
+            C220CacheSet::new(
+                vec![C220CacheTag {
+                    valid: true,
+                    dirty: true,
+                    age: 7,
+                    memory: C220LsuMemory::External,
+                    tag: 4,
+                }],
+                None,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let location = super::super::cache::C220CacheLocation { index: 0, way: 0 };
+    let pending = scheduler
+        .invalidate_external_line(0, &mut cache, location)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.line.address, 0x100);
+    assert!(!cache.tag(location).unwrap().valid);
+    assert!(cache.tag(location).unwrap().dirty);
+    assert!(
+        scheduler
+            .invalidate_external_line(0, &mut cache, location)
+            .unwrap()
+            .is_none()
+    );
+    scheduler.writes.dispatch_clock(1, false, true).unwrap();
+    assert_eq!(scheduler.writes.outstanding(), 1);
+    assert!(
+        scheduler
+            .apply_maintenance_write_response::<C220LsuSchedulerError>(
+                pending.write,
+                &mut cache,
+                |_, _| Err(C220LsuSchedulerError::MissingWriteData),
+            )
+            .is_err()
+    );
+    assert_eq!(scheduler.writes.outstanding(), 0);
+    assert_eq!(scheduler.maintenance_writes().count(), 1);
+    assert!(cache.tag(location).unwrap().dirty);
+    cache.line_mut(location).unwrap().fill(0x99);
+    scheduler
+        .apply_maintenance_write_response::<C220LsuSchedulerError>(
+            pending.write,
+            &mut cache,
+            |key, bytes| {
+                assert_eq!(key, pending.line);
+                assert_eq!(bytes, &[0x99; 64]);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        cache.tag(location).unwrap(),
+        C220CacheTag {
+            valid: true,
+            dirty: false,
+            age: 0,
+            memory: C220LsuMemory::External,
+            tag: 0,
+        }
+    );
+    assert_eq!(scheduler.maintenance_writes().count(), 0);
+    assert!(scheduler.writes.requests().next().is_none());
+    assert!(
+        scheduler
+            .invalidate_external_line(2, &mut cache, location)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!cache.tag(location).unwrap().valid);
+}
+
+#[test]
 fn captured_stores_coalesce_and_complete_through_cache_or_refill() {
     use crate::architecture::Architecture;
     use crate::sim::c220::scalar::{C220ScalarMappedAddress, C220StoreOperands};

@@ -37,8 +37,10 @@ pub enum C220LsuValue {
 mod read;
 use load::PendingLoad;
 pub use load::{C220LsuLoadPath, C220LsuLoadValue};
+mod maintenance;
 mod response;
 mod write_response;
+pub use maintenance::C220LsuMaintenanceWrite;
 pub use response::C220LsuReadCompletion;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +135,7 @@ pub struct C220LsuRequestScheduler {
     pending_stores: BTreeMap<C220LsuRequestId, PendingStore>,
     store_next_tick: Option<u64>,
     eviction_data: BTreeMap<u64, Vec<u8>>,
+    maintenance_writes: BTreeMap<super::write_queue::C220LsuWriteId, C220LsuMaintenanceWrite>,
 }
 
 impl C220LsuRequestScheduler {
@@ -172,6 +175,7 @@ impl C220LsuRequestScheduler {
             direct_events,
             direct_event,
             eviction_data: BTreeMap::new(),
+            maintenance_writes: BTreeMap::new(),
         })
     }
 

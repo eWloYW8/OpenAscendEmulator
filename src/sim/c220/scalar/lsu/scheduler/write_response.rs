@@ -31,6 +31,9 @@ impl C220LsuRequestScheduler {
     where
         E: From<C220LsuSchedulerError>,
     {
+        if self.maintenance_writes.contains_key(&id) {
+            return Err(C220LsuSchedulerError::MissingWriteData.into());
+        }
         let key = self
             .writes
             .request(id)
@@ -211,7 +214,10 @@ impl C220LsuRequestScheduler {
         Ok(completion)
     }
 
-    fn enter_write_response(&mut self, id: C220LsuWriteId) -> Result<(), C220LsuSchedulerError> {
+    pub(super) fn enter_write_response(
+        &mut self,
+        id: C220LsuWriteId,
+    ) -> Result<(), C220LsuSchedulerError> {
         match self
             .writes
             .request(id)

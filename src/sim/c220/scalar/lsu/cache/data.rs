@@ -25,6 +25,49 @@ pub struct C220DataCache {
 }
 
 impl C220DataCache {
+    pub fn tag(&self, location: C220CacheLocation) -> Result<super::C220CacheTag, C220CacheError> {
+        self.sets
+            .get(location.index as usize)
+            .ok_or(C220CacheError::InvalidIndex)?
+            .ways
+            .get(location.way)
+            .copied()
+            .ok_or(C220CacheError::InvalidWay)
+    }
+
+    /// Invalidate without changing data, dirty state, tag, or replacement age.
+    pub fn invalidate(&mut self, location: C220CacheLocation) -> Result<(), C220CacheError> {
+        self.sets
+            .get_mut(location.index as usize)
+            .ok_or(C220CacheError::InvalidIndex)?
+            .ways
+            .get_mut(location.way)
+            .ok_or(C220CacheError::InvalidWay)?
+            .valid = false;
+        Ok(())
+    }
+
+    pub(in crate::sim::c220::scalar::lsu) fn reset_after_maintenance_write(
+        &mut self,
+        location: C220CacheLocation,
+    ) -> Result<(), C220CacheError> {
+        let entry = self
+            .sets
+            .get_mut(location.index as usize)
+            .ok_or(C220CacheError::InvalidIndex)?
+            .ways
+            .get_mut(location.way)
+            .ok_or(C220CacheError::InvalidWay)?;
+        *entry = super::C220CacheTag {
+            valid: true,
+            dirty: false,
+            age: 0,
+            memory: C220LsuMemory::External,
+            tag: 0,
+        };
+        Ok(())
+    }
+
     /// Construct zero-filled data RAM using caller-supplied initial tag state.
     pub fn new(
         layout: C220CacheAddressLayout,
