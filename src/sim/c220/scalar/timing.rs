@@ -1,7 +1,8 @@
 use crate::architecture::Architecture;
 use crate::isa::c220::cube::C220CubeInstruction;
 use crate::isa::c220::scalar::{
-    C220AtomicStoreOffset, C220ScalarAtomicStore, C220ScalarConversionHint, C220ScalarDirectStore,
+    C220AtomicStoreOffset, C220PreloadOffset, C220ScalarAtomicStore, C220ScalarConversionHint,
+    C220ScalarDirectStore, C220ScalarPreload,
 };
 use crate::isa::c220::vector::scalar::C220VectorScalarInstruction;
 use crate::isa::c220::vector::{
@@ -232,6 +233,13 @@ impl C220ScalarTimingLane {
         }
         if let Some(instruction) = C220ScalarConversionHint::from_word(word) {
             include(instruction.source_register);
+            return resume_tick;
+        }
+        if let Some(instruction) = C220ScalarPreload::decode(word) {
+            include(instruction.base_register);
+            if let C220PreloadOffset::Register(register) = instruction.offset {
+                include(register);
+            }
             return resume_tick;
         }
         if let Some(instruction) = C220ScalarAtomicStore::decode(word) {

@@ -185,6 +185,7 @@ impl C220LsuRequestScheduler {
         if stage == C220LsuStage::M2 {
             self.validate_store_m2(tick)?;
             self.validate_atomic_m2(tick)?;
+            self.validate_preload_m2(tick, external)?;
         }
         if let Some((id, pending)) = pending
             && stage == C220LsuStage::M2
@@ -220,6 +221,7 @@ impl C220LsuRequestScheduler {
         if let C220LsuStageProgress::Advanced(id) = outcome.progress {
             self.advance_store_data(stage, tick, id, cache)?;
             self.advance_atomic_data(stage, tick, id, cache)?;
+            self.advance_preload(stage, tick, id, cache)?;
             self.advance_maintenance_stage(stage, tick, id, cache)?;
         }
         if let C220LsuStageProgress::Advanced(id) = outcome.progress
@@ -280,6 +282,9 @@ impl C220LsuRequestScheduler {
         line: &[u8],
     ) {
         for notification in notifications {
+            if let C220LsuCompletion::Load(id) = *notification {
+                self.finish_preload(id, tick, false);
+            }
             if let C220LsuCompletion::Load(id) = *notification
                 && let Some(pending) = self.pending_loads.get(&id).copied()
             {

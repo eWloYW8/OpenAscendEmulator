@@ -1,4 +1,38 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220PreloadOffset {
+    Immediate(u16),
+    Register(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220ScalarPreload {
+    pub base_register: u8,
+    pub offset: C220PreloadOffset,
+    pub post_index: bool,
+}
+
+impl C220ScalarPreload {
+    pub const fn decode(word: u32) -> Option<Self> {
+        if word >> 29 != 0 {
+            return None;
+        }
+        match (word >> 24) & 31 {
+            1 if (word >> 4) & 7 == 5 => Some(Self {
+                base_register: (((word >> 12) & 31) | ((word & 2) << 4)) as u8,
+                offset: C220PreloadOffset::Register((((word >> 7) & 31) | ((word & 1) << 5)) as u8),
+                post_index: word & 8 != 0,
+            }),
+            8 if (word >> 22) & 3 == 3 => Some(Self {
+                base_register: ((word >> 12) & 63) as u8,
+                offset: C220PreloadOffset::Immediate((word & 0xfff) as u16),
+                post_index: false,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220AtomicStoreOffset {
     Immediate(i16),
     Register(u8),

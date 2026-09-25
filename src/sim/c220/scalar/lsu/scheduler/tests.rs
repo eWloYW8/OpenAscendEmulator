@@ -49,6 +49,65 @@ fn maintenance_write_samples_live_data_and_retries_before_resetting_tags() {
     let location = super::super::cache::C220CacheLocation { index: 0, way: 0 };
     for hit in [false, true] {
         use crate::architecture::Architecture;
+        use crate::sim::c220::scalar::{C220PreloadOperands, C220ScalarMappedAddress};
+        use crate::sim::common::scalar::ScalarMachine;
+        let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+        machine.set_xreg(2, 0x100).unwrap();
+        let operands = C220PreloadOperands::capture(&machine, 0, 0x08c0_203f).unwrap();
+        assert_eq!(operands.effective_address, 0x13f);
+        let snapshot = *machine.xregs();
+        let mapped = C220ScalarMappedAddress {
+            address: operands.effective_address,
+            memory: C220LsuMemory::External,
+            stack: false,
+        };
+        let mut staged = scheduler.clone();
+        let mut ram = cache.clone();
+        if !hit {
+            ram.invalidate(location).unwrap();
+        }
+        let id = staged
+            .admit_preload(0, operands, mapped, false)
+            .unwrap()
+            .unwrap();
+        for tick in 1..5 {
+            for stage in [C220LsuStage::M2, C220LsuStage::M1, C220LsuStage::M0] {
+                staged
+                    .advance_with_cache(
+                        stage,
+                        tick,
+                        C220LsuExternalHazards {
+                            maintenance_active: false,
+                            maintenance_draining: false,
+                        },
+                        &mut ram,
+                    )
+                    .unwrap();
+            }
+        }
+        if !hit {
+            assert!(staged.preload_completions().next().is_none());
+            let read = staged.reads.dispatch_clock(5, true, true).unwrap()[0];
+            assert_eq!(read.byte_len, 64);
+            assert_eq!(read.line.address, 0x100);
+            staged
+                .apply_read_response(read.id, Some(&mut ram), |_, size| {
+                    Ok::<_, C220LsuSchedulerError>(vec![0xa5; size])
+                })
+                .unwrap();
+            assert_eq!(ram.line(location).unwrap(), &[0xa5; 64]);
+        }
+        let completions = staged.take_preload_completions();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].request, id);
+        assert_eq!(completions[0].cache_hit, hit);
+        assert!(staged.values().next().is_none());
+        assert_eq!(*machine.xregs(), snapshot);
+        assert!(staged.pending_preloads.is_empty());
+        assert!(staged.reads.requests().next().is_none());
+    }
+    for hit in [false, true] {
+        use crate::architecture::Architecture;
         use crate::sim::c220::scalar::C220AtomicStoreOperands;
         use crate::sim::common::scalar::ScalarMachine;
         let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);

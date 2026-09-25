@@ -28,6 +28,8 @@ mod direct_store;
 use direct_store::PendingDirectStore;
 mod atomic;
 mod load;
+mod preload;
+pub use preload::C220LsuPreloadCompletion;
 mod store;
 pub use atomic::C220LsuAtomicCompletion;
 use store::PendingStore;
@@ -140,6 +142,8 @@ pub struct C220LsuRequestScheduler {
     pub writes: C220LsuWriteQueue,
     pub reads: C220LsuReadQueue,
     pending_loads: BTreeMap<C220LsuRequestId, PendingLoad>,
+    pending_preloads: BTreeMap<C220LsuRequestId, preload::PendingPreload>,
+    preload_completions: VecDeque<C220LsuPreloadCompletion>,
     values: VecDeque<C220LsuValue>,
     pending_stores: BTreeMap<C220LsuRequestId, PendingStore>,
     pending_atomics: BTreeMap<C220LsuRequestId, atomic::PendingAtomic>,
@@ -184,6 +188,8 @@ impl C220LsuRequestScheduler {
             writes,
             reads,
             pending_loads: BTreeMap::new(),
+            pending_preloads: BTreeMap::new(),
+            preload_completions: VecDeque::new(),
             values: VecDeque::new(),
             pending_stores: BTreeMap::new(),
             pending_atomics: BTreeMap::new(),
@@ -297,6 +303,7 @@ impl C220LsuRequestScheduler {
     ) -> Result<C220LsuStageOutcome, C220LsuSchedulerError> {
         if self.pipeline.head(stage).is_some_and(|head| {
             self.pending_loads.contains_key(&head.request)
+                || self.pending_preloads.contains_key(&head.request)
                 || self.pending_stores.contains_key(&head.request)
                 || self.pending_atomics.contains_key(&head.request)
                 || self.pending_maintenance.contains_key(&head.request)
