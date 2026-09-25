@@ -13,6 +13,7 @@ pub struct C220CoreLsuAdmission {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum DispatchedLsu {
+    Preload(C220CorePreloadIssue),
     AtomicStore(C220CoreAtomicIssue),
     Load(C220CoreLoadIssue),
     DirectStore(C220CoreLsuIssue),
@@ -23,6 +24,7 @@ pub(super) enum DispatchedLsu {
 impl DispatchedLsu {
     fn issue_tick(self) -> u64 {
         match self {
+            Self::Preload(issue) => issue.tick,
             Self::AtomicStore(issue) => issue.tick,
             Self::Load(issue) => issue.tick,
             Self::Store(issue) => issue.tick,
@@ -69,6 +71,7 @@ impl CoreLsu {
             return Ok(());
         }
         let address = match head {
+            DispatchedLsu::Preload(issue) => issue.operands.effective_address,
             DispatchedLsu::AtomicStore(issue) => issue.operands.effective_address,
             DispatchedLsu::Load(issue) => issue.operands.effective_address,
             DispatchedLsu::Store(issue) => issue.operands.effective_address,
@@ -88,6 +91,19 @@ impl CoreLsu {
             return Err(C220CoreError::UnsupportedTimedLsuAccess);
         }
         let (instruction_id, request, second_request) = match head {
+            DispatchedLsu::Preload(issue) => {
+                let Some(request) = self.scheduler.admit_preload(
+                    tick,
+                    issue.operands,
+                    mapped,
+                    self.config.partition_stack,
+                )?
+                else {
+                    return Ok(());
+                };
+                self.preloads.insert(request, (issue, None));
+                (issue.instruction_id, request, None)
+            }
             DispatchedLsu::Maintenance(_) => unreachable!(),
             DispatchedLsu::AtomicStore(issue) => {
                 let Some(request) = self.scheduler.admit_atomic_store(

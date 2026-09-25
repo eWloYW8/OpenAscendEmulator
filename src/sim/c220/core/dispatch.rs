@@ -46,6 +46,9 @@ impl C220Core {
             }));
         }
         let pc = self.state.scalar().pc();
+        if crate::isa::c220::scalar::C220ScalarPreload::decode(word).is_some() {
+            return self.step_preload_at(tick, word);
+        }
         if crate::isa::c220::scalar::C220ScalarAtomicStore::decode(word).is_some() {
             return self.step_atomic_store_at(tick, word);
         }

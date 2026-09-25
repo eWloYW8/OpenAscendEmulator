@@ -11,6 +11,7 @@ use crate::sim::common::scalar::ScalarProgramStep;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220CoreInstruction {
+    Preload(super::C220CorePreloadIssue),
     AtomicStore(super::C220CoreAtomicIssue),
     Load(super::C220CoreLoadIssue),
     Store(super::C220CoreStoreIssue),

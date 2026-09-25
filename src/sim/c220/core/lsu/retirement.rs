@@ -47,6 +47,17 @@ impl CoreLsu {
             })
             .transpose()?;
         match self.commits.retire_next_at(tick, machine)? {
+            Some(C220LsuRetirement::Preload {
+                request,
+                retire_tick,
+            }) => {
+                let (issue, data) = self.preloads.remove(&request).expect("issued preload");
+                self.preload_completions.push(C220CorePreloadCompletion {
+                    issue,
+                    data: data.expect("completed preload"),
+                    retire_tick,
+                });
+            }
             Some(C220LsuRetirement::AtomicStore {
                 request,
                 retire_tick,

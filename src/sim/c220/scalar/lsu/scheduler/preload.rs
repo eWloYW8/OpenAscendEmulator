@@ -68,6 +68,19 @@ impl C220LsuRequestScheduler {
         self.preload_completions.drain(..).collect()
     }
 
+    pub fn deliver_preload_completion(
+        &mut self,
+        tick: u64,
+        commits: &mut super::super::commit::C220LsuCommitLane,
+    ) -> Result<Option<C220LsuPreloadCompletion>, super::super::commit::C220LsuCommitError> {
+        let Some(completion) = self.preload_completions.front().copied() else {
+            return Ok(None);
+        };
+        commits.complete_preload_at(tick, completion.request)?;
+        self.preload_completions.pop_front();
+        Ok(Some(completion))
+    }
+
     pub(super) fn validate_preload_m2(
         &self,
         tick: u64,

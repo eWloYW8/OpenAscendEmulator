@@ -779,6 +779,45 @@ fn run_core_atomic_stores(core: &mut C220Core, mut tick: u64) {
         );
         tick = done.retire_tick + 102;
     }
+    run_core_preloads(core, tick);
+}
+
+fn run_core_preloads(core: &mut C220Core, mut tick: u64) {
+    for word in [0x08c0_503f, 0x0100_54d0, 0x0100_54d8] {
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(5, 0x2000).unwrap();
+        machine.set_xreg(9, 63).unwrap();
+        let before = *machine.xregs();
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Preload(issue),
+            ..
+        } = core.step_word_at(tick, word).unwrap()
+        else {
+            panic!("preload issues");
+        };
+        assert_eq!(issue.operands.effective_address, 0x203f);
+        assert_eq!(core.pending_preload_instructions().count(), 1);
+        assert_eq!(*core.state.scalar().machine().xregs(), before);
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(5, 0x20c0)
+            .unwrap();
+        let done = (tick + 1..tick + 200)
+            .find_map(|now| {
+                core.advance_to(now).unwrap();
+                core.take_preload_completions().into_iter().next()
+            })
+            .expect("preload retires");
+        assert_eq!(done.issue, issue);
+        assert_eq!(done.data.mapped.address, 0x203f);
+        assert_eq!(done.retire_tick, done.data.tick + 1);
+        assert_eq!(core.state.scalar().machine().xregs()[5], 0x20c0);
+        assert_eq!(core.pending_preload_instructions().count(), 0);
+        core.advance_to(done.retire_tick + 100).unwrap();
+        assert!(core.take_preload_completions().is_empty());
+        tick = done.retire_tick + 102;
+    }
 }
 
 #[test]

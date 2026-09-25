@@ -25,6 +25,7 @@ pub use lsu::{C220CoreAtomicCompletion, C220CoreAtomicIssue};
 pub use lsu::{C220CoreLoadCompletion, C220CoreLoadIssue};
 pub use lsu::{C220CoreLsuAdmission, C220CoreLsuCompletion, C220CoreLsuConfig, C220CoreLsuIssue};
 pub use lsu::{C220CoreMaintenanceCompletion, C220CoreMaintenanceIssue};
+pub use lsu::{C220CorePreloadCompletion, C220CorePreloadIssue};
 pub use lsu::{C220CoreStoreCompletion, C220CoreStoreIssue};
 mod cube;
 mod decode;

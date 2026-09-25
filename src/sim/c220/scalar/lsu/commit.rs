@@ -80,6 +80,10 @@ pub enum C220LsuCommitError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220LsuRetirement {
+    Preload {
+        request: C220LsuRequestId,
+        retire_tick: u64,
+    },
     AtomicStore {
         request: C220LsuRequestId,
         retire_tick: u64,
@@ -108,6 +112,7 @@ pub enum C220LsuRetirement {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetirementToken {
+    Preload(C220LsuRequestId),
     AtomicStore(C220LsuRequestId),
     Maintenance(C220LsuRequestId),
     Load(C220LoadId),
@@ -163,6 +168,7 @@ impl C220LsuCommitLane {
                         !self.store_pair_requests.contains_key(&data.request)
                     }
                     RetirementToken::DirectStore { .. }
+                    | RetirementToken::Preload(_)
                     | RetirementToken::Maintenance(_)
                     | RetirementToken::AtomicStore(_) => true,
                 })
@@ -202,6 +208,19 @@ impl C220LsuCommitLane {
         Ok(())
     }
 
+    pub fn complete_preload_at(
+        &mut self,
+        tick: u64,
+        request: C220LsuRequestId,
+    ) -> Result<(), C220LsuCommitError> {
+        self.check_retirement_send(tick)?;
+        self.check_store_request(request)?;
+        self.retirements
+            .push_back((tick + 1, RetirementToken::Preload(request)));
+        self.tick = tick;
+        Ok(())
+    }
+
     pub fn complete_atomic_at(
         &mut self,
         tick: u64,
@@ -237,9 +256,9 @@ impl C220LsuCommitLane {
                     request: pending, ..
                 } => *pending == request,
                 RetirementToken::Load(_) => false,
-                RetirementToken::Maintenance(pending) | RetirementToken::AtomicStore(pending) => {
-                    *pending == request
-                }
+                RetirementToken::Preload(pending)
+                | RetirementToken::Maintenance(pending)
+                | RetirementToken::AtomicStore(pending) => *pending == request,
             })
         {
             return Err(C220LsuCommitError::InvalidRequest);
@@ -372,6 +391,14 @@ impl C220LsuCommitLane {
             return Ok(None);
         };
         let request = match token {
+            RetirementToken::Preload(request) => {
+                self.retirements.pop_front();
+                self.tick = tick;
+                return Ok(Some(C220LsuRetirement::Preload {
+                    request,
+                    retire_tick: tick,
+                }));
+            }
             RetirementToken::AtomicStore(request) => {
                 self.retirements.pop_front();
                 self.tick = tick;

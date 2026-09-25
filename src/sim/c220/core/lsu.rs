@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
 mod atomic;
+mod preload;
+pub use preload::{C220CorePreloadCompletion, C220CorePreloadIssue};
 mod cache;
 pub use atomic::{C220CoreAtomicCompletion, C220CoreAtomicIssue};
 mod ingress;
@@ -70,6 +72,14 @@ pub struct C220CoreLsuCompletion {
 }
 
 pub(super) struct CoreLsu {
+    preloads: BTreeMap<
+        C220LsuRequestId,
+        (
+            C220CorePreloadIssue,
+            Option<crate::sim::c220::scalar::lsu::scheduler::C220LsuPreloadCompletion>,
+        ),
+    >,
+    preload_completions: Vec<C220CorePreloadCompletion>,
     atomics: BTreeMap<
         C220LsuRequestId,
         (
@@ -134,6 +144,8 @@ impl C220Core {
         }
         let port = self.connect_cache_write_port()?;
         self.lsu = Some(CoreLsu {
+            preloads: BTreeMap::new(),
+            preload_completions: Vec::new(),
             commits: C220LsuCommitLane::new(C220LoadCommitMode::Retirement),
             stores: BTreeMap::new(),
             store_completions: Vec::new(),
@@ -378,6 +390,12 @@ impl C220Core {
                     .expect("issued maintenance")
                     .1 = Some(completion);
             }
+            while let Some(data) = scheduler.deliver_preload_completion(tick, &mut lsu.commits)? {
+                lsu.preloads
+                    .get_mut(&data.request)
+                    .expect("issued preload")
+                    .1 = Some(data);
+            }
             scheduler.deliver_values(
                 tick,
                 &mut lsu.commits,
@@ -390,6 +408,7 @@ impl C220Core {
         lsu.send_writes_at(tick, pipeline)?;
         let scheduler = &lsu.scheduler;
         lsu.next_tick = if lsu.ingress.is_empty()
+            && lsu.preloads.is_empty()
             && lsu.pending.is_empty()
             && lsu.stores.is_empty()
             && lsu.maintenance.is_empty()
