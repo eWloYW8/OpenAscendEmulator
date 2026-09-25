@@ -1,4 +1,45 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220AtomicStoreOffset {
+    Immediate(i16),
+    Register(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220ScalarAtomicStore {
+    pub source_register: u8,
+    pub base_register: u8,
+    pub width_bytes: u8,
+    pub offset: C220AtomicStoreOffset,
+    pub post_index: bool,
+}
+
+impl C220ScalarAtomicStore {
+    pub const fn decode(word: u32) -> Option<Self> {
+        if word >> 29 != 0 {
+            return None;
+        }
+        let (offset, post_index) = match (word >> 24) & 31 {
+            1 if (word >> 4) & 7 == 7 => (
+                C220AtomicStoreOffset::Register(((word >> 7) & 31) as u8),
+                word & 8 != 0,
+            ),
+            22 | 23 => (
+                C220AtomicStoreOffset::Immediate(((word as i16) << 4) >> 4),
+                word & (1 << 24) != 0,
+            ),
+            _ => return None,
+        };
+        Some(Self {
+            source_register: ((word >> 17) & 31) as u8,
+            base_register: ((word >> 12) & 31) as u8,
+            width_bytes: 1 << ((word >> 22) & 3),
+            offset,
+            post_index,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220ScalarDirectStore {
     pub source_register: u8,
     pub base_register: u8,
