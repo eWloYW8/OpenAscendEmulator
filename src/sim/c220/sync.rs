@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+mod cross_core;
+pub use cross_core::{C220CrossCoreReception, C220DeviceSync};
+
 use thiserror::Error;
 
 use crate::isa::c220::hflag::{C220HardwareFlagOperation, C220HardwareFlagStep, C220MatrixMemory};

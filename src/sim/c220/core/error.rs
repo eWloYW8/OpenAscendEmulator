@@ -17,6 +17,8 @@ use crate::sim::common::scalar::ScalarInstructionError;
 
 #[derive(Debug, Error)]
 pub enum C220CoreError {
+    #[error("cross-core notification at PC {pc:#x} is not implemented for pipe {pipe}")]
+    UnsupportedCrossCorePipe { pc: u64, pipe: u8 },
     #[error(transparent)]
     AtomicStore(#[from] crate::sim::c220::scalar::C220AtomicStoreError),
     #[error(transparent)]

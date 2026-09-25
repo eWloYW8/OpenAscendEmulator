@@ -3022,6 +3022,37 @@ fn vabs_uses_modeled_five_tick_execution_stage() {
         5
     );
     let visible = timed.vector_pipeline().pending_visibility_tick().unwrap();
+    let cross = (2 << 29) | (15 << 21) | (4 << 18) | (6 << 2);
+    timed
+        .state
+        .scalar_mut()
+        .machine_mut()
+        .set_xreg(6, 0x710)
+        .unwrap();
+    let C220CoreStep::Executed {
+        instruction: C220CoreInstruction::CrossCore(reception),
+        ..
+    } = timed.step_word_at(1, cross | (2 << 10)).unwrap()
+    else {
+        panic!("idle cube notification must not drain the vector pipeline")
+    };
+    assert_eq!(reception.tick, 1);
+    assert_eq!(reception.payload.mode, 1);
+    assert_eq!(reception.payload.flag_id, 7);
+    let pc = timed.state.scalar().pc();
+    let next_id = timed.next_instruction_id();
+    assert!(matches!(
+        timed.step_word_at(2, cross | (1 << 10)).unwrap(),
+        C220CoreStep::Stalled(_)
+    ));
+    assert_eq!(timed.state.scalar().pc(), pc);
+    assert_eq!(timed.next_instruction_id(), next_id);
+    timed
+        .state
+        .scalar_mut()
+        .machine_mut()
+        .set_xreg(6, 0xb30)
+        .unwrap();
     timed.advance_to(visible).unwrap();
     assert_eq!(
         timed.state().ub().read_known(0x100, 4).unwrap(),
@@ -3032,6 +3063,29 @@ fn vabs_uses_modeled_five_tick_execution_stage() {
             .read1_grants
             .is_empty()
     );
+    let retire = timed
+        .vector
+        .pending_drain_tick()
+        .unwrap_or(visible)
+        .max(visible);
+    let C220CoreStep::Executed {
+        instruction: C220CoreInstruction::CrossCore(reception),
+        ..
+    } = timed.step_word_at(retire, cross | (1 << 10)).unwrap()
+    else {
+        panic!("vector notification should retire after its preceding instruction")
+    };
+    assert_eq!(reception.instruction_id, next_id);
+    assert_eq!(reception.pc, pc);
+    assert_eq!(reception.payload.value, 0xb30);
+    assert_eq!(reception.payload.mode, 3);
+    assert_eq!(reception.payload.flag_id, 11);
+    assert_eq!(timed.state.scalar().pc(), pc + 4);
+    assert!(matches!(
+        timed.step_word_at(retire + 1, cross | (4 << 10)),
+        Err(C220CoreError::UnsupportedCrossCorePipe { pipe: 4, .. })
+    ));
+    assert_eq!(timed.state.scalar().pc(), pc + 4);
 }
 
 #[test]

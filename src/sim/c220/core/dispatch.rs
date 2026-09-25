@@ -46,6 +46,11 @@ impl C220Core {
             }));
         }
         let pc = self.state.scalar().pc();
+        if let Some(instruction) =
+            crate::isa::c220::control::C220SetCrossCoreInstruction::decode(word)
+        {
+            return self.step_cross_core_at(tick, pc, instruction);
+        }
         if crate::isa::c220::scalar::C220ScalarPreload::decode(word).is_some() {
             return self.step_preload_at(tick, word);
         }
