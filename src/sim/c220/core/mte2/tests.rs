@@ -671,16 +671,23 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
             C220LoadCommitMode::DataBypass,
             C220LoadCommitMode::Retirement,
         ] {
-            for (suppressed, pair) in [(false, false), (true, false), (false, true), (true, true)] {
+            for (suppressed, second_register) in [
+                (false, None),
+                (true, None),
+                (false, Some(8)),
+                (true, Some(8)),
+                (false, Some(7)),
+                (true, Some(7)),
+            ] {
                 let mut machine = load_machine.clone();
-                let prior_second = machine.xregs()[8];
+                let prior_second = machine.xregs()[usize::from(second_register.unwrap_or(8))];
                 let operands = C220LoadOperands {
-                    second_destination: pair.then_some((8, prior_second)),
+                    second_destination: second_register.map(|register| (register, prior_second)),
                     ..operands
                 };
                 let data = crate::sim::c220::scalar::lsu::scheduler::C220LsuLoadValue {
                     operands,
-                    second_value: pair.then_some(0x5678),
+                    second_value: second_register.map(|_| 0x5678),
                     ..values[0]
                 };
                 let mut commits = C220LsuCommitLane::new(mode);
@@ -731,17 +738,23 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                 assert_eq!(retired.writeback_tick.is_none(), suppressed);
                 assert_eq!(commits.pending_count(), 0);
                 assert_eq!(commits.pending_destination(7), None);
-                if pair {
+                if let Some(register) = second_register {
                     assert_eq!(
                         retired.second_register_value,
-                        Some(if suppressed { prior_second } else { 0x5678 })
+                        Some(if register == 7 {
+                            retired.register_value
+                        } else if suppressed {
+                            prior_second
+                        } else {
+                            0x5678
+                        })
                     );
                     assert_eq!(
-                        commits.pending_destination(8),
-                        suppressed.then_some(C220LoadId(7))
+                        commits.pending_destination(register),
+                        (suppressed && register != 7).then_some(C220LoadId(7))
                     );
-                    commits.supersede(8);
-                    assert_eq!(commits.pending_destination(8), None);
+                    commits.supersede(register);
+                    assert_eq!(commits.pending_destination(register), None);
                 }
             }
         }

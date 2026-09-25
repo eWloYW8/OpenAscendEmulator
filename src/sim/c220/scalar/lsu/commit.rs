@@ -375,10 +375,10 @@ impl C220LsuCommitLane {
         data: C220LsuLoadValue,
         machine: &mut ScalarMachine,
     ) -> Result<(), C220LsuCommitError> {
-        machine.set_xreg(data.operands.destination_register, data.value)?;
         if let Some((register, _)) = data.operands.second_destination {
             machine.set_xreg(register, data.second_value.expect("validated pair data"))?;
         }
+        machine.set_xreg(data.operands.destination_register, data.value)?;
         for register in data.operands.destinations() {
             self.owners.remove(&register);
         }
@@ -400,10 +400,9 @@ impl C220LsuCommitLane {
         if machine.architecture() != Architecture::Dav2201
             || usize::from(operands.destination_register) >= machine.xregs().len()
             || usize::from(operands.base_register) >= machine.xregs().len()
-            || operands.second_destination.is_some_and(|(register, _)| {
-                usize::from(register) >= machine.xregs().len()
-                    || register == operands.destination_register
-            })
+            || operands
+                .second_destination
+                .is_some_and(|(register, _)| usize::from(register) >= machine.xregs().len())
         {
             Err(C220LsuCommitError::InvalidOperands)
         } else {

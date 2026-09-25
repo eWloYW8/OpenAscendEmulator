@@ -109,7 +109,7 @@ fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
     } = core
         .step_word_at(
             tick,
-            (9 << 24) | (3 << 22) | (7 << 17) | (5 << 12) | (9 << 7),
+            (9 << 24) | (3 << 22) | (7 << 17) | (5 << 12) | (7 << 7),
         )
         .unwrap()
     else {
@@ -150,7 +150,11 @@ fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
         completion.retirement.data.second_value,
         Some(expected_second)
     );
-    assert_eq!(core.state.scalar().machine().xregs()[9], expected_second);
+    assert_eq!(
+        completion.retirement.second_register_value,
+        Some(0xab00_0000)
+    );
+    assert_eq!(core.state.scalar().machine().xregs()[7], 0xab00_0000);
     assert_eq!(
         completion.retirement.data.path,
         crate::sim::c220::scalar::lsu::scheduler::C220LsuLoadPath::Refill

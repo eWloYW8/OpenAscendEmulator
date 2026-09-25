@@ -111,10 +111,9 @@ impl C220Core {
         let machine = self.state.scalar().machine();
         let operands = C220LoadOperands::capture(machine, pc, word)
             .map_err(crate::sim::common::scalar::ScalarInstructionError::from)?;
-        if operands.second_destination.is_some_and(|(register, _)| {
-            register == operands.destination_register
-                || (operands.effective_address & 63) + operands.access_bytes() as u64 > 64
-        }) {
+        if operands.second_destination.is_some()
+            && (operands.effective_address & 63) + operands.access_bytes() as u64 > 64
+        {
             return Err(C220CoreError::UnsupportedTimedLsuAccess);
         }
         if let Some(resume_tick) = [67, 68]

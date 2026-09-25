@@ -732,6 +732,20 @@ fn pair_load_reads_adjacent_values_and_updates_both_registers() {
         assert_eq!(machine.xregs()[0], 0x1000);
         assert_eq!(machine.spr2(), 0x55);
         assert_eq!(bus.accesses, 2);
+        let alias_word = (word & !(0x1f << 7)) | (5 << 7);
+        let aliased = machine
+            .execute_pair_load_word(0x204, alias_word, &mut bus)
+            .unwrap();
+        assert_eq!(aliased.first_value, first);
+        assert_eq!(aliased.second_value, second);
+        assert_eq!(
+            machine.xregs()[5],
+            if architecture == Architecture::Dav2201 {
+                first
+            } else {
+                second
+            }
+        );
     }
 }
 

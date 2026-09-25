@@ -328,8 +328,13 @@ impl ScalarMachine {
         let second_value = decode(second_bytes);
         let first_prior_value = self.xregs[usize::from(first_destination_register)];
         let second_prior_value = self.xregs[usize::from(second_destination_register)];
-        self.xregs[usize::from(first_destination_register)] = first_value;
-        self.xregs[usize::from(second_destination_register)] = second_value;
+        if self.architecture == Architecture::Dav2201 {
+            self.xregs[usize::from(second_destination_register)] = second_value;
+            self.xregs[usize::from(first_destination_register)] = first_value;
+        } else {
+            self.xregs[usize::from(first_destination_register)] = first_value;
+            self.xregs[usize::from(second_destination_register)] = second_value;
+        }
         Ok(ScalarPairLoadStep {
             pc,
             word,
