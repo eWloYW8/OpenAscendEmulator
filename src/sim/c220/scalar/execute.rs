@@ -52,7 +52,8 @@ impl C220State {
                 self.scalar.machine_mut(),
                 pc,
                 word,
-            )?;
+            )?
+            .step;
             self.scalar.advance_sequential();
             return Ok(ScalarProgramStep {
                 pc,
