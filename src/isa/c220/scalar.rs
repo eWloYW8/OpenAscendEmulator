@@ -119,7 +119,11 @@ impl C220ScalarSprImmediate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220ScalarConversion {
+    F32ToS32NearestAway,
+    F32ToS32Floor,
+    F32ToS32Ceil,
     F32ToS32Truncate,
+    F32ToS32NearestEven,
     S32ToF32,
 }
 
@@ -136,14 +140,18 @@ impl C220ScalarConversionHint {
             return None;
         }
         let conversion = match word & 0x1f {
+            0 => C220ScalarConversion::F32ToS32NearestAway,
+            1 => C220ScalarConversion::F32ToS32Floor,
+            2 => C220ScalarConversion::F32ToS32Ceil,
             3 => C220ScalarConversion::F32ToS32Truncate,
+            4 => C220ScalarConversion::F32ToS32NearestEven,
             5 => C220ScalarConversion::S32ToF32,
             _ => return None,
         };
         Some(Self {
             conversion,
-            destination_register: (((word >> 17) & 0x1f) | ((word >> 1) & 0x20)) as u8,
-            source_register: (((word >> 12) & 0x1f) | (word & 0x20)) as u8,
+            destination_register: ((word >> 17) & 0x1f) as u8,
+            source_register: ((word >> 12) & 0x1f) as u8,
         })
     }
 }

@@ -12,6 +12,30 @@ pub struct F32ToS32Result {
     pub status: F32ToS32Status,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum F32ToS32Rounding {
+    NearestEven,
+    NearestAway,
+    Floor,
+    Ceil,
+    Truncate,
+}
+
+pub fn f32_to_s32(bits: u32, rounding: F32ToS32Rounding, wrap_overflow: bool) -> F32ToS32Result {
+    if bits & 0x7f80_0000 == 0x7f80_0000 {
+        return f32_to_s32_truncate(bits, wrap_overflow);
+    }
+    let value = f32::from_bits(bits);
+    let rounded = match rounding {
+        F32ToS32Rounding::NearestEven => value.round_ties_even(),
+        F32ToS32Rounding::NearestAway => value.round(),
+        F32ToS32Rounding::Floor => value.floor(),
+        F32ToS32Rounding::Ceil => value.ceil(),
+        F32ToS32Rounding::Truncate => value.trunc(),
+    };
+    f32_to_s32_truncate(rounded.to_bits(), wrap_overflow)
+}
+
 pub fn f32_to_s32_truncate(bits: u32, wrap_overflow: bool) -> F32ToS32Result {
     let sign = bits >> 31 != 0;
     let exponent = (bits >> 23) & 0xff;
@@ -24,9 +48,7 @@ pub fn f32_to_s32_truncate(bits: u32, wrap_overflow: bool) -> F32ToS32Result {
             };
         }
         return F32ToS32Result {
-            value: if wrap_overflow {
-                if sign { u32::MAX } else { 1 }
-            } else if sign {
+            value: if sign {
                 i32::MIN as u32
             } else {
                 i32::MAX as u32

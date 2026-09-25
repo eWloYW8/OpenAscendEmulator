@@ -18,8 +18,7 @@ use crate::isa::c220::vector::C220MovemaskHint;
 use crate::sim::common::scalar::{ScalarMachine, ScalarMachineError};
 mod conversion;
 pub use conversion::{
-    C220ScalarConversionOutcome, C220ScalarConversionStep, execute_conversion_word,
-    execute_scalar_conversion,
+    C220ScalarConversionOutcome, execute_conversion_word, execute_scalar_conversion,
 };
 
 pub(crate) mod address;
