@@ -2,11 +2,13 @@ use crate::sim::c220::sync::{C220HardwareFlagState, C220HardwareFlagTimingError}
 use std::collections::{BTreeMap, VecDeque};
 
 use super::*;
+use crate::isa::c220::control::C220SetCrossCoreInstruction;
 use crate::sim::c220::memory::{C220L0c, C220LocalBuffer};
 use crate::sim::c220::mte::interface::{
     C220MteL0cReadError, C220MteL0cReadInterface, C220MteL0cReadResponse, C220MteL0cReadSend,
     C220MteOutputFragment,
 };
+use crate::sim::c220::sync::{C220CrossCoreReception, C220DeviceSync};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220FixpEngineConfig {
@@ -72,6 +74,16 @@ pub enum C220FixpEngineError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220FixpCrossCoreCommand {
+    pub instruction_id: u64,
+    pub pc: u64,
+    pub instruction: C220SetCrossCoreInstruction,
+    pub payload: C220DeviceSync,
+    pub dispatched_tick: u64,
+    pub ready_tick: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220FixpAdmission {
     Mte3RetirementPending,
     ResourceConflict,
@@ -92,6 +104,7 @@ pub struct C220FixpEngine {
     pub(super) commands: BTreeMap<u64, C220FixpCommandState>,
     factor_commands: BTreeMap<u64, C220FactorCommandState>,
     control_commands: BTreeMap<u64, u64>,
+    cross_core_commands: BTreeMap<u64, C220FixpCrossCoreCommand>,
     instruction_fifo: VecDeque<u64>,
     retirement_fifo: VecDeque<u64>,
     command_retirement: VecDeque<u64>,
@@ -128,6 +141,7 @@ impl C220FixpEngine {
             commands: BTreeMap::new(),
             factor_commands: BTreeMap::new(),
             control_commands: BTreeMap::new(),
+            cross_core_commands: BTreeMap::new(),
             instruction_fifo: VecDeque::new(),
             retirement_fifo: VecDeque::new(),
             command_retirement: VecDeque::new(),
@@ -165,6 +179,58 @@ impl C220FixpEngine {
         self.commands.contains_key(&id)
             || self.factor_commands.contains_key(&id)
             || self.control_commands.contains_key(&id)
+            || self.cross_core_commands.contains_key(&id)
+    }
+
+    pub fn cross_core_commands(&self) -> &BTreeMap<u64, C220FixpCrossCoreCommand> {
+        &self.cross_core_commands
+    }
+
+    pub(crate) fn admit_cross_core(
+        &mut self,
+        tick: u64,
+        id: u64,
+        pc: u64,
+        instruction: C220SetCrossCoreInstruction,
+        payload: C220DeviceSync,
+    ) -> Result<(), C220FixpEngineError> {
+        if self.contains_command(id) {
+            return Err(C220FixpEngineError::DuplicateCommand(id));
+        }
+        let ready_tick = tick
+            .checked_add(1)
+            .ok_or(C220FixpEngineError::ControlTimeOverflow)?;
+        self.cross_core_commands.insert(
+            id,
+            C220FixpCrossCoreCommand {
+                instruction_id: id,
+                pc,
+                instruction,
+                payload,
+                dispatched_tick: tick,
+                ready_tick,
+            },
+        );
+        self.command_retirement.push_back(id);
+        Ok(())
+    }
+
+    pub(crate) fn retire_ready_cross_core(&mut self, tick: u64) -> Option<C220CrossCoreReception> {
+        let id = self.command_retirement_head()?;
+        let command = *self.cross_core_commands.get(&id)?;
+        if tick < command.ready_tick || !self.can_retire_at(tick, id) {
+            return None;
+        }
+        self.cross_core_commands.remove(&id);
+        self.command_retirement.pop_front();
+        self.last_retirement_tick = Some(tick);
+        Some(C220CrossCoreReception {
+            instruction_id: id,
+            pc: command.pc,
+            tick,
+            instruction: command.instruction,
+            payload: command.payload,
+        })
     }
 
     pub(crate) fn admit_control(&mut self, tick: u64, id: u64) -> Result<(), C220FixpEngineError> {
@@ -323,6 +389,7 @@ impl C220FixpEngine {
         self.commands.is_empty()
             && self.factor_commands.is_empty()
             && self.control_commands.is_empty()
+            && self.cross_core_commands.is_empty()
             && self.datapath.is_idle()
             && self.output.bursts().is_empty()
     }

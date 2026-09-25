@@ -20,6 +20,9 @@ impl C220Core {
         if instruction.pipe_code == 3 {
             return self.step_mte1_at(tick, pc, instruction.word);
         }
+        if instruction.pipe_code == 10 {
+            return self.step_fixp_at(tick, pc, instruction.word);
+        }
         if instruction.pipe_code == 5 {
             if !self.mte3.physical {
                 return Err(C220CoreError::Mte3FrontendRequired);

@@ -1,4 +1,5 @@
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
+use crate::isa::c220::control::C220SetCrossCoreInstruction;
 use crate::isa::c220::hflag::{C220HardwareFlagInstruction, C220HardwareFlagStep};
 use crate::isa::c220::mte::factor::{C220FactorLoad, C220FactorLoadInstruction};
 use crate::isa::c220::mte::fixp::{C220FixpDestination, C220FixpInstruction};
@@ -6,6 +7,7 @@ use crate::sim::c220::mte::fixp::{
     C220FixpCommand, C220FixpExecutionError, C220FixpExternalCommand,
 };
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
+use crate::sim::c220::sync::{C220CrossCoreReception, C220DeviceSync};
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
 
@@ -35,6 +37,10 @@ pub(super) enum CapturedFixpOperation {
     },
     Factor(C220FactorLoad),
     HardwareFlag(C220HardwareFlagStep),
+    CrossCore {
+        instruction: C220SetCrossCoreInstruction,
+        payload: C220DeviceSync,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +57,7 @@ pub(super) struct FixpFrontend {
     pub last_issued: Option<u64>,
     pub barriers: VecDeque<super::C220FixpBarrier>,
     pub outcomes: Vec<C220CoreStep>,
+    pub cross_core_outcomes: Vec<C220CrossCoreReception>,
 }
 
 impl FixpFrontend {
@@ -69,7 +76,14 @@ impl C220Core {
         word: u32,
     ) -> Result<CapturedFixpCommand, C220CoreError> {
         let machine = self.state.scalar().machine();
-        let operation = if let Some(instruction) = C220FactorLoadInstruction::decode(word) {
+        let operation = if let Some(instruction) = C220SetCrossCoreInstruction::decode(word) {
+            CapturedFixpOperation::CrossCore {
+                instruction,
+                payload: C220DeviceSync::from_value(
+                    machine.xregs()[usize::from(instruction.source_register)],
+                ),
+            }
+        } else if let Some(instruction) = C220FactorLoadInstruction::decode(word) {
             CapturedFixpOperation::Factor(instruction.capture(machine.xregs()))
         } else if let Some(instruction) = C220HardwareFlagInstruction::decode(word) {
             CapturedFixpOperation::HardwareFlag(instruction.resolve(pc, machine.xregs())?)
@@ -163,6 +177,10 @@ impl C220Core {
         &self.fixp_frontend.outcomes
     }
 
+    pub fn last_fixp_cross_core_outcomes(&self) -> &[C220CrossCoreReception] {
+        &self.fixp_frontend.cross_core_outcomes
+    }
+
     pub fn queued_fixp_commands(&self) -> usize {
         self.fixp_frontend.issued.len() + self.fixp_frontend.commands.len()
     }
@@ -192,6 +210,16 @@ impl C220Core {
             Some(C220StallCause::FixpCommandQueueFull)
         } else if self.outstanding_fixp_commands() >= config.outstanding_limit.get() as usize {
             Some(C220StallCause::FixpOutstandingLimit)
+        } else if self.outstanding_fixp_commands() != 0
+            && self
+                .fixp_frontend
+                .issued
+                .front()
+                .is_some_and(|(_, command)| {
+                    matches!(command.operation, CapturedFixpOperation::CrossCore { .. })
+                })
+        {
+            Some(C220StallCause::FixpDependency)
         } else if self.fixp_frontend.barriers.front().is_some_and(|barrier| {
             self.fixp_frontend
                 .issued
@@ -295,6 +323,20 @@ impl C220Core {
                 command,
             } => self.dispatch_external_fixp_at(tick, issue, destination, command),
             CapturedFixpOperation::Factor(load) => self.dispatch_factor_at(tick, issue, load),
+            CapturedFixpOperation::CrossCore {
+                instruction,
+                payload,
+            } => {
+                self.fixp_engine_mut()
+                    .ok_or(C220CoreError::FixpUnconfigured)?
+                    .admit_cross_core(tick, issue.instruction_id, issue.pc, instruction, payload)?;
+                Ok(C220CoreStep::Executed {
+                    tick,
+                    instruction: C220CoreInstruction::FixpCrossCoreDispatched {
+                        instruction_id: issue.instruction_id,
+                    },
+                })
+            }
             CapturedFixpOperation::HardwareFlag(step) => {
                 let result = self.dispatch_hardware_flag_at(tick, issue.instruction_id, step)?;
                 if matches!(result, C220CoreStep::Executed { .. }) {

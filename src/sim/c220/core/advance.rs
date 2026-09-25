@@ -8,6 +8,7 @@ impl C220Core {
         self.mte3.begin_advance();
         self.vector.begin_advance();
         self.fixp_frontend.outcomes.clear();
+        self.fixp_frontend.cross_core_outcomes.clear();
         if let Some(fixp) = &mut self.fixp {
             fixp.factor_outcomes.clear();
         }
@@ -46,6 +47,9 @@ impl C220Core {
             self.retire_factor_at(event_tick)?;
             if let Some(engine) = self.fixp_engine_mut() {
                 engine.retire_ready_control(event_tick);
+                if let Some(reception) = engine.retire_ready_cross_core(event_tick) {
+                    self.fixp_frontend.cross_core_outcomes.push(reception);
+                }
             }
             self.mte2.commit_ready_at(
                 event_tick,

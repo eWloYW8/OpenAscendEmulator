@@ -331,6 +331,53 @@ mod tests {
                 ..
             }
         ));
+        core.step_word_at(918, empty_factor).unwrap();
+        let cross_word = (2 << 29) | (15 << 21) | (4 << 18) | (10 << 10) | (6 << 2);
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(6, 0xe20)
+            .unwrap();
+        let cross_id = core.next_instruction_id;
+        let cross_pc = core.state.scalar().pc();
+        assert!(matches!(
+            core.step_word_at(919, cross_word).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::FixpQueued { .. },
+                ..
+            }
+        ));
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(6, 0)
+            .unwrap();
+        core.step_word_at(920, empty_factor).unwrap();
+        assert!(core.fixp_frontend_outcomes().iter().any(|event| matches!(
+            event,
+            C220CoreStep::Stalled(crate::sim::c220::schedule::C220Stall {
+                cause: crate::sim::c220::schedule::C220StallCause::FixpDependency,
+                ..
+            })
+        )));
+        core.advance_to(926).unwrap();
+        assert!(core.last_fixp_cross_core_outcomes().is_empty());
+        let command = core.fixp_engine().unwrap().cross_core_commands()[&cross_id];
+        assert_eq!(command.dispatched_tick, 926);
+        assert_eq!(command.ready_tick, 927);
+        assert_eq!(command.payload.value, 0xe20);
+        core.advance_to(927).unwrap();
+        let reception = core.last_fixp_cross_core_outcomes()[0];
+        assert_eq!(reception.instruction_id, cross_id);
+        assert_eq!(reception.pc, cross_pc);
+        assert_eq!(reception.tick, 927);
+        assert_eq!((reception.payload.mode, reception.payload.flag_id), (2, 14));
+        assert!(core.fixp_engine().unwrap().cross_core_commands().is_empty());
+        assert!(core.pending_compute_drain().is_some());
+        core.advance_to(928).unwrap();
+        assert!(core.fixp_engine().unwrap().is_idle());
+        assert!(core.pending_compute_drain().is_none());
+        assert_eq!(core.hardware_flags.pending_mte_flags().count(), 2);
     }
 
     #[test]

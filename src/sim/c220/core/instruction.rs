@@ -30,6 +30,9 @@ pub enum C220CoreInstruction {
         /// Earliest transfer from the issue queue to the command scheduler.
         ready_tick: u64,
     },
+    FixpCrossCoreDispatched {
+        instruction_id: u64,
+    },
     FixpScheduled {
         instruction_id: u64,
         /// Earliest command dispatch; resource dependencies may delay it.
