@@ -5,6 +5,7 @@ use crate::sim::c220::memory::timed_memory::{C220MemoryReadCommand, C220MemoryRe
 use crate::sim::c220::mte::C220MtePipeline;
 use crate::sim::c220::scalar::C220LoadOperands;
 use crate::sim::c220::scalar::lsu::cache::C220DataCache;
+use crate::sim::c220::scalar::lsu::commit::C220RepeatedLoadNotification;
 use crate::sim::c220::scalar::lsu::commit::{
     C220LoadCommitMode, C220LoadId, C220LoadRetirement, C220LsuCommitLane,
 };
@@ -29,6 +30,7 @@ pub(super) struct CoreCache {
     pub(super) pending: BTreeMap<C220LoadId, C220CoreLoadIssue>,
     send_pending: Option<C220LsuReadRequest>,
     pub(super) completions: Vec<C220CoreLoadCompletion>,
+    pub(super) repeated_notifications: Vec<C220RepeatedLoadNotification>,
 }
 
 impl C220Core {
@@ -57,6 +59,7 @@ impl C220Core {
             pending: BTreeMap::new(),
             send_pending: None,
             completions: Vec::new(),
+            repeated_notifications: Vec::new(),
         });
         Ok(())
     }
@@ -77,6 +80,14 @@ impl C220Core {
             .as_mut()
             .and_then(|lsu| lsu.cache.as_mut())
             .map(|loads| std::mem::take(&mut loads.completions))
+            .unwrap_or_default()
+    }
+
+    pub fn take_repeated_load_notifications(&mut self) -> Vec<C220RepeatedLoadNotification> {
+        self.lsu
+            .as_mut()
+            .and_then(|lsu| lsu.cache.as_mut())
+            .map(|loads| std::mem::take(&mut loads.repeated_notifications))
             .unwrap_or_default()
     }
 

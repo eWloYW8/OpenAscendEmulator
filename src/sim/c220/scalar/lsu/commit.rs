@@ -25,6 +25,14 @@ pub enum C220LoadCommitMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct C220LoadId(pub u64);
 
+/// A retirement callback after the instruction's execution state was released.
+/// It occupies the retirement port but does not read memory or write registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220RepeatedLoadNotification {
+    pub instruction: C220LoadId,
+    pub retire_tick: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220LoadRetirement {
     pub instruction: C220LoadId,
@@ -73,6 +81,7 @@ pub enum C220LsuCommitError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220LsuRetirement {
     Load(C220LoadRetirement),
+    RepeatedLoad(C220RepeatedLoadNotification),
     Store {
         data: C220LsuStoreValue,
         retire_tick: u64,
@@ -328,18 +337,22 @@ impl C220LsuCommitLane {
                 }));
             }
         };
-        let Some(pending) = self
-            .pending
-            .get(&request)
-            .copied()
-            .filter(|pending| pending.data.is_some())
-        else {
+        let Some(pending) = self.pending.get(&request).copied() else {
+            self.retirements.pop_front();
+            self.tick = tick;
+            return Ok(Some(C220LsuRetirement::RepeatedLoad(
+                C220RepeatedLoadNotification {
+                    instruction: request,
+                    retire_tick: tick,
+                },
+            )));
+        };
+        let Some(data) = pending.data else {
             self.retirements.pop_front();
             self.tick = tick;
             return Ok(None);
         };
         Self::check_machine(machine, pending.operands)?;
-        let data = pending.data.expect("queued load data");
         let mut writeback_tick = pending.writeback_tick;
         if self.mode == C220LoadCommitMode::Retirement && !pending.suppressed {
             self.write_result(data, machine)?;

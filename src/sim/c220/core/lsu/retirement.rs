@@ -17,6 +17,13 @@ impl CoreLsu {
         machine: &mut ScalarMachine,
     ) -> Result<(), C220CoreError> {
         match self.commits.retire_next_at(tick, machine)? {
+            Some(C220LsuRetirement::RepeatedLoad(notification)) => {
+                self.cache
+                    .as_mut()
+                    .expect("issued load cache")
+                    .repeated_notifications
+                    .push(notification);
+            }
             Some(C220LsuRetirement::Load(retirement)) => {
                 let cache = self.cache.as_mut().expect("issued load cache");
                 let issue = cache

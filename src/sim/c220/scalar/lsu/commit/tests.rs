@@ -191,11 +191,26 @@ fn split_responses_share_state_but_consume_individual_notifications() {
                     );
                     assert!(done.responses.iter().all(Option::is_some));
                     assert_eq!(lane.pending_count(), 0);
-                    assert!(
-                        lane.retire_next_at(tick + 2, &mut machine)
-                            .unwrap()
-                            .is_none()
+                    let repeats = !early && path != C220LsuLoadPath::Cache;
+                    if repeats {
+                        assert!(
+                            lane.issue(tick + 1, C220LoadId(0), operands, &mut machine)
+                                .is_err()
+                        );
+                    }
+                    machine.set_xreg(7, 123).unwrap();
+                    machine.set_xreg(8, 456).unwrap();
+                    let repeated = lane.retire_next_at(tick + 2, &mut machine).unwrap();
+                    assert_eq!(
+                        repeated,
+                        repeats.then_some(C220LsuRetirement::RepeatedLoad(
+                            C220RepeatedLoadNotification {
+                                instruction: C220LoadId(0),
+                                retire_tick: tick + 2,
+                            }
+                        ))
                     );
+                    assert_eq!([machine.xregs()[7], machine.xregs()[8]], [123, 456]);
                     assert_eq!(lane.retirement_occupancy(), 0);
                 }
             }
