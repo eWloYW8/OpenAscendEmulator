@@ -4,6 +4,7 @@ mod cache;
 mod ingress;
 mod retirement;
 mod store;
+mod write_transport;
 use crate::sim::c220::scalar::lsu::commit::{C220LoadCommitMode, C220LsuCommitLane};
 use cache::CoreCache;
 pub use cache::{C220CoreLoadCompletion, C220CoreLoadIssue};
@@ -39,6 +40,7 @@ pub struct C220CoreLsuConfig {
     /// Refill UB responses into cache RAM. Existing valid tags still participate
     /// in lookup when refills are disabled.
     pub cache_ub: bool,
+    pub ub_write_allocate: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +70,7 @@ pub(super) struct CoreLsu {
     port: u32,
     pending: BTreeMap<C220LsuRequestId, C220CoreLsuIssue>,
     send_pending: Option<C220LsuWriteRequest>,
+    ub_writes: VecDeque<(u64, C220LsuWriteRequest)>,
     pub(super) next_tick: Option<u64>,
     completions: Vec<C220CoreLsuCompletion>,
     cache: Option<CoreCache>,
@@ -107,6 +110,7 @@ impl C220Core {
             port,
             pending: BTreeMap::new(),
             send_pending: None,
+            ub_writes: VecDeque::new(),
             next_tick: None,
             completions: Vec::new(),
             cache: None,
@@ -210,6 +214,7 @@ impl C220Core {
             pipeline.ub_vector_subcore()
                 != crate::sim::c220::mte::interface::biu_read::C220BiuSubcore::Cube,
         )?;
+        lsu.receive_ub_write_at(tick, pipeline, &mut self.state.ub)?;
         let scheduler = &mut lsu.scheduler;
         scheduler
             .writes
@@ -261,7 +266,7 @@ impl C220Core {
         }
         scheduler.process_direct_stores(tick)?;
         if let Some(cache) = &mut lsu.cache {
-            scheduler.process_stores(tick, &mut cache.cache)?;
+            scheduler.process_stores(tick, &mut cache.cache, lsu.config.ub_write_allocate)?;
             scheduler.deliver_values(
                 tick,
                 &mut lsu.commits,
@@ -287,32 +292,8 @@ impl C220Core {
         if let Some(loads) = &mut lsu.cache {
             loads.send_at(tick, pipeline, scheduler)?;
         }
-        if lsu.send_pending.is_none() {
-            let ready = pipeline
-                .biu_bus_writes()
-                .is_some_and(|bus| bus.cache_can_send(lsu.port));
-            lsu.send_pending = scheduler
-                .writes
-                .dispatch_clock(tick, false, ready)
-                .map_err(C220LsuSchedulerError::from)?
-                .into_iter()
-                .next();
-        }
-        if let Some(request) = lsu.send_pending {
-            let bytes =
-                u32::try_from(request.byte_len).map_err(|_| C220CoreError::InvalidCacheWrite)?;
-            if pipeline.send_cache_write(C220MemoryWriteCommand {
-                ready_tick: tick,
-                tag: C220MemoryWriteId::Cache {
-                    port: lsu.port,
-                    transaction: request.id.sequence(),
-                },
-                address: request.line.address,
-                bytes,
-            })? {
-                lsu.send_pending = None;
-            }
-        }
+        lsu.send_writes_at(tick, pipeline)?;
+        let scheduler = &lsu.scheduler;
         lsu.next_tick = if lsu.ingress.is_empty()
             && lsu.pending.is_empty()
             && lsu.stores.is_empty()
@@ -322,6 +303,7 @@ impl C220Core {
             && scheduler.reads.requests().next().is_none()
             && scheduler.writes.requests().next().is_none()
             && lsu.send_pending.is_none()
+            && lsu.ub_writes.is_empty()
         {
             None
         } else {

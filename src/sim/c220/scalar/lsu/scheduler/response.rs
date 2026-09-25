@@ -267,7 +267,7 @@ impl C220LsuRequestScheduler {
         Ok(())
     }
 
-    fn resolve_values(
+    pub(super) fn resolve_values(
         &mut self,
         tick: u64,
         key: C220LsuLineKey,

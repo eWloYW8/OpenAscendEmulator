@@ -95,9 +95,9 @@ fn captured_stores_coalesce_and_complete_through_cache_or_refill() {
             maintenance_draining: false,
         };
         for tick in 1..=6 {
-            scheduler.process_stores(tick, &mut cache).unwrap();
+            scheduler.process_stores(tick, &mut cache, true).unwrap();
             let before = scheduler.clone();
-            scheduler.process_stores(tick, &mut cache).unwrap();
+            scheduler.process_stores(tick, &mut cache, true).unwrap();
             assert_eq!(scheduler, before);
             for stage in [C220LsuStage::M2, C220LsuStage::M1, C220LsuStage::M0] {
                 scheduler

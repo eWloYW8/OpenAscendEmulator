@@ -335,16 +335,8 @@ impl C220LsuStoreBuffer {
         {
             return Err(C220LsuStoreError::InvalidRange);
         }
-        let entry = self.entry(key).ok_or(C220LsuStoreError::MissingEntry)?;
-        if key.memory != C220LsuMemory::Ub || entry.state == C220LsuStoreState::Idle {
-            return Err(C220LsuStoreError::InvalidWriteResponse);
-        }
-        if write_allocate && entry.valid.iter().any(|valid| !valid) {
-            return Err(C220LsuStoreError::IncompleteLine);
-        }
-        if !write_allocate {
-            self.merge_line(key, backing_line)?;
-        }
+        let bytes = self.prepare_ub_write(key, write_allocate, backing_line)?;
+        self.merge_line(key, &bytes)?;
         let entry = self.entry(key).expect("validated pending store");
         backing_line.copy_from_slice(entry.bytes());
         let mut notifications: Vec<_> = entry
@@ -375,6 +367,27 @@ impl C220LsuStoreBuffer {
             line,
             notifications,
         })
+    }
+
+    pub(super) fn prepare_ub_write(
+        &self,
+        key: C220LsuLineKey,
+        write_allocate: bool,
+        backing_line: &[u8],
+    ) -> Result<Vec<u8>, C220LsuStoreError> {
+        if backing_line.len() != self.config.line_bytes {
+            return Err(C220LsuStoreError::InvalidRange);
+        }
+        let entry = self.entry(key).ok_or(C220LsuStoreError::MissingEntry)?;
+        if key.memory != C220LsuMemory::Ub || entry.state == C220LsuStoreState::Idle {
+            return Err(C220LsuStoreError::InvalidWriteResponse);
+        }
+        if write_allocate && entry.valid.iter().any(|valid| !valid) {
+            return Err(C220LsuStoreError::IncompleteLine);
+        }
+        let mut bytes = backing_line.to_vec();
+        entry.write_valid_bytes(&mut bytes)?;
+        Ok(bytes)
     }
 
     fn entry_mut(

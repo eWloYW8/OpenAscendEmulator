@@ -566,6 +566,81 @@ fn run_core_ub_loads(core: &mut C220Core, mut tick: u64) {
             .next()
             .is_none()
     );
+    run_core_ub_stores(core, tick + 102);
+}
+
+fn run_core_ub_stores(core: &mut C220Core, mut tick: u64) {
+    use crate::sim::c220::scalar::lsu::scheduler::C220LsuStorePath;
+    core.state
+        .ub
+        .write_states(128, &vec![MemoryByteState::Known(0x44); 128])
+        .unwrap();
+    let cached = core.lsu_config().unwrap().cache_ub;
+    // An untouched line misses; the second address was populated by the loads.
+    for (address, hit) in [(136, false), (8, cached)] {
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(5, 0x80000 + address).unwrap();
+        machine.set_xreg(9, 0x8877_6655_4433_2211).unwrap();
+        let word = (20 << 24) | (3 << 22) | (9 << 17) | (5 << 12) | 8;
+        assert!(matches!(
+            core.step_word_at(tick, word).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Store(_),
+                ..
+            }
+        ));
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(9, 0)
+            .unwrap();
+        let done = (tick + 1..tick + 150)
+            .find_map(|now| {
+                core.advance_to(now).unwrap();
+                core.take_store_completions().into_iter().next()
+            })
+            .expect("UB store completes");
+        assert_eq!(
+            done.data.path,
+            if hit {
+                C220LsuStorePath::Cache
+            } else {
+                C220LsuStorePath::UbWrite
+            }
+        );
+        let value = 0x8877_6655_4433_2211_u64.to_le_bytes();
+        if hit {
+            assert_ne!(core.state.ub.read_known(address, 8).unwrap(), value);
+        } else {
+            assert_eq!(core.state.ub.read_known(address, 8).unwrap(), value);
+        }
+        tick = done.retire_tick + 100;
+        core.advance_to(tick).unwrap();
+        assert_eq!(core.state.ub.read_known(address, 8).unwrap(), value);
+        assert_eq!(
+            core.state.ub.read_known(address - 8, 8).unwrap(),
+            vec![
+                if address == 136 {
+                    0x44
+                } else if hit {
+                    0x22
+                } else {
+                    0x33
+                };
+                8
+            ]
+        );
+        assert!(
+            core.lsu_scheduler()
+                .unwrap()
+                .writes
+                .requests()
+                .next()
+                .is_none()
+        );
+        assert_eq!(core.pending_store_instructions().count(), 0);
+        tick += 2;
+    }
 }
 
 #[test]
@@ -713,6 +788,7 @@ fn native_mte3_write_path(mode: u8) {
             layout: C220CacheAddressLayout::new(6, 3, 8, 0xffffffffff).unwrap(),
             partition_stack: false,
             cache_ub: mode == 3,
+            ub_write_allocate: mode == 3,
         })
         .unwrap();
     }

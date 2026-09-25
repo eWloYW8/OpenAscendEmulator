@@ -73,29 +73,63 @@ impl C220LsuRequestScheduler {
         backing_line: &mut [u8],
         cache: &C220DataCache,
     ) -> Result<Option<C220LsuWriteCompletion>, C220LsuSchedulerError> {
+        let prior = backing_line.to_vec();
+        self.apply_ub_write_response(id, write_allocate, &prior, cache, |_, bytes| {
+            backing_line.copy_from_slice(bytes);
+            Ok(())
+        })
+    }
+
+    /// Apply the live UB write before releasing entries or producing values.
+    /// A failed sink leaves the response retryable with its data owners intact.
+    pub fn apply_ub_write_response<E>(
+        &mut self,
+        id: C220LsuWriteId,
+        write_allocate: bool,
+        backing_line: &[u8],
+        cache: &C220DataCache,
+        write: impl FnOnce(C220LsuLineKey, &[u8]) -> Result<(), E>,
+    ) -> Result<Option<C220LsuWriteCompletion>, E>
+    where
+        E: From<C220LsuSchedulerError>,
+    {
         let key = self
             .writes
             .request(id)
-            .ok_or(C220LsuWriteError::MissingRequest)?
+            .ok_or(C220LsuSchedulerError::Write(
+                C220LsuWriteError::MissingRequest,
+            ))?
             .line;
         if key.memory != C220LsuMemory::Ub {
-            return Err(C220LsuSchedulerError::MissingWriteData);
+            return Err(C220LsuSchedulerError::MissingWriteData.into());
         }
+        self.enter_write_response(id)?;
         if self.stores.entry(key).is_some() {
-            return self
-                .complete_ub_store_write(id, write_allocate, backing_line)
-                .map(Some);
+            let mut bytes = self
+                .stores
+                .prepare_ub_write(key, write_allocate, backing_line)
+                .map_err(C220LsuSchedulerError::from)?;
+            write(key, &bytes)?;
+            return Ok(Some(self.complete_ub_store_write(
+                id,
+                write_allocate,
+                &mut bytes,
+            )?));
         }
         let location = cache
             .find_way(key.address, key.memory)
             .ok_or(C220LsuSchedulerError::MissingWriteData)?;
-        let bytes = cache.line(location)?;
+        let bytes = cache.line(location).map_err(C220LsuSchedulerError::from)?;
         if bytes.len() != backing_line.len() {
-            return Err(super::super::cache::C220CacheError::InvalidLineSize.into());
+            return Err(C220LsuSchedulerError::Cache(
+                super::super::cache::C220CacheError::InvalidLineSize,
+            )
+            .into());
         }
-        self.enter_write_response(id)?;
-        backing_line.copy_from_slice(bytes);
-        self.writes.finish_response(id)?;
+        write(key, bytes)?;
+        self.writes
+            .finish_response(id)
+            .map_err(C220LsuSchedulerError::from)?;
         Ok(None)
     }
 
@@ -167,7 +201,7 @@ impl C220LsuRequestScheduler {
         let completion =
             self.stores
                 .complete_ub_write(key, write_allocate, backing_line, &mut self.misses)?;
-        self.resolve_load_values(
+        self.resolve_values(
             self.writes.tick(),
             key,
             &completion.notifications,

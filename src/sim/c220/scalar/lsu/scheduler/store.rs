@@ -7,9 +7,10 @@ use crate::sim::c220::scalar::{C220ScalarMappedAddress, C220StoreOperands};
 pub enum C220LsuStorePath {
     Cache,
     Refill,
+    UbWrite,
 }
 
-/// Store bytes have reached cache RAM; retirement transport remains separate.
+/// Store data completion; retirement transport remains separate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220LsuStoreValue {
     pub request: C220LsuRequestId,
@@ -58,7 +59,6 @@ impl C220LsuRequestScheduler {
         let split = operands.second_source_operand.is_some() && address >> 6 != second_address >> 6;
         let bytes = if split { width } else { operands.bytes().len() };
         if ![1, 2, 4, 8].contains(&operands.width_bytes)
-            || mapped.memory != C220LsuMemory::External
             || offset + bytes > size as usize
             || (split && second_address % size + width as u64 > size)
         {
@@ -202,8 +202,10 @@ impl C220LsuRequestScheduler {
         &mut self,
         tick: u64,
         cache: &mut C220DataCache,
+        ub_write_allocate: bool,
     ) -> Result<(), C220LsuSchedulerError> {
         self.reads.check_tick(tick)?;
+        self.writes.check_tick(tick)?;
         if self.store_next_tick.is_none_or(|next| next > tick) {
             return Ok(());
         }
@@ -212,6 +214,7 @@ impl C220LsuRequestScheduler {
         }
         let next = tick.checked_add(1).ok_or(EventError::TimeOverflow)?;
         self.reads.advance_to(tick)?;
+        self.writes.advance_to(tick)?;
         self.stores.advance_timeouts();
         let ready: Vec<_> = self
             .stores
@@ -226,6 +229,9 @@ impl C220LsuRequestScheduler {
                 .get(&first)
                 .ok_or(C220LsuSchedulerError::MissingStoreLookup)?;
             if entry.cache_hit() {
+                if key.memory == C220LsuMemory::Ub {
+                    self.writes.check_enqueue(1)?;
+                }
                 let data_location = cache
                     .find_way(key.address, key.memory)
                     .ok_or(C220LsuSchedulerError::MissingCacheLine)?;
@@ -234,11 +240,20 @@ impl C220LsuRequestScheduler {
                     .flatten()
                     .ok_or(C220LsuSchedulerError::MissingStoreLookup)?;
                 entry.write_valid_bytes(cache.line_mut(data_location)?)?;
-                cache.mark_dirty(dirty_location)?;
+                if key.memory == C220LsuMemory::External {
+                    cache.mark_dirty(dirty_location)?;
+                } else {
+                    self.writes.enqueue(key)?;
+                }
                 let entry = self.stores.remove(key).expect("flushed store");
                 for request in entry.requests() {
                     self.finish_store(*request, tick, C220LsuStorePath::Cache);
                 }
+            } else if key.memory == C220LsuMemory::Ub && !ub_write_allocate {
+                self.writes.check_enqueue(1)?;
+                self.writes.enqueue(key)?;
+                self.stores
+                    .set_state(key, super::super::store_buffer::C220LsuStoreState::Fetching)?;
             } else {
                 self.enqueue_store_read(key, pending.partition_address)?;
             }
@@ -264,7 +279,16 @@ impl C220LsuRequestScheduler {
     pub(super) fn resolve_store_values(&mut self, tick: u64, notifications: &[C220LsuCompletion]) {
         for notification in notifications {
             if let C220LsuCompletion::Store(request) = notification {
-                self.finish_store(*request, tick, C220LsuStorePath::Refill);
+                let path = if self
+                    .pending_stores
+                    .get(request)
+                    .is_some_and(|store| store.mapped.memory == C220LsuMemory::Ub)
+                {
+                    C220LsuStorePath::UbWrite
+                } else {
+                    C220LsuStorePath::Refill
+                };
+                self.finish_store(*request, tick, path);
             }
         }
     }
