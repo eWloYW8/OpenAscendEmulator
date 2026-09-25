@@ -5,6 +5,7 @@ pub mod fixp;
 pub mod load2d;
 pub mod load2d_sparse;
 pub mod load2d_transpose;
+pub mod load3d;
 pub mod out_to_l1;
 mod registers;
 pub mod set2d;

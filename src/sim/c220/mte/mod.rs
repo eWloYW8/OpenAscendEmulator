@@ -5,6 +5,7 @@ mod generator;
 pub use generator::C220MteGeneratorCallback;
 pub mod fixp;
 pub mod interface;
+pub mod load3d;
 pub mod mte1;
 pub mod mte2;
 pub mod mte3;

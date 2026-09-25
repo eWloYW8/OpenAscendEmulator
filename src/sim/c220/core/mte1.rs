@@ -14,6 +14,26 @@ use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
 
 impl C220Core {
+    /// Inspect LOAD3Dv2 inputs without issuing or advancing the core clock.
+    pub fn capture_load3d_v2(
+        &self,
+        word: u32,
+    ) -> Result<
+        Option<crate::sim::c220::mte::load3d::C220Load3dV2Command>,
+        crate::sim::c220::mte::load3d::C220Load3dCaptureError,
+    > {
+        let machine = self.state.scalar().machine();
+        crate::isa::c220::mte::load3d::C220Load3dV2Instruction::decode(word)
+            .map(|instruction| {
+                crate::sim::c220::mte::load3d::C220Load3dV2Command::capture(
+                    instruction,
+                    machine.xregs(),
+                    |register| machine.spr_value(register),
+                )
+            })
+            .transpose()
+    }
+
     pub(super) fn step_mte1_at(
         &mut self,
         tick: u64,
