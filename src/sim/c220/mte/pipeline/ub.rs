@@ -1,6 +1,8 @@
 use super::{C220BiuSubcore, C220MtePipeline, C220MtePipelineError, C220MtePipelineEvent};
 use crate::sim::c220::memory::C220UbCycle;
-use crate::sim::c220::memory::ub_service::{C220UbMtePort, C220UbMteService, C220UbServiceRequest};
+use crate::sim::c220::memory::ub_service::{
+    C220UbService, C220UbServicePort, C220UbServiceRequest, C220UbVectorActivity,
+};
 use crate::sim::c220::mte::interface::biu_write::{C220BiuWriteSource, C220BiuWriteSourceRequest};
 use crate::sim::c220::mte::interface::ub_read::{
     C220UbReadAcknowledgment, C220UbReadFragment, C220UbReadInterface,
@@ -95,10 +97,7 @@ impl C220MtePipeline {
         Ok(self.ub_read[index].take_completion(self.events.tick(), tag)?)
     }
 
-    pub fn ub_memory(
-        &self,
-        core: C220BiuSubcore,
-    ) -> Result<&C220UbMteService, C220MtePipelineError> {
+    pub fn ub_memory(&self, core: C220BiuSubcore) -> Result<&C220UbService, C220MtePipelineError> {
         Ok(&self.ub_memory[Self::ub_read_index(core)?])
     }
 
@@ -125,17 +124,17 @@ impl C220MtePipeline {
             let interface = &mut self.ub_write[index];
             let memory = &mut self.ub_memory[index];
             let read = &mut self.ub_read[index];
-            if let Some(response) = memory.take_response(tick, C220UbMtePort::Read)? {
+            if let Some(response) = memory.take_response(tick, C220UbServicePort::MteRead)? {
                 let request = read.receive_response(tick, response.request.id)?;
                 self.trace
                     .push(C220MtePipelineEvent::UbReadResponse(core, request));
             }
-            if memory.can_receive(tick, C220UbMtePort::Read)
+            if memory.can_receive(tick, C220UbServicePort::MteRead)
                 && let Some(request) = read.take_request(tick)?
             {
                 assert!(memory.receive(
                     tick,
-                    C220UbMtePort::Read,
+                    C220UbServicePort::MteRead,
                     C220UbServiceRequest {
                         id: request.id,
                         address: request.fragment.address,
@@ -145,17 +144,17 @@ impl C220MtePipeline {
                 self.trace
                     .push(C220MtePipelineEvent::UbReadRequest(core, request));
             }
-            if let Some(response) = memory.take_response(tick, C220UbMtePort::Write0)? {
+            if let Some(response) = memory.take_response(tick, C220UbServicePort::MteWrite0)? {
                 let request = interface.receive_response(tick, response.request.id)?;
                 self.trace
                     .push(C220MtePipelineEvent::UbResponse(core, request));
             }
-            if memory.can_receive(tick, C220UbMtePort::Write0)
+            if memory.can_receive(tick, C220UbServicePort::MteWrite0)
                 && let Some(request) = interface.take_request(tick)?
             {
                 assert!(memory.receive(
                     tick,
-                    C220UbMtePort::Write0,
+                    C220UbServicePort::MteWrite0,
                     C220UbServiceRequest {
                         id: request.id,
                         address: request.fragment.destination_address,
@@ -168,8 +167,11 @@ impl C220MtePipeline {
             let connected = core == self.biu_subcore;
             let cycle = memory.arbitrate(
                 tick,
-                if connected { vector_banks } else { 0 },
-                connected && vector_trigger,
+                C220UbVectorActivity {
+                    bank_mask: if connected { vector_banks } else { 0 },
+                    triggered: connected && vector_trigger,
+                    ..Default::default()
+                },
             )?;
             if !cycle.decisions.is_empty() || !cycle.completed.is_empty() {
                 self.trace

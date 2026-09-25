@@ -780,7 +780,7 @@ fn conversion_uses_live_deqscale_while_fused_keeps_its_captured_descriptor_addre
 #[test]
 fn masked_write_reacquires_bank_and_delays_mte_until_second_grant() {
     use crate::sim::c220::memory::ub_service::{
-        C220UbMtePort, C220UbMteService, C220UbServiceRequest,
+        C220UbService, C220UbServicePort, C220UbServiceRequest,
     };
     use crate::sim::c220::vector::timing::{C220VectorUopKind, C220VectorUopStages};
 
@@ -849,7 +849,7 @@ fn masked_write_reacquires_bank_and_delays_mte_until_second_grant() {
         .unwrap();
     assert_eq!(pipeline.pending_visibility_tick(), Some(17));
     assert_eq!(pipeline.pending_drain_tick(), Some(17));
-    let mut memory = C220UbMteService::default();
+    let mut memory = C220UbService::default();
     for tick in 0..=17 {
         let releases = pipeline.advance_to(tick, &mut core).unwrap();
         if tick == 7 || tick == 8 {
@@ -871,7 +871,7 @@ fn masked_write_reacquires_bank_and_delays_mte_until_second_grant() {
             memory
                 .receive(
                     tick,
-                    C220UbMtePort::Write0,
+                    C220UbServicePort::MteWrite0,
                     C220UbServiceRequest {
                         id: 1,
                         address: 0,
@@ -880,7 +880,16 @@ fn masked_write_reacquires_bank_and_delays_mte_until_second_grant() {
                 )
                 .unwrap();
         }
-        let mte = memory.arbitrate(tick, banks, !cycles.is_empty()).unwrap();
+        let mte = memory
+            .arbitrate(
+                tick,
+                crate::sim::c220::memory::ub_service::C220UbVectorActivity {
+                    bank_mask: banks,
+                    triggered: !cycles.is_empty(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         if tick == 7 || tick == 14 {
             let decision = cycles[0].decisions[0];
             assert!(decision.granted);

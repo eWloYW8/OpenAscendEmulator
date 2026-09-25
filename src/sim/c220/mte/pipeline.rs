@@ -51,9 +51,7 @@ use crate::isa::c220::mte::set2d::{C220Set2dDestination, C220Set2dFill};
 use crate::sim::c220::memory::biu_read::{C220BiuBusReadError, C220BiuBusReads};
 use crate::sim::c220::memory::biu_write::{C220BiuBusWriteError, C220BiuBusWrites};
 use crate::sim::c220::memory::timed_memory::{C220TimedMemory, C220TimedMemoryError};
-use crate::sim::c220::memory::ub_service::{
-    C220UbMteService, C220UbServiceCycle, C220UbServiceError,
-};
+use crate::sim::c220::memory::ub_service::{C220UbService, C220UbServiceCycle, C220UbServiceError};
 use crate::sim::c220::mte::set2d::{
     C220Set2dBandwidths, C220Set2dEventOutcome, C220Set2dEvents, C220Set2dFrontend,
     C220Set2dFrontendError, C220Set2dGates, C220Set2dIssue, C220Set2dOutputs,
@@ -338,7 +336,7 @@ pub struct C220MtePipeline {
     biu_bus_writes: Option<C220BiuBusWrites>,
     timed_memory: Option<C220TimedMemory>,
     ub_read_valid: [EventId; 2],
-    ub_memory: [C220UbMteService; 2],
+    ub_memory: [C220UbService; 2],
     last_ub_service: Option<u64>,
     dma_hardware_sync_blocked: bool,
     selected_mte2_generator: Option<Mte2Generator>,
@@ -482,7 +480,7 @@ impl C220MtePipeline {
             dma_tails: Vec::new(),
             biu_bus_reads: None,
             ub_write: std::array::from_fn(|_| C220UbWriteInterface::default()),
-            ub_memory: std::array::from_fn(|_| C220UbMteService::default()),
+            ub_memory: std::array::from_fn(|_| C220UbService::default()),
             last_ub_service: None,
             dma_hardware_sync_blocked: false,
             selected_mte2_generator: None,
@@ -562,7 +560,7 @@ impl C220MtePipeline {
                 .iter()
                 .flatten()
                 .all(C220BiuWriteSource::is_idle)
-            && self.ub_memory.iter().all(C220UbMteService::is_idle)
+            && self.ub_memory.iter().all(C220UbService::is_idle)
             && self
                 .biu_read
                 .as_ref()
