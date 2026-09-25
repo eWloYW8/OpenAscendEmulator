@@ -26,6 +26,7 @@ pub struct C220Load3dCoordinate {
     pub k_iteration: u32,
     pub remaining_bytes: u32,
     pub phase_length: u32,
+    pub filter_remaining: u32,
     pub last_k: bool,
     pub invalid_k: bool,
     pub spatial_padding: bool,
@@ -289,6 +290,7 @@ impl Iterator for C220Load3dCoordinates {
                 .wrapping_sub(self.k as u32)
                 .wrapping_mul(self.storage_bytes),
             phase_length: self.phase.length,
+            filter_remaining: u32::from(geometry.filter_w).wrapping_sub(self.initial_x as u32),
             last_k: next_k as i32
                 >= self
                     .phase

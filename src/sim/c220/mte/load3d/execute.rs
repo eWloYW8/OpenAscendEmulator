@@ -41,6 +41,29 @@ mod tests {
         let input: Vec<u8> = (0..640).map(|index| (index % 251) as u8).collect();
         memory.l1_mut().write_known(0, &input).unwrap();
         let report = command.execute(&mut memory).unwrap();
+        let requests = command.read_requests().unwrap();
+        assert_eq!(requests.len(), 8);
+        assert_eq!(requests.iter().filter(|r| r.completes_output).count(), 2);
+        assert!(
+            requests[..4]
+                .iter()
+                .all(|r| r.input_bytes == 128 && r.destination_address == 1024)
+        );
+        assert!(
+            requests[4..]
+                .iter()
+                .all(|r| r.input_bytes == 32 && r.destination_address == 1536)
+        );
+        assert_eq!(requests[4].source_address, 512);
+        let mut merged = command;
+        merged.matrix.width = 64;
+        merged.operands.geometry.filter_w = 4;
+        merged.operands.geometry.channel_size = 8;
+        merged.operands.extent.k_length = 32;
+        let requests = merged.read_requests().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].input_bytes, 152);
+        assert!(requests[0].completes_output);
         assert_eq!(report.spr54, Some(40));
         assert_eq!(
             (report.tiles, report.coordinates, report.output_packets),

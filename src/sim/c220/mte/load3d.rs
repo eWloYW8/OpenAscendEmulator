@@ -11,6 +11,8 @@ mod writeback;
 pub use writeback::C220Load3dWrite;
 mod execute;
 pub use execute::{C220Load3dExecutionError, C220Load3dExecutionReport};
+mod requests;
+pub use requests::{C220Load3dReadRequest, C220Load3dRequestError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("LOAD3Dv2 requires SPR {register}")]
