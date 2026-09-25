@@ -47,6 +47,12 @@ impl C220Core {
         let next_tick = tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?;
         let operands = C220StoreOperands::capture(self.state.scalar().machine(), pc, word)
             .map_err(crate::sim::common::scalar::ScalarInstructionError::from)?;
+        if operands.second_source_operand.is_some()
+            && (operands.requires_pair_split()
+                || (operands.effective_address & 63) + operands.bytes().len() as u64 > 64)
+        {
+            return Err(C220CoreError::UnsupportedTimedLsuAccess);
+        }
         if let Some(resume_tick) = [67, 68]
             .into_iter()
             .filter_map(|spr| self.scalar_timing.pending_spr_retirement(spr))

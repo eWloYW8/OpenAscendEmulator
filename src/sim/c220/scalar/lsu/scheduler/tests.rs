@@ -10,7 +10,7 @@ fn captured_stores_coalesce_and_complete_through_cache_or_refill() {
     use crate::architecture::Architecture;
     use crate::sim::c220::scalar::{C220ScalarMappedAddress, C220StoreOperands};
     use crate::sim::common::scalar::ScalarMachine;
-    for hit in [false, true] {
+    for (hit, pair) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut scheduler = C220LsuRequestScheduler::new(
             4,
             2,
@@ -60,10 +60,15 @@ fn captured_stores_coalesce_and_complete_through_cache_or_refill() {
         let first = C220StoreOperands::capture(
             &machine,
             0,
-            (20 << 24) | (3 << 22) | (5 << 17) | (5 << 12) | 8,
+            if pair {
+                (9 << 24) | (3 << 22) | (5 << 17) | (5 << 12) | (6 << 7) | 1
+            } else {
+                (20 << 24) | (3 << 22) | (5 << 17) | (5 << 12) | 8
+            },
         )
         .unwrap();
-        assert_eq!(first.updated_base, Some(0x110));
+        assert_eq!(first.updated_base, (!pair).then_some(0x110));
+        assert_eq!(first.second_source_operand, pair.then_some((6, 1)));
         assert_eq!(first.source_operand, Some((5, 0x108)));
         assert_eq!(machine.xregs()[5], 0x108);
         let second =
@@ -83,6 +88,7 @@ fn captured_stores_coalesce_and_complete_through_cache_or_refill() {
             .unwrap()
             .unwrap();
         machine.set_xreg(5, u64::MAX).unwrap();
+        machine.set_xreg(6, u64::MAX).unwrap();
         let hazards = C220LsuExternalHazards {
             maintenance_active: false,
             maintenance_draining: false,
@@ -139,6 +145,9 @@ fn captured_stores_coalesce_and_complete_through_cache_or_refill() {
         let location = cache.find_way(0x100, C220LsuMemory::External).unwrap();
         let mut expected = [0x55; 64];
         expected[8..16].copy_from_slice(&0x108_u64.to_le_bytes());
+        if pair {
+            expected[16..24].copy_from_slice(&1_u64.to_le_bytes());
+        }
         expected[9] = 0xff;
         assert_eq!(cache.line(location).unwrap(), expected);
         assert!(cache.sets()[0].ways()[0].dirty);

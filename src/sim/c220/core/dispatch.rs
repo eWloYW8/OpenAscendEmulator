@@ -63,15 +63,13 @@ impl C220Core {
                     ScalarInstruction::ScalarIndexedStore { .. }
                     | ScalarInstruction::ScalarIndexedImmediateStore { .. }
                     | ScalarInstruction::ScalarStoreImmediate { .. }
+                    | ScalarInstruction::ScalarPairStore { .. }
                     | ScalarInstruction::ScalarLoadStoreImmediate {
                         operation: ScalarLoadStoreOperation::Store,
                         ..
                     },
                 ) => return self.step_store_at(tick, word),
-                Some(
-                    ScalarInstruction::ScalarPairLoad { .. }
-                    | ScalarInstruction::ScalarPairStore { .. },
-                ) => {
+                Some(ScalarInstruction::ScalarPairLoad { .. }) => {
                     return Err(C220CoreError::UnsupportedTimedLsuAccess);
                 }
                 _ => {}

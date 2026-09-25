@@ -41,8 +41,9 @@ impl C220LsuRequestScheduler {
         let address = mapped.address & 0x0000_ffff_ffff_ffff;
         let offset = (address % size) as usize;
         if ![1, 2, 4, 8].contains(&operands.width_bytes)
+            || operands.requires_pair_split()
             || mapped.memory != C220LsuMemory::External
-            || offset + usize::from(operands.width_bytes) > size as usize
+            || offset + operands.bytes().len() > size as usize
         {
             return Err(C220LsuSchedulerError::UnsupportedStoreAccess);
         }

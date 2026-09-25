@@ -259,7 +259,7 @@ fn run_core_stores(core: &mut C220Core, mut tick: u64) {
         };
         let words = [
             first_store,
-            (4 << 24) | (3 << 22) | (10 << 17) | (5 << 12),
+            (9 << 24) | (3 << 22) | (10 << 17) | (5 << 12) | (9 << 7) | 1,
             (3 << 24) | (3 << 22) | (7 << 17) | (6 << 12),
         ];
         let mut issues = Vec::new();
@@ -316,6 +316,7 @@ fn run_core_stores(core: &mut C220Core, mut tick: u64) {
         let bytes = cache.line(location).unwrap();
         assert_eq!(&bytes[..8], &first_value.to_le_bytes());
         assert_eq!(&bytes[8..16], &0xaabb_ccdd_u64.to_le_bytes());
+        assert_eq!(&bytes[16..24], &0x1122_3344_u64.to_le_bytes());
         assert_eq!(core.memory.read_known_at(address, 64).unwrap(), backing);
         assert_eq!(core.pending_store_instructions().count(), 0);
         assert_eq!(core.lsu_retirement_occupancy(), 0);
@@ -324,6 +325,22 @@ fn run_core_stores(core: &mut C220Core, mut tick: u64) {
             C220CoreStep::Executed { .. }
         ));
         tick += 2;
+        for (offset, dtype) in [(56, 3), (61, 1)] {
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_xreg(5, address + offset)
+                .unwrap();
+            let pc = core.state.scalar().pc();
+            let word = (9 << 24) | (dtype << 22) | (10 << 17) | (5 << 12) | (9 << 7) | 1;
+            assert!(matches!(
+                core.step_word_at(tick, word),
+                Err(C220CoreError::UnsupportedTimedLsuAccess)
+            ));
+            assert_eq!(core.state.scalar().pc(), pc);
+            assert_eq!(core.pending_store_instructions().count(), 0);
+            tick += 1;
+        }
     }
 }
 
