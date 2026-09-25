@@ -245,15 +245,24 @@ impl ScalarMachine {
             width_bytes,
             base_register,
             signed_offset,
-            post_index: false,
+            post_index,
             value,
             ..
         }) = ScalarInstruction::from_word(self.architecture, word)
         else {
             return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
         };
+        if post_index && self.architecture != Architecture::Dav2201 {
+            return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
+        }
         let prior_base_value = self.xregs[usize::from(base_register)];
-        let effective_address = prior_base_value.wrapping_add(signed_offset as i64 as u64);
+        let adjusted = prior_base_value.wrapping_add(signed_offset as i64 as u64);
+        let effective_address = if post_index {
+            prior_base_value
+        } else {
+            adjusted
+        };
+        let updated_base = post_index.then_some(adjusted);
         let mut bytes = [0_u8; 8];
         match value {
             ScalarStoreImmediateValue::Zero => {}
@@ -262,6 +271,9 @@ impl ScalarMachine {
         }
         bus.write(effective_address, &bytes[..usize::from(width_bytes)])
             .map_err(ScalarMemoryExecutionError::Backend)?;
+        if let Some(base) = updated_base {
+            self.xregs[usize::from(base_register)] = base;
+        }
         Ok(ScalarImmediateStoreStep {
             pc,
             word,
@@ -269,6 +281,7 @@ impl ScalarMachine {
             width_bytes,
             base_register,
             prior_base_value,
+            updated_base,
             value,
             bytes,
         })

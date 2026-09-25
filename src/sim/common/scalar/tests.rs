@@ -1881,6 +1881,45 @@ fn scalar_immediate_store_writes_only_the_selected_bytes() {
             }
         }
     }
+    for offset in [-2048_i16, -1, 0, 1, 2047] {
+        for dtype in 0..4 {
+            for value in 0..3 {
+                let raw = u32::from(offset as u16) & 0xfff;
+                let word = (15 << 24)
+                    | (dtype << 22)
+                    | (5 << 12)
+                    | ((raw & 0xf80) << 10)
+                    | ((raw & 0x7f) << 5)
+                    | 4
+                    | value;
+                let mut machine = ScalarMachine::new(Architecture::Dav2201, [0; 32], 0);
+                machine.set_xreg(5, 8).unwrap();
+                let before = machine.clone();
+                let captured =
+                    crate::sim::c220::scalar::C220StoreOperands::capture(&machine, 0, word)
+                        .unwrap();
+                assert_eq!(machine, before);
+                let mut bus = TestBus::new(8);
+                let step = machine
+                    .execute_immediate_store_word(0, word, &mut bus)
+                    .unwrap();
+                let updated = 8_u64.wrapping_add(offset as i64 as u64);
+                assert_eq!(step.effective_address, 8);
+                assert_eq!(step.updated_base, Some(updated));
+                assert_eq!(machine.xregs()[5], updated);
+                assert_eq!(captured.effective_address, 8);
+                assert_eq!(captured.updated_base, Some(updated));
+                let width = 1_usize << dtype;
+                let expected: u64 = match value {
+                    0 => 0,
+                    1 => 1,
+                    _ => u64::MAX,
+                };
+                assert_eq!(&bus.bytes[..width], &expected.to_le_bytes()[..width]);
+                assert_eq!(captured.bytes(), &bus.bytes[..width]);
+            }
+        }
+    }
 }
 
 #[test]
@@ -1892,26 +1931,26 @@ fn scalar_immediate_store_rejects_unsupported_forms_and_backend_errors_atomicall
     let mut bus = TestBus::new(0x1c7df4);
     bus.bytes.fill(0xa5);
 
-    for word in [WORD | 3, WORD | 4] {
+    assert!(matches!(
+        machine.execute_immediate_store_word(0x113120bc, WORD | 3, &mut bus),
+        Err(ScalarMemoryExecutionError::UnsupportedWord { .. })
+    ));
+    assert_eq!(machine, before);
+    assert_eq!(bus.bytes, [0xa5; 32]);
+    assert_eq!(bus.accesses, 0);
+
+    bus.fail = true;
+    for word in [WORD, WORD | 4] {
         assert!(matches!(
-            machine.execute_immediate_store_word(0x113120bc, word, &mut bus),
-            Err(ScalarMemoryExecutionError::UnsupportedWord { .. })
+            machine.execute_instruction(0x113120bc, word, &mut bus),
+            Err(ScalarInstructionError::Memory(
+                ScalarMemoryExecutionError::Backend(_)
+            ))
         ));
         assert_eq!(machine, before);
         assert_eq!(bus.bytes, [0xa5; 32]);
         assert_eq!(bus.accesses, 0);
     }
-
-    bus.fail = true;
-    assert!(matches!(
-        machine.execute_instruction(0x113120bc, WORD, &mut bus),
-        Err(ScalarInstructionError::Memory(
-            ScalarMemoryExecutionError::Backend(_)
-        ))
-    ));
-    assert_eq!(machine, before);
-    assert_eq!(bus.bytes, [0xa5; 32]);
-    assert_eq!(bus.accesses, 0);
 
     let mut c310 = ScalarMachine::new(Architecture::Dav3510, [0; 32], 0x55);
     c310.set_xreg(30, 0x208028).unwrap();

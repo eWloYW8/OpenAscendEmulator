@@ -249,8 +249,16 @@ fn run_core_stores(core: &mut C220Core, mut tick: u64) {
         machine.set_xreg(6, address).unwrap();
         machine.set_xreg(9, 0x1122_3344).unwrap();
         machine.set_xreg(10, 0xaabb_ccdd).unwrap();
+        let (first_store, first_value) = if path == C220LsuStorePath::Refill {
+            ((15 << 24) | (3 << 22) | (5 << 12) | (8 << 5) | 4 | 1, 1_u64)
+        } else {
+            (
+                (20 << 24) | (3 << 22) | (9 << 17) | (5 << 12) | 8,
+                0x1122_3344,
+            )
+        };
         let words = [
-            (20 << 24) | (3 << 22) | (9 << 17) | (5 << 12) | 8,
+            first_store,
             (4 << 24) | (3 << 22) | (10 << 17) | (5 << 12),
             (3 << 24) | (3 << 22) | (7 << 17) | (6 << 12),
         ];
@@ -302,11 +310,11 @@ fn run_core_stores(core: &mut C220Core, mut tick: u64) {
         assert_eq!(stores[1].retire_tick, stores[0].retire_tick + 1);
         assert_ne!(loads[0].retirement.retire_tick, stores[0].retire_tick);
         assert_ne!(loads[0].retirement.retire_tick, stores[1].retire_tick);
-        assert_eq!(core.state.scalar().machine().xregs()[7], 0x1122_3344);
+        assert_eq!(core.state.scalar().machine().xregs()[7], first_value);
         let cache = core.data_cache().unwrap();
         let location = cache.find_way(address, C220LsuMemory::External).unwrap();
         let bytes = cache.line(location).unwrap();
-        assert_eq!(&bytes[..8], &0x1122_3344_u64.to_le_bytes());
+        assert_eq!(&bytes[..8], &first_value.to_le_bytes());
         assert_eq!(&bytes[8..16], &0xaabb_ccdd_u64.to_le_bytes());
         assert_eq!(core.memory.read_known_at(address, 64).unwrap(), backing);
         assert_eq!(core.pending_store_instructions().count(), 0);

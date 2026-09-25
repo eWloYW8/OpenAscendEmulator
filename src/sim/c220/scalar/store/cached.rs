@@ -88,7 +88,7 @@ impl C220StoreOperands {
                     base_register,
                     width_bytes,
                     signed_offset,
-                    post_index: false,
+                    post_index,
                     value,
                 } => (
                     base_register,
@@ -96,7 +96,7 @@ impl C220StoreOperands {
                     None,
                     None,
                     signed_offset as i64 as u64,
-                    false,
+                    post_index,
                     constant(value),
                 ),
                 _ => return Err(unsupported()),

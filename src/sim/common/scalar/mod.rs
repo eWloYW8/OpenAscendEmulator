@@ -228,6 +228,7 @@ pub struct ScalarImmediateStoreStep {
     pub width_bytes: u8,
     pub base_register: u8,
     pub prior_base_value: u64,
+    pub updated_base: Option<u64>,
     pub value: ScalarStoreImmediateValue,
     pub bytes: [u8; 8],
 }
