@@ -7,6 +7,8 @@ mod tiles;
 pub use tiles::{C220Load3dTile, C220Load3dTiles};
 mod coordinates;
 pub use coordinates::{C220Load3dCoordinate, C220Load3dCoordinateError, C220Load3dCoordinates};
+mod writeback;
+pub use writeback::C220Load3dWrite;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("LOAD3Dv2 requires SPR {register}")]
