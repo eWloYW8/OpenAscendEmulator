@@ -365,34 +365,79 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
     .unwrap();
     let id = core.next_instruction_id();
     let initial_ub = core.state.ub().read_states(0, 8192).unwrap();
-    use crate::sim::c220::memory::biu_read::{C220BiuReadCacheConfig, C220BiuReadCacheKind};
-    use crate::sim::c220::memory::timed_memory::{C220MemoryReadCommand, C220MemoryReadId};
-    let pipeline = core.mte_pipeline.as_mut().unwrap();
-    let cache_port = pipeline
-        .connect_cache_read_port(
-            C220BiuReadCacheKind::Data,
-            C220BiuReadCacheConfig {
-                request_capacity: NonZeroU32::new(2).unwrap(),
-                response_capacity: NonZeroU32::new(1).unwrap(),
-                request_latency: 1,
-                response_latency: 1,
+    use crate::sim::c220::memory::biu_read::C220BiuReadCacheConfig;
+    use crate::sim::c220::memory::timed_memory::C220MemoryReadId;
+    use crate::sim::c220::scalar::lsu::{cache::*, miss_buffer::*, scheduler::*, store_buffer::*};
+    let mut lsu = C220LsuRequestScheduler::new(
+        4,
+        2,
+        2,
+        2,
+        C220LsuMissBuffer::new(C220LsuMissConfig {
+            line_bytes: 64,
+            main_entries: 2,
+            sub_entries: 2,
+        })
+        .unwrap(),
+        C220LsuStoreBuffer::new(C220LsuStoreConfig {
+            line_bytes: 64,
+            main_entries: 2,
+            sub_entries: 2,
+            timeout_ticks: 4,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let line = C220LsuLineKey {
+        address: 0x2fc0,
+        memory: C220LsuMemory::External,
+    };
+    let load = lsu
+        .admit(
+            0,
+            C220LsuRequest {
+                line,
+                access: C220LsuAccess::Load,
             },
+            None,
         )
+        .unwrap()
+        .unwrap()
+        .0;
+    let read = lsu
+        .enqueue_load_miss(line, load, line.address)
+        .unwrap()
+        .unwrap();
+    let mut cache = C220DataCache::new(
+        C220CacheAddressLayout::new(6, 0, 6, u64::MAX).unwrap(),
+        64,
+        vec![
+            C220CacheSet::new(
+                vec![C220CacheTag {
+                    valid: false,
+                    dirty: false,
+                    age: 0,
+                    memory: C220LsuMemory::External,
+                    tag: 0,
+                }],
+                None,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let cache_port = core
+        .connect_cache_read_port(C220BiuReadCacheConfig {
+            request_capacity: NonZeroU32::new(2).unwrap(),
+            response_capacity: NonZeroU32::new(1).unwrap(),
+            request_latency: 1,
+            response_latency: 1,
+        })
         .unwrap();
     let cache_tag = C220MemoryReadId::DataCache {
         port: cache_port,
-        transaction: 1,
+        transaction: read.sequence(),
     };
-    assert!(
-        pipeline
-            .send_cache_read(C220MemoryReadCommand {
-                ready_tick: 0,
-                tag: cache_tag,
-                address: source,
-                bytes: 64,
-            })
-            .unwrap()
-    );
     let mut cache_completed = false;
     assert!(
         matches!(core.step_word_at(0, word).unwrap(), C220CoreStep::Executed {
@@ -407,14 +452,26 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
     for tick in 1..250 {
         core.advance_to(tick).unwrap();
         core.advance_to(tick).unwrap();
-        if let Some(beat) = core
-            .mte_pipeline
-            .as_mut()
+        if tick == 1 {
+            let request = lsu.reads.dispatch_clock(tick, false, true).unwrap()[0];
+            assert!(core.send_cache_read_at(tick, cache_port, request).unwrap());
+            core.memory
+                .write_known_at(line.address, &[0x31; 64])
+                .unwrap();
+        }
+        if let Some((completed, result, refill)) = core
+            .commit_cache_read_at(tick, cache_port, &mut lsu, &mut cache)
             .unwrap()
-            .take_cache_read_return(C220BiuReadCacheKind::Data, cache_port)
         {
-            assert_eq!(beat.tag, cache_tag);
-            assert_eq!(beat.transaction_id, 0);
+            assert_eq!(completed, read);
+            assert_eq!(result.notifications, [C220LsuCompletion::Load(load)]);
+            assert_eq!(
+                result.load_line,
+                core.memory.read_known_at(line.address, 64).unwrap()
+            );
+            assert_eq!(cache.line(refill.location).unwrap(), result.load_line);
+            assert_eq!(lsu.reads.outstanding(), 0);
+            assert!(lsu.misses.entries().is_empty());
             assert!(!cache_completed);
             cache_completed = true;
         }

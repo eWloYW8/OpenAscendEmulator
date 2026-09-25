@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use super::cache::C220CacheError;
 use super::direct_store::C220LsuDirectStoreBuffer;
+use super::read_queue::{C220LsuReadError, C220LsuReadQueue};
 
 use super::miss_buffer::{C220LsuMissBuffer, C220LsuMissError};
 use super::store_buffer::{C220LsuLineKey, C220LsuStoreBuffer, C220LsuStoreError};
@@ -24,6 +25,7 @@ mod tests;
 
 mod direct_store;
 use direct_store::PendingDirectStore;
+mod read;
 mod response;
 mod write_response;
 pub use response::C220LsuReadCompletion;
@@ -85,6 +87,8 @@ pub enum C220LsuSchedulerError {
     Cache(#[from] C220CacheError),
     #[error(transparent)]
     Write(#[from] C220LsuWriteError),
+    #[error(transparent)]
+    Read(#[from] C220LsuReadError),
     #[error("write response does not match the required data source")]
     MissingWriteData,
     #[error(transparent)]
@@ -104,12 +108,14 @@ pub struct C220LsuRequestScheduler {
     direct_events: EventDispatcher<()>,
     direct_event: EventId,
     pub writes: C220LsuWriteQueue,
+    pub reads: C220LsuReadQueue,
     eviction_data: BTreeMap<u64, Vec<u8>>,
 }
 
 impl C220LsuRequestScheduler {
     pub fn new(
         capacity: u32,
+        read_capacity: u32,
         write_capacity: u32,
         direct_store_capacity: usize,
         misses: C220LsuMissBuffer,
@@ -123,6 +129,7 @@ impl C220LsuRequestScheduler {
         let process = direct_events.add_process((), false);
         direct_events.subscribe(direct_event, process);
         let writes = C220LsuWriteQueue::new(write_capacity, stores.line_bytes());
+        let reads = C220LsuReadQueue::new(read_capacity, stores.line_bytes());
         Ok(Self {
             pipeline: C220LsuRequestPipeline::new(capacity)?,
             requests: BTreeMap::new(),
@@ -134,6 +141,7 @@ impl C220LsuRequestScheduler {
             misses,
             stores,
             writes,
+            reads,
             direct_events,
             direct_event,
             eviction_data: BTreeMap::new(),
@@ -163,10 +171,12 @@ impl C220LsuRequestScheduler {
                 return Err(C220LsuSchedulerError::UnalignedLine);
             }
         }
+        self.reads.check_tick(tick)?;
         self.writes.check_tick(tick)?;
         self.direct_events.check_advance_to(tick)?;
         let admitted = self.pipeline.admit(tick, second.is_some())?;
         self.writes.advance_to(tick)?;
+        self.reads.advance_to(tick)?;
         self.direct_events.advance_to(tick)?;
         let Some(ids) = admitted else {
             return Ok(None);
@@ -229,6 +239,7 @@ impl C220LsuRequestScheduler {
         tick: u64,
         external: C220LsuExternalHazards,
     ) -> Result<C220LsuStageOutcome, C220LsuSchedulerError> {
+        self.reads.check_tick(tick)?;
         self.writes.check_tick(tick)?;
         self.direct_events.check_advance_to(tick)?;
         let mut stall = self
@@ -253,6 +264,7 @@ impl C220LsuRequestScheduler {
             C220LsuStage::M2 => self.advance_direct_store_m2(tick, stall.is_some())?,
         };
         self.writes.advance_to(tick)?;
+        self.reads.advance_to(tick)?;
         self.direct_events.advance_to(tick)?;
         let consumed = match progress {
             C220LsuStageProgress::Advanced(id) if stage == C220LsuStage::M2 => {

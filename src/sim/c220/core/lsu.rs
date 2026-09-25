@@ -18,6 +18,7 @@ use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CoreLsuConfig {
     pub request_capacity: u32,
+    pub read_capacity: u32,
     pub write_capacity: u32,
     pub direct_store_capacity: usize,
     pub misses: C220LsuMissConfig,
@@ -68,6 +69,7 @@ impl C220Core {
         }
         let scheduler = C220LsuRequestScheduler::new(
             config.request_capacity,
+            config.read_capacity,
             config.write_capacity,
             config.direct_store_capacity,
             C220LsuMissBuffer::new(config.misses).map_err(C220LsuSchedulerError::from)?,

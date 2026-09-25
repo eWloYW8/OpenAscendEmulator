@@ -155,6 +155,7 @@ fn native_mte3_write_path(mode: u8) {
         use crate::sim::c220::scalar::lsu::store_buffer::C220LsuStoreConfig;
         core.configure_lsu(C220CoreLsuConfig {
             request_capacity: 4,
+            read_capacity: 2,
             write_capacity: 2,
             direct_store_capacity: 2,
             misses: C220LsuMissConfig {

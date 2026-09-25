@@ -1,4 +1,5 @@
 use super::{C220Core, C220CoreError};
+mod read;
 use crate::sim::c220::memory::timed_memory::{C220MemoryWriteCommand, C220MemoryWriteId};
 use crate::sim::c220::scalar::lsu::scheduler::C220LsuRequestScheduler;
 use crate::sim::c220::scalar::lsu::store_buffer::C220LsuCompletion;

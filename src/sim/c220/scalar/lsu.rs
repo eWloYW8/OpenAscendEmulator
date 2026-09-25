@@ -5,6 +5,7 @@ use thiserror::Error;
 pub mod cache;
 pub mod direct_store;
 pub mod miss_buffer;
+pub mod read_queue;
 pub mod scheduler;
 pub mod store_buffer;
 pub mod write_queue;

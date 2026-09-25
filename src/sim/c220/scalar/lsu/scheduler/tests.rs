@@ -12,6 +12,7 @@ fn response_ownership_controls_linked_completion_order_and_data() {
             4,
             2,
             2,
+            2,
             C220LsuMissBuffer::new(C220LsuMissConfig {
                 line_bytes: 64,
                 main_entries: 2,
@@ -47,10 +48,22 @@ fn response_ownership_controls_linked_completion_order_and_data() {
             .stores
             .store(line, store, 7, &[0xaa], false)
             .unwrap();
-        scheduler
-            .misses
-            .push(line, load, &mut scheduler.stores)
+        let read = scheduler
+            .enqueue_load_miss(line, load, line.address)
+            .unwrap()
             .unwrap();
+        assert!(
+            scheduler
+                .reads
+                .dispatch_clock(0, true, true)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            scheduler.reads.dispatch_clock(1, true, true).unwrap()[0].id,
+            read
+        );
+        assert_eq!(scheduler.reads.outstanding(), 1);
         let before = scheduler.clone();
         assert!(scheduler.complete_miss_read(line, &[0; 8], None).is_err());
         assert_eq!(scheduler, before);
@@ -83,9 +96,29 @@ fn response_ownership_controls_linked_completion_order_and_data() {
         );
         assert_eq!(cache_ram, cache_before);
         assert_eq!(scheduler, before);
+        assert!(
+            scheduler
+                .apply_cached_read_response::<C220LsuSchedulerError>(
+                    read,
+                    &mut cache_ram,
+                    |_, _| { Err(C220LsuSchedulerError::MissingCacheLine) }
+                )
+                .is_err()
+        );
+        assert_eq!(scheduler.reads.outstanding(), 0);
+        assert!(scheduler.reads.request(read).is_some());
         let (completion, refill) = scheduler
-            .complete_cached_miss_read(line, line.address, &[0x33; 64], &mut cache_ram)
+            .apply_cached_read_response::<C220LsuSchedulerError>(
+                read,
+                &mut cache_ram,
+                |key, size| {
+                    assert_eq!(key, line);
+                    assert_eq!(size, 64);
+                    Ok(vec![0x33; size])
+                },
+            )
             .unwrap();
+        assert!(scheduler.reads.request(read).is_none());
         let evicted = refill.writeback.unwrap();
         assert_eq!(evicted.address, 128);
         assert_eq!(evicted.bytes, [0x77; 64]);
@@ -171,14 +204,18 @@ fn response_ownership_controls_linked_completion_order_and_data() {
             .stores
             .store(line, store, 9, &[0xbb], false)
             .unwrap();
-        scheduler
-            .stores
-            .set_state(line, C220LsuStoreState::Fetching)
-            .unwrap();
-        scheduler
-            .misses
-            .push(line, load, &mut scheduler.stores)
-            .unwrap();
+        let read = scheduler.enqueue_store_read(line, line.address).unwrap();
+        assert_eq!(
+            scheduler
+                .enqueue_load_miss(line, load, line.address)
+                .unwrap(),
+            None
+        );
+        assert_eq!(scheduler.reads.requests().count(), 1);
+        assert_eq!(
+            scheduler.reads.dispatch_clock(2, true, true).unwrap()[0].id,
+            read
+        );
         let mut buffer_only = scheduler.clone();
         let expected_completion = buffer_only
             .complete_store_read(
@@ -201,7 +238,9 @@ fn response_ownership_controls_linked_completion_order_and_data() {
         assert_eq!(scheduler, before);
         assert_eq!(cache_ram, cache_before);
         let (completion, refill) = scheduler
-            .complete_cached_store_read(line, line.address, &[0x55; 64], &mut cache_ram)
+            .apply_cached_read_response::<C220LsuSchedulerError>(read, &mut cache_ram, |_, size| {
+                Ok(vec![0x55; size])
+            })
             .unwrap();
         assert_eq!(completion, expected_completion);
         assert_eq!(scheduler.misses, buffer_only.misses);
@@ -272,6 +311,7 @@ fn response_ownership_controls_linked_completion_order_and_data() {
 fn live_miss_hazards_replay_stores_until_the_line_is_released() {
     let mut scheduler = C220LsuRequestScheduler::new(
         4,
+        2,
         2,
         2,
         C220LsuMissBuffer::new(C220LsuMissConfig {

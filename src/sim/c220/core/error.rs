@@ -49,6 +49,8 @@ pub enum C220CoreError {
         "cache BIU handoff requires an in-flight external write with a representable byte length"
     )]
     InvalidCacheWrite,
+    #[error("cache read requires an in-flight external request of at most one response beat")]
+    InvalidCacheRead,
     #[error(transparent)]
     Lsu(#[from] crate::sim::c220::scalar::lsu::scheduler::C220LsuSchedulerError),
     #[error(transparent)]
