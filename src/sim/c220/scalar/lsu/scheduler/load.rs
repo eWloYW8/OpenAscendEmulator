@@ -184,6 +184,7 @@ impl C220LsuRequestScheduler {
         let mut result = None;
         if stage == C220LsuStage::M2 {
             self.validate_store_m2(tick)?;
+            self.validate_atomic_m2(tick)?;
         }
         if let Some((id, pending)) = pending
             && stage == C220LsuStage::M2
@@ -218,6 +219,7 @@ impl C220LsuRequestScheduler {
         let outcome = self.advance_impl(stage, tick, external)?;
         if let C220LsuStageProgress::Advanced(id) = outcome.progress {
             self.advance_store_data(stage, tick, id, cache)?;
+            self.advance_atomic_data(stage, tick, id, cache)?;
             self.advance_maintenance_stage(stage, tick, id, cache)?;
         }
         if let C220LsuStageProgress::Advanced(id) = outcome.progress

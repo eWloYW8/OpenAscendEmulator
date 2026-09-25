@@ -224,6 +224,10 @@ impl C220LsuRequestScheduler {
         for key in ready {
             let entry = self.stores.entry(key).expect("ready store");
             let first = entry.requests()[0];
+            if self.pending_atomics.contains_key(&first) {
+                self.flush_atomic_store(tick, key, cache)?;
+                continue;
+            }
             let pending = *self
                 .pending_stores
                 .get(&first)
@@ -262,7 +266,13 @@ impl C220LsuRequestScheduler {
         Ok(())
     }
 
-    fn finish_store(&mut self, request: C220LsuRequestId, tick: u64, path: C220LsuStorePath) {
+    pub(super) fn finish_store(
+        &mut self,
+        request: C220LsuRequestId,
+        tick: u64,
+        path: C220LsuStorePath,
+    ) {
+        self.finish_atomic_store(request, tick, None);
         if let Some(pending) = self.pending_stores.remove(&request) {
             self.values
                 .push_back(C220LsuValue::Store(C220LsuStoreValue {

@@ -47,6 +47,95 @@ fn maintenance_write_samples_live_data_and_retries_before_resetting_tags() {
     )
     .unwrap();
     let location = super::super::cache::C220CacheLocation { index: 0, way: 0 };
+    for hit in [false, true] {
+        use crate::architecture::Architecture;
+        use crate::sim::c220::scalar::C220AtomicStoreOperands;
+        use crate::sim::common::scalar::ScalarMachine;
+        let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+        machine.set_xreg(1, 0x4433_2211).unwrap();
+        machine.set_xreg(2, 0x100).unwrap();
+        machine.set_spr_value(67, 1 << 25).unwrap();
+        let operands = C220AtomicStoreOperands::capture(&machine, 0, 0x1682_2000).unwrap();
+        let mut staged = scheduler.clone();
+        let mut ram = cache.clone();
+        if !hit {
+            ram.invalidate(location).unwrap();
+        }
+        let id = staged.admit_atomic_store(0, operands).unwrap().unwrap();
+        for tick in 1..5 {
+            staged.process_stores(tick, &mut ram, false).unwrap();
+            for stage in [C220LsuStage::M2, C220LsuStage::M1, C220LsuStage::M0] {
+                staged
+                    .advance_with_cache(
+                        stage,
+                        tick,
+                        C220LsuExternalHazards {
+                            maintenance_active: false,
+                            maintenance_draining: false,
+                        },
+                        &mut ram,
+                    )
+                    .unwrap();
+            }
+        }
+        let completed = staged.take_atomic_completions();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].request, id);
+        assert_eq!(completed[0].tick, 4);
+        assert_eq!(completed[0].cache_hit.is_some(), hit);
+        assert_eq!(&ram.line(location).unwrap()[..4], &[0x11, 0x22, 0x33, 0x44]);
+        assert!(ram.tag(location).unwrap().atomic);
+        assert!(ram.tag(location).unwrap().dirty);
+        assert!(staged.stores.entries().is_empty());
+        assert_eq!(staged.next_store_tick(), None);
+        assert!(staged.writes.requests().next().is_none());
+    }
+    {
+        use super::super::cache::C220AtomicCacheHit;
+        let mut ram = cache.clone();
+        let key = C220LsuLineKey {
+            address: 0x100,
+            memory: C220LsuMemory::External,
+        };
+        let mut stores = scheduler.stores.clone();
+        stores
+            .store(key, C220LsuRequestId(0), 3, &[0x41, 0x42], true)
+            .unwrap();
+        let entry = stores.entry(key).unwrap();
+        ram.line_mut(location).unwrap().fill(0x99);
+        assert_eq!(
+            entry.write_atomic_hit(&mut ram, location).unwrap(),
+            C220AtomicCacheHit::UpdatedDirtyAtomicLine
+        );
+        assert_eq!(
+            &ram.line(location).unwrap()[2..6],
+            &[0x99, 0x41, 0x42, 0x99]
+        );
+        ram.refill(key.address, key.address, key.memory, &[0x99; 64], true)
+            .unwrap();
+        let before = ram.clone();
+        assert_eq!(
+            entry.write_atomic_hit(&mut ram, location).unwrap(),
+            C220AtomicCacheHit::DirtyNonAtomicConflict
+        );
+        assert_eq!(ram, before);
+        ram.refill(key.address, key.address, key.memory, &[0x99; 64], false)
+            .unwrap();
+        let before_tag = ram.tag(location).unwrap();
+        assert_eq!(
+            entry.write_atomic_hit(&mut ram, location).unwrap(),
+            C220AtomicCacheHit::ReplacedCleanLine
+        );
+        assert_eq!(ram.line(location).unwrap(), entry.bytes());
+        assert_eq!(
+            ram.tag(location).unwrap(),
+            C220CacheTag {
+                atomic: true,
+                ..before_tag
+            }
+        );
+        assert_eq!(stores.entry(key).unwrap().requests().len(), 1);
+    }
     use super::super::cache::C220CacheMaintenanceTarget;
     for (target, cleaned) in [
         (C220CacheMaintenanceTarget::External, false),

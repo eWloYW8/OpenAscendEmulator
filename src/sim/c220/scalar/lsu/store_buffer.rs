@@ -81,6 +81,16 @@ pub struct C220LsuStoreEntry {
 }
 
 impl C220LsuStoreEntry {
+    /// Apply this entry's current data and byte mask to an atomic cache hit.
+    /// Request retirement and removal remain the controller's responsibility.
+    pub fn write_atomic_hit(
+        &self,
+        cache: &mut super::cache::C220DataCache,
+        location: super::cache::C220CacheLocation,
+    ) -> Result<super::cache::C220AtomicCacheHit, super::cache::C220CacheError> {
+        cache.write_atomic_hit(location, &self.bytes, &self.valid)
+    }
+
     pub const fn key(&self) -> C220LsuLineKey {
         self.key
     }

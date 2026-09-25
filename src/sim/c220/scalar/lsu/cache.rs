@@ -4,6 +4,13 @@ mod data;
 pub use data::{C220CacheLocation, C220CacheRefill, C220DataCache};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220AtomicCacheHit {
+    ReplacedCleanLine,
+    UpdatedDirtyAtomicLine,
+    DirtyNonAtomicConflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CacheTag {
     pub atomic: bool,
     pub valid: bool,

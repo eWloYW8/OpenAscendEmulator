@@ -17,6 +17,7 @@ use super::{
 pub enum C220LsuAccess {
     Load,
     Store,
+    AtomicStore,
     Other,
 }
 
@@ -25,8 +26,10 @@ mod tests;
 
 mod direct_store;
 use direct_store::PendingDirectStore;
+mod atomic;
 mod load;
 mod store;
+pub use atomic::C220LsuAtomicCompletion;
 use store::PendingStore;
 pub use store::{C220LsuStorePath, C220LsuStoreValue};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +138,8 @@ pub struct C220LsuRequestScheduler {
     pending_loads: BTreeMap<C220LsuRequestId, PendingLoad>,
     values: VecDeque<C220LsuValue>,
     pending_stores: BTreeMap<C220LsuRequestId, PendingStore>,
+    pending_atomics: BTreeMap<C220LsuRequestId, atomic::PendingAtomic>,
+    atomic_completions: Vec<C220LsuAtomicCompletion>,
     store_next_tick: Option<u64>,
     eviction_data: BTreeMap<u64, Vec<u8>>,
     maintenance_writes: BTreeMap<super::write_queue::C220LsuWriteId, C220LsuMaintenanceWrite>,
@@ -177,6 +182,8 @@ impl C220LsuRequestScheduler {
             pending_loads: BTreeMap::new(),
             values: VecDeque::new(),
             pending_stores: BTreeMap::new(),
+            pending_atomics: BTreeMap::new(),
+            atomic_completions: Vec::new(),
             store_next_tick: None,
             direct_events,
             direct_event,
@@ -267,7 +274,7 @@ impl C220LsuRequestScheduler {
                     return Some(C220LsuStall::StoreForbidden);
                 }
             }
-            C220LsuAccess::Other => return None,
+            C220LsuAccess::AtomicStore | C220LsuAccess::Other => return None,
         }
         if self.writes.has_hazard(key) {
             return Some(C220LsuStall::Eviction);
@@ -287,6 +294,7 @@ impl C220LsuRequestScheduler {
         if self.pipeline.head(stage).is_some_and(|head| {
             self.pending_loads.contains_key(&head.request)
                 || self.pending_stores.contains_key(&head.request)
+                || self.pending_atomics.contains_key(&head.request)
                 || self.pending_maintenance.contains_key(&head.request)
         }) {
             return Err(C220LsuSchedulerError::CacheRequired);

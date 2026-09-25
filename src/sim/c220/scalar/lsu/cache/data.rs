@@ -25,6 +25,58 @@ pub struct C220DataCache {
 }
 
 impl C220DataCache {
+    /// Allocate an atomic store line without a backing read or refill writeback.
+    /// The controller must resolve replacement hazards before this data action.
+    pub fn install_atomic_line(
+        &mut self,
+        address: u64,
+        partition_address: u64,
+        bytes: &[u8],
+    ) -> Result<C220CacheLocation, C220CacheError> {
+        if self.line_bytes != 64 || bytes.len() != 64 {
+            return Err(C220CacheError::InvalidLineSize);
+        }
+        let index = self.layout.index(address);
+        let set = &mut self.sets[index as usize];
+        let way = set.victim(partition_address);
+        set.install(way, self.layout.tag(address), C220LsuMemory::External, true)?;
+        set.ways[way].atomic = true;
+        self.data[index as usize][way].copy_from_slice(bytes);
+        Ok(C220CacheLocation { index, way })
+    }
+
+    /// Publish a buffered atomic store after the controller selects its hit.
+    /// This stage copies already computed store data; it does not add again.
+    /// Dirty ordinary lines report a conflict without modifying data or tags.
+    pub fn write_atomic_hit(
+        &mut self,
+        location: C220CacheLocation,
+        bytes: &[u8],
+        valid: &[bool],
+    ) -> Result<super::C220AtomicCacheHit, C220CacheError> {
+        use super::C220AtomicCacheHit;
+        if self.line_bytes != 64 || bytes.len() != 64 || valid.len() != 64 {
+            return Err(C220CacheError::InvalidLineSize);
+        }
+        let tag = self.tag(location)?;
+        if tag.dirty && !tag.atomic {
+            return Ok(C220AtomicCacheHit::DirtyNonAtomicConflict);
+        }
+        let line = self.line_mut(location)?;
+        if tag.dirty {
+            for ((destination, source), written) in line.iter_mut().zip(bytes).zip(valid) {
+                if *written {
+                    *destination = *source;
+                }
+            }
+            Ok(C220AtomicCacheHit::UpdatedDirtyAtomicLine)
+        } else {
+            line.copy_from_slice(bytes);
+            self.sets[location.index as usize].ways[location.way].atomic = true;
+            Ok(C220AtomicCacheHit::ReplacedCleanLine)
+        }
+    }
+
     pub fn tag(&self, location: C220CacheLocation) -> Result<super::C220CacheTag, C220CacheError> {
         self.sets
             .get(location.index as usize)
