@@ -1755,5 +1755,38 @@ mod tests {
         flags.advance_to(162).unwrap();
         assert_eq!(bulk.hardware_flags, flags);
         assert!(bulk.pending_mte1_commands().next().is_none());
+        let mte2_cross = (cross & !(15 << 10)) | (4 << 10);
+        bulk.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(6, 0xc10)
+            .unwrap();
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Mte2(issue),
+            ..
+        } = bulk.step_word_at(163, mte2_cross).unwrap()
+        else {
+            panic!("MTE2 cross-core admission")
+        };
+        assert!(matches!(
+            issue.timing,
+            crate::sim::c220::mte::mte2::C220Mte2IssueTiming::CrossCore { dispatch_tick: 163 }
+        ));
+        assert!(bulk.mte2.last_outcomes().is_empty());
+        assert!(bulk.mte2.is_busy());
+        bulk.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(6, 0)
+            .unwrap();
+        bulk.advance_to(164).unwrap();
+        let reception = bulk.mte2.last_outcomes()[0].cross_core_reception().unwrap();
+        assert_eq!(reception.instruction_id, issue.instruction_id);
+        assert_eq!(reception.tick, 164);
+        assert_eq!(reception.payload.value, 0xc10);
+        assert_eq!((reception.payload.mode, reception.payload.flag_id), (1, 12));
+        assert!(!bulk.mte2.is_busy());
+        flags.advance_to(164).unwrap();
+        assert_eq!(bulk.hardware_flags, flags);
     }
 }

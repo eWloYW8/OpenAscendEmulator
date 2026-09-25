@@ -16,6 +16,34 @@ impl C220Core {
         if instruction.pipe_code == 3 {
             return self.step_mte1_at(tick, pc, instruction.word);
         }
+        if instruction.pipe_code == 4 {
+            let pipeline = self
+                .mte_pipeline
+                .as_mut()
+                .ok_or(C220CoreError::MteUnconfigured)?;
+            if self.mte2.is_busy() || !pipeline.can_issue_mte2_cross_core() {
+                return Ok(C220CoreStep::Stalled(C220Stall {
+                    tick,
+                    pc,
+                    resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+                    cause: C220StallCause::Mte2Dependency,
+                }));
+            }
+            let value =
+                self.state.scalar().machine().xregs()[usize::from(instruction.source_register)];
+            let issue = self.mte2.issue_cross_core(
+                pipeline,
+                self.next_instruction_id,
+                pc,
+                instruction,
+                C220DeviceSync::from_value(value),
+            )?;
+            self.state.commit_c220_sequential_issue();
+            return Ok(C220CoreStep::Executed {
+                tick,
+                instruction: C220CoreInstruction::Mte2(issue),
+            });
+        }
         let (pending, cause) = match instruction.pipe_code {
             1 => (
                 self.vector.pending_drain_tick(),

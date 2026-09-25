@@ -3082,8 +3082,8 @@ fn vabs_uses_modeled_five_tick_execution_stage() {
     assert_eq!(reception.payload.flag_id, 11);
     assert_eq!(timed.state.scalar().pc(), pc + 4);
     assert!(matches!(
-        timed.step_word_at(retire + 1, cross | (4 << 10)),
-        Err(C220CoreError::UnsupportedCrossCorePipe { pipe: 4, .. })
+        timed.step_word_at(retire + 1, cross | (5 << 10)),
+        Err(C220CoreError::UnsupportedCrossCorePipe { pipe: 5, .. })
     ));
     assert_eq!(timed.state.scalar().pc(), pc + 4);
 }

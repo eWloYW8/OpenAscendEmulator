@@ -6,6 +6,10 @@ use crate::sim::c220::mte::set2d::{C220Set2dIssue, C220Set2dResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte2Command {
+    CrossCore {
+        instruction: crate::isa::c220::control::C220SetCrossCoreInstruction,
+        payload: crate::sim::c220::sync::C220DeviceSync,
+    },
     MovOutToUb(C220Mte2TransferPlan),
     MovOutToL1(C220Mte2L1TransferPlan),
     Set2d(C220Set2dFill),
@@ -13,6 +17,8 @@ pub enum C220Mte2Command {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte2IssueTiming {
+    /// Zero-uop notification dispatched through the selected generator.
+    CrossCore { dispatch_tick: u64 },
     /// Zero burst count or length; no generator, memory traffic or rate estimate.
     Disabled,
     /// Requests traverse the generator; completion must come from the consumer.
@@ -58,6 +64,7 @@ pub struct C220Mte2EventState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220Mte2Result {
+    CrossCore(crate::sim::c220::sync::C220DeviceSync),
     MovOutToUb(UbTransferResult),
     MovOutToL1(C220L1DmaResult),
     Set2d(C220Set2dResult),
@@ -68,4 +75,22 @@ pub struct C220Mte2Outcome {
     pub command: C220Mte2CommandState,
     pub retire_tick: u64,
     pub result: C220Mte2Result,
+}
+
+impl C220Mte2Outcome {
+    pub fn cross_core_reception(&self) -> Option<crate::sim::c220::sync::C220CrossCoreReception> {
+        let C220Mte2Command::CrossCore { instruction, .. } = self.command.command else {
+            return None;
+        };
+        let C220Mte2Result::CrossCore(payload) = self.result else {
+            return None;
+        };
+        Some(crate::sim::c220::sync::C220CrossCoreReception {
+            instruction_id: self.command.instruction_id,
+            pc: self.command.pc,
+            tick: self.retire_tick,
+            instruction,
+            payload,
+        })
+    }
 }

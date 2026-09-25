@@ -265,6 +265,7 @@ pub enum C220MtePipelineError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mte2Generator {
+    Load3d,
     Dma,
     L1Fill,
 }
@@ -883,7 +884,20 @@ impl C220MtePipeline {
             .is_none_or(|generator| match generator {
                 Mte2Generator::Dma => self.dma.is_idle(),
                 Mte2Generator::L1Fill => self.set2d_l1.is_idle(),
+                Mte2Generator::Load3d => true,
             })
+    }
+
+    pub(crate) fn can_issue_mte2_cross_core(&self) -> bool {
+        self.mte2_generator_idle()
+    }
+
+    pub(crate) fn issue_mte2_cross_core(&mut self) -> Result<u64, C220MtePipelineError> {
+        if !self.can_issue_mte2_cross_core() {
+            return Err(C220MtePipelineError::CommandBusy);
+        }
+        self.selected_mte2_generator = Some(Mte2Generator::Load3d);
+        Ok(self.events.tick())
     }
 
     pub fn can_issue_mte2_dma(&self) -> bool {
