@@ -1060,6 +1060,7 @@ mod tests {
     #[test]
     fn load3dv2_runs_through_shared_l1_and_commits_spr54() {
         use crate::sim::c220::mte::mte1::C220Mte1TransferResult;
+        use crate::sim::c220::schedule::{C220Stall, C220StallCause};
         let mut core = matrix_core();
         core.advance_to(300).unwrap();
         let machine = core.state.scalar_mut().machine_mut();
@@ -1090,6 +1091,16 @@ mod tests {
             panic!("LOAD3Dv2 admission");
         };
         assert_eq!(issue.uop_count, 8);
+        let read_spr54 = (2 << 24) | (1 << 22) | (14 << 17) | (22 << 12) | (17 << 7);
+        let waiting_pc = core.state.scalar().pc();
+        assert!(matches!(
+            core.step_word_at(302, read_spr54).unwrap(),
+            C220CoreStep::Stalled(C220Stall {
+                cause: C220StallCause::Mte1Dependency,
+                ..
+            })
+        ));
+        assert_eq!(core.state.scalar().pc(), waiting_pc);
         core.state
             .scalar_mut()
             .machine_mut()
@@ -1099,7 +1110,7 @@ mod tests {
             .l1_mut()
             .write_known(8192, &[0x73; 640])
             .unwrap();
-        let outcome = (302..600)
+        let outcome = (303..600)
             .find_map(|tick| {
                 core.advance_to(tick).unwrap();
                 core.last_mte1_outcomes().first().copied()
@@ -1121,6 +1132,12 @@ mod tests {
             assert_eq!(&row[8..], &[0; 24]);
         }
         assert!(core.pending_mte1_commands().next().is_none());
+        assert!(matches!(
+            core.step_word_at(outcome.retire_tick + 1, read_spr54)
+                .unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        assert_eq!(core.state.scalar().machine().xregs()[14], 40);
     }
 
     #[test]

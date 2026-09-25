@@ -54,6 +54,23 @@ impl C220Core {
             }));
         }
         let pc = self.state.scalar().pc();
+        if matches!(
+            crate::isa::scalar::ScalarInstruction::from_word(Architecture::Dav2201, word),
+            Some(
+                crate::isa::scalar::ScalarInstruction::ScalarKey2MoveFromSpr {
+                    encoded_source_spr: 54,
+                    ..
+                }
+            )
+        ) && let Some(ready) = self.mte1.next_event_tick()
+        {
+            return Ok(C220CoreStep::Stalled(C220Stall {
+                tick,
+                pc,
+                resume_tick: ready.max(tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?),
+                cause: C220StallCause::Mte1Dependency,
+            }));
+        }
         if let Some(instruction) =
             crate::isa::c220::control::C220WaitDeviceFlagInstruction::decode(word)
         {
