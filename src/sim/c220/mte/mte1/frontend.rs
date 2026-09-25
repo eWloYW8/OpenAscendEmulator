@@ -23,17 +23,33 @@ pub use events::{C220Mte1ReadEventOutcome, C220Mte1ReadEvents};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1ReadKind {
+    Load3dv2,
     Load2d,
     Bt,
 }
 
 impl C220Mte1ReadKind {
-    pub(in crate::sim::c220::mte) const ALL: [Self; 2] = [Self::Load2d, Self::Bt];
+    pub(in crate::sim::c220::mte) const ALL: [Self; 3] = [Self::Load3dv2, Self::Load2d, Self::Bt];
+
+    const fn generated_ticks(self) -> u64 {
+        match self {
+            Self::Load3dv2 => 19,
+            _ => GENERATED_TICKS,
+        }
+    }
+
+    const fn generated_capacity(self) -> usize {
+        match self {
+            Self::Load3dv2 => 20,
+            _ => GENERATED_CAPACITY,
+        }
+    }
 
     pub(in crate::sim::c220::mte) const fn index(self) -> usize {
         match self {
-            Self::Load2d => 0,
-            Self::Bt => 1,
+            Self::Load3dv2 => 0,
+            Self::Load2d => 1,
+            Self::Bt => 2,
         }
     }
 }
@@ -47,6 +63,7 @@ pub struct C220Mte1ReadBandwidths {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1ReadTransfer {
+    Load3dv2(crate::sim::c220::mte::load3d::C220Load3dV2Command),
     Load2d(C220Load2dTransfer),
     Load2dTranspose(C220Load2dTransposeTransfer),
     Load2dSparse(C220Load2dSparseTransfer),
@@ -56,6 +73,7 @@ pub enum C220Mte1ReadTransfer {
 impl C220Mte1ReadTransfer {
     pub const fn is_empty(self) -> bool {
         match self {
+            Self::Load3dv2(command) => command.disabled.any(),
             Self::Load2d(transfer) => transfer.descriptor.repeat_count == 0,
             Self::Load2dTranspose(transfer) => transfer.repeat_count() == 0,
             Self::Load2dSparse(transfer) => transfer.repeat_count() == 0,
@@ -65,6 +83,7 @@ impl C220Mte1ReadTransfer {
 
     pub const fn kind(self) -> C220Mte1ReadKind {
         match self {
+            Self::Load3dv2(_) => C220Mte1ReadKind::Load3dv2,
             Self::Load2d(_) | Self::Load2dTranspose(_) | Self::Load2dSparse(_) => {
                 C220Mte1ReadKind::Load2d
             }
@@ -75,6 +94,7 @@ impl C220Mte1ReadTransfer {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1ReadUop {
+    Load3dv2(crate::sim::c220::mte::load3d::C220Load3dReadUop),
     Sparse(C220SparseReadUop),
     Load2d(C220Load2dReadUop),
     Bt(C220BtReadUop),
@@ -86,6 +106,15 @@ impl C220Mte1ReadUop {
         instruction_id: u64,
         bandwidths: C220Mte1ReadBandwidths,
     ) -> C220MteL1ReadOperation<Self> {
+        if let Self::Load3dv2(uop) = self {
+            let bandwidth = match uop.logical.destination {
+                crate::isa::c220::mte::load3d::C220Load3dDestination::L0a => bandwidths.l0a,
+                crate::isa::c220::mte::load3d::C220Load3dDestination::L0b => bandwidths.l0b,
+            };
+            return uop
+                .operation(instruction_id, bandwidth)
+                .map_payload(Self::Load3dv2);
+        }
         let (
             source_address,
             input_bytes,
@@ -96,6 +125,7 @@ impl C220Mte1ReadUop {
             completes_logical_uop,
             last_in_instruction,
         ) = match self {
+            Self::Load3dv2(_) => unreachable!("handled above"),
             Self::Sparse(uop) => (
                 uop.source_address,
                 uop.input_bytes,
@@ -163,6 +193,7 @@ impl C220Mte1ReadUop {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Plan {
+    Load3dv2(VecDeque<crate::sim::c220::mte::load3d::C220Load3dReadUop>),
     Sparse(C220SparseRequestPlan),
     Load2d(C220Load2dRequestPlan),
     Bt(C220BtRequestPlan),
@@ -171,6 +202,7 @@ enum Plan {
 impl Plan {
     fn remaining(&self) -> u64 {
         match self {
+            Self::Load3dv2(plan) => plan.len() as u64,
             Self::Sparse(plan) => plan.len() as u64,
             Self::Load2d(plan) => plan.len() as u64,
             Self::Bt(plan) => plan.remaining_requests(),
@@ -179,6 +211,7 @@ impl Plan {
 
     fn next(&mut self) -> Option<C220Mte1ReadUop> {
         match self {
+            Self::Load3dv2(plan) => plan.pop_front().map(C220Mte1ReadUop::Load3dv2),
             Self::Sparse(plan) => plan.next().map(C220Mte1ReadUop::Sparse),
             Self::Load2d(plan) => plan.next().map(C220Mte1ReadUop::Load2d),
             Self::Bt(plan) => plan.next().map(C220Mte1ReadUop::Bt),
@@ -239,6 +272,8 @@ pub struct C220Mte1ReadFrontendCycle {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220Mte1ReadFrontendError {
+    #[error(transparent)]
+    Load3dv2(#[from] crate::sim::c220::mte::load3d::C220Load3dRequestError),
     #[error("MTE1 read generator cannot accept a command")]
     CommandBusy,
     #[error("MTE1 read generator {expected:?} cannot accept {requested:?}")]
@@ -258,8 +293,9 @@ pub enum C220Mte1ReadFrontendError {
     Interface(#[from] C220MteL1Error),
 }
 
-/// One generation engine. LOAD2D (including transpose) and BT use separate
-/// instances but feed the same L1 interface and input port. The caller chooses
+/// One generation engine. LOAD3Dv2, LOAD2D (including transpose), and BT use
+/// separate instances with their own queue delays and capacities, but feed the
+/// same L1 interface and input port. The caller chooses
 /// producer callback order explicitly; this type does not invent cross-engine
 /// arbitration. An idle frontend does not imply its submitted work has retired.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,7 +337,7 @@ impl C220Mte1ReadFrontend {
     }
 
     pub fn can_issue(&self) -> bool {
-        self.generation.is_none() && self.generated.len() < GENERATED_CAPACITY
+        self.generation.is_none() && self.generated.len() < self.kind.generated_capacity()
     }
 
     pub fn queue_state(&self) -> C220Mte1ReadFrontendQueues {
@@ -338,6 +374,9 @@ impl C220Mte1ReadFrontend {
             return Err(C220Mte1ReadFrontendError::CommandBusy);
         }
         let plan = match transfer {
+            C220Mte1ReadTransfer::Load3dv2(command) => {
+                Plan::Load3dv2(command.physical_reads(self.access_width)?.collect())
+            }
             C220Mte1ReadTransfer::Load2dSparse(transfer) => {
                 Plan::Sparse(C220SparseRequestPlan::new(transfer, self.access_width))
             }
@@ -381,10 +420,10 @@ impl C220Mte1ReadFrontend {
         let eligible = self
             .instruction_ready_tick()
             .is_some_and(|ready| ready <= tick)
-            && self.generated.len() < GENERATED_CAPACITY;
+            && self.generated.len() < self.kind.generated_capacity();
         let generated = if eligible {
             let ready_tick = tick
-                .checked_add(GENERATED_TICKS)
+                .checked_add(self.kind.generated_ticks())
                 .ok_or(C220Mte1ReadFrontendError::TimeOverflow)?;
             let generation = self.generation.as_mut().expect("eligible instruction");
             let operation = generation

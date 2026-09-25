@@ -22,6 +22,8 @@ pub const C220_MTE1_OUTSTANDING_LIMIT: usize = 31;
 #[derive(Debug, thiserror::Error)]
 pub enum C220Mte1RuntimeError {
     #[error(transparent)]
+    Load3dv2(#[from] crate::sim::c220::mte::load3d::C220Load3dExecutionError),
+    #[error(transparent)]
     Transfer(#[from] C220Load2dTransferError),
     #[error(transparent)]
     Bt(#[from] C220BtTransferError),
@@ -39,6 +41,7 @@ pub enum C220Mte1RuntimeError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1TransferResult {
+    Load3dv2(crate::sim::c220::mte::load3d::C220Load3dExecutionReport),
     CrossCore(crate::sim::c220::sync::C220DeviceSync),
     Load2dSparse(C220SparseTransferResult),
     Load2d(C220Load2dTransferResult),
@@ -125,6 +128,16 @@ impl Mte1Engine {
         flags: &mut C220HardwareFlagState,
     ) -> Result<C220Mte1Issue, C220Mte1RuntimeError> {
         let memory = match command {
+            C220Mte1Command::Read(C220Mte1ReadTransfer::Load3dv2(command)) => {
+                Some(match command.operands.instruction.destination {
+                    crate::isa::c220::mte::load3d::C220Load3dDestination::L0a => {
+                        C220MatrixMemory::L0a
+                    }
+                    crate::isa::c220::mte::load3d::C220Load3dDestination::L0b => {
+                        C220MatrixMemory::L0b
+                    }
+                })
+            }
             C220Mte1Command::CrossCore { .. } => None,
             C220Mte1Command::Set2d(fill) => match fill.instruction.destination {
                 C220Set2dDestination::L0a => Some(C220MatrixMemory::L0a),
@@ -279,6 +292,9 @@ impl Mte1Engine {
                 return Ok(());
             }
             let result = match pending.command {
+                C220Mte1Command::Read(C220Mte1ReadTransfer::Load3dv2(command)) => {
+                    C220Mte1TransferResult::Load3dv2(command.execute(memory)?)
+                }
                 C220Mte1Command::CrossCore { payload, .. } => {
                     C220Mte1TransferResult::CrossCore(payload)
                 }

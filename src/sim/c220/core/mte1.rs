@@ -59,6 +59,10 @@ impl C220Core {
                     registers[usize::from(instruction.source_register)],
                 ),
             })
+        } else if let Some(command) = self.capture_load3d_v2(word)? {
+            Some(C220Mte1Command::Read(C220Mte1ReadTransfer::Load3dv2(
+                command,
+            )))
         } else if let Some(decoded) = C220Set2dInstruction::decode(word) {
             let pattern = self
                 .state

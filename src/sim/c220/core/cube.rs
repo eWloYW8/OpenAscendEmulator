@@ -1058,6 +1058,72 @@ mod tests {
     }
 
     #[test]
+    fn load3dv2_runs_through_shared_l1_and_commits_spr54() {
+        use crate::sim::c220::mte::mte1::C220Mte1TransferResult;
+        let mut core = matrix_core();
+        core.advance_to(300).unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        for (register, value) in [
+            (10, 4096),
+            (11, 8192),
+            (12, 40 | (16 << 16)),
+            (13, (1 << 12) | (1 << 20) | (40 << 48)),
+        ] {
+            machine.set_xreg(register, value).unwrap();
+        }
+        for (register, value) in [
+            (10, 4 | (4 << 16)),
+            (92, 0),
+            (13, 0),
+            (58, 1 << 16),
+            (22, 0),
+            (54, 0),
+        ] {
+            machine.set_spr_value(register, value).unwrap();
+        }
+        let word = (3 << 29) | (20 << 22) | (10 << 17) | (11 << 12) | (12 << 7) | (13 << 2);
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Mte1 { issue, .. },
+            ..
+        } = core.step_word_at(301, word).unwrap()
+        else {
+            panic!("LOAD3Dv2 admission");
+        };
+        assert_eq!(issue.uop_count, 8);
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(11, 0)
+            .unwrap();
+        core.local_memory
+            .l1_mut()
+            .write_known(8192, &[0x73; 640])
+            .unwrap();
+        let outcome = (302..600)
+            .find_map(|tick| {
+                core.advance_to(tick).unwrap();
+                core.last_mte1_outcomes().first().copied()
+            })
+            .expect("LOAD3Dv2 retirement");
+        assert!(outcome.retire_tick > 321);
+        let C220Mte1TransferResult::Load3dv2(report) = outcome.result else {
+            panic!("LOAD3Dv2 result");
+        };
+        assert_eq!(report.output_packets, 2);
+        assert_eq!(core.state.scalar().machine().spr_value(54), Some(40));
+        assert_eq!(
+            core.local_memory.l0a().read_known(4096, 512).unwrap(),
+            [0x73; 512]
+        );
+        let tail = core.local_memory.l0a().read_known(4608, 512).unwrap();
+        for row in tail.chunks_exact(32) {
+            assert_eq!(&row[..8], &[0x73; 8]);
+            assert_eq!(&row[8..], &[0; 24]);
+        }
+        assert!(core.pending_mte1_commands().next().is_none());
+    }
+
+    #[test]
     fn grouped_transpose_runs_through_mte1_and_retires_captured_operands() {
         use crate::sim::c220::mte::mte1::C220Mte1TransferResult;
 

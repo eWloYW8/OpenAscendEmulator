@@ -39,11 +39,24 @@ impl C220Core {
                 }))
                 .min()
                 .map_or(tick, |next| next.min(tick));
+            let previous_mte1_outcomes = self.mte1.outcomes.len();
             self.mte1.commit_ready_at(
                 event_tick,
                 &mut self.local_memory,
                 &mut self.hardware_flags,
             )?;
+            for outcome in &self.mte1.outcomes[previous_mte1_outcomes..] {
+                if let crate::sim::c220::mte::mte1::C220Mte1TransferResult::Load3dv2(report) =
+                    outcome.result
+                    && let Some(value) = report.spr54
+                {
+                    self.state
+                        .scalar_mut()
+                        .machine_mut()
+                        .set_spr_value(54, value)
+                        .map_err(C220CoreError::Load3dSpr)?;
+                }
+            }
             self.retire_factor_at(event_tick)?;
             if let Some(engine) = self.fixp_engine_mut() {
                 engine.retire_ready_control(event_tick);
