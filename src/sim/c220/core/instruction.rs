@@ -14,6 +14,7 @@ pub enum C220CoreInstruction {
     Load(super::C220CoreLoadIssue),
     Store(super::C220CoreStoreIssue),
     DirectStore(super::C220CoreLsuIssue),
+    Maintenance(super::C220CoreMaintenanceIssue),
     FixpBarrier {
         barrier: super::C220FixpBarrier,
         completed_tick: Option<u64>,

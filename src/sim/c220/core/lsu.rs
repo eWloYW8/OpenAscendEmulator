@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 mod cache;
 mod ingress;
+mod maintenance;
 mod retirement;
 mod store;
 mod write_transport;
@@ -10,6 +11,7 @@ use cache::CoreCache;
 pub use cache::{C220CoreLoadCompletion, C220CoreLoadIssue};
 pub use ingress::C220CoreLsuAdmission;
 use ingress::DispatchedLsu;
+pub use maintenance::{C220CoreMaintenanceCompletion, C220CoreMaintenanceIssue};
 pub use store::{C220CoreStoreCompletion, C220CoreStoreIssue};
 
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
@@ -65,6 +67,14 @@ pub(super) struct CoreLsu {
     commits: C220LsuCommitLane,
     stores: BTreeMap<C220LsuRequestId, C220CoreStoreIssue>,
     store_completions: Vec<C220CoreStoreCompletion>,
+    maintenance: BTreeMap<
+        C220LsuRequestId,
+        (
+            C220CoreMaintenanceIssue,
+            Option<crate::sim::c220::scalar::lsu::scheduler::C220LsuMaintenanceCompletion>,
+        ),
+    >,
+    maintenance_completions: Vec<C220CoreMaintenanceCompletion>,
     ingress: VecDeque<DispatchedLsu>,
     admissions: Vec<C220CoreLsuAdmission>,
     scheduler: C220LsuRequestScheduler,
@@ -113,6 +123,8 @@ impl C220Core {
             commits: C220LsuCommitLane::new(C220LoadCommitMode::Retirement),
             stores: BTreeMap::new(),
             store_completions: Vec::new(),
+            maintenance: BTreeMap::new(),
+            maintenance_completions: Vec::new(),
             ingress: VecDeque::new(),
             admissions: Vec::new(),
             scheduler,
@@ -253,25 +265,43 @@ impl C220Core {
             pipeline.cache_write_completion(lsu.port)
         {
             let write = C220LsuWriteId::from_sequence(transaction);
-            if scheduler.writes.request(write).is_some_and(|request| {
-                scheduler.evicted_line(request.line.address).is_none()
-                    && scheduler
-                        .direct_stores()
-                        .entry(request.line.address)
-                        .is_some()
-            }) {
-                lsu.commits.check_retirement_send(tick)?;
-            }
-            let completion =
-                scheduler.apply_external_write_response::<C220CoreError>(write, |key, bytes| {
-                    self.memory.write_known_at(key.address, bytes)?;
-                    Ok(())
-                })?;
-            pipeline.take_cache_write_completion(lsu.port)?;
-            if let Some(C220LsuCompletion::Store(request)) = completion
-                && lsu.pending.contains_key(&request)
+            if scheduler
+                .maintenance_writes()
+                .any(|pending| pending.write == write)
             {
-                lsu.commits.complete_direct_store_at(tick, request, write)?;
+                let cache = lsu.cache.as_mut().ok_or(C220CoreError::LsuUnconfigured)?;
+                scheduler.apply_maintenance_write_response::<C220CoreError>(
+                    write,
+                    &mut cache.cache,
+                    |key, bytes| {
+                        self.memory.write_known_at(key.address, bytes)?;
+                        Ok(())
+                    },
+                )?;
+                pipeline.take_cache_write_completion(lsu.port)?;
+            } else {
+                if scheduler.writes.request(write).is_some_and(|request| {
+                    scheduler.evicted_line(request.line.address).is_none()
+                        && scheduler
+                            .direct_stores()
+                            .entry(request.line.address)
+                            .is_some()
+                }) {
+                    lsu.commits.check_retirement_send(tick)?;
+                }
+                let completion = scheduler.apply_external_write_response::<C220CoreError>(
+                    write,
+                    |key, bytes| {
+                        self.memory.write_known_at(key.address, bytes)?;
+                        Ok(())
+                    },
+                )?;
+                pipeline.take_cache_write_completion(lsu.port)?;
+                if let Some(C220LsuCompletion::Store(request)) = completion
+                    && lsu.pending.contains_key(&request)
+                {
+                    lsu.commits.complete_direct_store_at(tick, request, write)?;
+                }
             }
         }
         scheduler.process_direct_stores(tick)?;
@@ -283,22 +313,39 @@ impl C220Core {
                 self.state.scalar_mut().machine_mut(),
             )?;
         }
-        let hazards = C220LsuExternalHazards {
-            maintenance_active: false,
-            maintenance_draining: false,
-        };
         for stage in [C220LsuStage::M2, C220LsuStage::M1, C220LsuStage::M0] {
+            let hazards = C220LsuExternalHazards {
+                maintenance_active: false,
+                maintenance_draining: scheduler.maintenance_head()
+                    && lsu.commits.retirement_occupancy() != 0,
+            };
+            if stage == C220LsuStage::M2
+                && scheduler
+                    .pipeline()
+                    .head(stage)
+                    .is_some_and(|head| lsu.maintenance.contains_key(&head.request))
+            {
+                lsu.commits.check_retirement_send(tick)?;
+            }
             if let Some(loads) = &mut lsu.cache {
                 scheduler.advance_with_cache(stage, tick, hazards, &mut loads.cache)?;
             } else {
                 scheduler.advance(stage, tick, hazards)?;
             }
+            for completion in scheduler.take_maintenance_completions() {
+                let request = completion.request;
+                lsu.commits.complete_maintenance_at(tick, request)?;
+                lsu.maintenance
+                    .get_mut(&request)
+                    .expect("issued maintenance")
+                    .1 = Some(completion);
+            }
+            scheduler.deliver_values(
+                tick,
+                &mut lsu.commits,
+                self.state.scalar_mut().machine_mut(),
+            )?;
         }
-        scheduler.deliver_values(
-            tick,
-            &mut lsu.commits,
-            self.state.scalar_mut().machine_mut(),
-        )?;
         if let Some(loads) = &mut lsu.cache {
             loads.send_at(tick, pipeline, scheduler)?;
         }
@@ -307,6 +354,8 @@ impl C220Core {
         lsu.next_tick = if lsu.ingress.is_empty()
             && lsu.pending.is_empty()
             && lsu.stores.is_empty()
+            && lsu.maintenance.is_empty()
+            && !scheduler.maintenance_active()
             && lsu.commits.pending_count() == 0
             && lsu.commits.retirement_occupancy() == 0
             && lsu.cache.as_ref().is_none_or(CoreCache::is_idle)

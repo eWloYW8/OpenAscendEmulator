@@ -641,6 +641,72 @@ fn run_core_ub_stores(core: &mut C220Core, mut tick: u64) {
         assert_eq!(core.pending_store_instructions().count(), 0);
         tick += 2;
     }
+    run_core_maintenance(core, tick);
+}
+
+fn run_core_maintenance(core: &mut C220Core, mut tick: u64) {
+    for entire in [false, true] {
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_spr_value(67, 1 << 25).unwrap();
+        machine.set_xreg(5, 0x20c0).unwrap();
+        let value = if entire {
+            0x1234_5678_u64
+        } else {
+            0x9988_7766_u64
+        };
+        machine.set_xreg(9, value).unwrap();
+        let store = (20 << 24) | (3 << 22) | (9 << 17) | (5 << 12);
+        assert!(matches!(
+            core.step_word_at(tick, store).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        let word = 0x402c_0002 | (5 << 12) | if entire { 1 << 17 } else { 0 };
+        assert!(matches!(
+            core.step_word_at(tick + 1, word).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Maintenance(_),
+                ..
+            }
+        ));
+        let mut store_tick = None;
+        let load = (9 << 24) | (3 << 22) | (7 << 17) | (5 << 12) | (9 << 7);
+        assert!(matches!(
+            core.step_word_at(tick + 2, load).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        let done = (tick + 3..tick + 200)
+            .find_map(|now| {
+                core.advance_to(now).unwrap();
+                if let Some(store) = core.take_store_completions().into_iter().next() {
+                    store_tick = Some(store.retire_tick);
+                }
+                core.take_maintenance_completions().into_iter().next()
+            })
+            .expect("maintenance retires");
+        assert!(done.data.tick > store_tick.unwrap());
+        assert_eq!(done.retire_tick, done.data.tick + 1);
+        assert!(!done.data.writes.is_empty());
+        assert_ne!(
+            core.memory.read_known_at(0x20c0, 8).unwrap(),
+            value.to_le_bytes()
+        );
+        core.advance_to(done.retire_tick + 100).unwrap();
+        assert_eq!(
+            core.memory.read_known_at(0x20c0, 8).unwrap(),
+            value.to_le_bytes()
+        );
+        let loaded = core.take_load_completions();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].retirement.data.value, value);
+        assert!(loaded[0].retirement.retire_tick > done.retire_tick);
+        assert_eq!(core.pending_maintenance_instructions().count(), 0);
+        assert!(!core.lsu_scheduler().unwrap().maintenance_active());
+        assert_eq!(
+            core.lsu_scheduler().unwrap().maintenance_writes().count(),
+            0
+        );
+        tick = done.retire_tick + 102;
+    }
 }
 
 #[test]

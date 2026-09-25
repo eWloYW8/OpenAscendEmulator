@@ -106,6 +106,40 @@ impl C220DataCache {
         &self.sets
     }
 
+    /// Addressed maintenance matches a valid tag across memory spaces.
+    pub fn lookup_maintenance(
+        &mut self,
+        address: u64,
+        partition_address: u64,
+    ) -> Option<C220CacheLocation> {
+        let index = self.layout.index(address);
+        let tag = self.layout.tag(address);
+        let set = &mut self.sets[index as usize];
+        let way = set
+            .partition(partition_address)
+            .find(|&way| set.ways[way].valid && set.ways[way].tag == tag)?;
+        set.promote(way).expect("selected maintenance way");
+        Some(C220CacheLocation { index, way })
+    }
+
+    /// Whole-cache scans exclude the stack partition and visit way before index.
+    pub fn maintenance_lines(&self, memory: Option<C220LsuMemory>) -> Vec<C220CacheLocation> {
+        let first = &self.sets[0];
+        let mut selected = Vec::new();
+        for way in first.partition(0) {
+            for (index, set) in self.sets.iter().enumerate() {
+                let tag = set.ways[way];
+                if tag.valid && memory.is_none_or(|memory| memory == tag.memory) {
+                    selected.push(C220CacheLocation {
+                        index: index as u32,
+                        way,
+                    });
+                }
+            }
+        }
+        selected
+    }
+
     pub fn replacement_requires_writeback(&self, address: u64, partition_address: u64) -> bool {
         let set = &self.sets[self.layout.index(address) as usize];
         let tag = set.ways[set.victim(partition_address)];

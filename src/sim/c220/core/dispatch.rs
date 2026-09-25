@@ -50,6 +50,11 @@ impl C220Core {
             return self.step_direct_store_at(tick, word);
         }
         if self.lsu.is_some() {
+            if let Some(instruction) =
+                crate::isa::flow::DcciInstruction::decode(Architecture::Dav2201, word)
+            {
+                return self.step_maintenance_at(tick, instruction);
+            }
             use crate::isa::scalar::{ScalarInstruction, ScalarLoadStoreOperation};
             match ScalarInstruction::from_word(Architecture::Dav2201, word) {
                 Some(

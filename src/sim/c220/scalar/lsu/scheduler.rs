@@ -40,7 +40,9 @@ pub use load::{C220LsuLoadPath, C220LsuLoadValue};
 mod maintenance;
 mod response;
 mod write_response;
-pub use maintenance::C220LsuMaintenanceWrite;
+pub use maintenance::{
+    C220LsuMaintenanceCompletion, C220LsuMaintenanceScope, C220LsuMaintenanceWrite,
+};
 pub use response::C220LsuReadCompletion;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +138,10 @@ pub struct C220LsuRequestScheduler {
     store_next_tick: Option<u64>,
     eviction_data: BTreeMap<u64, Vec<u8>>,
     maintenance_writes: BTreeMap<super::write_queue::C220LsuWriteId, C220LsuMaintenanceWrite>,
+    pending_maintenance: BTreeMap<C220LsuRequestId, maintenance::PendingMaintenance>,
+    maintenance_completions: Vec<C220LsuMaintenanceCompletion>,
+    maintenance_active: bool,
+    maintenance_release_tick: Option<u64>,
 }
 
 impl C220LsuRequestScheduler {
@@ -176,6 +182,10 @@ impl C220LsuRequestScheduler {
             direct_event,
             eviction_data: BTreeMap::new(),
             maintenance_writes: BTreeMap::new(),
+            pending_maintenance: BTreeMap::new(),
+            maintenance_completions: Vec::new(),
+            maintenance_active: false,
+            maintenance_release_tick: None,
         })
     }
 
@@ -277,6 +287,7 @@ impl C220LsuRequestScheduler {
         if self.pipeline.head(stage).is_some_and(|head| {
             self.pending_loads.contains_key(&head.request)
                 || self.pending_stores.contains_key(&head.request)
+                || self.pending_maintenance.contains_key(&head.request)
         }) {
             return Err(C220LsuSchedulerError::CacheRequired);
         }
@@ -298,9 +309,11 @@ impl C220LsuRequestScheduler {
             .filter(|head| head.ready_tick <= tick)
             .and_then(|head| self.hazard(self.requests[&head.request], external));
         if stage == C220LsuStage::M0 && self.pipeline.head(stage).is_some() {
-            if external.maintenance_active {
+            if external.maintenance_active || self.maintenance_active {
                 stall = Some(C220LsuStall::Maintenance);
-            } else if stall.is_none() && external.maintenance_draining {
+            } else if stall.is_none()
+                && (external.maintenance_draining || self.maintenance_needs_drain())
+            {
                 stall = Some(C220LsuStall::Drain);
             }
         }

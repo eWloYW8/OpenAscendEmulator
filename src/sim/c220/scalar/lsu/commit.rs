@@ -80,6 +80,10 @@ pub enum C220LsuCommitError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220LsuRetirement {
+    Maintenance {
+        request: C220LsuRequestId,
+        retire_tick: u64,
+    },
     Load(C220LoadRetirement),
     RepeatedLoad(C220RepeatedLoadNotification),
     Store {
@@ -100,6 +104,7 @@ pub enum C220LsuRetirement {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetirementToken {
+    Maintenance(C220LsuRequestId),
     Load(C220LoadId),
     Store(C220LsuStoreValue),
     DirectStore {
@@ -152,7 +157,7 @@ impl C220LsuCommitLane {
                     RetirementToken::Store(data) => {
                         !self.store_pair_requests.contains_key(&data.request)
                     }
-                    RetirementToken::DirectStore { .. } => true,
+                    RetirementToken::DirectStore { .. } | RetirementToken::Maintenance(_) => true,
                 })
                 .count()
     }
@@ -190,6 +195,19 @@ impl C220LsuCommitLane {
         Ok(())
     }
 
+    pub fn complete_maintenance_at(
+        &mut self,
+        tick: u64,
+        request: C220LsuRequestId,
+    ) -> Result<(), C220LsuCommitError> {
+        self.check_retirement_send(tick)?;
+        self.check_store_request(request)?;
+        self.retirements
+            .push_back((tick + 1, RetirementToken::Maintenance(request)));
+        self.tick = tick;
+        Ok(())
+    }
+
     fn check_store_request(&self, request: C220LsuRequestId) -> Result<(), C220LsuCommitError> {
         if self.requests.contains_key(&request)
             || self.store_pair_requests.contains_key(&request)
@@ -199,6 +217,7 @@ impl C220LsuCommitLane {
                     request: pending, ..
                 } => *pending == request,
                 RetirementToken::Load(_) => false,
+                RetirementToken::Maintenance(pending) => *pending == request,
             })
         {
             return Err(C220LsuCommitError::InvalidRequest);
@@ -316,6 +335,14 @@ impl C220LsuCommitLane {
             return Ok(None);
         };
         let request = match token {
+            RetirementToken::Maintenance(request) => {
+                self.retirements.pop_front();
+                self.tick = tick;
+                return Ok(Some(C220LsuRetirement::Maintenance {
+                    request,
+                    retire_tick: tick,
+                }));
+            }
             RetirementToken::Load(request) => request,
             RetirementToken::Store(data) => {
                 self.retirements.pop_front();

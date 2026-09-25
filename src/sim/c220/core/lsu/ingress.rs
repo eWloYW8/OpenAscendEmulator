@@ -16,6 +16,7 @@ pub(super) enum DispatchedLsu {
     Load(C220CoreLoadIssue),
     DirectStore(C220CoreLsuIssue),
     Store(C220CoreStoreIssue),
+    Maintenance(C220CoreMaintenanceIssue),
 }
 
 impl DispatchedLsu {
@@ -24,6 +25,7 @@ impl DispatchedLsu {
             Self::Load(issue) => issue.tick,
             Self::Store(issue) => issue.tick,
             Self::DirectStore(issue) => issue.tick,
+            Self::Maintenance(issue) => issue.tick,
         }
     }
 }
@@ -57,10 +59,18 @@ impl CoreLsu {
         else {
             return Ok(());
         };
+        if let DispatchedLsu::Maintenance(issue) = head {
+            if let Some(request) = self.scheduler.admit_maintenance(tick, issue.scope)? {
+                self.maintenance.insert(request, (issue, None));
+                self.ingress.pop_front();
+            }
+            return Ok(());
+        }
         let address = match head {
             DispatchedLsu::Load(issue) => issue.operands.effective_address,
             DispatchedLsu::Store(issue) => issue.operands.effective_address,
             DispatchedLsu::DirectStore(issue) => issue.operands.effective_address,
+            DispatchedLsu::Maintenance(_) => unreachable!(),
         };
         let roots = machine
             .spr_value(67)
@@ -74,6 +84,7 @@ impl CoreLsu {
             return Err(C220CoreError::UnsupportedTimedLsuAccess);
         }
         let (instruction_id, request, second_request) = match head {
+            DispatchedLsu::Maintenance(_) => unreachable!(),
             DispatchedLsu::Load(issue) => {
                 let Some((request, second)) = self.scheduler.admit_load(
                     tick,
