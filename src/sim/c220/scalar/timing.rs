@@ -16,7 +16,6 @@ use crate::isa::flow::{
 use crate::isa::scalar::{
     ScalarInstruction, ScalarKey0Operation, ScalarKey7Operation, ScalarLoadStoreOperation,
 };
-use crate::sim::common::scalar::SCALAR_X_REGISTER_COUNT;
 
 mod rules;
 use super::spr::C220ScalarSprTimingTicket;
@@ -45,7 +44,7 @@ pub struct C220ScalarTimingTicket {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct C220ScalarTimingLane {
-    pending_xreg_retirement: [Option<u64>; SCALAR_X_REGISTER_COUNT],
+    pending_xreg_retirement: BTreeMap<u8, u64>,
     fixed_drain_tick: Option<u64>,
     variable_instructions: VecDeque<PendingVariable>,
     variable_events: Vec<u64>,
@@ -71,11 +70,8 @@ impl C220ScalarTimingLane {
         let ready = self.variable_events.partition_point(|event| *event <= tick);
         self.variable_events.drain(..ready);
         self.variable_instructions.drain(..ready);
-        for retirement in &mut self.pending_xreg_retirement {
-            if retirement.is_some_and(|retire_tick| retire_tick <= tick) {
-                *retirement = None;
-            }
-        }
+        self.pending_xreg_retirement
+            .retain(|_, retirement| *retirement > tick);
     }
 
     pub fn dependency_tick(&self, word: u32, tick: u64) -> Option<u64> {
@@ -437,7 +433,8 @@ impl C220ScalarTimingLane {
             return;
         }
         if let Some(destination) = ticket.destination_register {
-            self.pending_xreg_retirement[usize::from(destination)] = Some(ticket.retire_tick);
+            self.pending_xreg_retirement
+                .insert(destination, ticket.retire_tick);
         }
         self.fixed_drain_tick = Some(
             self.fixed_drain_tick
@@ -446,7 +443,7 @@ impl C220ScalarTimingLane {
     }
 
     pub(crate) fn supersede_destination(&mut self, destination: u8) {
-        self.pending_xreg_retirement[usize::from(destination)] = None;
+        self.pending_xreg_retirement.remove(&destination);
         for pending in &mut self.variable_instructions {
             if pending.ticket.destination_register == Some(destination) {
                 pending.destination_live = false;
@@ -455,7 +452,7 @@ impl C220ScalarTimingLane {
     }
 
     pub(crate) fn load_waw_tick(&self, destination: u8) -> Option<u64> {
-        self.pending_xreg_retirement[usize::from(destination)]
+        self.pending_xreg_retirement.get(&destination).copied()
     }
 
     pub(crate) fn issue_spr(&mut self, ticket: C220ScalarSprTimingTicket) {
@@ -469,9 +466,8 @@ impl C220ScalarTimingLane {
 
     pub fn pending_xreg_retirement(&self, register: u8) -> Option<u64> {
         self.pending_xreg_retirement
-            .get(usize::from(register))
+            .get(&register)
             .copied()
-            .flatten()
             .into_iter()
             .chain(
                 self.variable_instructions
@@ -496,8 +492,7 @@ impl C220ScalarTimingLane {
 
     pub fn pending_drain_tick(&self) -> Option<u64> {
         self.pending_xreg_retirement
-            .iter()
-            .flatten()
+            .values()
             .copied()
             .chain(self.variable_events.iter().copied())
             .chain(self.pending_spr_retirement.values().copied())
@@ -526,6 +521,18 @@ mod tests {
     #[test]
     fn variable_notifications_preserve_duplicates_and_destination_hazards() {
         let mut lane = C220ScalarTimingLane::default();
+        lane.issue(C220ScalarTimingTicket {
+            class: C220ScalarTimingClass::Fixed,
+            issue_tick: 0,
+            retire_tick: 2,
+            execution_stage: 1,
+            source_register: None,
+            destination_register: Some(32),
+        });
+        assert_eq!(lane.dependency_tick(0x08c2_003f, 1), Some(2));
+        assert_eq!(lane.load_waw_tick(32), Some(2));
+        lane.advance_to(2);
+        assert_eq!(lane.pending_xreg_retirement(32), None);
         let divide = (5 << 17) | (1 << 12) | (2 << 7) | 5;
         let sqrt = 0x0200_0000 | (6 << 17) | (1 << 12);
         lane.issue(

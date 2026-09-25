@@ -30,6 +30,7 @@ const SCALAR_SPR_SNAPSHOT_CAPACITY: usize = 243;
 pub struct ScalarMachine {
     architecture: Architecture,
     xregs: [u64; SCALAR_X_REGISTER_COUNT],
+    c220_xreg32: u64,
     spr2: u64,
     spr_values: [Option<u64>; SCALAR_SPR_SNAPSHOT_CAPACITY],
     model_time: Option<u64>,
@@ -388,6 +389,7 @@ impl ScalarMachine {
         Self {
             architecture,
             xregs,
+            c220_xreg32: 0,
             spr2,
             spr_values: [None; SCALAR_SPR_SNAPSHOT_CAPACITY],
             model_time: None,
@@ -443,6 +445,15 @@ impl ScalarMachine {
 
     pub const fn xregs(&self) -> &[u64; SCALAR_X_REGISTER_COUNT] {
         &self.xregs
+    }
+
+    /// Read a numbered register without conflating an absent register with zero.
+    pub fn xreg_value(&self, register: u8) -> Option<u64> {
+        if register == 32 && self.architecture == Architecture::Dav2201 {
+            Some(self.c220_xreg32)
+        } else {
+            self.xregs.get(usize::from(register)).copied()
+        }
     }
 
     pub const fn spr2(&self) -> u64 {
@@ -744,6 +755,10 @@ impl ScalarMachine {
     }
 
     pub fn set_xreg(&mut self, register: u8, value: u64) -> Result<(), ScalarMachineError> {
+        if register == 32 && self.architecture == Architecture::Dav2201 {
+            self.c220_xreg32 = value;
+            return Ok(());
+        }
         let slot = self
             .xregs
             .get_mut(usize::from(register))

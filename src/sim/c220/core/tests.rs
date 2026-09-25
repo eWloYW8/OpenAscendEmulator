@@ -783,10 +783,11 @@ fn run_core_atomic_stores(core: &mut C220Core, mut tick: u64) {
 }
 
 fn run_core_preloads(core: &mut C220Core, mut tick: u64) {
-    for word in [0x08c0_503f, 0x0100_54d0, 0x0100_54d8] {
+    for word in [0x08c0_503f, 0x0100_54d0, 0x0100_54d8, 0x08c2_003f] {
         let machine = core.state.scalar_mut().machine_mut();
         machine.set_xreg(5, 0x2000).unwrap();
         machine.set_xreg(9, 63).unwrap();
+        machine.set_xreg(32, 0x2000).unwrap();
         let before = *machine.xregs();
         let C220CoreStep::Executed {
             instruction: C220CoreInstruction::Preload(issue),

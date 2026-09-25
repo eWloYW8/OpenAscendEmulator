@@ -11,6 +11,8 @@ pub struct C220PreloadOperands {
     pub base_value: u64,
     pub offset_value: u64,
     pub effective_address: u64,
+    /// Missing source registers read as zero; retain their identities for diagnostics.
+    pub missing_registers: [Option<u8>; 2],
 }
 
 impl C220PreloadOperands {
@@ -24,18 +26,13 @@ impl C220PreloadOperands {
             return Err(unsupported());
         }
         let instruction = C220ScalarPreload::decode(word).ok_or_else(unsupported)?;
-        let read = |register: u8| {
-            machine
-                .xregs()
-                .get(usize::from(register))
-                .copied()
-                .ok_or(ScalarMachineError::RegisterOutOfRange(register))
+        let base = machine.xreg_value(instruction.base_register);
+        let (offset, offset_register) = match instruction.offset {
+            C220PreloadOffset::Immediate(value) => (Some(u64::from(value)), None),
+            C220PreloadOffset::Register(register) => (machine.xreg_value(register), Some(register)),
         };
-        let base_value = read(instruction.base_register)?;
-        let offset_value = match instruction.offset {
-            C220PreloadOffset::Immediate(value) => u64::from(value),
-            C220PreloadOffset::Register(register) => read(register)?,
-        };
+        let base_value = base.unwrap_or(0);
+        let offset_value = offset.unwrap_or(0);
         Ok(Self {
             pc,
             word,
@@ -43,6 +40,10 @@ impl C220PreloadOperands {
             base_value,
             offset_value,
             effective_address: base_value.wrapping_add(offset_value),
+            missing_registers: [
+                base.is_none().then_some(instruction.base_register),
+                offset_register.filter(|_| offset.is_none()),
+            ],
         })
     }
 }
@@ -64,10 +65,18 @@ mod tests {
         let extended = C220ScalarPreload::decode(0x0100_21d3).unwrap();
         assert_eq!(extended.base_register, 34);
         assert_eq!(extended.offset, C220PreloadOffset::Register(35));
-        assert!(matches!(
-            C220PreloadOperands::capture(&machine, 0, 0x0100_21d3),
-            Err(ScalarMachineError::RegisterOutOfRange(34))
-        ));
+        let absent = C220PreloadOperands::capture(&machine, 0, 0x0100_21d3).unwrap();
+        assert_eq!(absent.missing_registers, [Some(34), Some(35)]);
+        assert_eq!(absent.effective_address, 0);
+        machine.set_xreg(32, 0x2000).unwrap();
+        let extra = C220PreloadOperands::capture(&machine, 0, 0x08c2_003f).unwrap();
+        assert_eq!(extra.effective_address, 0x203f);
+        assert_eq!(extra.missing_registers, [None, None]);
+        assert_eq!(machine.xreg_value(32), Some(0x2000));
+        assert_eq!(machine.xreg_value(33), None);
+        let mut c310 = ScalarMachine::from_pem_initial_state(Architecture::Dav3510);
+        assert!(c310.set_xreg(32, 1).is_err());
+        assert_eq!(c310.xreg_value(32), None);
         assert_eq!(
             C220ScalarPreload::decode(0x08c2_2fff)
                 .unwrap()
