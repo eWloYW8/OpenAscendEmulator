@@ -12,29 +12,56 @@ impl C220LsuRequestScheduler {
         id: C220LsuWriteId,
         backing_line: &mut [u8],
     ) -> Result<Option<C220LsuCompletion>, C220LsuSchedulerError> {
+        self.apply_external_write_response(id, |_, bytes| {
+            if bytes.len() != backing_line.len() {
+                return Err(super::super::cache::C220CacheError::InvalidLineSize.into());
+            }
+            backing_line.copy_from_slice(bytes);
+            Ok(())
+        })
+    }
+
+    /// Release transport credit before writing, then notify and remove data
+    /// only after the sink succeeds. A failed sink retains a retryable response.
+    pub fn apply_external_write_response<E>(
+        &mut self,
+        id: C220LsuWriteId,
+        write: impl FnOnce(C220LsuLineKey, &[u8]) -> Result<(), E>,
+    ) -> Result<Option<C220LsuCompletion>, E>
+    where
+        E: From<C220LsuSchedulerError>,
+    {
         let key = self
             .writes
             .request(id)
-            .ok_or(C220LsuWriteError::MissingRequest)?
+            .ok_or(C220LsuSchedulerError::Write(
+                C220LsuWriteError::MissingRequest,
+            ))?
             .line;
         if key.memory != C220LsuMemory::External {
-            return Err(C220LsuSchedulerError::MissingWriteData);
-        }
-        if self.eviction_data.contains_key(&key.address) {
-            self.complete_eviction_write(id, backing_line)?;
-            return Ok(None);
-        }
-        let entry = self
-            .direct_stores
-            .entry(key.address)
-            .ok_or(C220LsuSchedulerError::MissingWriteData)?;
-        if entry.bytes().len() != backing_line.len() {
-            return Err(super::super::cache::C220CacheError::InvalidLineSize.into());
+            return Err(C220LsuSchedulerError::MissingWriteData.into());
         }
         self.enter_write_response(id)?;
-        let request = self.direct_stores.complete(key.address, backing_line)?;
-        self.writes.finish_response(id)?;
-        Ok(Some(C220LsuCompletion::Store(request)))
+        let completion = if let Some(bytes) = self.eviction_data.get(&key.address) {
+            write(key, bytes)?;
+            self.eviction_data.remove(&key.address);
+            None
+        } else {
+            let entry = self
+                .direct_stores
+                .entry(key.address)
+                .ok_or(C220LsuSchedulerError::MissingWriteData)?;
+            write(key, entry.bytes())?;
+            let request = self
+                .direct_stores
+                .remove(key.address)
+                .map_err(C220LsuSchedulerError::from)?;
+            Some(C220LsuCompletion::Store(request))
+        };
+        self.writes
+            .finish_response(id)
+            .map_err(C220LsuSchedulerError::from)?;
+        Ok(completion)
     }
 
     /// UB replies without a matching store entry write the current cache line,

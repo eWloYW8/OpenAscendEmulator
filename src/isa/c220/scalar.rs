@@ -1,4 +1,30 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220ScalarDirectStore {
+    pub source_register: u8,
+    pub base_register: u8,
+    pub width_bytes: u8,
+    pub offset_bytes: i16,
+}
+
+impl C220ScalarDirectStore {
+    pub const fn decode(word: u32) -> Option<Self> {
+        if word >> 29 != 0 || (word >> 25) & 0xf != 12 {
+            return None;
+        }
+        Some(Self {
+            source_register: ((word >> 17) & 31) as u8,
+            base_register: ((word >> 12) & 31) as u8,
+            width_bytes: 1 << ((word >> 22) & 3),
+            offset_bytes: ((word as i16) << 4) >> 4,
+        })
+    }
+
+    pub const fn effective_address(self, base: u64) -> u64 {
+        base.wrapping_add_signed(self.offset_bytes as i64)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220ScalarSprImmediate {
     pub destination_spr: u16,
     pub immediate: u16,
@@ -53,6 +79,18 @@ mod tests {
 
     #[test]
     fn scalar_conversion_words_decode() {
+        for opcode in [0x1800_0000, 0x1900_0000] {
+            for size in 0..4 {
+                let word = opcode | (size << 22) | (31 << 17) | (17 << 12) | 0xffd;
+                let store = C220ScalarDirectStore::decode(word).unwrap();
+                assert_eq!((store.source_register, store.base_register), (31, 17));
+                assert_eq!(store.width_bytes, 1 << size);
+                assert_eq!(store.offset_bytes, -3);
+                assert_eq!(store.effective_address(2), u64::MAX);
+            }
+        }
+        assert!(C220ScalarDirectStore::decode(0x1a00_0000).is_none());
+        assert!(C220ScalarDirectStore::decode(0x3800_0000).is_none());
         let truncate = C220ScalarConversionHint::from_word(0x0210_8583).unwrap();
         assert_eq!(truncate.conversion, C220ScalarConversion::F32ToS32Truncate);
         assert_eq!(

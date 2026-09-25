@@ -1,5 +1,5 @@
 use super::{C220BiuSubcore, C220MtePipeline, C220MtePipelineError, C220MtePipelineEvent};
-use crate::sim::c220::memory::biu_write::{C220BiuMteBusWrites, C220BiuWriteReturnKind};
+use crate::sim::c220::memory::biu_write::{C220BiuBusWrites, C220BiuWriteReturnKind};
 use crate::sim::c220::memory::timed_memory::{
     C220MemoryWriteCommand, C220MemoryWriteId, C220MemoryWriteTransfer,
 };
@@ -59,7 +59,26 @@ impl C220MtePipeline {
             return Err(C220MtePipelineError::MemoryOwnedWrite);
         }
         if let Some(bus) = &mut self.biu_bus_writes {
-            return Ok(bus.take_data(self.events.tick()));
+            if !bus
+                .queued_data()
+                .front()
+                .is_some_and(|head| matches!(head.tag, C220MemoryWriteId::Mte(_)))
+            {
+                return Ok(None);
+            }
+            return Ok(bus.take_data(self.events.tick()).map(|transfer| {
+                let C220MemoryWriteId::Mte(tag) = transfer.tag else {
+                    unreachable!("MTE data head")
+                };
+                let mut data = *self
+                    .biu_write_data
+                    .delivered()
+                    .find(|data| data.source.request.tag == tag)
+                    .expect("outstanding MTE data");
+                data.ready_tick = transfer.ready_tick;
+                data.sent_tick = self.events.tick();
+                data
+            }));
         }
         Ok(self.biu_write_data.take_request(self.events.tick())?)
     }
@@ -160,11 +179,11 @@ impl C220MtePipeline {
         if self.biu_write_commands.is_none() {
             return Err(C220MtePipelineError::BiuWriteCommandDisconnected);
         }
-        self.biu_bus_writes = Some(C220BiuMteBusWrites::new(outstanding));
+        self.biu_bus_writes = Some(C220BiuBusWrites::new(outstanding));
         Ok(())
     }
 
-    pub fn biu_bus_writes(&self) -> Option<&C220BiuMteBusWrites> {
+    pub fn biu_bus_writes(&self) -> Option<&C220BiuBusWrites> {
         self.biu_bus_writes.as_ref()
     }
 
@@ -180,7 +199,7 @@ impl C220MtePipeline {
             .biu_bus_writes
             .as_mut()
             .ok_or(C220MtePipelineError::BiuBusDisconnected)?
-            .receive(self.events.tick(), kind, tag)?)
+            .receive(self.events.tick(), kind, C220MemoryWriteId::Mte(tag))?)
     }
 
     pub(super) fn advance_biu_bus_returns(
@@ -195,7 +214,7 @@ impl C220MtePipeline {
                 C220BiuWriteReturnKind::Dbid,
                 C220BiuWriteReturnKind::Completion,
             ] {
-                while let Some(C220MemoryWriteId::Mte(tag)) = memory.front(tick, kind) {
+                while let Some(tag) = memory.front(tick, kind) {
                     if !bus.receive(tick, kind, tag)? {
                         break;
                     }
@@ -226,43 +245,48 @@ impl C220MtePipeline {
         let Some(bus) = &mut self.biu_bus_writes else {
             return Ok(());
         };
-        if bus.can_receive_command()
-            && let Some(command) = self
+        if bus.can_admit_command(tick) {
+            let commands = self
                 .biu_write_commands
                 .as_mut()
-                .expect("connected command route")
-                .take_request(tick)?
-        {
-            bus.push_command(tick, command)?;
+                .expect("connected command route");
+            let head = commands.requests().front().copied().map(|command| {
+                let request = command.command.input.generated.request;
+                C220MemoryWriteCommand {
+                    ready_tick: command.ready_tick,
+                    tag: C220MemoryWriteId::Mte(command.command.tag),
+                    address: request.destination_address,
+                    bytes: request.bytes,
+                }
+            });
+            if matches!(
+                bus.admit_inputs(tick, head)?,
+                Some(C220MemoryWriteId::Mte(_))
+            ) {
+                commands.take_request(tick)?;
+            }
         }
-        if let Some(data) = self.biu_write_data.take_request(tick)? {
-            bus.push_data(tick, data)?;
+        let data = self.biu_write_data.take_request(tick)?;
+        bus.advance_cache_data(tick, data.is_some())?;
+        if let Some(data) = data {
+            bus.push_data(
+                tick,
+                C220MemoryWriteTransfer {
+                    ready_tick: tick,
+                    tag: C220MemoryWriteId::Mte(data.source.request.tag),
+                },
+            )?;
         }
         if let Some(memory) = &mut self.timed_memory {
             if memory.can_push(C220BiuWriteReturnKind::Dbid)
                 && let Some(command) = bus.take_command(tick)
             {
-                let request = command.command.input.generated.request;
-                memory.push_command(
-                    tick,
-                    C220MemoryWriteCommand {
-                        ready_tick: tick,
-                        tag: C220MemoryWriteId::Mte(command.command.tag),
-                        address: request.destination_address,
-                        bytes: request.bytes,
-                    },
-                )?;
+                memory.push_command(tick, command)?;
             }
             if memory.can_push(C220BiuWriteReturnKind::Completion)
                 && let Some(data) = bus.take_data(tick)
             {
-                memory.push_data(
-                    tick,
-                    C220MemoryWriteTransfer {
-                        ready_tick: tick,
-                        tag: C220MemoryWriteId::Mte(data.source.request.tag),
-                    },
-                )?;
+                memory.push_data(tick, data)?;
             }
         }
         Ok(())
@@ -378,7 +402,29 @@ impl C220MtePipeline {
             return Err(C220MtePipelineError::MemoryOwnedWrite);
         }
         if let Some(bus) = &mut self.biu_bus_writes {
-            return Ok(bus.take_command(self.events.tick()));
+            if !bus
+                .queued_commands()
+                .front()
+                .is_some_and(|head| matches!(head.tag, C220MemoryWriteId::Mte(_)))
+            {
+                return Ok(None);
+            }
+            return Ok(bus.take_command(self.events.tick()).map(|transfer| {
+                let C220MemoryWriteId::Mte(tag) = transfer.tag else {
+                    unreachable!("MTE command head")
+                };
+                let command = self
+                    .biu_write_commands
+                    .as_ref()
+                    .expect("connected command route")
+                    .outstanding()
+                    .find(|command| command.tag == tag)
+                    .expect("outstanding MTE command");
+                C220BiuWriteCommandTransfer {
+                    ready_tick: transfer.ready_tick,
+                    command,
+                }
+            }));
         }
         Ok(self
             .biu_write_commands

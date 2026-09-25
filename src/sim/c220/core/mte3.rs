@@ -71,6 +71,9 @@ impl C220Core {
         &mut self,
         bandwidth: NonZeroU32,
     ) -> Result<(), C220CoreError> {
+        if self.lsu.is_some() {
+            return Err(C220CoreError::LsuAlreadyConfigured);
+        }
         let pipeline = self
             .mte_pipeline
             .as_mut()

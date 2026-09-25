@@ -17,6 +17,12 @@ use crate::sim::common::scalar::ScalarInstructionError;
 
 #[derive(Debug, Error)]
 pub enum C220CoreError {
+    #[error("scalar LSU requires explicit geometry, shared BIU and timed memory configuration")]
+    LsuUnconfigured,
+    #[error("scalar LSU is already configured")]
+    LsuAlreadyConfigured,
+    #[error("scalar LSU cannot map address {address:#x}; check local roots and address bank")]
+    LsuAddress { address: u64 },
     #[error(transparent)]
     ExternalFixp(#[from] crate::sim::c220::mte::fixp::C220FixpRuntimeError),
     #[error("factor loads require explicit read port and bandwidth configuration")]
@@ -39,6 +45,12 @@ pub enum C220CoreError {
     MtePipelineBusy,
     #[error(transparent)]
     MtePipeline(#[from] crate::sim::c220::mte::C220MtePipelineError),
+    #[error(
+        "cache BIU handoff requires an in-flight external write with a representable byte length"
+    )]
+    InvalidCacheWrite,
+    #[error(transparent)]
+    Lsu(#[from] crate::sim::c220::scalar::lsu::scheduler::C220LsuSchedulerError),
     #[error(transparent)]
     CubeRuntime(#[from] crate::sim::c220::cube::C220CubeRuntimeError),
     #[error(transparent)]

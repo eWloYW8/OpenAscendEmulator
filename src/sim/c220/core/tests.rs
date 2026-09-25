@@ -58,7 +58,7 @@ fn native_mte3_write_path(mode: u8) {
     let mut core = C220Core::new(
         C220State::new(ScalarStepper::new(machine, 0), UbMemory::new(256, 256)),
         MappedMemory::bind(
-            SparseMemory::new(vec![MemoryRegion::unknown(128)], 256, 256),
+            SparseMemory::new(vec![MemoryRegion::unknown(256)], 256, 256),
             &[0x2000],
         )
         .unwrap(),
@@ -149,6 +149,30 @@ fn native_mte3_write_path(mode: u8) {
         })
         .unwrap();
     }
+    if mode == 2 {
+        use crate::sim::c220::scalar::lsu::cache::C220CacheAddressLayout;
+        use crate::sim::c220::scalar::lsu::miss_buffer::C220LsuMissConfig;
+        use crate::sim::c220::scalar::lsu::store_buffer::C220LsuStoreConfig;
+        core.configure_lsu(C220CoreLsuConfig {
+            request_capacity: 4,
+            write_capacity: 2,
+            direct_store_capacity: 2,
+            misses: C220LsuMissConfig {
+                line_bytes: 64,
+                main_entries: 2,
+                sub_entries: 2,
+            },
+            stores: C220LsuStoreConfig {
+                line_bytes: 64,
+                main_entries: 2,
+                sub_entries: 2,
+                timeout_ticks: 4,
+            },
+            layout: C220CacheAddressLayout::new(6, 3, 8, 0xffffffffff).unwrap(),
+            partition_stack: false,
+        })
+        .unwrap();
+    }
     assert!(matches!(
         core.step_word_at(0, word).unwrap(),
         C220CoreStep::Executed {
@@ -174,14 +198,77 @@ fn native_mte3_write_path(mode: u8) {
     assert!(core.take_mte3_dma_request().is_none());
     if mode == 2 {
         assert!(core.take_biu_write_command_at(7).is_err());
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(1, 0x2086).unwrap();
+        machine.set_xreg(2, 0x12ab).unwrap();
+        machine.set_spr_value(67, 0x2000000).unwrap();
+        machine.set_spr_value(68, 0x2000000).unwrap();
+        let pc = core.state.scalar().pc();
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::DirectStore(issue),
+            ..
+        } = core
+            .step_word_at(7, 0x1800_0000 | (2 << 17) | (1 << 12) | 0xffd)
+            .unwrap()
+        else {
+            panic!("direct store must enter the LSU");
+        };
+        assert_eq!(core.state.scalar().pc(), pc + 4);
+        assert_eq!(core.pending_lsu_instructions().count(), 1);
+        assert!(core.take_lsu_completions().is_empty());
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(2, 0)
+            .unwrap();
+        core.advance_to(10).unwrap();
+        let lsu = core.lsu_scheduler().unwrap();
+        assert!(lsu.pending_direct_store(issue.request).is_none());
+        assert_eq!(lsu.pipeline().queued_requests(), 0);
+        assert_eq!(lsu.direct_stores().entries().len(), 1);
+        core.advance_to(10).unwrap();
+        assert_eq!(
+            core.lsu_scheduler()
+                .unwrap()
+                .direct_stores()
+                .entries()
+                .len(),
+            1
+        );
+        assert!(core.memory().read_known_at(0x2080, 64).is_err());
+        assert!(matches!(
+            core.step_word_at(10, 0x40e0_1800).unwrap(),
+            C220CoreStep::Stalled(_)
+        ));
+        assert_eq!(core.state.scalar().pc(), pc + 4);
         core.state
             .ub
             .write_states(0, &vec![MemoryByteState::Known(9); 128])
             .unwrap();
-        let retired = (8..160)
+        let mut cache_done = false;
+        let mut mte_done = false;
+        let retired = (11..160)
             .find(|&tick| {
                 core.advance_to(tick).unwrap();
-                !core.last_mte3_dma_outcomes().is_empty()
+                mte_done |= !core.last_mte3_dma_outcomes().is_empty();
+                for completion in core.take_lsu_completions() {
+                    assert_eq!(completion.issue, issue);
+                    assert_eq!(completion.tick, tick);
+                    let mut expected = vec![0; 64];
+                    expected[3] = 0xab;
+                    assert_eq!(core.memory().read_known_at(0x2080, 64).unwrap(), expected);
+                    assert!(
+                        core.lsu_scheduler()
+                            .unwrap()
+                            .direct_stores()
+                            .entries()
+                            .is_empty()
+                    );
+                    assert_eq!(core.lsu_scheduler().unwrap().writes.outstanding(), 0);
+                    assert_eq!(core.pending_lsu_instructions().count(), 0);
+                    cache_done = true;
+                }
+                mte_done && cache_done
             })
             .expect("native memory service completes without externally injected responses");
         assert_eq!(

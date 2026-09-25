@@ -11,6 +11,7 @@ use crate::sim::common::scalar::ScalarProgramStep;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220CoreInstruction {
+    DirectStore(super::C220CoreLsuIssue),
     FixpBarrier {
         barrier: super::C220FixpBarrier,
         completed_tick: Option<u64>,

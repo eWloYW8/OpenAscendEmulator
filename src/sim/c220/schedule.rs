@@ -4,6 +4,7 @@ use thiserror::Error;
 pub enum C220StallCause {
     InstructionRate,
     ScalarDependency,
+    LsuDependency,
     Mte1IssueRate,
     Mte1Dependency,
     MtePhysicalDependency,

@@ -1,10 +1,34 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::num::{NonZeroU32, NonZeroU64};
 
-use super::biu_read::{C220BiuReadCommandTransfer, C220BiuReadReturn};
 use super::biu_write::C220BiuWriteReturnKind;
-use crate::sim::c220::mte::interface::biu_read::C220BiuReadRequest;
-use crate::sim::c220::mte::interface::biu_read::returns::C220BiuReadBeat;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum C220MemoryReadId {
+    Mte(NonZeroU32),
+    InstructionCache { port: u32, transaction: u64 },
+    DataCache { port: u32, transaction: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220MemoryReadCommand {
+    pub ready_tick: u64,
+    pub tag: C220MemoryReadId,
+    pub address: u64,
+    pub bytes: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220MemoryReadBeat {
+    pub tag: C220MemoryReadId,
+    pub transaction_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220MemoryReadReturn {
+    pub ready_tick: u64,
+    pub beat: C220MemoryReadBeat,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum C220MemoryWriteId {
@@ -64,7 +88,7 @@ pub struct C220MemoryCredits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220MemoryReadAdmission {
     pub tick: u64,
-    pub request: C220BiuReadRequest,
+    pub request: C220MemoryReadCommand,
 }
 
 /// Deterministic memory service. Latencies use profile range midpoints; this
@@ -105,10 +129,10 @@ pub struct C220TimedMemory {
     pending: u32,
     commands: VecDeque<C220MemoryWriteCommand>,
     data: VecDeque<C220MemoryWriteTransfer>,
-    reads: VecDeque<C220BiuReadCommandTransfer>,
+    reads: VecDeque<C220MemoryReadCommand>,
     read_admissions: Vec<C220MemoryReadAdmission>,
-    scheduled_reads: BTreeMap<u64, VecDeque<C220BiuReadBeat>>,
-    ready_reads: VecDeque<C220BiuReadReturn>,
+    scheduled_reads: BTreeMap<u64, VecDeque<C220MemoryReadBeat>>,
+    ready_reads: VecDeque<C220MemoryReadReturn>,
     scheduled: [BTreeMap<u64, VecDeque<C220MemoryWriteId>>; 2],
     ready: [VecDeque<C220MemoryWriteTransfer>; 2],
     transactions: BTreeMap<C220MemoryWriteId, Transaction>,
@@ -180,11 +204,11 @@ impl C220TimedMemory {
             && self.ready_reads.is_empty()
     }
 
-    pub fn ready_reads(&self) -> &VecDeque<C220BiuReadReturn> {
+    pub fn ready_reads(&self) -> &VecDeque<C220MemoryReadReturn> {
         &self.ready_reads
     }
 
-    pub fn scheduled_reads(&self) -> &BTreeMap<u64, VecDeque<C220BiuReadBeat>> {
+    pub fn scheduled_reads(&self) -> &BTreeMap<u64, VecDeque<C220MemoryReadBeat>> {
         &self.scheduled_reads
     }
 
@@ -201,17 +225,14 @@ impl C220TimedMemory {
     pub(crate) fn push_read(
         &mut self,
         tick: u64,
-        request: C220BiuReadRequest,
+        mut request: C220MemoryReadCommand,
     ) -> Result<(), C220TimedMemoryError> {
-        let ready_tick = add(tick, 1)?;
-        self.reads.push_back(C220BiuReadCommandTransfer {
-            ready_tick,
-            request,
-        });
+        request.ready_tick = add(tick, 1)?;
+        self.reads.push_back(request);
         Ok(())
     }
 
-    pub(crate) fn read_front(&self, tick: u64) -> Option<C220BiuReadBeat> {
+    pub(crate) fn read_front(&self, tick: u64) -> Option<C220MemoryReadBeat> {
         self.ready_reads
             .front()
             .filter(|head| head.ready_tick <= tick)
@@ -294,8 +315,8 @@ impl C220TimedMemory {
             else {
                 break;
             };
-            let request = command.request.input.generated.request;
-            let region = self.address_region(request.source_address);
+            let request = command;
+            let region = self.address_region(request.address);
             let pool = region * 2;
             if request.bytes >= self.credits[pool] {
                 break;
@@ -305,15 +326,15 @@ impl C220TimedMemory {
             self.scheduled_reads
                 .entry(ready)
                 .or_default()
-                .extend((0..count).map(|transaction_id| C220BiuReadBeat {
-                    tag: command.request.tag,
+                .extend((0..count).map(|transaction_id| C220MemoryReadBeat {
+                    tag: command.tag,
                     transaction_id,
                 }));
             self.pending += count;
             self.credits[pool] -= request.bytes;
             self.read_admissions.push(C220MemoryReadAdmission {
                 tick,
-                request: command.request,
+                request: command,
             });
             self.reads.pop_front();
         }
@@ -354,7 +375,7 @@ impl C220TimedMemory {
             self.ready_reads.extend(
                 beats
                     .into_iter()
-                    .map(|beat| C220BiuReadReturn { ready_tick, beat }),
+                    .map(|beat| C220MemoryReadReturn { ready_tick, beat }),
             );
         }
         for channel in 0..2 {

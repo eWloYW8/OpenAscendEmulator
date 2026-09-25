@@ -423,8 +423,23 @@ fn live_miss_hazards_replay_stores_until_the_line_is_released() {
     assert!(!scheduler.writes.has_hazard(external_line));
     assert_eq!(scheduler.writes.outstanding(), 0);
     let layout = C220CacheAddressLayout::new(6, 3, 8, 0xffffffffff).unwrap();
+    let mut machine = crate::sim::common::scalar::ScalarMachine::from_pem_initial_state(
+        crate::architecture::Architecture::Dav2201,
+    );
+    machine.set_xreg(1, 0xffff_0000_0000_0006).unwrap();
+    machine.set_xreg(2, 0x12ab).unwrap();
+    let operands = crate::sim::c220::scalar::C220DirectStoreOperands::capture(
+        &machine,
+        0x100,
+        0x1800_0000 | (2 << 17) | (1 << 12) | 0xffd,
+    )
+    .unwrap();
+    machine.set_xreg(2, 0).unwrap();
+    assert_eq!(operands.bytes(), &[0xab]);
+    assert_eq!(operands.effective_address, 0xffff_0000_0000_0003);
+    assert_eq!(machine.xregs()[1], operands.base_value);
     scheduler
-        .push_direct_store(9, 0xffff_0000_0000_0003, store_id, &[0xab], layout)
+        .execute_direct_store(9, store_id, &operands, layout)
         .unwrap();
     scheduler
         .push_direct_store(9, 5, load_id, &[0xcd], layout)
@@ -453,6 +468,15 @@ fn live_miss_hazards_replay_stores_until_the_line_is_released() {
     assert_eq!(sent[0].byte_len, 64);
     assert_eq!(sent[0].line.address, 0);
     let mut backing = [0xff; 64];
+    assert_eq!(
+        scheduler.apply_external_write_response::<C220LsuSchedulerError>(first, |_, _| {
+            Err(C220LsuSchedulerError::MissingCacheLine)
+        }),
+        Err(C220LsuSchedulerError::MissingCacheLine)
+    );
+    assert_eq!(scheduler.writes.outstanding(), 0);
+    assert_eq!(scheduler.direct_stores.entries().len(), 2);
+    assert!(scheduler.writes.has_hazard(external_line));
     assert_eq!(
         scheduler
             .complete_external_write_response(first, &mut backing)

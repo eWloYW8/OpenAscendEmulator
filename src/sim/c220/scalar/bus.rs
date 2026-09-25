@@ -178,5 +178,18 @@ mod tests {
             Err(C220ScalarBusError::AliasBoundary { .. })
         ));
         assert_eq!(fallback.0, [0x1000080, external_root + 0x80]);
+        use crate::sim::c220::scalar::C220ScalarMappedAddress;
+        use crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory;
+        let stack = C220ScalarMappedAddress::decode(root + 0x130080, root, root).unwrap();
+        assert_eq!(stack.memory, C220LsuMemory::Ub);
+        assert_eq!(stack.address, 0x30080);
+        assert!(stack.stack);
+        assert_eq!(stack.cache_address(true), (1 << 63) | 0x30080);
+        assert_eq!(stack.cache_address(false), 0x30080);
+        let mapped = C220ScalarMappedAddress::decode(root + 0x100080, root, external_root).unwrap();
+        assert_eq!(mapped.memory, C220LsuMemory::External);
+        assert_eq!(mapped.address, external_root + 0x80);
+        assert!(mapped.stack);
+        assert!(C220ScalarMappedAddress::decode(root + 0x80, root, root).is_none());
     }
 }

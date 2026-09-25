@@ -19,6 +19,9 @@ use crate::sim::c220::vector::va::C220VaRegisters;
 use crate::sim::c220::vector::vmsu::C220VmsuPipeline;
 
 mod advance;
+mod cache;
+mod lsu;
+pub use lsu::{C220CoreLsuCompletion, C220CoreLsuConfig, C220CoreLsuIssue};
 mod cube;
 mod decode;
 mod dispatch;
@@ -110,6 +113,7 @@ pub struct C220Core {
     state: C220State,
     mte2: C220Mte2Pipeline,
     scalar_timing: C220ScalarTimingLane,
+    lsu: Option<lsu::CoreLsu>,
     mte1: Mte1Engine,
     mte_pipeline: Option<C220MtePipeline>,
     fixp: Option<fixp::CoreFixp>,
@@ -156,6 +160,7 @@ impl C220Core {
             state,
             mte2: C220Mte2Pipeline::new(timing.mte2),
             scalar_timing: C220ScalarTimingLane::default(),
+            lsu: None,
             mte1: Mte1Engine::default(),
             mte_pipeline: None,
             fixp: None,
@@ -198,6 +203,9 @@ impl C220Core {
         &mut self,
         config: C220MtePipelineConfig,
     ) -> Result<(), C220CoreError> {
+        if self.lsu.is_some() {
+            return Err(C220CoreError::LsuAlreadyConfigured);
+        }
         if self.mte1.pending_commands().next().is_some()
             || self
                 .fixp
@@ -223,6 +231,9 @@ impl C220Core {
         &mut self,
         config: crate::sim::c220::memory::timed_memory::C220TimedMemoryConfig,
     ) -> Result<(), C220CoreError> {
+        if self.lsu.is_some() {
+            return Err(C220CoreError::LsuAlreadyConfigured);
+        }
         self.mte_pipeline
             .as_mut()
             .ok_or(C220CoreError::MteUnconfigured)?
@@ -337,7 +348,9 @@ impl C220Core {
         let mut tick = start_tick;
         let mut events = Vec::new();
         loop {
-            let stop = if self.state.scalar().is_halted() {
+            let stop = if self.state.scalar().is_halted()
+                && self.lsu.as_ref().is_none_or(|lsu| lsu.next_tick.is_none())
+            {
                 Some(C220RunStop::Halted)
             } else if tick >= tick_limit {
                 Some(C220RunStop::TickBudget)
@@ -355,6 +368,11 @@ impl C220Core {
                     events,
                     stop,
                 });
+            }
+            if self.state.scalar().is_halted() {
+                self.advance_to(tick)?;
+                tick = tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?;
+                continue;
             }
             let event = self.step_loaded_at(tick, kernel, code_memory)?;
             tick = match &event {
@@ -384,6 +402,10 @@ impl C220Core {
 
     fn pending_compute_drain(&self) -> Option<(u64, C220StallCause)> {
         [
+            self.lsu
+                .as_ref()
+                .and_then(|lsu| lsu.next_tick)
+                .map(|tick| (tick, C220StallCause::LsuDependency)),
             self.external_fixp
                 .as_ref()
                 .and_then(|fixp| {

@@ -21,6 +21,7 @@ impl C220Core {
                 .next_event_tick()
                 .into_iter()
                 .chain(self.mte1.next_event_tick())
+                .chain(self.lsu.as_ref().and_then(|lsu| lsu.next_tick))
                 .chain(self.mte2.next_event_tick())
                 .chain(self.vector.next_event_tick())
                 .chain(self.mte3.pending_retirement_tick())
@@ -105,6 +106,7 @@ impl C220Core {
                 break;
             }
             self.release_fixp_barriers_at(event_tick);
+            self.advance_lsu_at(event_tick)?;
             self.cube.advance_event(
                 event_tick,
                 &mut self.local_memory,

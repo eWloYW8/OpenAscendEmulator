@@ -5,6 +5,16 @@ use super::store_buffer::{C220LsuLineKey, C220LsuMemory};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct C220LsuWriteId(u64);
 
+impl C220LsuWriteId {
+    pub const fn sequence(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) const fn from_sequence(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220LsuWriteState {
     Queued,

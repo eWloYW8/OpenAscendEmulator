@@ -76,20 +76,12 @@ impl C220LsuDirectStoreBuffer {
         Ok(())
     }
 
-    pub(super) fn complete(
-        &mut self,
-        address: u64,
-        backing: &mut [u8],
-    ) -> Result<C220LsuRequestId, C220LsuStoreError> {
-        if backing.len() != self.line_bytes {
-            return Err(C220LsuStoreError::InvalidRange);
-        }
+    pub(super) fn remove(&mut self, address: u64) -> Result<C220LsuRequestId, C220LsuStoreError> {
         let index = self
             .entries
             .iter()
             .position(|entry| entry.address == address)
             .ok_or(C220LsuStoreError::MissingEntry)?;
-        backing.copy_from_slice(&self.entries[index].bytes);
         Ok(self.entries.remove(index).request)
     }
 }

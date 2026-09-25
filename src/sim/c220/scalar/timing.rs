@@ -1,6 +1,6 @@
 use crate::architecture::Architecture;
 use crate::isa::c220::cube::C220CubeInstruction;
-use crate::isa::c220::scalar::C220ScalarConversionHint;
+use crate::isa::c220::scalar::{C220ScalarConversionHint, C220ScalarDirectStore};
 use crate::isa::c220::vector::scalar::C220VectorScalarInstruction;
 use crate::isa::c220::vector::{
     C220BroadcastInstruction, C220CopyInstruction, C220MovevInstruction, C220ShiftInstruction,
@@ -208,6 +208,11 @@ impl C220ScalarTimingLane {
         }
         if let Some(instruction) = C220ScalarConversionHint::from_word(word) {
             include(instruction.source_register);
+            return resume_tick;
+        }
+        if let Some(instruction) = C220ScalarDirectStore::decode(word) {
+            include(instruction.source_register);
+            include(instruction.base_register);
             return resume_tick;
         }
         let hint = ScalarInstruction::from_word(Architecture::Dav2201, word)?;
@@ -503,6 +508,8 @@ mod tests {
             assert_eq!(lane.dependency_tick(word, 4), None);
         }
         for word in [
+            0x1800_0000 | (6 << 17) | (4 << 12),
+            0x1900_0000 | (3 << 17) | (6 << 12),
             (6 << 29) | (3 << 17) | (4 << 12) | (6 << 7),
             (6 << 29) | (3 << 24) | (3 << 17) | (4 << 12) | (5 << 7) | (6 << 2),
             0x9c80_0003 | (3 << 17) | (4 << 12) | (6 << 7) | (5 << 2),

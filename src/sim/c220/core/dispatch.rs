@@ -46,6 +46,9 @@ impl C220Core {
             }));
         }
         let pc = self.state.scalar().pc();
+        if crate::isa::c220::scalar::C220ScalarDirectStore::decode(word).is_some() {
+            return self.step_direct_store_at(tick, word);
+        }
         if let Some(barrier) = PipelineBarrierStep::decode(Architecture::Dav2201, pc, word)
             .filter(|barrier| barrier.scope == PipelineBarrierScope::Fix)
         {

@@ -365,7 +365,40 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
     .unwrap();
     let id = core.next_instruction_id();
     let initial_ub = core.state.ub().read_states(0, 8192).unwrap();
-    core.step_word_at(0, word).unwrap();
+    use crate::sim::c220::memory::biu_read::{C220BiuReadCacheConfig, C220BiuReadCacheKind};
+    use crate::sim::c220::memory::timed_memory::{C220MemoryReadCommand, C220MemoryReadId};
+    let pipeline = core.mte_pipeline.as_mut().unwrap();
+    let cache_port = pipeline
+        .connect_cache_read_port(
+            C220BiuReadCacheKind::Data,
+            C220BiuReadCacheConfig {
+                request_capacity: NonZeroU32::new(2).unwrap(),
+                response_capacity: NonZeroU32::new(1).unwrap(),
+                request_latency: 1,
+                response_latency: 1,
+            },
+        )
+        .unwrap();
+    let cache_tag = C220MemoryReadId::DataCache {
+        port: cache_port,
+        transaction: 1,
+    };
+    assert!(
+        pipeline
+            .send_cache_read(C220MemoryReadCommand {
+                ready_tick: 0,
+                tag: cache_tag,
+                address: source,
+                bytes: 64,
+            })
+            .unwrap()
+    );
+    let mut cache_completed = false;
+    assert!(
+        matches!(core.step_word_at(0, word).unwrap(), C220CoreStep::Executed {
+        instruction: C220CoreInstruction::Mte2(issue), ..
+    } if issue.instruction_id == id)
+    );
     core.memory.write_unknown_at(source, 1).unwrap();
     core.memory.write_known_at(source + 1, &[5]).unwrap();
     let mut admitted = std::collections::BTreeSet::new();
@@ -374,6 +407,17 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
     for tick in 1..250 {
         core.advance_to(tick).unwrap();
         core.advance_to(tick).unwrap();
+        if let Some(beat) = core
+            .mte_pipeline
+            .as_mut()
+            .unwrap()
+            .take_cache_read_return(C220BiuReadCacheKind::Data, cache_port)
+        {
+            assert_eq!(beat.tag, cache_tag);
+            assert_eq!(beat.transaction_id, 0);
+            assert!(!cache_completed);
+            cache_completed = true;
+        }
         for admission in core
             .mte_pipeline
             .as_ref()
@@ -383,13 +427,18 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
             .read_admissions()
         {
             let request = admission.request;
-            assert_eq!(request.input.generated.instruction_id, id);
+            if request.tag == cache_tag {
+                continue;
+            }
+            assert!(matches!(
+                request.tag,
+                crate::sim::c220::memory::timed_memory::C220MemoryReadId::Mte(_)
+            ));
             assert!(admission.tick <= tick);
-            if admitted.insert((request.input.generated.uop_index, request.byte_offset)) {
-                let request = request.input.generated.request;
+            if admitted.insert((admission.tick, request.tag)) {
                 admitted_bytes += request.bytes as usize;
                 core.memory
-                    .write_known_at(request.source_address, &vec![9; request.bytes as usize])
+                    .write_known_at(request.address, &vec![9; request.bytes as usize])
                     .unwrap();
                 core.memory.write_unknown_at(source + 2, 1).unwrap();
             }
@@ -411,6 +460,7 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
         0
     );
     assert_eq!(admitted_bytes, plan.bytes);
+    assert!(cache_completed);
     for segment in plan.descriptor_segments().unwrap() {
         let expected: Vec<_> = (0..segment.bytes)
             .map(

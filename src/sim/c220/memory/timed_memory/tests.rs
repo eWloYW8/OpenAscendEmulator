@@ -1,15 +1,7 @@
 use super::*;
-use crate::sim::c220::mte::interface::biu_read::C220BiuSubcore;
 
 #[test]
 fn reads_share_ddr_credits_and_pending_slots_with_writes() {
-    use crate::sim::c220::mte::dma::C220DmaGenerated;
-    use crate::sim::c220::mte::interface::biu_read::{
-        C220BiuReadInput, write::C220BiuWriteDestination,
-    };
-    use crate::sim::c220::mte::uop::{
-        C220DmaDestinationLayout, C220DmaUopMode, C220DmaUopRequest, C220DmaUopRoute,
-    };
     for (slots, limit) in [(1, 1025), (8, 513)] {
         let timing = C220MemoryRegionTiming {
             read: C220MemoryLatency {
@@ -40,6 +32,44 @@ fn reads_share_ddr_credits_and_pending_slots_with_writes() {
         )
         .unwrap();
         let tag = NonZeroU32::new(1).unwrap();
+        let mut shared_reads = memory.clone();
+        let sources = [
+            C220MemoryReadId::Mte(tag),
+            C220MemoryReadId::DataCache {
+                port: 0,
+                transaction: 1,
+            },
+            C220MemoryReadId::InstructionCache {
+                port: 0,
+                transaction: 1,
+            },
+        ];
+        let mut received = Vec::new();
+        let mut sent = 0;
+        for tick in 0..20 {
+            if sent < sources.len() && shared_reads.can_push_read() {
+                shared_reads
+                    .push_read(
+                        tick,
+                        C220MemoryReadCommand {
+                            ready_tick: tick,
+                            tag: sources[sent],
+                            address: 0,
+                            bytes: 64,
+                        },
+                    )
+                    .unwrap();
+                sent += 1;
+            }
+            shared_reads.advance(tick).unwrap();
+            while let Some(beat) = shared_reads.read_front(tick) {
+                assert_eq!(beat.transaction_id, 0);
+                received.push(beat.tag);
+                shared_reads.pop_read();
+            }
+        }
+        assert_eq!(received, sources);
+        assert!(shared_reads.is_idle());
         memory.transactions.insert(
             C220MemoryWriteId::Mte(tag),
             Transaction {
@@ -56,35 +86,11 @@ fn reads_share_ddr_credits_and_pending_slots_with_writes() {
                 },
             )
             .unwrap();
-        let read = C220BiuReadRequest {
-            tag,
-            byte_offset: 0,
-            input: C220BiuReadInput {
-                subcore: C220BiuSubcore::Vector0,
-                destination: C220BiuWriteDestination::Ub0,
-                prefetch: false,
-                generated: C220DmaGenerated {
-                    instruction_id: 2,
-                    uop_index: 0,
-                    ready_tick: 0,
-                    request: C220DmaUopRequest {
-                        route: C220DmaUopRoute::Ordinary,
-                        burst_index: 0,
-                        source_address: 0,
-                        destination_address: 0,
-                        bytes: 512,
-                        last_in_burst: true,
-                    },
-                    destination: C220DmaDestinationLayout {
-                        base: 0,
-                        burst_bytes: 512,
-                        burst_stride: 512,
-                    },
-                    mode: C220DmaUopMode::Wide512,
-                    out_of_order: false,
-                    last_in_instruction: true,
-                },
-            },
+        let read = C220MemoryReadCommand {
+            ready_tick: 0,
+            tag: C220MemoryReadId::Mte(tag),
+            address: 0,
+            bytes: 512,
         };
         memory.push_read(0, read).unwrap();
         memory.advance(1).unwrap();
@@ -99,8 +105,8 @@ fn reads_share_ddr_credits_and_pending_slots_with_writes() {
         for id in 0..4 {
             assert_eq!(
                 memory.read_front(5),
-                Some(C220BiuReadBeat {
-                    tag,
+                Some(C220MemoryReadBeat {
+                    tag: read.tag,
                     transaction_id: id
                 })
             );
@@ -111,7 +117,7 @@ fn reads_share_ddr_credits_and_pending_slots_with_writes() {
         memory.pop(C220BiuWriteReturnKind::Completion);
         assert!(memory.is_idle());
         let mut l2_read = read;
-        l2_read.input.generated.request.source_address = 4096;
+        l2_read.address = 4096;
         memory.push_read(7, l2_read).unwrap();
         memory.advance(8).unwrap();
         assert_eq!(memory.credits(), [limit - 384, limit, limit - 512]);

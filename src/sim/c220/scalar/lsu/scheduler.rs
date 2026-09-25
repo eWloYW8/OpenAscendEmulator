@@ -23,6 +23,7 @@ pub enum C220LsuAccess {
 mod tests;
 
 mod direct_store;
+use direct_store::PendingDirectStore;
 mod response;
 mod write_response;
 pub use response::C220LsuReadCompletion;
@@ -99,6 +100,7 @@ pub struct C220LsuRequestScheduler {
     pub misses: C220LsuMissBuffer,
     pub stores: C220LsuStoreBuffer,
     direct_stores: C220LsuDirectStoreBuffer,
+    pending_direct_stores: BTreeMap<C220LsuRequestId, PendingDirectStore>,
     direct_events: EventDispatcher<()>,
     direct_event: EventId,
     pub writes: C220LsuWriteQueue,
@@ -124,6 +126,7 @@ impl C220LsuRequestScheduler {
         Ok(Self {
             pipeline: C220LsuRequestPipeline::new(capacity)?,
             requests: BTreeMap::new(),
+            pending_direct_stores: BTreeMap::new(),
             direct_stores: C220LsuDirectStoreBuffer::new(
                 stores.line_bytes(),
                 direct_store_capacity,
@@ -247,7 +250,7 @@ impl C220LsuRequestScheduler {
                 stall == Some(C220LsuStall::Drain),
             )?,
             C220LsuStage::M1 => self.pipeline.advance_m1(tick, stall.is_some())?,
-            C220LsuStage::M2 => self.pipeline.advance_m2(tick, stall.is_some())?,
+            C220LsuStage::M2 => self.advance_direct_store_m2(tick, stall.is_some())?,
         };
         self.writes.advance_to(tick)?;
         self.direct_events.advance_to(tick)?;
