@@ -61,7 +61,16 @@ fn maintenance_write_samples_live_data_and_retries_before_resetting_tags() {
         if !hit {
             ram.invalidate(location).unwrap();
         }
-        let id = staged.admit_atomic_store(0, operands).unwrap().unwrap();
+        let mapped = crate::sim::c220::scalar::C220ScalarMappedAddress::decode(
+            operands.effective_address,
+            1 << 25,
+            0,
+        )
+        .unwrap();
+        let id = staged
+            .admit_atomic_store(0, operands, mapped, false)
+            .unwrap()
+            .unwrap();
         for tick in 1..5 {
             staged.process_stores(tick, &mut ram, false).unwrap();
             for stage in [C220LsuStage::M2, C220LsuStage::M1, C220LsuStage::M0] {

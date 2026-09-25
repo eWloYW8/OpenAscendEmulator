@@ -60,12 +60,24 @@ impl C220Core {
                 cause: C220StallCause::ScalarDependency,
             }));
         }
-        let operands = C220AtomicStoreOperands::capture(self.state.scalar().machine(), pc, word)
-            .map_err(crate::sim::common::scalar::ScalarInstructionError::from)?;
+        let mut operands =
+            C220AtomicStoreOperands::capture(self.state.scalar().machine(), pc, word)
+                .map_err(crate::sim::common::scalar::ScalarInstructionError::from)?;
         let lsu = self.lsu.as_mut().ok_or(C220CoreError::LsuUnconfigured)?;
         if lsu.cache.is_none() {
             return Err(C220CoreError::LsuUnconfigured);
         }
+        operands.local_root = lsu
+            .config
+            .address_roots
+            .functional_roots(
+                Some(operands.local_root),
+                self.state.scalar().machine().spr_value(68),
+            )
+            .ok_or(C220CoreError::LsuAddress {
+                address: operands.effective_address,
+            })?
+            .0;
         if lsu.config.stores.line_bytes != 64
             || (operands.effective_address & 63) + operands.bytes().len() as u64 > 64
         {

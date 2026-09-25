@@ -762,6 +762,11 @@ fn run_core_atomic_stores(core: &mut C220Core, mut tick: u64) {
             })
             .expect("atomic store retires");
         assert_eq!(done.issue, issue);
+        assert_eq!(done.data.mapped.address, address);
+        assert_eq!(
+            done.data.mapped.memory,
+            crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory::External
+        );
         assert_eq!(done.result.previous_bytes(), 0x1ff_u32.to_le_bytes());
         assert_eq!(done.result.stored_bytes(), 0x100_u32.to_le_bytes());
         assert_eq!(done.retire_tick, done.data.tick + 1);
@@ -903,6 +908,7 @@ fn native_mte3_write_path(mode: u8) {
         use crate::sim::c220::scalar::lsu::miss_buffer::C220LsuMissConfig;
         use crate::sim::c220::scalar::lsu::store_buffer::C220LsuStoreConfig;
         core.configure_lsu(C220CoreLsuConfig {
+            address_roots: Default::default(),
             request_capacity: 3,
             read_capacity: 2,
             write_capacity: 2,

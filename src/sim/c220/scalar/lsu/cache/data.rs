@@ -31,6 +31,7 @@ impl C220DataCache {
         &mut self,
         address: u64,
         partition_address: u64,
+        memory: C220LsuMemory,
         bytes: &[u8],
     ) -> Result<C220CacheLocation, C220CacheError> {
         if self.line_bytes != 64 || bytes.len() != 64 {
@@ -39,14 +40,14 @@ impl C220DataCache {
         let index = self.layout.index(address);
         let set = &mut self.sets[index as usize];
         let way = set.victim(partition_address);
-        set.install(way, self.layout.tag(address), C220LsuMemory::External, true)?;
+        set.install(way, self.layout.tag(address), memory, true)?;
         set.ways[way].atomic = true;
         self.data[index as usize][way].copy_from_slice(bytes);
         Ok(C220CacheLocation { index, way })
     }
 
     /// Publish a buffered atomic store after the controller selects its hit.
-    /// This stage copies already computed store data; it does not add again.
+    /// This stage copies captured source data; functional arithmetic is separate.
     /// Dirty ordinary lines report a conflict without modifying data or tags.
     pub fn write_atomic_hit(
         &mut self,

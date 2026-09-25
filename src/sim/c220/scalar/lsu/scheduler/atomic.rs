@@ -1,19 +1,21 @@
 use super::super::cache::{C220AtomicCacheHit, C220CacheLocation, C220DataCache};
-use super::super::store_buffer::C220LsuMemory;
 use super::*;
-use crate::sim::c220::scalar::C220AtomicStoreOperands;
+use crate::sim::c220::scalar::{C220AtomicStoreOperands, C220ScalarMappedAddress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220LsuAtomicCompletion {
     pub request: C220LsuRequestId,
     pub tick: u64,
     pub operands: C220AtomicStoreOperands,
+    pub mapped: C220ScalarMappedAddress,
     pub cache_hit: Option<C220AtomicCacheHit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PendingAtomic {
     operands: C220AtomicStoreOperands,
+    mapped: C220ScalarMappedAddress,
+    partition_address: u64,
     line: C220LsuLineKey,
     offset: usize,
     lookup: Option<Option<C220CacheLocation>>,
@@ -26,18 +28,17 @@ impl C220LsuRequestScheduler {
         &mut self,
         tick: u64,
         operands: C220AtomicStoreOperands,
+        mapped: C220ScalarMappedAddress,
+        partition_stack: bool,
     ) -> Result<Option<C220LsuRequestId>, C220LsuSchedulerError> {
-        let address = operands.effective_address & 0x0000_ffff_ffff_ffff;
+        let address = mapped.address & 0x0000_ffff_ffff_ffff;
         let offset = (address & 63) as usize;
-        if self.stores.line_bytes() != 64
-            || !operands.is_external()
-            || offset + operands.bytes().len() > 64
-        {
+        if self.stores.line_bytes() != 64 || offset + operands.bytes().len() > 64 {
             return Err(C220LsuSchedulerError::UnsupportedStoreAccess);
         }
         let line = C220LsuLineKey {
             address: address & !63,
-            memory: C220LsuMemory::External,
+            memory: mapped.memory,
         };
         let Some((id, _)) = self.admit(
             tick,
@@ -54,6 +55,8 @@ impl C220LsuRequestScheduler {
             id,
             PendingAtomic {
                 operands,
+                mapped,
+                partition_address: mapped.cache_address(partition_stack),
                 line,
                 offset,
                 lookup: None,
@@ -114,7 +117,7 @@ impl C220LsuRequestScheduler {
             C220LsuStage::M0 => {
                 let hit = cache.lookup_partitioned(
                     pending.line.address,
-                    pending.operands.effective_address,
+                    pending.partition_address,
                     pending.line.memory,
                 );
                 pending.lookup = Some(hit.or(pending.lookup.flatten()));
@@ -156,7 +159,8 @@ impl C220LsuRequestScheduler {
         } else {
             cache.install_atomic_line(
                 key.address,
-                pending.operands.effective_address,
+                pending.partition_address,
+                key.memory,
                 entry.bytes(),
             )?;
             None
@@ -180,6 +184,7 @@ impl C220LsuRequestScheduler {
                 request,
                 tick,
                 operands: pending.operands,
+                mapped: pending.mapped,
                 cache_hit,
             });
         }

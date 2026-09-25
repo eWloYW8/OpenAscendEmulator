@@ -18,7 +18,7 @@ use crate::numeric::conversion::{F32ToS32Status, f32_to_s32_truncate, s32_to_f32
 use crate::sim::common::scalar::{ScalarMachine, ScalarMachineError, ScalarStep};
 
 pub(crate) mod address;
-pub use address::C220ScalarMappedAddress;
+pub use address::{C220ScalarAddressConfig, C220ScalarMappedAddress};
 pub(crate) mod bus;
 pub mod lsu;
 pub mod timing;

@@ -33,6 +33,7 @@ use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CoreLsuConfig {
+    pub address_roots: crate::sim::c220::scalar::C220ScalarAddressConfig,
     pub request_capacity: u32,
     pub read_capacity: u32,
     pub write_capacity: u32,

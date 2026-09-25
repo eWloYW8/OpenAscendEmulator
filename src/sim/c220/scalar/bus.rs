@@ -164,6 +164,28 @@ mod tests {
 
     #[test]
     fn external_routes_translate_addresses_before_access() {
+        use crate::sim::c220::scalar::C220ScalarAddressConfig;
+        for system in [None, Some(11)] {
+            for stack in [None, Some(22)] {
+                let config = C220ScalarAddressConfig {
+                    system_base: system,
+                    stack_base: stack,
+                };
+                assert_eq!(
+                    config.lsu_roots(Some(33), Some(44)),
+                    Some((system.unwrap_or(33), stack.unwrap_or(44)))
+                );
+                assert_eq!(
+                    config.functional_roots(Some(33), Some(44)),
+                    Some(if system.is_some() && stack.is_some() {
+                        (11, 22)
+                    } else {
+                        (33, 44)
+                    })
+                );
+                assert_eq!(config.functional_roots(None, None), system.zip(stack));
+            }
+        }
         let mut ub = UbMemory::new(32, 32);
         let mut fallback = AddressBus::default();
         let root = 0x2_000000;

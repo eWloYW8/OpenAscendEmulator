@@ -4,6 +4,27 @@ const EXTERNAL_ADDRESS_MASK: u64 = 0xffffffffffff;
 
 pub(crate) const C220_UB_BYTES: u64 = 0x30000;
 
+/// Optional fixed bases. Unconfigured bases are read from SPR67 and SPR68.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct C220ScalarAddressConfig {
+    pub system_base: Option<u64>,
+    pub stack_base: Option<u64>,
+}
+
+impl C220ScalarAddressConfig {
+    /// The LSU selects each base independently.
+    pub fn lsu_roots(self, spr67: Option<u64>, spr68: Option<u64>) -> Option<(u64, u64)> {
+        self.system_base.or(spr67).zip(self.stack_base.or(spr68))
+    }
+
+    /// Functional scalar execution uses fixed bases only when both are configured.
+    pub fn functional_roots(self, spr67: Option<u64>, spr68: Option<u64>) -> Option<(u64, u64)> {
+        self.system_base
+            .zip(self.stack_base)
+            .or_else(|| spr67.zip(spr68))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220ScalarMappedAddress {
     pub address: u64,

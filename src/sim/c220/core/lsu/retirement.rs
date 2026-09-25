@@ -34,7 +34,14 @@ impl CoreLsu {
                 };
                 operands.control = spr(3)?;
                 operands.atomic_control = spr(90)?;
-                operands.local_root = spr(67)?;
+                operands.local_root = self
+                    .config
+                    .address_roots
+                    .functional_roots(machine.spr_value(67), machine.spr_value(68))
+                    .ok_or(C220CoreError::LsuAddress {
+                        address: operands.effective_address,
+                    })?
+                    .0;
                 let result = operands.execute(memory, self.config.atomic_fp16_rounding)?;
                 Ok::<_, C220CoreError>(result)
             })
