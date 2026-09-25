@@ -3,6 +3,9 @@ use crate::isa::c220::mte::load3d::{
     C220Load3dV2Instruction, C220Load3dV2Operands,
 };
 
+mod tiles;
+pub use tiles::{C220Load3dTile, C220Load3dTiles};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("LOAD3Dv2 requires SPR {register}")]
 pub struct C220Load3dCaptureError {
@@ -41,6 +44,10 @@ pub struct C220Load3dV2Command {
 }
 
 impl C220Load3dV2Command {
+    pub fn tiles(self) -> C220Load3dTiles {
+        C220Load3dTiles::new(self)
+    }
+
     pub fn capture(
         instruction: C220Load3dV2Instruction,
         registers: &[u64; 32],
