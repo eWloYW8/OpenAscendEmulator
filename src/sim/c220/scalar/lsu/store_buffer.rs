@@ -240,11 +240,38 @@ impl C220LsuStoreBuffer {
         bytes: &[u8],
         cache_hit: bool,
     ) -> Result<(), C220LsuStoreError> {
+        self.insert(key, request, offset, bytes, cache_hit, false)
+    }
+
+    /// Atomic stores may merge into a forbidden entry without changing its
+    /// ownership, state, initial hit result, or timeout.
+    pub fn store_atomic(
+        &mut self,
+        key: C220LsuLineKey,
+        request: C220LsuRequestId,
+        offset: usize,
+        bytes: &[u8],
+        cache_hit: bool,
+    ) -> Result<(), C220LsuStoreError> {
+        self.insert(key, request, offset, bytes, cache_hit, true)
+    }
+
+    fn insert(
+        &mut self,
+        key: C220LsuLineKey,
+        request: C220LsuRequestId,
+        offset: usize,
+        bytes: &[u8],
+        cache_hit: bool,
+        allow_forbidden: bool,
+    ) -> Result<(), C220LsuStoreError> {
         if !key.address.is_multiple_of(self.config.line_bytes as u64) {
             return Err(C220LsuStoreError::UnalignedLine);
         }
         let range = checked_range(offset, bytes.len(), self.config.line_bytes)?;
-        if self.full(key) || self.entry(key).is_some_and(|entry| entry.forbidden) {
+        if self.full(key)
+            || (!allow_forbidden && self.entry(key).is_some_and(|entry| entry.forbidden))
+        {
             return Err(C220LsuStoreError::Blocked);
         }
         let index = match self.entries.iter().position(|entry| entry.key == key) {
@@ -599,9 +626,18 @@ mod tests {
             stores.store(key, first, 0, &[1], false),
             Err(C220LsuStoreError::Blocked)
         );
-        stores.set_forbidden(key, false).unwrap();
         let third = pipeline.admit(0, false).unwrap().unwrap().0;
-        stores.store(key, third, 10, &[7], false).unwrap();
+        stores.store_atomic(key, third, 10, &[7], true).unwrap();
+        assert!(stores.entry(key).unwrap().forbidden());
+        assert!(!stores.entry(key).unwrap().cache_hit());
+        assert_eq!(stores.entry(key).unwrap().remaining_ticks(), 2);
+        let full = stores.clone();
+        assert_eq!(
+            stores.store_atomic(key, third, 11, &[9], true),
+            Err(C220LsuStoreError::Blocked)
+        );
+        assert_eq!(stores, full);
+        stores.set_forbidden(key, false).unwrap();
         assert!(stores.full(key));
         assert_eq!(stores.ready_to_flush().count(), 1);
         stores.set_state(key, C220LsuStoreState::Fetching).unwrap();

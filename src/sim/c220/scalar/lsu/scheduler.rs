@@ -105,6 +105,10 @@ pub enum C220LsuSchedulerError {
     MissingLoadLookup,
     #[error("store operands must fit their cache-line requests")]
     UnsupportedStoreAccess,
+    #[error(
+        "atomic store at PC {pc:#x} reached a full STB for {line:?}; no retirement can be modeled for this insertion"
+    )]
+    AtomicStoreCapacity { pc: u64, line: C220LsuLineKey },
     #[error("store buffer request has no captured cache lookup")]
     MissingStoreLookup,
     #[error("read response requires a fetching store entry")]

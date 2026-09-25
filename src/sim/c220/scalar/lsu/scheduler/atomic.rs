@@ -89,13 +89,11 @@ impl C220LsuRequestScheduler {
             pending
                 .lookup
                 .ok_or(C220LsuSchedulerError::MissingStoreLookup)?;
-            if self.stores.full(pending.line)
-                || self
-                    .stores
-                    .entry(pending.line)
-                    .is_some_and(|entry| entry.forbidden())
-            {
-                return Err(C220LsuStoreError::Blocked.into());
+            if self.stores.full(pending.line) {
+                return Err(C220LsuSchedulerError::AtomicStoreCapacity {
+                    pc: pending.operands.pc,
+                    line: pending.line,
+                });
             }
             tick.checked_add(1).ok_or(EventError::TimeOverflow)?;
         }
@@ -123,7 +121,7 @@ impl C220LsuRequestScheduler {
             }
             C220LsuStage::M1 => {}
             C220LsuStage::M2 => {
-                self.stores.store(
+                self.stores.store_atomic(
                     pending.line,
                     id,
                     pending.offset,
