@@ -38,11 +38,19 @@ pub fn execute_conversion_word(
     })
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct C220ScalarConversionStatus {
+    pub overflow: bool,
+    pub underflow: bool,
+    pub nan_operand: bool,
+    pub infinity_operand: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220ScalarConversionOutcome {
     pub value: u64,
     pub spr2: u64,
-    pub status: F32ToS32Status,
+    pub status: C220ScalarConversionStatus,
 }
 
 pub fn execute_scalar_conversion(
@@ -52,49 +60,71 @@ pub fn execute_scalar_conversion(
     prior_spr2: u64,
     pc: u64,
 ) -> C220ScalarConversionOutcome {
-    match conversion {
-        C220ScalarConversion::F32ToS32NearestAway
-        | C220ScalarConversion::F32ToS32Floor
-        | C220ScalarConversion::F32ToS32Ceil
-        | C220ScalarConversion::F32ToS32Truncate
-        | C220ScalarConversion::F32ToS32NearestEven => {
+    use crate::sim::c220::numeric::fp16::{
+        C220Fp16Mode, C220Fp16Rounding, c220_f32_to_fp16, c220_fp16_to_fp32_bits,
+    };
+    let mut status = C220ScalarConversionStatus::default();
+    let value = match conversion {
+        C220ScalarConversion::S32ToF32 => u64::from(s32_to_f32_bits(source_value as u32)),
+        C220ScalarConversion::F16ToF32 => {
+            let bits = source_value as u16;
+            status.nan_operand = bits & 0x7fff > 0x7c00;
+            status.infinity_operand = bits & 0x7fff == 0x7c00;
+            u64::from(c220_fp16_to_fp32_bits(bits))
+        }
+        C220ScalarConversion::F32ToF16 | C220ScalarConversion::F32ToF16Odd => {
+            let odd = conversion == C220ScalarConversion::F32ToF16Odd;
+            let result = c220_f32_to_fp16(
+                source_value as u32,
+                if odd {
+                    C220Fp16Rounding::Odd
+                } else {
+                    C220Fp16Rounding::NearestEven
+                },
+                C220Fp16Mode::from_control_spr(spr3),
+            );
+            status.overflow = result.status.overflow;
+            status.underflow = result.status.underflow;
+            status.nan_operand = result.status.nan_operand;
+            status.infinity_operand = result.status.infinity_operand;
+            if odd && (status.nan_operand || status.infinity_operand) {
+                0
+            } else {
+                u64::from(result.bits)
+            }
+        }
+        _ => {
             let rounding = match conversion {
                 C220ScalarConversion::F32ToS32NearestAway => F32ToS32Rounding::NearestAway,
                 C220ScalarConversion::F32ToS32Floor => F32ToS32Rounding::Floor,
                 C220ScalarConversion::F32ToS32Ceil => F32ToS32Rounding::Ceil,
                 C220ScalarConversion::F32ToS32Truncate => F32ToS32Rounding::Truncate,
                 C220ScalarConversion::F32ToS32NearestEven => F32ToS32Rounding::NearestEven,
-                C220ScalarConversion::S32ToF32 => unreachable!(),
+                _ => unreachable!(),
             };
             let result = f32_to_s32(source_value as u32, rounding, spr3 & (1 << 59) != 0);
-            let status_flag = match result.status {
-                F32ToS32Status::None => 0,
-                F32ToS32Status::Overflow => 0x20,
-                F32ToS32Status::NaN | F32ToS32Status::Infinity => 0x2000,
-            };
-            let spr2 = if status_flag == 0 {
-                prior_spr2
+            status.overflow = result.status == F32ToS32Status::Overflow;
+            status.nan_operand = result.status == F32ToS32Status::NaN;
+            status.infinity_operand = result.status == F32ToS32Status::Infinity;
+            if status.nan_operand || status.infinity_operand {
+                0
             } else {
-                (prior_spr2 & 0xffff_ffff_ff00_ffff) | (((pc >> 2) & 0xff) << 16) | status_flag
-            };
-            C220ScalarConversionOutcome {
-                value: if matches!(
-                    result.status,
-                    F32ToS32Status::NaN | F32ToS32Status::Infinity
-                ) {
-                    0
-                } else {
-                    u64::from(result.value)
-                },
-                spr2,
-                status: result.status,
+                u64::from(result.value)
             }
         }
-        C220ScalarConversion::S32ToF32 => C220ScalarConversionOutcome {
-            value: u64::from(s32_to_f32_bits(source_value as u32)),
-            spr2: prior_spr2,
-            status: F32ToS32Status::None,
-        },
+    };
+    let flags = (u64::from(status.overflow) << 5)
+        | (u64::from(status.underflow) << 6)
+        | (u64::from(status.nan_operand || status.infinity_operand) << 13);
+    let spr2 = if flags == 0 {
+        prior_spr2
+    } else {
+        (prior_spr2 & 0xffff_ffff_ff00_ffff) | (((pc >> 2) & 0xff) << 16) | flags
+    };
+    C220ScalarConversionOutcome {
+        value,
+        spr2,
+        status,
     }
 }
 
@@ -104,6 +134,42 @@ mod tests {
 
     #[test]
     fn conversion_reports_exception_in_spr2_without_losing_prior_flags() {
+        for (opcode, input, saturated, nonsaturated, flags) in [
+            (6_u32, 3.5_f32.to_bits(), 0x4300, 0x4300, 0),
+            (6, 0x8000_0000, 0x8000, 0x8000, 0),
+            (6, 1, 0, 0, 0x40),
+            (6, 65520_f32.to_bits(), 0x7bff, 0x7c00, 0x20),
+            (6, 0x7f80_0000, 0x7bff, 0x7c00, 0x2000),
+            (6, 0xff80_0000, 0xfbff, 0xfc00, 0x2000),
+            (6, 0x7fc0_0001, 0, 0x7fff, 0x2000),
+            (7, 0x3c00, 0x3f80_0000, 0x3f80_0000, 0),
+            (7, 1, 0x3380_0000, 0x3380_0000, 0),
+            (7, 0x8000, 0x8000_0000, 0x8000_0000, 0),
+            (7, 0x7c00, 0x7f80_0000, 0x7f80_0000, 0x2000),
+            (7, 0xfc01, 0x7fff_ffff, 0x7fff_ffff, 0x2000),
+            (8, 0x3f80_0001, 0x3c01, 0x3c01, 0),
+            (8, 1, 1, 1, 0),
+            (8, 65520_f32.to_bits(), 0x7bff, 0x7bff, 0),
+            (8, 0x7f80_0000, 0, 0, 0x2000),
+            (8, 0x7fc0_0001, 0, 0, 0x2000),
+        ] {
+            for (control, expected) in [(0, saturated), (1 << 48, nonsaturated)] {
+                let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+                machine.set_xreg(7, u64::from(input)).unwrap();
+                machine.set_spr_value(3, control).unwrap();
+                machine.set_spr_value(2, 0x100).unwrap();
+                let word = 0x0200_0580 | (7 << 12) | (9 << 17) | opcode;
+                let result = execute_conversion_word(&mut machine, 0x104, word).unwrap();
+                assert_eq!(result.value, expected, "opcode {opcode}, input {input:#x}");
+                assert_eq!(
+                    result.spr2,
+                    if flags == 0 { 0x100 } else { 0x41_0100 | flags }
+                );
+                let timing =
+                    crate::sim::c220::scalar::timing::C220ScalarTimingRule::decode(word).unwrap();
+                assert_eq!((timing.latency_ticks, timing.execution_stage), (2, 2));
+            }
+        }
         let modes = [
             C220ScalarConversion::F32ToS32NearestAway,
             C220ScalarConversion::F32ToS32Floor,
@@ -161,7 +227,7 @@ mod tests {
         );
         assert_eq!(overflow.value, i32::MAX as u32 as u64);
         assert_eq!(overflow.spr2, 0x41_0120);
-        assert_eq!(overflow.status, F32ToS32Status::Overflow);
+        assert!(overflow.status.overflow);
 
         let convert_back = execute_scalar_conversion(
             C220ScalarConversion::S32ToF32,

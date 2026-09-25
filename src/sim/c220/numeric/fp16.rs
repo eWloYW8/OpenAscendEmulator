@@ -1,4 +1,6 @@
 use crate::isa::c220::vector::scalar::C220VectorScalarOperation;
+mod conversion;
+pub use conversion::{C220Fp16Rounding, c220_f32_to_fp16};
 
 const SIGN: u16 = 0x8000;
 const EXPONENT: u16 = 0x7c00;

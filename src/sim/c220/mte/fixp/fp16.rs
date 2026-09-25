@@ -1,6 +1,6 @@
 use crate::numeric::fp32::{Fp32VectorOperation, evaluate_fp32_value};
-use crate::sim::c220::numeric::fixp::{C220FixpRoundMode, c220_fixp_f32_to_f16};
 use crate::sim::c220::numeric::fp16::{C220Fp16Mode, C220Fp16Outcome, C220Fp16Status};
+use crate::sim::c220::numeric::fp16::{C220Fp16Rounding, c220_f32_to_fp16};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220FixpActivation<'a> {
@@ -86,7 +86,7 @@ impl<'a> C220FixpFp16Conversion<'a> {
         } else {
             self.mode
         };
-        let mut result = c220_fixp_f32_to_f16(bits, C220FixpRoundMode::NearestEven, mode);
+        let mut result = c220_f32_to_fp16(bits, C220Fp16Rounding::NearestEven, mode);
         result.status = result.status.merge(activation_status);
         Ok(result)
     }

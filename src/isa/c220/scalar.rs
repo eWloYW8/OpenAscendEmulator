@@ -125,6 +125,9 @@ pub enum C220ScalarConversion {
     F32ToS32Truncate,
     F32ToS32NearestEven,
     S32ToF32,
+    F32ToF16,
+    F16ToF32,
+    F32ToF16Odd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +149,9 @@ impl C220ScalarConversionHint {
             3 => C220ScalarConversion::F32ToS32Truncate,
             4 => C220ScalarConversion::F32ToS32NearestEven,
             5 => C220ScalarConversion::S32ToF32,
+            6 => C220ScalarConversion::F32ToF16,
+            7 => C220ScalarConversion::F16ToF32,
+            8 => C220ScalarConversion::F32ToF16Odd,
             _ => return None,
         };
         Some(Self {
