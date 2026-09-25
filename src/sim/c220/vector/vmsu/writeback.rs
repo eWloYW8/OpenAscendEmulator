@@ -32,6 +32,10 @@ pub(super) struct Writeback {
 }
 
 impl Writeback {
+    pub(super) fn request_pending(&self) -> bool {
+        !self.requests.is_empty()
+    }
+
     pub(super) fn has_room(&self) -> bool {
         self.waiting.len() < UOP_CAPACITY
     }

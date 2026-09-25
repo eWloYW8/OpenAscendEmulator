@@ -41,6 +41,8 @@ pub struct C220CoreLsuConfig {
     /// in lookup when refills are disabled.
     pub cache_ub: bool,
     pub ub_write_allocate: bool,
+    /// Block scalar UB access while the corresponding Vector request port is occupied.
+    pub scalar_uses_vector_ports: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +100,14 @@ impl C220Core {
             C220LsuMissBuffer::new(config.misses).map_err(C220LsuSchedulerError::from)?,
             C220LsuStoreBuffer::new(config.stores).map_err(C220LsuSchedulerError::from)?,
         )?;
+        let pipeline = self
+            .mte_pipeline
+            .as_mut()
+            .ok_or(C220CoreError::LsuUnconfigured)?;
+        let subcore = pipeline.ub_vector_subcore();
+        if subcore != crate::sim::c220::mte::interface::biu_read::C220BiuSubcore::Cube {
+            pipeline.configure_scalar_ub_ports(subcore, config.scalar_uses_vector_ports)?;
+        }
         let port = self.connect_cache_write_port()?;
         self.lsu = Some(CoreLsu {
             commits: C220LsuCommitLane::new(C220LoadCommitMode::Retirement),

@@ -115,7 +115,7 @@ impl C220Core {
             )?;
             self.vector.advance_event(event_tick, &mut self.state)?;
             if let Some(pipeline) = &mut self.mte_pipeline {
-                pipeline.advance_ub_service(self.vector.ub_cycles_at(event_tick))?;
+                pipeline.advance_ub_service(self.vector.ub_activity_at(event_tick))?;
             }
             self.mte3
                 .commit_ready_at(event_tick, self.state.ub(), &mut self.memory)?;

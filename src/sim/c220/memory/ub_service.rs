@@ -133,6 +133,14 @@ pub struct C220UbService {
 }
 
 impl C220UbService {
+    pub const fn scalar_uses_vector_ports(&self) -> bool {
+        self.scalar_uses_vector_ports
+    }
+
+    pub(crate) fn set_scalar_uses_vector_ports(&mut self, shared: bool) {
+        self.scalar_uses_vector_ports = shared;
+    }
+
     pub fn new(scalar_uses_vector_ports: bool) -> Self {
         Self {
             scalar_uses_vector_ports,

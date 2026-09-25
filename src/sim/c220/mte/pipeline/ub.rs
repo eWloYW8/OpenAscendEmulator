@@ -1,5 +1,4 @@
 use super::{C220BiuSubcore, C220MtePipeline, C220MtePipelineError, C220MtePipelineEvent};
-use crate::sim::c220::memory::C220UbCycle;
 use crate::sim::c220::memory::ub_service::{
     C220UbService, C220UbServicePort, C220UbServiceRequest, C220UbVectorActivity,
 };
@@ -10,6 +9,20 @@ use crate::sim::c220::mte::interface::ub_read::{
 use std::num::NonZeroU32;
 
 impl C220MtePipeline {
+    /// Configure port sharing before submitting work; each vector core has its own UB.
+    pub fn configure_scalar_ub_ports(
+        &mut self,
+        core: C220BiuSubcore,
+        shared: bool,
+    ) -> Result<(), C220MtePipelineError> {
+        let index = Self::ub_read_index(core)?;
+        if !self.is_idle() {
+            return Err(C220MtePipelineError::CommandBusy);
+        }
+        self.ub_memory[index].set_scalar_uses_vector_ports(shared);
+        Ok(())
+    }
+
     pub fn configure_biu_write_source(
         &mut self,
         core: C220BiuSubcore,
@@ -110,19 +123,13 @@ impl C220MtePipeline {
 
     /// Runs after this tick's higher-priority Vector grants. Each vector
     /// subcore owns a separate UB; the connected core supplies only its mask.
-    pub fn advance_ub_service<'a>(
+    pub fn advance_ub_service(
         &mut self,
-        vector_cycles: impl IntoIterator<Item = &'a C220UbCycle>,
+        vector: C220UbVectorActivity,
     ) -> Result<(), C220MtePipelineError> {
         let tick = self.events.tick();
         if self.last_ub_service == Some(tick) {
             return Ok(());
-        }
-        let mut vector_banks = 0;
-        let mut vector_trigger = false;
-        for cycle in vector_cycles.into_iter().filter(|cycle| cycle.tick == tick) {
-            vector_banks |= cycle.bank_mask;
-            vector_trigger = true;
         }
         for (index, core) in [C220BiuSubcore::Vector0, C220BiuSubcore::Vector1]
             .into_iter()
@@ -174,10 +181,10 @@ impl C220MtePipeline {
             let connected = core == self.biu_subcore;
             let cycle = memory.arbitrate(
                 tick,
-                C220UbVectorActivity {
-                    bank_mask: if connected { vector_banks } else { 0 },
-                    triggered: connected && vector_trigger,
-                    ..Default::default()
+                if connected {
+                    vector
+                } else {
+                    C220UbVectorActivity::default()
                 },
             )?;
             if !cycle.decisions.is_empty() || !cycle.completed.is_empty() {

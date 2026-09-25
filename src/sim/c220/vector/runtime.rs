@@ -26,6 +26,24 @@ pub struct C220VectorFence {
 }
 
 impl VectorEngine {
+    pub(in crate::sim::c220) fn ub_activity_at(
+        &self,
+        tick: u64,
+    ) -> crate::sim::c220::memory::ub_service::C220UbVectorActivity {
+        let (write, read) = self.pipeline.ub_port_occupancy(tick);
+        let (merge_write, merge_read) = self.vmsu.ub_port_occupancy();
+        let mut activity = crate::sim::c220::memory::ub_service::C220UbVectorActivity {
+            write_pending: write || merge_write,
+            read_pending: read || merge_read,
+            ..Default::default()
+        };
+        for cycle in self.ub_cycles_at(tick) {
+            activity.bank_mask |= cycle.bank_mask;
+            activity.triggered = true;
+        }
+        activity
+    }
+
     pub(in crate::sim::c220) fn signal_scalar(&mut self, flag_id: u32) {
         let fence = self.instruction_fence();
         self.scalar_flags

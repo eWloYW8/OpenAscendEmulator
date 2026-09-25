@@ -197,6 +197,28 @@ impl C220VectorPipeline {
         &self.last_ub_cycles
     }
 
+    /// Outstanding requests after Vector arbitration, excluding future uops
+    /// and completed requests waiting only for response delivery.
+    pub fn ub_port_occupancy(&self, tick: u64) -> (bool, bool) {
+        let write = self.pending.iter().any(|entry| {
+            entry.release_tick.is_some_and(|ready| ready <= tick)
+                && entry
+                    .write
+                    .as_ref()
+                    .is_some_and(|request| !request.is_complete())
+        });
+        let read = self.pending.iter().any(|entry| {
+            entry.admitted
+                && entry.admission_tick <= tick
+                && entry.read.as_ref().is_some_and(|read| {
+                    [C220UbPort::VectorRead0, C220UbPort::VectorRead1]
+                        .into_iter()
+                        .any(|port| !read.request(port).is_complete())
+                })
+        });
+        (write, read)
+    }
+
     pub fn last_write_completions(&self) -> &[C220VectorWriteCompletion] {
         &self.last_write_completions
     }

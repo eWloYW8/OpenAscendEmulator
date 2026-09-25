@@ -540,7 +540,7 @@ fn biu_write_waits_for_dbid_and_all_source_packets_before_data_transport() {
     let mut sent = None;
     for tick in 0..40 {
         pipeline.advance(tick).unwrap();
-        pipeline.advance_ub_service(std::iter::empty()).unwrap();
+        pipeline.advance_ub_service(Default::default()).unwrap();
         if tick == 5 {
             pipeline.receive_biu_write_dbid(core, request.tag).unwrap();
         }
@@ -630,7 +630,13 @@ fn ub_reads_share_vector_banks_and_wait_for_matching_response_tags() {
                 write_group_mask: 0,
                 decisions: Vec::new(),
             });
-            pipeline.advance_ub_service(vector.iter()).unwrap();
+            pipeline
+                .advance_ub_service(crate::sim::c220::memory::ub_service::C220UbVectorActivity {
+                    bank_mask: vector.as_ref().map_or(0, |cycle| cycle.bank_mask),
+                    triggered: vector.is_some(),
+                    ..Default::default()
+                })
+                .unwrap();
             for event in pipeline.last_events() {
                 if let C220MtePipelineEvent::UbReadResponse(_, request) = event {
                     assert_eq!(request.sent_tick, 4);
@@ -648,6 +654,75 @@ fn ub_reads_share_vector_banks_and_wait_for_matching_response_tags() {
         }
     }
     assert_eq!(completion_ticks, [15, 20]);
+    use crate::sim::c220::memory::ub_service::{
+        C220UbServicePort, C220UbServiceRequest, C220UbVectorActivity,
+    };
+    for shared in [false, true] {
+        let mut pipeline = C220MtePipeline::new(
+            0,
+            C220MtePipelineConfig {
+                core_kind: crate::sim::c220::device::C220CoreKind::Vector0,
+                ..config
+            },
+        );
+        for core in [C220BiuSubcore::Vector0, C220BiuSubcore::Vector1] {
+            pipeline.configure_scalar_ub_ports(core, shared).unwrap();
+        }
+        for core in [C220BiuSubcore::Vector0, C220BiuSubcore::Vector1] {
+            let service = pipeline.ub_memory_mut(core).unwrap();
+            assert_eq!(service.scalar_uses_vector_ports(), shared);
+            assert!(
+                service
+                    .receive(
+                        0,
+                        C220UbServicePort::ScalarRead,
+                        C220UbServiceRequest {
+                            id: 0,
+                            address: 0,
+                            bytes: 32
+                        }
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(
+            pipeline
+                .configure_scalar_ub_ports(C220BiuSubcore::Vector0, !shared)
+                .is_err()
+        );
+        pipeline.advance(1).unwrap();
+        pipeline
+            .advance_ub_service(C220UbVectorActivity {
+                read_pending: true,
+                triggered: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            pipeline
+                .ub_memory(C220BiuSubcore::Vector0)
+                .unwrap()
+                .inputs(C220UbServicePort::ScalarRead)
+                .len(),
+            usize::from(shared)
+        );
+        assert!(
+            pipeline
+                .ub_memory(C220BiuSubcore::Vector1)
+                .unwrap()
+                .inputs(C220UbServicePort::ScalarRead)
+                .is_empty()
+        );
+        pipeline.advance(2).unwrap();
+        pipeline.advance_ub_service(Default::default()).unwrap();
+        assert!(
+            pipeline
+                .ub_memory(C220BiuSubcore::Vector0)
+                .unwrap()
+                .inputs(C220UbServicePort::ScalarRead)
+                .is_empty()
+        );
+    }
 }
 
 #[test]

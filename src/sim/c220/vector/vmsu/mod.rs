@@ -58,6 +58,13 @@ pub struct C220VmsuPipeline {
 }
 
 impl C220VmsuPipeline {
+    pub fn ub_port_occupancy(&self) -> (bool, bool) {
+        self.active
+            .as_ref()
+            .and_then(|active| active.repeat.as_ref())
+            .map_or((false, false), RepeatMachine::ub_port_occupancy)
+    }
+
     pub const fn new(rules: C220VectorTimingRules) -> Self {
         Self {
             next_generation: 0,

@@ -789,6 +789,7 @@ fn native_mte3_write_path(mode: u8) {
             partition_stack: false,
             cache_ub: mode == 3,
             ub_write_allocate: mode == 3,
+            scalar_uses_vector_ports: mode == 3,
         })
         .unwrap();
     }

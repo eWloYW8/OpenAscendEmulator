@@ -52,6 +52,13 @@ pub(super) struct RepeatMachine {
 }
 
 impl RepeatMachine {
+    pub(super) fn ub_port_occupancy(&self) -> (bool, bool) {
+        (
+            self.writeback.request_pending(),
+            !self.read_queue.is_empty(),
+        )
+    }
+
     pub(super) fn new(
         issue: &C220MergeIssue,
         data: C220MergeRepeatData,
