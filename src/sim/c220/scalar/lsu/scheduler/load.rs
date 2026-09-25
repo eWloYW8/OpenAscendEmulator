@@ -1,6 +1,6 @@
 use super::super::cache::{C220CacheLocation, C220DataCache};
 use super::super::commit::{C220LsuCommitError, C220LsuCommitLane};
-use super::super::store_buffer::C220LsuCompletion;
+use super::super::store_buffer::{C220LsuCompletion, C220LsuPairPart};
 use super::*;
 use crate::sim::c220::scalar::{C220LoadOperands, C220ScalarMappedAddress};
 
@@ -23,6 +23,7 @@ pub struct C220LsuLoadValue {
     pub value: u64,
     pub second_value: Option<u64>,
     pub path: C220LsuLoadPath,
+    pub part: C220LsuPairPart,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +34,7 @@ pub(super) struct PendingLoad {
     partition_address: u64,
     offset: usize,
     lookup: Option<Option<C220CacheLocation>>,
+    part: C220LsuPairPart,
 }
 
 impl C220LsuRequestScheduler {
@@ -42,14 +44,22 @@ impl C220LsuRequestScheduler {
         operands: C220LoadOperands,
         mapped: C220ScalarMappedAddress,
         partition_stack: bool,
-    ) -> Result<Option<C220LsuRequestId>, C220LsuSchedulerError> {
+    ) -> Result<Option<(C220LsuRequestId, Option<C220LsuRequestId>)>, C220LsuSchedulerError> {
         let size = self.misses.line_bytes() as u64;
         let physical_address = mapped.address & 0x0000_ffff_ffff_ffff;
         let offset = (physical_address % size) as usize;
+        let width = usize::from(operands.width_bytes);
+        let split = operands.second_destination.is_some()
+            && physical_address >> 6 != physical_address.wrapping_add(width as u64) >> 6;
+        let second_address = physical_address.wrapping_add(width as u64);
+        let bytes = if split {
+            width
+        } else {
+            operands.access_bytes()
+        };
         if ![1, 2, 4, 8].contains(&operands.width_bytes)
-            || offset + operands.access_bytes() > size as usize
-            || (operands.second_destination.is_some()
-                && (operands.effective_address & 63) + operands.access_bytes() as u64 > 64)
+            || offset + bytes > size as usize
+            || (split && second_address % size + width as u64 > size)
         {
             return Err(C220LsuStoreError::InvalidRange.into());
         }
@@ -57,13 +67,20 @@ impl C220LsuRequestScheduler {
             address: physical_address / size * size,
             memory: mapped.memory,
         };
-        let Some((id, _)) = self.admit(
+        let second_line = C220LsuLineKey {
+            address: second_address / size * size,
+            memory: mapped.memory,
+        };
+        let Some((id, second)) = self.admit(
             tick,
             C220LsuRequest {
                 line,
                 access: C220LsuAccess::Load,
             },
-            None,
+            split.then_some(C220LsuRequest {
+                line: second_line,
+                access: C220LsuAccess::Load,
+            }),
         )?
         else {
             return Ok(None);
@@ -77,9 +94,32 @@ impl C220LsuRequestScheduler {
                 offset,
                 partition_address: mapped.cache_address(partition_stack),
                 lookup: None,
+                part: if split {
+                    C220LsuPairPart::First
+                } else {
+                    C220LsuPairPart::Both
+                },
             },
         );
-        Ok(Some(id))
+        if let Some(second) = second {
+            let second_mapped = C220ScalarMappedAddress {
+                address: second_address,
+                ..mapped
+            };
+            self.pending_loads.insert(
+                second,
+                PendingLoad {
+                    operands,
+                    mapped: second_mapped,
+                    line: second_line,
+                    offset: (second_address % size) as usize,
+                    partition_address: second_mapped.cache_address(partition_stack),
+                    lookup: None,
+                    part: C220LsuPairPart::Second,
+                },
+            );
+        }
+        Ok(Some((id, second)))
     }
 
     pub fn pending_load(&self, id: C220LsuRequestId) -> Option<&C220LoadOperands> {
@@ -151,7 +191,7 @@ impl C220LsuRequestScheduler {
             let location = pending
                 .lookup
                 .ok_or(C220LsuSchedulerError::MissingLoadLookup)?;
-            let width = pending.operands.access_bytes();
+            let width = pending.access_bytes();
             let store = self.stores.entry(pending.line);
             let covered = store
                 .map(|entry| entry.covered_bytes(pending.offset, width))
@@ -224,6 +264,7 @@ impl C220LsuRequestScheduler {
             value: values[0],
             second_value: pending.operands.second_destination.map(|_| values[1]),
             path,
+            part: pending.part,
         }));
     }
 

@@ -1,7 +1,13 @@
 use std::collections::{BTreeMap, VecDeque};
 
+mod data;
+pub use data::C220LoadResponse;
+#[cfg(test)]
+mod tests;
+
 use super::C220LsuRequestId;
-use super::scheduler::{C220LsuLoadValue, C220LsuStoreValue};
+use super::scheduler::{C220LsuLoadPath, C220LsuLoadValue, C220LsuStoreValue};
+use super::store_buffer::C220LsuPairPart;
 use super::write_queue::C220LsuWriteId;
 use crate::architecture::Architecture;
 use crate::sim::c220::scalar::C220LoadOperands;
@@ -19,6 +25,8 @@ pub struct C220LoadId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220LoadRetirement {
     pub instruction: C220LoadId,
+    /// Combined values. Split loads use the first request/address and the final
+    /// response's tick/path; `responses` retains each individual transaction.
     pub data: C220LsuLoadValue,
     pub issue_tick: u64,
     pub admission_tick: u64,
@@ -27,6 +35,8 @@ pub struct C220LoadRetirement {
     pub suppressed: bool,
     pub register_value: u64,
     pub second_register_value: Option<u64>,
+    /// Individual request responses, in operand order for a split load.
+    pub responses: [Option<C220LoadResponse>; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +44,8 @@ struct PendingLoad {
     operands: C220LoadOperands,
     issue_tick: u64,
     admission: Option<(u64, C220LsuRequestId)>,
+    second_request: Option<C220LsuRequestId>,
+    responses: [Option<C220LsuLoadValue>; 2],
     suppressed: bool,
     writeback_tick: Option<u64>,
     data: Option<C220LsuLoadValue>,
@@ -206,7 +218,12 @@ impl C220LsuCommitLane {
     ) -> Result<(), C220LsuCommitError> {
         self.check_tick(tick)?;
         Self::check_machine(machine, operands)?;
-        if self.pending.contains_key(&instruction) {
+        if self.pending.contains_key(&instruction)
+            || self
+                .retirements
+                .iter()
+                .any(|(_, token)| matches!(token, RetirementToken::Load(id) if *id == instruction))
+        {
             return Err(C220LsuCommitError::InvalidRequest);
         }
         if let Some(base) = operands.updated_base {
@@ -221,6 +238,8 @@ impl C220LsuCommitLane {
                 operands,
                 issue_tick: tick,
                 admission: None,
+                second_request: None,
+                responses: [None; 2],
                 suppressed: false,
                 writeback_tick: None,
                 data: None,
@@ -239,64 +258,29 @@ impl C220LsuCommitLane {
         tick: u64,
         instruction: C220LoadId,
         request: C220LsuRequestId,
+        second_request: Option<C220LsuRequestId>,
     ) -> Result<(), C220LsuCommitError> {
         self.check_tick(tick)?;
         let pending = self
             .pending
             .get_mut(&instruction)
             .ok_or(C220LsuCommitError::InvalidRequest)?;
-        if pending.admission.is_some() || self.requests.contains_key(&request) {
-            return Err(C220LsuCommitError::InvalidRequest);
-        }
-        pending.admission = Some((tick, request));
-        self.requests.insert(request, instruction);
-        self.tick = tick;
-        Ok(())
-    }
-
-    /// Data becomes available now; architectural retirement remains separate.
-    /// A rejected completion remains owned by the caller, without register changes.
-    pub fn complete_data_at(
-        &mut self,
-        tick: u64,
-        data: C220LsuLoadValue,
-        machine: &mut ScalarMachine,
-    ) -> Result<(), C220LsuCommitError> {
-        self.check_tick(tick)?;
-        Self::check_machine(machine, data.operands)?;
-        let ready = tick.checked_add(1).ok_or(C220LsuCommitError::Overflow)?;
-        let instruction = *self
-            .requests
-            .get(&data.request)
-            .ok_or(C220LsuCommitError::InvalidRequest)?;
-        let pending = self
-            .pending
-            .get(&instruction)
-            .ok_or(C220LsuCommitError::InvalidRequest)?;
-        if pending.operands != data.operands
-            || data.second_value.is_some() != data.operands.second_destination.is_some()
-            || pending.data.is_some()
-            || data.tick > tick
-            || data.tick < pending.admission.expect("bound request").0
+        if pending.admission.is_some()
+            || self.requests.contains_key(&request)
+            || second_request.is_some_and(|second| {
+                second == request
+                    || self.requests.contains_key(&second)
+                    || pending.operands.second_destination.is_none()
+            })
         {
             return Err(C220LsuCommitError::InvalidRequest);
         }
-        if self.retirements.len() == 64 {
-            return Err(C220LsuCommitError::RetirementFull);
+        pending.admission = Some((tick, request));
+        pending.second_request = second_request;
+        self.requests.insert(request, instruction);
+        if let Some(second) = second_request {
+            self.requests.insert(second, instruction);
         }
-        if self.mode == C220LoadCommitMode::DataBypass && !pending.suppressed {
-            self.write_result(data, machine)?;
-            self.pending
-                .get_mut(&instruction)
-                .expect("checked load")
-                .writeback_tick = Some(tick);
-        }
-        self.pending
-            .get_mut(&instruction)
-            .expect("checked load")
-            .data = Some(data);
-        self.retirements
-            .push_back((ready, RetirementToken::Load(instruction)));
         self.tick = tick;
         Ok(())
     }
@@ -342,7 +326,16 @@ impl C220LsuCommitLane {
                 }));
             }
         };
-        let pending = self.pending[&request];
+        let Some(pending) = self
+            .pending
+            .get(&request)
+            .copied()
+            .filter(|pending| pending.data.is_some())
+        else {
+            self.retirements.pop_front();
+            self.tick = tick;
+            return Ok(None);
+        };
         Self::check_machine(machine, pending.operands)?;
         let data = pending.data.expect("queued load data");
         let mut writeback_tick = pending.writeback_tick;
@@ -353,6 +346,9 @@ impl C220LsuCommitLane {
         self.retirements.pop_front();
         self.pending.remove(&request);
         self.requests.remove(&data.request);
+        if let Some(second) = pending.second_request {
+            self.requests.remove(&second);
+        }
         self.tick = tick;
         Ok(Some(C220LsuRetirement::Load(C220LoadRetirement {
             instruction: request,
@@ -362,6 +358,9 @@ impl C220LsuCommitLane {
             writeback_tick,
             retire_tick: tick,
             suppressed: pending.suppressed,
+            responses: pending
+                .responses
+                .map(|response| response.map(C220LoadResponse::from)),
             register_value: machine.xregs()[usize::from(pending.operands.destination_register)],
             second_register_value: pending
                 .operands

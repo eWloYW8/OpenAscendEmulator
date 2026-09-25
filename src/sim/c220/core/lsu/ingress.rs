@@ -7,6 +7,7 @@ use crate::sim::common::scalar::ScalarMachine;
 pub struct C220CoreLsuAdmission {
     pub instruction_id: u64,
     pub request: C220LsuRequestId,
+    pub second_request: Option<C220LsuRequestId>,
     pub tick: u64,
     pub mapped: C220ScalarMappedAddress,
 }
@@ -67,12 +68,12 @@ impl CoreLsu {
             .ok_or(C220CoreError::LsuAddress { address })?;
         let mapped = C220ScalarMappedAddress::decode(address, roots.0, roots.1)
             .ok_or(C220CoreError::LsuAddress { address })?;
-        let (instruction_id, request) = match head {
+        let (instruction_id, request, second_request) = match head {
             DispatchedLsu::Load(issue) => {
                 if mapped.memory != C220LsuMemory::External {
                     return Err(C220CoreError::UnsupportedTimedLsuAccess);
                 }
-                let Some(request) = self.scheduler.admit_load(
+                let Some((request, second)) = self.scheduler.admit_load(
                     tick,
                     issue.operands,
                     mapped,
@@ -82,8 +83,8 @@ impl CoreLsu {
                     return Ok(());
                 };
                 self.commits
-                    .admit(tick, C220LoadId(issue.instruction_id), request)?;
-                (issue.instruction_id, request)
+                    .admit(tick, C220LoadId(issue.instruction_id), request, second)?;
+                (issue.instruction_id, request, second)
             }
             DispatchedLsu::DirectStore(issue) => {
                 let Some(request) = self.scheduler.admit_direct_store(
@@ -97,7 +98,7 @@ impl CoreLsu {
                     return Ok(());
                 };
                 self.pending.insert(request, issue);
-                (issue.instruction_id, request)
+                (issue.instruction_id, request, None)
             }
             DispatchedLsu::Store(issue) => {
                 let Some(request) = self.scheduler.admit_store(
@@ -110,13 +111,14 @@ impl CoreLsu {
                     return Ok(());
                 };
                 self.stores.insert(request, issue);
-                (issue.instruction_id, request)
+                (issue.instruction_id, request, None)
             }
         };
         self.ingress.pop_front();
         self.admissions.push(C220CoreLsuAdmission {
             instruction_id,
             request,
+            second_request,
             tick,
             mapped,
         });

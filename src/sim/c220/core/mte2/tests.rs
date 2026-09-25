@@ -406,7 +406,8 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
         memory: line.memory,
         stack: false,
     };
-    let load = lsu.admit_load(0, operands, mapped, false).unwrap().unwrap();
+    let (load, second) = lsu.admit_load(0, operands, mapped, false).unwrap().unwrap();
+    assert_eq!(second, None);
     load_machine.set_xreg(5, 0).unwrap();
     assert_eq!(lsu.pending_load(load), Some(&operands));
     let mut read = None;
@@ -517,7 +518,7 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                 commits
                     .issue(0, C220LoadId(7), operands, &mut machine)
                     .unwrap();
-                commits.admit(0, C220LoadId(7), load).unwrap();
+                commits.admit(0, C220LoadId(7), load, None).unwrap();
                 assert_eq!(
                     completed_lsu
                         .deliver_values(tick, &mut commits, &mut machine)
@@ -631,10 +632,11 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
             address: mapped.address / 64 * 64,
             memory: mapped.memory,
         };
-        let request = lsu
+        let (request, second) = lsu
             .admit_load(tick, operands, mapped, false)
             .unwrap()
             .unwrap();
+        assert_eq!(second, None);
         let mut expected = if path == C220LsuLoadPath::StoreForward {
             [0xbb; 8]
         } else {
@@ -700,8 +702,14 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                     commits.supersede(7);
                     machine.set_xreg(7, 0x1234).unwrap();
                 }
-                commits.admit(tick + 1, C220LoadId(7), request).unwrap();
-                assert!(commits.admit(tick + 1, C220LoadId(7), request).is_err());
+                commits
+                    .admit(tick + 1, C220LoadId(7), request, None)
+                    .unwrap();
+                assert!(
+                    commits
+                        .admit(tick + 1, C220LoadId(7), request, None)
+                        .is_err()
+                );
                 commits
                     .complete_data_at(tick + 3, data, &mut machine)
                     .unwrap();

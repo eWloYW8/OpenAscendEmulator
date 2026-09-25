@@ -2,12 +2,26 @@ use super::*;
 use crate::sim::c220::scalar::lsu::store_buffer::{C220LsuPairPart, C220LsuStoreEntry};
 
 impl PendingLoad {
+    pub(super) fn access_bytes(&self) -> usize {
+        if self.part == C220LsuPairPart::Both {
+            self.operands.access_bytes()
+        } else {
+            usize::from(self.operands.width_bytes)
+        }
+    }
+
     pub(super) fn read_line(&self, line: &[u8]) -> [u64; 2] {
         let width = usize::from(self.operands.width_bytes);
-        let count = self.operands.access_bytes() / width;
         let mut values = [0; 2];
-        for (index, value) in values.iter_mut().enumerate().take(count) {
-            let start = self.offset + index * width;
+        for (index, value) in values.iter_mut().enumerate() {
+            let start = match (self.part, index) {
+                (C220LsuPairPart::Both, 0) => self.offset,
+                (C220LsuPairPart::Both, 1) if self.operands.second_destination.is_some() => {
+                    self.offset + width
+                }
+                (C220LsuPairPart::First, 0) | (C220LsuPairPart::Second, 1) => self.offset,
+                _ => continue,
+            };
             let mut bytes = [0; 8];
             bytes[..width].copy_from_slice(&line[start..start + width]);
             *value = u64::from_le_bytes(bytes);
@@ -32,7 +46,7 @@ impl PendingLoad {
             // pair coverage. Intermediate coverage leaves the cache data intact.
             if (covered > 0 && covered <= width) || covered == 2 * width {
                 forwarded = store
-                    .forward_pair(self.offset, width, C220LsuPairPart::Both, &mut values)?
+                    .forward_pair(self.offset, width, self.part, &mut values)?
                     .into_iter()
                     .any(|changed| changed);
             }
@@ -79,6 +93,7 @@ mod tests {
                     partition_address: 0x108,
                     offset: 8,
                     lookup: None,
+                    part: C220LsuPairPart::Both,
                 };
                 let mut stores = C220LsuStoreBuffer::new(C220LsuStoreConfig {
                     line_bytes: 64,

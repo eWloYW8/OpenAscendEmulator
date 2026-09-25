@@ -298,6 +298,7 @@ impl C220Core {
             && lsu.pending.is_empty()
             && lsu.stores.is_empty()
             && lsu.commits.pending_count() == 0
+            && lsu.commits.retirement_occupancy() == 0
             && lsu.cache.as_ref().is_none_or(CoreCache::is_idle)
             && scheduler.reads.requests().next().is_none()
             && scheduler.writes.requests().next().is_none()

@@ -113,6 +113,9 @@ impl C220Core {
             .map_err(crate::sim::common::scalar::ScalarInstructionError::from)?;
         if operands.second_destination.is_some()
             && (operands.effective_address & 63) + operands.access_bytes() as u64 > 64
+            && !operands
+                .effective_address
+                .is_multiple_of(u64::from(operands.width_bytes))
         {
             return Err(C220CoreError::UnsupportedTimedLsuAccess);
         }

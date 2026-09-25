@@ -167,6 +167,64 @@ fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
     );
     assert_eq!(core.pending_load_instructions().count(), 0);
     tick = completion.retirement.retire_tick + 2;
+    for repeat in 0..2 {
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(5, 0x2078)
+            .unwrap();
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(7, u64::MAX)
+            .unwrap();
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(9, u64::MAX)
+            .unwrap();
+        let first = u64::from_le_bytes(
+            core.memory
+                .read_known_at(0x2078, 8)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        let word = (9 << 24) | (3 << 22) | (7 << 17) | (5 << 12) | (9 << 7);
+        assert!(matches!(
+            core.step_word_at(tick, word).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        let mut partial_seen = false;
+        let done = (tick + 1..tick + 100)
+            .find_map(|now| {
+                core.advance_to(now).unwrap();
+                let regs = core.state.scalar().machine().xregs();
+                partial_seen |= regs[7] == 0 && regs[9] == 0xab00_0000;
+                core.take_load_completions().into_iter().next()
+            })
+            .expect("split load completes");
+        let admission = core.take_lsu_admissions();
+        assert_eq!(admission.len(), 1);
+        assert!(admission[0].second_request.is_some());
+        assert_eq!(done.retirement.data.value, first);
+        assert_eq!(done.retirement.data.second_value, Some(0xab00_0000));
+        assert_eq!(done.retirement.register_value, first);
+        assert_eq!(done.retirement.second_register_value, Some(0xab00_0000));
+        let responses = done.retirement.responses.map(Option::unwrap);
+        assert_eq!(responses[0].request, admission[0].request);
+        assert_eq!(Some(responses[1].request), admission[0].second_request);
+        if repeat == 0 {
+            assert!(responses[1].tick < responses[0].tick);
+            assert_eq!(partial_seen, bypass);
+        } else {
+            assert_eq!(responses[1].tick, responses[0].tick + 1);
+        }
+        tick = done.retirement.retire_tick + 2;
+        core.advance_to(tick).unwrap();
+        assert_eq!(core.lsu_retirement_occupancy(), 0);
+        assert!(core.take_load_completions().is_empty());
+    }
     for suppressed in [false, true] {
         core.state
             .scalar_mut()
@@ -205,14 +263,15 @@ fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
     core.state
         .scalar_mut()
         .machine_mut()
-        .set_xreg(5, 0x2080)
+        .set_xreg(5, 0x2078)
         .unwrap();
     let mut completed = Vec::new();
     let mut stalled = false;
     for _ in 0..12 {
         let pc = core.state.scalar().pc();
         loop {
-            let step = core.step_word_at(tick, 0x03ce_5000).unwrap();
+            let word = (9 << 24) | (3 << 22) | (7 << 17) | (5 << 12) | (7 << 7);
+            let step = core.step_word_at(tick, word).unwrap();
             completed.extend(core.take_load_completions());
             assert!(core.lsu_ingress_occupancy() <= 2);
             tick += 1;
@@ -239,7 +298,7 @@ fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
     assert!(
         completed
             .iter()
-            .all(|done| done.retirement.data.value == 0xab00_0000)
+            .all(|done| done.retirement.data.value == u64::from_le_bytes([9; 8]))
     );
     let admissions = core.take_lsu_admissions();
     assert_eq!(admissions.len(), 12);
@@ -499,7 +558,7 @@ fn native_mte3_write_path(mode: u8) {
         use crate::sim::c220::scalar::lsu::miss_buffer::C220LsuMissConfig;
         use crate::sim::c220::scalar::lsu::store_buffer::C220LsuStoreConfig;
         core.configure_lsu(C220CoreLsuConfig {
-            request_capacity: 2,
+            request_capacity: 3,
             read_capacity: 2,
             write_capacity: 2,
             direct_store_capacity: 2,
