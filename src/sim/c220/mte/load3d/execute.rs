@@ -55,6 +55,30 @@ mod tests {
                 .all(|r| r.input_bytes == 32 && r.destination_address == 1536)
         );
         assert_eq!(requests[4].source_address, 512);
+        let physical: Vec<_> = command
+            .physical_reads(std::num::NonZeroU32::new(48).unwrap())
+            .unwrap()
+            .collect();
+        assert_eq!(physical.len(), 16);
+        assert_eq!(physical.iter().map(|r| r.input_bytes).sum::<u32>(), 640);
+        assert_eq!(physical.iter().filter(|r| r.completes_output).count(), 2);
+        assert_eq!(physical.iter().filter(|r| r.last_in_instruction).count(), 1);
+        assert_eq!(
+            (
+                physical[0].input_bytes,
+                physical[1].input_bytes,
+                physical[2].input_bytes
+            ),
+            (48, 48, 32)
+        );
+        assert_eq!(physical[2].source_address, 96);
+        let operation = physical
+            .last()
+            .unwrap()
+            .operation(71, std::num::NonZeroU32::new(64).unwrap());
+        assert_eq!(operation.instruction_id, 71);
+        assert_eq!(operation.output_bytes, 512);
+        assert!(operation.completes_logical_uop && operation.last_in_instruction);
         let mut merged = command;
         merged.matrix.width = 64;
         merged.operands.geometry.filter_w = 4;

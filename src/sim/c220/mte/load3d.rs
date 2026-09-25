@@ -13,6 +13,8 @@ mod execute;
 pub use execute::{C220Load3dExecutionError, C220Load3dExecutionReport};
 mod requests;
 pub use requests::{C220Load3dReadRequest, C220Load3dRequestError};
+mod physical;
+pub use physical::{C220Load3dPhysicalReads, C220Load3dReadUop};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("LOAD3Dv2 requires SPR {register}")]
