@@ -122,8 +122,12 @@ impl C220Core {
             if self.mte3.physical
                 && let Some(pipeline) = &mut self.mte_pipeline
             {
-                self.mte3
-                    .commit_dma_at(event_tick, pipeline, self.state.ub(), &mut self.memory)?;
+                self.mte3.commit_native_at(
+                    event_tick,
+                    pipeline,
+                    self.state.ub(),
+                    &mut self.memory,
+                )?;
             }
             if event_tick == tick {
                 break;

@@ -223,7 +223,7 @@ impl C220Core {
                 .external_fixp
                 .as_ref()
                 .is_some_and(|fixp| !fixp.engine.is_idle() || !fixp.bindings.is_idle())
-            || !self.mte3.dma_commands.is_empty()
+            || !self.mte3.native_commands.is_empty()
             || self.mte_pipeline.as_ref().is_some_and(|p| !p.is_idle())
         {
             return Err(C220CoreError::MtePipelineBusy);

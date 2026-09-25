@@ -4,6 +4,10 @@ use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 use crate::sim::c220::sync::{C220CrossCoreReception, C220DeviceSync};
 
 impl C220Core {
+    pub fn last_mte3_cross_core_outcomes(&self) -> &[C220CrossCoreReception] {
+        &self.mte3.cross_core_outcomes
+    }
+
     pub(super) fn step_cross_core_at(
         &mut self,
         tick: u64,
@@ -15,6 +19,38 @@ impl C220Core {
         }
         if instruction.pipe_code == 3 {
             return self.step_mte1_at(tick, pc, instruction.word);
+        }
+        if instruction.pipe_code == 5 {
+            if !self.mte3.physical {
+                return Err(C220CoreError::Mte3FrontendRequired);
+            }
+            let pipeline = self
+                .mte_pipeline
+                .as_mut()
+                .ok_or(C220CoreError::MteUnconfigured)?;
+            if !self.mte3.native_commands.is_empty() || !pipeline.mte3_frontend().can_issue() {
+                return Ok(C220CoreStep::Stalled(C220Stall {
+                    tick,
+                    pc,
+                    resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+                    cause: C220StallCause::Mte3Dependency,
+                }));
+            }
+            let value =
+                self.state.scalar().machine().xregs()[usize::from(instruction.source_register)];
+            let record = pipeline.issue_mte3_cross_core(
+                self.next_instruction_id,
+                instruction,
+                C220DeviceSync::from_value(value),
+            )?;
+            self.mte3
+                .native_commands
+                .insert(self.next_instruction_id, (pc, instruction.word));
+            self.state.commit_c220_sequential_issue();
+            return Ok(C220CoreStep::Executed {
+                tick,
+                instruction: C220CoreInstruction::Mte3CrossCore(record),
+            });
         }
         if instruction.pipe_code == 4 {
             let pipeline = self

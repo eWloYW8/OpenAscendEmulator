@@ -3083,7 +3083,7 @@ fn vabs_uses_modeled_five_tick_execution_stage() {
     assert_eq!(timed.state.scalar().pc(), pc + 4);
     assert!(matches!(
         timed.step_word_at(retire + 1, cross | (5 << 10)),
-        Err(C220CoreError::UnsupportedCrossCorePipe { pipe: 5, .. })
+        Err(C220CoreError::Mte3FrontendRequired)
     ));
     assert_eq!(timed.state.scalar().pc(), pc + 4);
 }

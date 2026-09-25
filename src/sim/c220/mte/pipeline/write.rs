@@ -443,12 +443,15 @@ impl C220MtePipeline {
         if commands.can_push(self.biu_subcore)
             && let Some(generated) = self.mte3.output()
         {
-            let transfer = self
+            let command = self
                 .mte3
                 .records()
                 .find(|record| record.instruction_id == generated.instruction_id)
                 .expect("generated command record")
-                .transfer;
+                .command;
+            let super::super::mte3::frontend::C220Mte3Command::Dma(transfer) = command else {
+                unreachable!("only DMA commands generate write requests");
+            };
             let gather_stride = if generated.request.route == C220DmaUopRoute::SourceGapGather {
                 let descriptor = transfer.descriptor;
                 Some((u32::from(descriptor.burst_length) + u32::from(descriptor.source_gap)) * 32)

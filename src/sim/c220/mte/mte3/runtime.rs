@@ -42,8 +42,10 @@ pub(in crate::sim::c220) struct Mte3Engine {
     pending: VecDeque<C220Mte3CommandState>,
     pub(in crate::sim::c220) outcomes: Vec<C220Mte3Outcome>,
     pub(in crate::sim::c220) physical: bool,
-    pub(in crate::sim::c220) dma_commands: BTreeMap<u64, (u64, u32)>,
+    pub(in crate::sim::c220) native_commands: BTreeMap<u64, (u64, u32)>,
     pub(in crate::sim::c220) dma_outcomes: Vec<C220Mte3DmaOutcome>,
+    pub(in crate::sim::c220) cross_core_outcomes:
+        Vec<crate::sim::c220::sync::C220CrossCoreReception>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,17 +77,19 @@ impl Mte3Engine {
             pending: VecDeque::new(),
             outcomes: Vec::new(),
             physical: false,
-            dma_commands: BTreeMap::new(),
+            native_commands: BTreeMap::new(),
             dma_outcomes: Vec::new(),
+            cross_core_outcomes: Vec::new(),
         }
     }
 
     pub(in crate::sim::c220) fn begin_advance(&mut self) {
         self.outcomes.clear();
         self.dma_outcomes.clear();
+        self.cross_core_outcomes.clear();
     }
 
-    pub(in crate::sim::c220) fn commit_dma_at(
+    pub(in crate::sim::c220) fn commit_native_at(
         &mut self,
         tick: u64,
         pipeline: &mut C220MtePipeline,
@@ -96,10 +100,28 @@ impl Mte3Engine {
             return Ok(());
         };
         let &(pc, word) = self
-            .dma_commands
+            .native_commands
             .get(&record.instruction_id)
             .ok_or(C220Mte3RuntimeError::UnknownCommand(record.instruction_id))?;
-        let plan = record.transfer;
+        let plan = match record.command {
+            super::frontend::C220Mte3Command::Dma(plan) => plan,
+            super::frontend::C220Mte3Command::CrossCore {
+                instruction,
+                payload,
+            } => {
+                pipeline.retire_mte3(record.instruction_id)?;
+                self.native_commands.remove(&record.instruction_id);
+                self.cross_core_outcomes
+                    .push(crate::sim::c220::sync::C220CrossCoreReception {
+                        instruction_id: record.instruction_id,
+                        pc,
+                        tick,
+                        instruction,
+                        payload,
+                    });
+                return Ok(());
+            }
+        };
         let result = copy_c220_mov_ub_to_hbm(
             ub,
             memory,
@@ -108,7 +130,7 @@ impl Mte3Engine {
             plan.destination_address,
         )?;
         pipeline.retire_mte3(record.instruction_id)?;
-        self.dma_commands.remove(&record.instruction_id);
+        self.native_commands.remove(&record.instruction_id);
         self.dma_outcomes.push(C220Mte3DmaOutcome {
             tick,
             pc,

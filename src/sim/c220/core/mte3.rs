@@ -44,7 +44,7 @@ impl C220Core {
     }
 
     pub fn connect_mte3_biu(&mut self, config: C220BiuWriteConfig) -> Result<(), C220CoreError> {
-        if self.mte3.pending_commands().next().is_some() || !self.mte3.dma_commands.is_empty() {
+        if self.mte3.pending_commands().next().is_some() || !self.mte3.native_commands.is_empty() {
             return Err(C220CoreError::MtePipelineBusy);
         }
         self.mte_pipeline
@@ -166,7 +166,7 @@ impl C220Core {
     /// Use the native command/generator path. The transport must drain and
     /// acknowledge each request; no aggregate completion estimate is used.
     pub fn connect_mte3_dma(&mut self) -> Result<(), C220CoreError> {
-        if self.mte3.pending_commands().next().is_some() || !self.mte3.dma_commands.is_empty() {
+        if self.mte3.pending_commands().next().is_some() || !self.mte3.native_commands.is_empty() {
             return Err(C220CoreError::MtePipelineBusy);
         }
         self.mte_pipeline
@@ -229,7 +229,7 @@ impl C220Core {
                 FlagOperation::Set => {
                     let dependency = if instruction.source_pipe_code == 5 && self.mte3.physical {
                         C220OutputDependency::Mte3(
-                            self.mte3.dma_commands.keys().next_back().copied(),
+                            self.mte3.native_commands.keys().next_back().copied(),
                         )
                     } else if instruction.source_pipe_code == 5 {
                         C220OutputDependency::NotBefore(
@@ -252,7 +252,7 @@ impl C220Core {
                                 C220OutputDependency::NotBefore(ready) => Some(ready),
                                 C220OutputDependency::Mte3(fence) => {
                                     if fence.is_some_and(|id| {
-                                        self.mte3.dma_commands.range(..=id).next().is_some()
+                                        self.mte3.native_commands.range(..=id).next().is_some()
                                     }) {
                                         None
                                     } else {
@@ -302,7 +302,7 @@ impl C220Core {
                 }
                 let record = pipeline.issue_mte3_dma(self.next_instruction_id, plan)?;
                 self.mte3
-                    .dma_commands
+                    .native_commands
                     .insert(self.next_instruction_id, (pc, word));
                 self.state.commit_c220_sequential_issue();
                 return Ok(C220CoreStep::Executed {

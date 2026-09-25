@@ -17,6 +17,8 @@ use crate::sim::common::scalar::ScalarInstructionError;
 
 #[derive(Debug, Error)]
 pub enum C220CoreError {
+    #[error("MTE3 cross-core notification requires the native command frontend")]
+    Mte3FrontendRequired,
     #[error("cross-core notification at PC {pc:#x} is not implemented for pipe {pipe}")]
     UnsupportedCrossCorePipe { pc: u64, pipe: u8 },
     #[error(transparent)]

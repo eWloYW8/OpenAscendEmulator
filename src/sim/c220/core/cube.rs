@@ -1788,5 +1788,44 @@ mod tests {
         assert!(!bulk.mte2.is_busy());
         flags.advance_to(164).unwrap();
         assert_eq!(bulk.hardware_flags, flags);
+        bulk.connect_mte3_dma().unwrap();
+        bulk.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(6, 0xd30)
+            .unwrap();
+        let mte3_cross = (cross & !(15 << 10)) | (5 << 10);
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Mte3CrossCore(record),
+            ..
+        } = bulk.step_word_at(165, mte3_cross).unwrap()
+        else {
+            panic!("MTE3 cross-core admission")
+        };
+        assert_eq!(record.issue_tick, 165);
+        assert_eq!(record.dispatch_tick, None);
+        bulk.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(6, 0)
+            .unwrap();
+        bulk.advance_to(168).unwrap();
+        assert!(bulk.last_mte3_cross_core_outcomes().is_empty());
+        assert!(bulk.take_mte3_dma_request().is_none());
+        assert_eq!(
+            bulk.mte_pipeline()
+                .unwrap()
+                .mte3_frontend()
+                .selected_generator(),
+            Some(crate::sim::c220::mte::mte3::frontend::C220Mte3Generator::Load3d)
+        );
+        bulk.advance_to(169).unwrap();
+        let reception = bulk.last_mte3_cross_core_outcomes()[0];
+        assert_eq!(reception.instruction_id, record.instruction_id);
+        assert_eq!(reception.tick, 169);
+        assert_eq!(reception.payload.value, 0xd30);
+        assert_eq!((reception.payload.mode, reception.payload.flag_id), (3, 13));
+        assert!(bulk.mte_pipeline().unwrap().mte3_frontend().is_idle());
+        assert!(bulk.mte3.native_commands.is_empty());
     }
 }

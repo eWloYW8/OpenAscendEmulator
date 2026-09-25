@@ -11,6 +11,7 @@ use crate::sim::common::scalar::ScalarProgramStep;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220CoreInstruction {
+    Mte3CrossCore(crate::sim::c220::mte::mte3::frontend::C220Mte3Record),
     CrossCore(crate::sim::c220::sync::C220CrossCoreReception),
     Preload(super::C220CorePreloadIssue),
     AtomicStore(super::C220CoreAtomicIssue),

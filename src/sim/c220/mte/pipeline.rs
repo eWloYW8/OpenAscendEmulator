@@ -846,6 +846,23 @@ impl C220MtePipeline {
         self.mte3.take_output()
     }
 
+    pub(crate) fn issue_mte3_cross_core(
+        &mut self,
+        instruction_id: u64,
+        instruction: crate::isa::c220::control::C220SetCrossCoreInstruction,
+        payload: crate::sim::c220::sync::C220DeviceSync,
+    ) -> Result<C220Mte3Record, C220MtePipelineError> {
+        Ok(self.mte3_events.issue_command(
+            &mut self.events,
+            &mut self.mte3,
+            instruction_id,
+            super::mte3::frontend::C220Mte3Command::CrossCore {
+                instruction,
+                payload,
+            },
+        )?)
+    }
+
     pub fn acknowledge_mte3_dma(
         &mut self,
         instruction_id: u64,
@@ -1287,7 +1304,11 @@ impl C220MtePipeline {
                     });
                     self.mte3.set_external_fixp_pending(
                         self.core_kind == crate::sim::c220::device::C220CoreKind::Cube
-                            && (outstanding_fixp != 0 || self.fixp_head_is_convert),
+                            && outstanding_fixp != 0,
+                    );
+                    self.mte3.set_fixp_head_pending(
+                        self.core_kind == crate::sim::c220::device::C220CoreKind::Cube
+                            && self.fixp_head_is_convert,
                     );
                     if let Some(outcome) =
                         self.mte3_events
