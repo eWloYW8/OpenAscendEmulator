@@ -25,6 +25,7 @@ pub struct C220Load3dCoordinate {
     pub m_point: u32,
     pub k_iteration: u32,
     pub remaining_bytes: u32,
+    pub phase_length: u32,
     pub last_k: bool,
     pub invalid_k: bool,
     pub spatial_padding: bool,
@@ -71,6 +72,10 @@ pub struct C220Load3dCoordinates {
 }
 
 impl C220Load3dCoordinates {
+    pub(super) fn initial_channel_offset(&self) -> u32 {
+        self.phases[0].offset
+    }
+
     pub(super) fn new(
         command: C220Load3dV2Command,
         tile: C220Load3dTile,
@@ -283,6 +288,7 @@ impl Iterator for C220Load3dCoordinates {
                 .length
                 .wrapping_sub(self.k as u32)
                 .wrapping_mul(self.storage_bytes),
+            phase_length: self.phase.length,
             last_k: next_k as i32
                 >= self
                     .phase
