@@ -671,8 +671,18 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
             C220LoadCommitMode::DataBypass,
             C220LoadCommitMode::Retirement,
         ] {
-            for suppressed in [false, true] {
+            for (suppressed, pair) in [(false, false), (true, false), (false, true), (true, true)] {
                 let mut machine = load_machine.clone();
+                let prior_second = machine.xregs()[8];
+                let operands = C220LoadOperands {
+                    second_destination: pair.then_some((8, prior_second)),
+                    ..operands
+                };
+                let data = crate::sim::c220::scalar::lsu::scheduler::C220LsuLoadValue {
+                    operands,
+                    second_value: pair.then_some(0x5678),
+                    ..values[0]
+                };
                 let mut commits = C220LsuCommitLane::new(mode);
                 commits
                     .issue(tick, C220LoadId(7), operands, &mut machine)
@@ -686,11 +696,11 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                 commits.admit(tick + 1, C220LoadId(7), request).unwrap();
                 assert!(commits.admit(tick + 1, C220LoadId(7), request).is_err());
                 commits
-                    .complete_data_at(tick + 3, values[0], &mut machine)
+                    .complete_data_at(tick + 3, data, &mut machine)
                     .unwrap();
                 assert!(
                     commits
-                        .complete_data_at(tick + 3, values[0], &mut machine)
+                        .complete_data_at(tick + 3, data, &mut machine)
                         .is_err()
                 );
                 if suppressed && mode == C220LoadCommitMode::Retirement {
@@ -710,7 +720,7 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                 else {
                     panic!("load retirement");
                 };
-                assert_eq!(retired.data, values[0]);
+                assert_eq!(retired.data, data);
                 assert_eq!(retired.instruction, C220LoadId(7));
                 assert_eq!(retired.admission_tick, tick + 1);
                 assert_eq!(retired.suppressed, suppressed);
@@ -721,6 +731,18 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                 assert_eq!(retired.writeback_tick.is_none(), suppressed);
                 assert_eq!(commits.pending_count(), 0);
                 assert_eq!(commits.pending_destination(7), None);
+                if pair {
+                    assert_eq!(
+                        retired.second_register_value,
+                        Some(if suppressed { prior_second } else { 0x5678 })
+                    );
+                    assert_eq!(
+                        commits.pending_destination(8),
+                        suppressed.then_some(C220LoadId(7))
+                    );
+                    commits.supersede(8);
+                    assert_eq!(commits.pending_destination(8), None);
+                }
             }
         }
     }

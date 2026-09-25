@@ -26,6 +26,7 @@ pub struct C220LoadRetirement {
     pub retire_tick: u64,
     pub suppressed: bool,
     pub register_value: u64,
+    pub second_register_value: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,12 +186,13 @@ impl C220LsuCommitLane {
         self.retirements.front().map(|entry| entry.0)
     }
 
+    /// Suppress the producing instruction, but release only this register's
+    /// dependency. Other destination dependencies are not implicitly cancelled.
     pub fn supersede(&mut self, register: u8) {
-        if let Some(request) = self.owners.remove(&register) {
-            self.pending
-                .get_mut(&request)
-                .expect("live load owner")
-                .suppressed = true;
+        if let Some(request) = self.owners.remove(&register)
+            && let Some(pending) = self.pending.get_mut(&request)
+        {
+            pending.suppressed = true;
         }
     }
 
@@ -210,7 +212,9 @@ impl C220LsuCommitLane {
         if let Some(base) = operands.updated_base {
             machine.set_xreg(operands.base_register, base)?;
         }
-        self.supersede(operands.destination_register);
+        for register in operands.destinations() {
+            self.supersede(register);
+        }
         self.pending.insert(
             instruction,
             PendingLoad {
@@ -222,8 +226,9 @@ impl C220LsuCommitLane {
                 data: None,
             },
         );
-        self.owners
-            .insert(operands.destination_register, instruction);
+        for register in operands.destinations() {
+            self.owners.insert(register, instruction);
+        }
         self.tick = tick;
         Ok(())
     }
@@ -269,6 +274,7 @@ impl C220LsuCommitLane {
             .get(&instruction)
             .ok_or(C220LsuCommitError::InvalidRequest)?;
         if pending.operands != data.operands
+            || data.second_value.is_some() != data.operands.second_destination.is_some()
             || pending.data.is_some()
             || data.tick > tick
             || data.tick < pending.admission.expect("bound request").0
@@ -279,8 +285,7 @@ impl C220LsuCommitLane {
             return Err(C220LsuCommitError::RetirementFull);
         }
         if self.mode == C220LoadCommitMode::DataBypass && !pending.suppressed {
-            machine.set_xreg(data.operands.destination_register, data.value)?;
-            self.owners.remove(&data.operands.destination_register);
+            self.write_result(data, machine)?;
             self.pending
                 .get_mut(&instruction)
                 .expect("checked load")
@@ -342,8 +347,7 @@ impl C220LsuCommitLane {
         let data = pending.data.expect("queued load data");
         let mut writeback_tick = pending.writeback_tick;
         if self.mode == C220LoadCommitMode::Retirement && !pending.suppressed {
-            machine.set_xreg(pending.operands.destination_register, data.value)?;
-            self.owners.remove(&pending.operands.destination_register);
+            self.write_result(data, machine)?;
             writeback_tick = Some(tick);
         }
         self.retirements.pop_front();
@@ -359,7 +363,26 @@ impl C220LsuCommitLane {
             retire_tick: tick,
             suppressed: pending.suppressed,
             register_value: machine.xregs()[usize::from(pending.operands.destination_register)],
+            second_register_value: pending
+                .operands
+                .second_destination
+                .map(|(register, _)| machine.xregs()[usize::from(register)]),
         })))
+    }
+
+    fn write_result(
+        &mut self,
+        data: C220LsuLoadValue,
+        machine: &mut ScalarMachine,
+    ) -> Result<(), C220LsuCommitError> {
+        machine.set_xreg(data.operands.destination_register, data.value)?;
+        if let Some((register, _)) = data.operands.second_destination {
+            machine.set_xreg(register, data.second_value.expect("validated pair data"))?;
+        }
+        for register in data.operands.destinations() {
+            self.owners.remove(&register);
+        }
+        Ok(())
     }
 
     fn check_tick(&self, tick: u64) -> Result<(), C220LsuCommitError> {
@@ -377,6 +400,10 @@ impl C220LsuCommitLane {
         if machine.architecture() != Architecture::Dav2201
             || usize::from(operands.destination_register) >= machine.xregs().len()
             || usize::from(operands.base_register) >= machine.xregs().len()
+            || operands.second_destination.is_some_and(|(register, _)| {
+                usize::from(register) >= machine.xregs().len()
+                    || register == operands.destination_register
+            })
         {
             Err(C220LsuCommitError::InvalidOperands)
         } else {

@@ -111,12 +111,19 @@ impl C220Core {
         let machine = self.state.scalar().machine();
         let operands = C220LoadOperands::capture(machine, pc, word)
             .map_err(crate::sim::common::scalar::ScalarInstructionError::from)?;
+        if operands.second_destination.is_some_and(|(register, _)| {
+            register == operands.destination_register
+                || (operands.effective_address & 63) + operands.access_bytes() as u64 > 64
+        }) {
+            return Err(C220CoreError::UnsupportedTimedLsuAccess);
+        }
         if let Some(resume_tick) = [67, 68]
             .into_iter()
             .filter_map(|spr| self.scalar_timing.pending_spr_retirement(spr))
             .chain(
-                self.scalar_timing
-                    .load_waw_tick(operands.destination_register),
+                operands
+                    .destinations()
+                    .filter_map(|register| self.scalar_timing.load_waw_tick(register)),
             )
             .filter(|ready| *ready > tick)
             .max()
@@ -145,8 +152,9 @@ impl C220Core {
             operands,
             self.state.scalar_mut().machine_mut(),
         )?;
-        self.scalar_timing
-            .supersede_destination(operands.destination_register);
+        for register in operands.destinations() {
+            self.scalar_timing.supersede_destination(register);
+        }
         let issue = C220CoreLoadIssue {
             instruction_id: self.next_instruction_id,
             tick,

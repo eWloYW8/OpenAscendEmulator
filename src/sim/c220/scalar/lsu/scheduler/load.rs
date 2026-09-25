@@ -4,6 +4,8 @@ use super::super::store_buffer::C220LsuCompletion;
 use super::*;
 use crate::sim::c220::scalar::{C220LoadOperands, C220ScalarMappedAddress};
 
+mod data;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220LsuLoadPath {
     Cache,
@@ -19,6 +21,7 @@ pub struct C220LsuLoadValue {
     pub operands: C220LoadOperands,
     pub mapped: C220ScalarMappedAddress,
     pub value: u64,
+    pub second_value: Option<u64>,
     pub path: C220LsuLoadPath,
 }
 
@@ -44,7 +47,9 @@ impl C220LsuRequestScheduler {
         let physical_address = mapped.address & 0x0000_ffff_ffff_ffff;
         let offset = (physical_address % size) as usize;
         if ![1, 2, 4, 8].contains(&operands.width_bytes)
-            || offset + usize::from(operands.width_bytes) > size as usize
+            || offset + operands.access_bytes() > size as usize
+            || (operands.second_destination.is_some()
+                && (operands.effective_address & 63) + operands.access_bytes() as u64 > 64)
         {
             return Err(C220LsuStoreError::InvalidRange.into());
         }
@@ -146,30 +151,24 @@ impl C220LsuRequestScheduler {
             let location = pending
                 .lookup
                 .ok_or(C220LsuSchedulerError::MissingLoadLookup)?;
-            let width = usize::from(pending.operands.width_bytes);
+            let width = pending.operands.access_bytes();
             let store = self.stores.entry(pending.line);
             let covered = store
                 .map(|entry| entry.covered_bytes(pending.offset, width))
                 .transpose()?
                 .unwrap_or(0);
             if location.is_some() || covered == width {
-                let mut bytes = [0; 8];
-                if let Some(location) = location {
-                    bytes[..width].copy_from_slice(
-                        &cache.line(location)?[pending.offset..pending.offset + width],
-                    );
-                }
-                if covered != 0 {
-                    store
-                        .expect("covered store bytes")
-                        .forward_scalar(pending.offset, &mut bytes[..width])?;
-                }
-                let path = match (location.is_some(), covered != 0) {
+                let (values, forwarded) = pending.read_data(
+                    location.map(|location| cache.line(location)).transpose()?,
+                    store,
+                    covered,
+                )?;
+                let path = match (location.is_some(), forwarded) {
                     (true, false) => C220LsuLoadPath::Cache,
                     (true, true) => C220LsuLoadPath::CacheAndStore,
                     _ => C220LsuLoadPath::StoreForward,
                 };
-                result = Some((u64::from_le_bytes(bytes), path));
+                result = Some((values, path));
             } else {
                 self.reads.check_enqueue()?;
                 tick.checked_add(1).ok_or(C220LsuReadError::Overflow)?;
@@ -213,7 +212,7 @@ impl C220LsuRequestScheduler {
         id: C220LsuRequestId,
         pending: PendingLoad,
         tick: u64,
-        value: u64,
+        values: [u64; 2],
         path: C220LsuLoadPath,
     ) {
         self.pending_loads.remove(&id);
@@ -222,7 +221,8 @@ impl C220LsuRequestScheduler {
             tick,
             operands: pending.operands,
             mapped: pending.mapped,
-            value,
+            value: values[0],
+            second_value: pending.operands.second_destination.map(|_| values[1]),
             path,
         }));
     }
@@ -239,14 +239,11 @@ impl C220LsuRequestScheduler {
                 && let Some(pending) = self.pending_loads.get(&id).copied()
             {
                 debug_assert_eq!(pending.line, key);
-                let width = usize::from(pending.operands.width_bytes);
-                let mut bytes = [0; 8];
-                bytes[..width].copy_from_slice(&line[pending.offset..pending.offset + width]);
                 self.finish_load(
                     id,
                     pending,
                     tick,
-                    u64::from_le_bytes(bytes),
+                    pending.read_line(line),
                     C220LsuLoadPath::Refill,
                 );
             }

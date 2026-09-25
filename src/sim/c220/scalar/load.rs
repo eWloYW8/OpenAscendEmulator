@@ -2,7 +2,7 @@ use crate::architecture::Architecture;
 use crate::isa::scalar::{ScalarInstruction, ScalarLoadStoreOperation};
 use crate::sim::common::scalar::{ScalarMachine, ScalarMachineError};
 
-/// Single-register load operands captured before cache execution. Register
+/// Load operands captured before cache execution. Register
 /// updates remain deferred until the core delivers architectural completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220LoadOperands {
@@ -10,6 +10,7 @@ pub struct C220LoadOperands {
     pub word: u32,
     pub destination_register: u8,
     pub prior_destination_value: u64,
+    pub second_destination: Option<(u8, u64)>,
     pub base_register: u8,
     pub base_value: u64,
     pub offset_operand: Option<(u8, u64)>,
@@ -30,6 +31,34 @@ impl C220LoadOperands {
         }
         let instruction =
             ScalarInstruction::from_word(Architecture::Dav2201, word).ok_or_else(unsupported)?;
+        if let ScalarInstruction::ScalarPairLoad {
+            first_destination_register,
+            second_destination_register,
+            base_register,
+            signed_offset,
+            width_bytes,
+            sign_extend: false,
+            ..
+        } = instruction
+        {
+            let base_value = machine.xregs()[usize::from(base_register)];
+            return Ok(Self {
+                pc,
+                word,
+                destination_register: first_destination_register,
+                prior_destination_value: machine.xregs()[usize::from(first_destination_register)],
+                second_destination: Some((
+                    second_destination_register,
+                    machine.xregs()[usize::from(second_destination_register)],
+                )),
+                base_register,
+                base_value,
+                offset_operand: None,
+                effective_address: base_value.wrapping_add(signed_offset as i64 as u64),
+                updated_base: None,
+                width_bytes,
+            });
+        }
         let (
             destination_register,
             base_register,
@@ -90,6 +119,21 @@ impl C220LoadOperands {
             updated_base,
             base_value: machine.xregs()[usize::from(base_register)],
             prior_destination_value: machine.xregs()[usize::from(destination_register)],
+            second_destination: None,
         })
+    }
+
+    pub fn destinations(&self) -> impl Iterator<Item = u8> {
+        std::iter::once(self.destination_register)
+            .chain(self.second_destination.map(|(register, _)| register))
+    }
+
+    pub fn access_bytes(&self) -> usize {
+        usize::from(self.width_bytes)
+            * if self.second_destination.is_some() {
+                2
+            } else {
+                1
+            }
     }
 }

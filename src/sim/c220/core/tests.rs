@@ -95,11 +95,23 @@ fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
     let machine = core.state.scalar_mut().machine_mut();
     machine.set_xreg(5, 0x2080).unwrap();
     machine.set_xreg(7, u64::MAX).unwrap();
+    let expected_second = u64::from_le_bytes(
+        core.memory
+            .read_known_at(0x2088, 8)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
     let pc = core.state.scalar().pc();
     let C220CoreStep::Executed {
         instruction: C220CoreInstruction::Load(issue),
         ..
-    } = core.step_word_at(tick, 0x03ce_5000).unwrap()
+    } = core
+        .step_word_at(
+            tick,
+            (9 << 24) | (3 << 22) | (7 << 17) | (5 << 12) | (9 << 7),
+        )
+        .unwrap()
     else {
         panic!("timed load issue");
     };
@@ -134,6 +146,15 @@ fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
     assert_eq!(admissions[0].instruction_id, issue.instruction_id);
     assert_eq!(admissions[0].request, completion.retirement.data.request);
     assert_eq!(completion.retirement.data.value, 0xab00_0000);
+    assert_eq!(
+        completion.retirement.data.second_value,
+        Some(expected_second)
+    );
+    assert_eq!(core.state.scalar().machine().xregs()[9], expected_second);
+    assert_eq!(
+        completion.retirement.data.path,
+        crate::sim::c220::scalar::lsu::scheduler::C220LsuLoadPath::Refill
+    );
     assert_eq!(core.state.scalar().machine().xregs()[8], 0xab00_0000);
     assert_eq!(read_tick, completion.retirement.writeback_tick);
     assert_eq!(
@@ -260,7 +281,7 @@ fn run_core_stores(core: &mut C220Core, mut tick: u64) {
         let words = [
             first_store,
             (9 << 24) | (3 << 22) | (10 << 17) | (5 << 12) | (9 << 7) | 1,
-            (3 << 24) | (3 << 22) | (7 << 17) | (6 << 12),
+            (9 << 24) | (3 << 22) | (7 << 17) | (6 << 12) | (8 << 7),
         ];
         let mut issues = Vec::new();
         let mut stores = Vec::new();
@@ -311,6 +332,9 @@ fn run_core_stores(core: &mut C220Core, mut tick: u64) {
         assert_ne!(loads[0].retirement.retire_tick, stores[0].retire_tick);
         assert_ne!(loads[0].retirement.retire_tick, stores[1].retire_tick);
         assert_eq!(core.state.scalar().machine().xregs()[7], first_value);
+        assert_eq!(core.state.scalar().machine().xregs()[8], 0xaabb_ccdd);
+        assert_eq!(loads[0].retirement.data.second_value, Some(0xaabb_ccdd));
+        assert_eq!(loads[0].retirement.second_register_value, Some(0xaabb_ccdd));
         let cache = core.data_cache().unwrap();
         let location = cache.find_way(address, C220LsuMemory::External).unwrap();
         let bytes = cache.line(location).unwrap();
