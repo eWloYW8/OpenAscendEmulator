@@ -17,6 +17,10 @@ use crate::sim::common::scalar::ScalarInstructionError;
 
 #[derive(Debug, Error)]
 pub enum C220CoreError {
+    #[error("timed scalar LSU does not yet support this access or cache geometry")]
+    UnsupportedTimedLsuAccess,
+    #[error(transparent)]
+    LoadCommit(#[from] crate::sim::c220::scalar::lsu::load_commit::C220LoadCommitError),
     #[error("scalar LSU requires explicit geometry, shared BIU and timed memory configuration")]
     LsuUnconfigured,
     #[error("scalar LSU is already configured")]

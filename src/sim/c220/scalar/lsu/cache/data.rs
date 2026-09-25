@@ -55,6 +55,10 @@ impl C220DataCache {
         self.line_bytes
     }
 
+    pub const fn layout(&self) -> C220CacheAddressLayout {
+        self.layout
+    }
+
     pub fn sets(&self) -> &[C220CacheSet] {
         &self.sets
     }

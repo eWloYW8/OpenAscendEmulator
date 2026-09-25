@@ -76,6 +76,15 @@ impl C220ScalarTimingLane {
     }
 
     pub fn dependency_tick(&self, word: u32, tick: u64) -> Option<u64> {
+        self.dependency_tick_with_loads(word, tick, |_| false)
+    }
+
+    pub(crate) fn dependency_tick_with_loads(
+        &self,
+        word: u32,
+        tick: u64,
+        mut pending_load: impl FnMut(u8) -> bool,
+    ) -> Option<u64> {
         let spr = match ScalarInstruction::from_word(Architecture::Dav2201, word) {
             Some(ScalarInstruction::ScalarKey2MoveFromSpr {
                 encoded_source_spr, ..
@@ -94,6 +103,15 @@ impl C220ScalarTimingLane {
                 .pending_spr_retirement(instruction.destination_spr)
                 .filter(|retirement| *retirement > tick);
         }
+        if let Some(rule) = C220ScalarTimingRule::decode(word)
+            && rule.class == C220ScalarTimingClass::Variable
+            && let Some(destination) = rule.destination_register
+            && let Some(ready) = self
+                .pending_xreg_retirement(destination)
+                .filter(|ready| *ready > tick)
+        {
+            resume_tick = Some(resume_tick.map_or(ready, |prior| prior.max(ready)));
+        }
         let mut include = |register: u8| {
             if let Some(retire_tick) = self
                 .pending_xreg_retirement(register)
@@ -102,13 +120,11 @@ impl C220ScalarTimingLane {
                 resume_tick =
                     Some(resume_tick.map_or(retire_tick, |prior: u64| prior.max(retire_tick)));
             }
+            if pending_load(register) {
+                let retry = tick.saturating_add(1);
+                resume_tick = Some(resume_tick.map_or(retry, |prior| prior.max(retry)));
+            }
         };
-        if let Some(rule) = C220ScalarTimingRule::decode(word)
-            && rule.class == C220ScalarTimingClass::Variable
-            && let Some(destination) = rule.destination_register
-        {
-            include(destination);
-        }
         if let Some(mut mask) = crate::isa::c220::mte::read_register_mask(word) {
             while mask != 0 {
                 include(mask.trailing_zeros() as u8);
@@ -389,12 +405,7 @@ impl C220ScalarTimingLane {
         // Issue is called only after the dependency gate accepts the writer.
         // Replaced results still retire, but no longer block register readers.
         if let Some(destination) = ticket.destination_register {
-            self.pending_xreg_retirement[usize::from(destination)] = None;
-            for pending in &mut self.variable_instructions {
-                if pending.ticket.destination_register == Some(destination) {
-                    pending.destination_live = false;
-                }
-            }
+            self.supersede_destination(destination);
         }
         if ticket.class == C220ScalarTimingClass::Variable {
             let index = self
@@ -414,6 +425,19 @@ impl C220ScalarTimingLane {
             self.fixed_drain_tick
                 .map_or(ticket.retire_tick, |prior| prior.max(ticket.retire_tick)),
         );
+    }
+
+    pub(crate) fn supersede_destination(&mut self, destination: u8) {
+        self.pending_xreg_retirement[usize::from(destination)] = None;
+        for pending in &mut self.variable_instructions {
+            if pending.ticket.destination_register == Some(destination) {
+                pending.destination_live = false;
+            }
+        }
+    }
+
+    pub(crate) fn load_waw_tick(&self, destination: u8) -> Option<u64> {
+        self.pending_xreg_retirement[usize::from(destination)]
     }
 
     pub(crate) fn issue_spr(&mut self, ticket: C220ScalarSprTimingTicket) {

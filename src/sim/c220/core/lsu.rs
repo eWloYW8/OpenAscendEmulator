@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 
+mod load;
+use load::CoreLoads;
+pub use load::{C220CoreLoadCompletion, C220CoreLoadIssue};
+
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
 use crate::sim::c220::memory::timed_memory::{C220MemoryWriteCommand, C220MemoryWriteId};
 use crate::sim::c220::scalar::lsu::cache::C220CacheAddressLayout;
@@ -51,6 +55,7 @@ pub(super) struct CoreLsu {
     send_pending: Option<C220LsuWriteRequest>,
     pub(super) next_tick: Option<u64>,
     completions: Vec<C220CoreLsuCompletion>,
+    loads: Option<CoreLoads>,
 }
 
 impl C220Core {
@@ -84,6 +89,7 @@ impl C220Core {
             send_pending: None,
             next_tick: None,
             completions: Vec::new(),
+            loads: None,
         });
         Ok(())
     }
@@ -191,6 +197,19 @@ impl C220Core {
             .writes
             .advance_to(tick)
             .map_err(C220LsuSchedulerError::from)?;
+        scheduler
+            .reads
+            .advance_to(tick)
+            .map_err(C220LsuSchedulerError::from)?;
+        if let Some(loads) = &mut lsu.loads {
+            loads.receive_at(
+                tick,
+                pipeline,
+                scheduler,
+                &mut self.memory,
+                self.state.scalar_mut().machine_mut(),
+            )?;
+        }
         if let Some(C220MemoryWriteId::Cache { transaction, .. }) =
             pipeline.cache_write_completion(lsu.port)
         {
@@ -214,7 +233,19 @@ impl C220Core {
             maintenance_draining: false,
         };
         for stage in [C220LsuStage::M2, C220LsuStage::M1, C220LsuStage::M0] {
-            scheduler.advance(stage, tick, hazards)?;
+            if let Some(loads) = &mut lsu.loads {
+                scheduler.advance_with_cache(stage, tick, hazards, &mut loads.cache)?;
+            } else {
+                scheduler.advance(stage, tick, hazards)?;
+            }
+        }
+        if let Some(loads) = &mut lsu.loads {
+            loads.send_at(
+                tick,
+                pipeline,
+                scheduler,
+                self.state.scalar_mut().machine_mut(),
+            )?;
         }
         if lsu.send_pending.is_none() {
             let ready = pipeline
@@ -243,6 +274,8 @@ impl C220Core {
             }
         }
         lsu.next_tick = if lsu.pending.is_empty()
+            && lsu.loads.as_ref().is_none_or(CoreLoads::is_idle)
+            && scheduler.reads.requests().next().is_none()
             && scheduler.writes.requests().next().is_none()
             && lsu.send_pending.is_none()
         {

@@ -39,6 +39,12 @@ fn endpoint(tag: C220MemoryReadId) -> Option<(usize, usize)> {
 }
 
 impl C220BiuBusReads {
+    pub fn cache_can_send(&self, kind: C220BiuReadCacheKind, port: u32) -> bool {
+        self.cache_ports[kind.index()]
+            .get(port as usize)
+            .is_some_and(|port| port.input.len() < port.config.request_capacity.get() as usize)
+    }
+
     pub fn add_cache_port(
         &mut self,
         kind: C220BiuReadCacheKind,

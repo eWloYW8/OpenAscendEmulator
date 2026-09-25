@@ -37,7 +37,7 @@ impl C220Core {
         if let Some(stall) = gate {
             return Ok(C220CoreStep::Stalled(stall));
         }
-        if let Some(resume_tick) = self.scalar_timing.dependency_tick(word, tick) {
+        if let Some(resume_tick) = self.load_dependency_tick(word, tick) {
             return Ok(C220CoreStep::Stalled(C220Stall {
                 tick,
                 pc: self.state.scalar().pc(),
@@ -48,6 +48,32 @@ impl C220Core {
         let pc = self.state.scalar().pc();
         if crate::isa::c220::scalar::C220ScalarDirectStore::decode(word).is_some() {
             return self.step_direct_store_at(tick, word);
+        }
+        if self.lsu.is_some() {
+            use crate::isa::scalar::{ScalarInstruction, ScalarLoadStoreOperation};
+            match ScalarInstruction::from_word(Architecture::Dav2201, word) {
+                Some(
+                    ScalarInstruction::ScalarLoadStoreImmediate {
+                        operation: ScalarLoadStoreOperation::Load,
+                        ..
+                    }
+                    | ScalarInstruction::ScalarIndexedLoad { .. },
+                ) => return self.step_load_at(tick, word),
+                Some(
+                    ScalarInstruction::ScalarPairLoad { .. }
+                    | ScalarInstruction::ScalarPairStore { .. }
+                    | ScalarInstruction::ScalarIndexedStore { .. }
+                    | ScalarInstruction::ScalarIndexedImmediateStore { .. }
+                    | ScalarInstruction::ScalarStoreImmediate { .. }
+                    | ScalarInstruction::ScalarLoadStoreImmediate {
+                        operation: ScalarLoadStoreOperation::Store,
+                        ..
+                    },
+                ) => {
+                    return Err(C220CoreError::UnsupportedTimedLsuAccess);
+                }
+                _ => {}
+            }
         }
         if let Some(barrier) = PipelineBarrierStep::decode(Architecture::Dav2201, pc, word)
             .filter(|barrier| barrier.scope == PipelineBarrierScope::Fix)
@@ -175,6 +201,9 @@ impl C220Core {
                     .state
                     .step_scalar_word_with_ub(word, &mut self.memory)?;
                 if let Some(ticket) = timing {
+                    if let Some(destination) = ticket.destination_register {
+                        self.supersede_load_destination(destination);
+                    }
                     self.scalar_timing.issue(ticket);
                 }
                 if let Some(ticket) = spr_timing {

@@ -28,9 +28,152 @@ const C220_VECTOR_TO_MTE3_WAIT_FLAG_WORD: u32 = 0x40c2_06b4;
 const C220_MTE3_TO_VECTOR_SET_FLAG_WORD: u32 = 0x40a2_14a8;
 const C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD: u32 = 0x40c2_14cc;
 
+fn connect_test_read_bus(core: &mut C220Core) {
+    use crate::sim::c220::mte::interface::biu_read::write::C220BiuWriteBandwidths;
+    use crate::sim::c220::mte::interface::biu_read::{C220BiuReadConfig, C220BiuSubcore};
+    use std::num::NonZeroU32;
+    let width = NonZeroU32::new(128).unwrap();
+    core.connect_mte2_bus(
+        C220BiuReadConfig {
+            outstanding: NonZeroU32::new(2).unwrap(),
+            weights: [1; 3],
+            group_vector_returns: true,
+            write_bandwidths: C220BiuWriteBandwidths {
+                l1: width,
+                l0a: width,
+                l0b: width,
+                ub: width,
+            },
+        },
+        C220BiuSubcore::Vector0,
+        NonZeroU32::new(2).unwrap(),
+    )
+    .unwrap();
+}
+
+fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
+    use crate::sim::c220::memory::biu_read::C220BiuReadCacheConfig;
+    use crate::sim::c220::scalar::lsu::cache::*;
+    use crate::sim::c220::scalar::lsu::load_commit::C220LoadCommitMode;
+    use crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory;
+    use std::num::NonZeroU32;
+    let cache = C220DataCache::new(
+        C220CacheAddressLayout::new(6, 3, 8, 0xffffffffff).unwrap(),
+        64,
+        (0..4)
+            .map(|_| {
+                C220CacheSet::new(
+                    vec![C220CacheTag {
+                        valid: false,
+                        dirty: false,
+                        age: 0,
+                        memory: C220LsuMemory::External,
+                        tag: 0,
+                    }],
+                    None,
+                )
+                .unwrap()
+            })
+            .collect(),
+    )
+    .unwrap();
+    core.configure_lsu_loads(
+        cache,
+        if bypass {
+            C220LoadCommitMode::DataBypass
+        } else {
+            C220LoadCommitMode::Retirement
+        },
+        C220BiuReadCacheConfig {
+            request_capacity: NonZeroU32::new(2).unwrap(),
+            response_capacity: NonZeroU32::new(2).unwrap(),
+            request_latency: 1,
+            response_latency: 1,
+        },
+    )
+    .unwrap();
+    let machine = core.state.scalar_mut().machine_mut();
+    machine.set_xreg(5, 0x2080).unwrap();
+    machine.set_xreg(7, u64::MAX).unwrap();
+    let pc = core.state.scalar().pc();
+    let C220CoreStep::Executed {
+        instruction: C220CoreInstruction::Load(issue),
+        ..
+    } = core.step_word_at(tick, 0x03ce_5000).unwrap()
+    else {
+        panic!("timed load issue");
+    };
+    assert_eq!(core.state.scalar().pc(), pc + 4);
+    assert_eq!(core.state.scalar().machine().xregs()[7], u64::MAX);
+    assert_eq!(core.pending_load_instructions().count(), 1);
+    let read = 0x0200_0800 | (8 << 17) | (7 << 12);
+    assert!(matches!(
+        core.step_word_at(tick + 1, read).unwrap(),
+        C220CoreStep::Stalled(_)
+    ));
+    let mut read_tick = None;
+    let completion = (tick + 2..tick + 100)
+        .find_map(|now| {
+            if read_tick.is_none() {
+                match core.step_word_at(now, read).unwrap() {
+                    C220CoreStep::Executed { .. } => read_tick = Some(now),
+                    C220CoreStep::Stalled(_) => assert_eq!(core.state.scalar().pc(), pc + 4),
+                }
+            } else {
+                core.advance_to(now).unwrap();
+            }
+            core.take_load_completions().into_iter().next()
+        })
+        .expect("automatic load completion");
+    assert_eq!(completion.issue, issue);
+    assert_eq!(completion.retirement.data.value, 0xab00_0000);
+    assert_eq!(core.state.scalar().machine().xregs()[8], 0xab00_0000);
+    assert_eq!(read_tick, completion.retirement.writeback_tick);
+    assert_eq!(
+        completion.retirement.retire_tick - read_tick.unwrap(),
+        u64::from(bypass)
+    );
+    assert_eq!(core.pending_load_instructions().count(), 0);
+    tick = completion.retirement.retire_tick + 2;
+    for suppressed in [false, true] {
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(5, 0x2080)
+            .unwrap();
+        let word = (19 << 24) | (3 << 22) | (5 << 17) | (5 << 12) | 8;
+        assert!(matches!(
+            core.step_word_at(tick, word).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Load(_),
+                ..
+            }
+        ));
+        assert_eq!(core.state.scalar().machine().xregs()[5], 0x2088);
+        if suppressed {
+            let add = (5 << 17) | (1 << 12) | (2 << 7) | 1;
+            assert!(matches!(
+                core.step_word_at(tick + 1, add).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+        }
+        let prior = core.state.scalar().machine().xregs()[5];
+        core.advance_to(tick + 4).unwrap();
+        let completions = core.take_load_completions();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].retirement.suppressed, suppressed);
+        assert_eq!(completions[0].retirement.data.tick, tick + 3);
+        assert_eq!(
+            core.state.scalar().machine().xregs()[5],
+            if suppressed { prior } else { 0xab00_0000 }
+        );
+        tick += 6;
+    }
+}
+
 #[test]
 fn native_mte3_waits_for_responses_and_reads_ub_at_retirement() {
-    for mode in 0..3 {
+    for mode in 0..4 {
         native_mte3_write_path(mode);
     }
 }
@@ -111,7 +254,8 @@ fn native_mte3_write_path(mode: u8) {
     } else {
         core.connect_mte3_biu(config).unwrap();
     }
-    if mode == 2 {
+    if mode >= 2 {
+        connect_test_read_bus(&mut core);
         use crate::sim::c220::memory::timed_memory::{
             C220MemoryCredits, C220MemoryLatency, C220MemoryRegionTiming, C220TimedMemoryConfig,
         };
@@ -149,7 +293,7 @@ fn native_mte3_write_path(mode: u8) {
         })
         .unwrap();
     }
-    if mode == 2 {
+    if mode >= 2 {
         use crate::sim::c220::scalar::lsu::cache::C220CacheAddressLayout;
         use crate::sim::c220::scalar::lsu::miss_buffer::C220LsuMissConfig;
         use crate::sim::c220::scalar::lsu::store_buffer::C220LsuStoreConfig;
@@ -197,7 +341,7 @@ fn native_mte3_write_path(mode: u8) {
     assert!(core.take_mte3_dma_request().is_none());
     core.advance_to(7).unwrap();
     assert!(core.take_mte3_dma_request().is_none());
-    if mode == 2 {
+    if mode >= 2 {
         assert!(core.take_biu_write_command_at(7).is_err());
         let machine = core.state.scalar_mut().machine_mut();
         machine.set_xreg(1, 0x2086).unwrap();
@@ -298,6 +442,7 @@ fn native_mte3_write_path(mode: u8) {
                 .pending_completions(),
             0
         );
+        run_core_loads(&mut core, retired + 2, mode == 3);
         return;
     }
     let transfer = (8..30)
