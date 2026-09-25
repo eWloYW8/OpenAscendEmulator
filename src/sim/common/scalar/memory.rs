@@ -98,9 +98,9 @@ impl ScalarMachine {
         else {
             return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
         };
-        let value = self.xregs[usize::from(source_register)];
-        let base_value = self.xregs[usize::from(base_register)];
-        let offset_value = self.xregs[usize::from(offset_register)];
+        let value = self.xreg_value(source_register).unwrap_or(0);
+        let base_value = self.xreg_value(base_register).unwrap_or(0);
+        let offset_value = self.xreg_value(offset_register).unwrap_or(0);
         let indexed_address =
             base_value.wrapping_add(offset_value.wrapping_mul(u64::from(width_bytes)));
         let effective_address = if post_index {
@@ -113,7 +113,7 @@ impl ScalarMachine {
         bus.write(effective_address, &bytes[..usize::from(width_bytes)])
             .map_err(ScalarMemoryExecutionError::Backend)?;
         if let Some(updated_base) = updated_base {
-            self.xregs[usize::from(base_register)] = updated_base;
+            self.write_existing_xreg(base_register, updated_base);
         }
         Ok(ScalarIndexedStoreStep {
             pc,
@@ -147,8 +147,8 @@ impl ScalarMachine {
         else {
             return Err(ScalarMemoryExecutionError::UnsupportedWord { pc, word });
         };
-        let base_value = self.xregs[usize::from(base_register)];
-        let offset_value = self.xregs[usize::from(offset_register)];
+        let base_value = self.xreg_value(base_register).unwrap_or(0);
+        let offset_value = self.xreg_value(offset_register).unwrap_or(0);
         let indexed_address =
             base_value.wrapping_add(offset_value.wrapping_mul(u64::from(width_bytes)));
         let effective_address = if post_index {
@@ -161,11 +161,11 @@ impl ScalarMachine {
         bus.read(effective_address, &mut bytes[..usize::from(width_bytes)])
             .map_err(ScalarMemoryExecutionError::Backend)?;
         let value = u64::from_le_bytes(bytes);
-        let prior_destination_value = self.xregs[usize::from(destination_register)];
+        let prior_destination_value = self.xreg_value(destination_register).unwrap_or(0);
         if let Some(updated_base) = updated_base {
-            self.xregs[usize::from(base_register)] = updated_base;
+            self.write_existing_xreg(base_register, updated_base);
         }
-        self.xregs[usize::from(destination_register)] = value;
+        self.write_existing_xreg(destination_register, value);
         Ok(ScalarIndexedLoadStep {
             pc,
             word,

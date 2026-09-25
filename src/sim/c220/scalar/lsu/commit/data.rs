@@ -93,7 +93,7 @@ impl C220LsuCommitLane {
             data
         };
         if self.mode == C220LoadCommitMode::DataBypass && !pending.suppressed {
-            self.write_result(combined, machine)?;
+            self.write_result(combined, machine);
             self.pending
                 .get_mut(&instruction)
                 .expect("checked load")

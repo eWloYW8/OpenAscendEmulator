@@ -202,7 +202,24 @@ fn captured_indexed_scalar_loads_decode_on_supported_architectures() {
                 post_index: false,
             })
         );
-        assert_eq!(ScalarInstruction::from_word(architecture, word | 1), None);
+        for extension in 0..8 {
+            assert_eq!(
+                ScalarInstruction::from_word(Architecture::Dav2201, word | extension),
+                Some(ScalarInstruction::ScalarIndexedLoad {
+                    width_bytes: 1,
+                    destination_register: destination | ((extension as u8 & 4) << 3),
+                    base_register: base | ((extension as u8 & 2) << 4),
+                    offset_register: offset | ((extension as u8 & 1) << 5),
+                    post_index: false,
+                })
+            );
+            if extension != 0 {
+                assert_eq!(
+                    ScalarInstruction::from_word(Architecture::Dav3510, word | extension),
+                    None
+                );
+            }
+        }
     }
 }
 

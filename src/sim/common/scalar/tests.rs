@@ -85,26 +85,34 @@ fn c220_indexed_stores_snapshot_sources_before_base_writeback() {
     for dtype in 0..4 {
         let width = 1_usize << dtype;
         for post_index in [false, true] {
-            for source in [1, 20, 22] {
+            for source in [1, 20, 22, 32, 63] {
                 let word = 0x0100_0020
                     | (dtype << 22)
-                    | (source << 17)
+                    | ((source & 31) << 17)
+                    | ((source >> 5) << 2)
                     | (20 << 12)
                     | (22 << 7)
                     | if post_index { 8 } else { 0 };
                 assert!(ScalarInstruction::from_word(Architecture::Dav3510, word).is_none());
-                for extension in [1, 2, 4] {
-                    assert!(
-                        ScalarInstruction::from_word(Architecture::Dav2201, word | extension)
-                            .is_none()
-                    );
-                }
                 let mut machine = ScalarMachine::new(Architecture::Dav2201, [0; 32], 0);
                 machine.set_xreg(1, 0xfedc_ba98_7654_3210).unwrap();
                 machine.set_xreg(20, 0x1010).unwrap();
                 machine.set_xreg(22, u64::MAX).unwrap();
+                machine.set_xreg(32, 0x1234_5678_9abc_def0).unwrap();
                 let before = machine.clone();
-                let expected = machine.xregs()[source as usize].to_le_bytes();
+                let expected = machine.xreg_value(source as u8).unwrap_or(0).to_le_bytes();
+                let captured =
+                    crate::sim::c220::scalar::C220StoreOperands::capture(&machine, 0, word)
+                        .unwrap();
+                assert_eq!(captured.bytes(), &expected[..width]);
+                assert_eq!(
+                    captured.missing_registers().collect::<Vec<_>>(),
+                    if source > 32 {
+                        vec![source as u8]
+                    } else {
+                        vec![]
+                    }
+                );
                 let mut bus = TestBus::new(0x1000);
                 bus.fail = true;
                 assert!(machine.execute_instruction(0, word, &mut bus).is_err());
@@ -138,10 +146,11 @@ fn c220_indexed_loads_handle_post_index_aliases_and_wrapping_offsets() {
     for dtype in 0..4 {
         let width = 1_usize << dtype;
         for post_index in [false, true] {
-            for destination in [1, 20, 22] {
+            for destination in [1, 20, 22, 32, 63] {
                 let word = 0x0100_0000
                     | (dtype << 22)
-                    | (destination << 17)
+                    | ((destination & 31) << 17)
+                    | ((destination >> 5) << 2)
                     | (20 << 12)
                     | (22 << 7)
                     | if post_index { 8 } else { 0 };
@@ -170,7 +179,10 @@ fn c220_indexed_loads_handle_post_index_aliases_and_wrapping_offsets() {
                 expected[..width].fill(0xa7);
                 let value = u64::from_le_bytes(expected);
                 assert_eq!(step.value, value);
-                assert_eq!(machine.xregs()[destination as usize], value);
+                assert_eq!(
+                    machine.xreg_value(destination as u8),
+                    (destination <= 32).then_some(value)
+                );
                 assert_eq!(
                     machine.xregs()[20],
                     if destination == 20 {

@@ -41,15 +41,17 @@ impl C220LoadOperands {
             ..
         } = instruction
         {
-            let base_value = machine.xregs()[usize::from(base_register)];
+            let base_value = machine.xreg_value(base_register).unwrap_or(0);
             return Ok(Self {
                 pc,
                 word,
                 destination_register: first_destination_register,
-                prior_destination_value: machine.xregs()[usize::from(first_destination_register)],
+                prior_destination_value: machine
+                    .xreg_value(first_destination_register)
+                    .unwrap_or(0),
                 second_destination: Some((
                     second_destination_register,
-                    machine.xregs()[usize::from(second_destination_register)],
+                    machine.xreg_value(second_destination_register).unwrap_or(0),
                 )),
                 base_register,
                 base_value,
@@ -76,7 +78,7 @@ impl C220LoadOperands {
                 ..
             } if sign_extend != Some(true) => {
                 let effect = instruction
-                    .scalar_address_effect(machine.xregs()[usize::from(base_register)])
+                    .scalar_address_effect(machine.xreg_value(base_register).unwrap_or(0))
                     .expect("load address");
                 (
                     data_register,
@@ -94,8 +96,8 @@ impl C220LoadOperands {
                 width_bytes,
                 post_index,
             } => {
-                let base = machine.xregs()[usize::from(base_register)];
-                let offset = machine.xregs()[usize::from(offset_register)];
+                let base = machine.xreg_value(base_register).unwrap_or(0);
+                let offset = machine.xreg_value(offset_register).unwrap_or(0);
                 let adjusted = base.wrapping_add(offset.wrapping_mul(u64::from(width_bytes)));
                 (
                     destination_register,
@@ -117,8 +119,8 @@ impl C220LoadOperands {
             offset_operand,
             effective_address: address,
             updated_base,
-            base_value: machine.xregs()[usize::from(base_register)],
-            prior_destination_value: machine.xregs()[usize::from(destination_register)],
+            base_value: machine.xreg_value(base_register).unwrap_or(0),
+            prior_destination_value: machine.xreg_value(destination_register).unwrap_or(0),
             second_destination: None,
         })
     }
@@ -126,6 +128,19 @@ impl C220LoadOperands {
     pub fn destinations(&self) -> impl Iterator<Item = u8> {
         std::iter::once(self.destination_register)
             .chain(self.second_destination.map(|(register, _)| register))
+    }
+
+    /// Encoded registers absent from the C220 register file. Reads produce
+    /// zero and writes are discarded; the operand IDs remain observable.
+    pub fn missing_registers(&self) -> impl Iterator<Item = u8> {
+        [
+            Some(self.base_register),
+            self.offset_operand.map(|(register, _)| register),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.destinations())
+        .filter(|register| *register > 32)
     }
 
     pub fn access_bytes(&self) -> usize {

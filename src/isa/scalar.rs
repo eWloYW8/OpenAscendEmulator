@@ -316,13 +316,13 @@ impl ScalarInstruction {
             AicClass::Scalar
                 if matches!(architecture, Architecture::Dav2201)
                     && ((word >> 24) & 0x1f) == 1
-                    && word & 0x77 == 0x20 =>
+                    && word & 0x70 == 0x20 =>
             {
                 Some(Self::ScalarIndexedStore {
                     width_bytes: 1 << ((word >> 22) & 3),
-                    source_register: ((word >> 17) & 0x1f) as u8,
-                    base_register: ((word >> 12) & 0x1f) as u8,
-                    offset_register: ((word >> 7) & 0x1f) as u8,
+                    source_register: (((word >> 17) & 0x1f) | ((word & 4) << 3)) as u8,
+                    base_register: (((word >> 12) & 0x1f) | ((word & 2) << 4)) as u8,
+                    offset_register: (((word >> 7) & 0x1f) | ((word & 1) << 5)) as u8,
                     post_index: word & 8 != 0,
                 })
             }
@@ -330,7 +330,7 @@ impl ScalarInstruction {
                 if ((word >> 24) & 0x1f) == 1
                     && word
                         & if matches!(architecture, Architecture::Dav2201) {
-                            0x77
+                            0x70
                         } else {
                             0x7f
                         }
@@ -338,9 +338,9 @@ impl ScalarInstruction {
             {
                 Some(Self::ScalarIndexedLoad {
                     width_bytes: 1 << ((word >> 22) & 3),
-                    destination_register: ((word >> 17) & 0x1f) as u8,
-                    base_register: ((word >> 12) & 0x1f) as u8,
-                    offset_register: ((word >> 7) & 0x1f) as u8,
+                    destination_register: (((word >> 17) & 0x1f) | ((word & 4) << 3)) as u8,
+                    base_register: (((word >> 12) & 0x1f) | ((word & 2) << 4)) as u8,
+                    offset_register: (((word >> 7) & 0x1f) | ((word & 1) << 5)) as u8,
                     post_index: word & 8 != 0,
                 })
             }

@@ -30,7 +30,7 @@ impl C220StoreOperands {
         }
         let instruction =
             ScalarInstruction::from_word(Architecture::Dav2201, word).ok_or_else(unsupported)?;
-        let read = |register: u8| machine.xregs()[usize::from(register)];
+        let read = |register: u8| machine.xreg_value(register).unwrap_or(0);
         if let ScalarInstruction::ScalarPairStore {
             first_source_register,
             second_source_register,
@@ -158,5 +158,18 @@ impl C220StoreOperands {
             1
         };
         &self.bytes[..usize::from(self.width_bytes) * count]
+    }
+
+    /// Encoded source registers absent from the C220 register file.
+    pub fn missing_registers(&self) -> impl Iterator<Item = u8> {
+        [
+            Some(self.base_register),
+            self.source_operand.map(|(register, _)| register),
+            self.second_source_operand.map(|(register, _)| register),
+            self.offset_operand.map(|(register, _)| register),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|register| *register > 32)
     }
 }

@@ -819,6 +819,74 @@ fn run_core_preloads(core: &mut C220Core, mut tick: u64) {
         assert!(core.take_preload_completions().is_empty());
         tick = done.retire_tick + 102;
     }
+    run_core_extended_loads(core, tick);
+}
+
+fn run_core_extended_loads(core: &mut C220Core, mut tick: u64) {
+    for (destination, base, offset, post_index) in [
+        (32, 5, 9, false),
+        (7, 32, 9, false),
+        (7, 5, 32, false),
+        (63, 5, 63, false),
+        (32, 32, 9, true),
+        (7, 32, 9, true),
+    ] {
+        let word = (1 << 24)
+            | (3 << 22)
+            | ((destination & 31) << 17)
+            | ((base & 31) << 12)
+            | ((offset & 31) << 7)
+            | ((destination >> 5) << 2)
+            | ((base >> 5) << 1)
+            | (offset >> 5)
+            | (u32::from(post_index) << 3);
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(base as u8, 0x2000).unwrap();
+        if offset <= 32 {
+            machine.set_xreg(offset as u8, 8).unwrap();
+        }
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Load(issue),
+            ..
+        } = core.step_word_at(tick, word).unwrap()
+        else {
+            panic!("extended load issues");
+        };
+        assert_eq!(issue.operands.base_register, base as u8);
+        assert_eq!(issue.operands.destination_register, destination as u8);
+        assert_eq!(
+            issue.operands.effective_address,
+            if offset <= 32 && !post_index {
+                0x2040
+            } else {
+                0x2000
+            }
+        );
+        assert_eq!(issue.operands.updated_base, post_index.then_some(0x2040));
+        if post_index {
+            assert_eq!(
+                core.state.scalar().machine().xreg_value(base as u8),
+                Some(0x2040)
+            );
+        }
+        assert_eq!(
+            issue.operands.missing_registers().count(),
+            if offset > 32 { 2 } else { 0 }
+        );
+        let done = (tick + 1..tick + 200)
+            .find_map(|now| {
+                core.advance_to(now).unwrap();
+                core.take_load_completions().into_iter().next()
+            })
+            .expect("extended load retires");
+        let machine = core.state.scalar().machine();
+        assert_eq!(
+            machine.xreg_value(destination as u8),
+            (destination <= 32).then_some(done.retirement.data.value)
+        );
+        assert_eq!(core.pending_load_instructions().count(), 0);
+        tick = done.retirement.retire_tick + 2;
+    }
 }
 
 #[test]

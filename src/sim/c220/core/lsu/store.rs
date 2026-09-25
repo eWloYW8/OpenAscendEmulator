@@ -91,8 +91,7 @@ impl C220Core {
             self.state
                 .scalar_mut()
                 .machine_mut()
-                .set_xreg(operands.base_register, base)
-                .map_err(crate::sim::common::scalar::ScalarInstructionError::from)?;
+                .write_existing_xreg(operands.base_register, base);
         }
         let issue = C220CoreStoreIssue {
             instruction_id: self.next_instruction_id,

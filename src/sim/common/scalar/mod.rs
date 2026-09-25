@@ -767,6 +767,12 @@ impl ScalarMachine {
         Ok(())
     }
 
+    /// Architectural write without allocating an absent numbered register.
+    /// Returns whether the register exists and was written.
+    pub(crate) fn write_existing_xreg(&mut self, register: u8, value: u64) -> bool {
+        self.set_xreg(register, value).is_ok()
+    }
+
     pub fn execute_jump_compare_word(
         &mut self,
         pc: u64,

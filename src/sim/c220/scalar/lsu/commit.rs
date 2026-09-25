@@ -299,7 +299,7 @@ impl C220LsuCommitLane {
             return Err(C220LsuCommitError::InvalidRequest);
         }
         if let Some(base) = operands.updated_base {
-            machine.set_xreg(operands.base_register, base)?;
+            machine.write_existing_xreg(operands.base_register, base);
         }
         for register in operands.destinations() {
             self.supersede(register);
@@ -454,7 +454,7 @@ impl C220LsuCommitLane {
         Self::check_machine(machine, pending.operands)?;
         let mut writeback_tick = pending.writeback_tick;
         if self.mode == C220LoadCommitMode::Retirement && !pending.suppressed {
-            self.write_result(data, machine)?;
+            self.write_result(data, machine);
             writeback_tick = Some(tick);
         }
         self.retirements.pop_front();
@@ -475,27 +475,24 @@ impl C220LsuCommitLane {
             responses: pending
                 .responses
                 .map(|response| response.map(C220LoadResponse::from)),
-            register_value: machine.xregs()[usize::from(pending.operands.destination_register)],
+            register_value: machine
+                .xreg_value(pending.operands.destination_register)
+                .unwrap_or(0),
             second_register_value: pending
                 .operands
                 .second_destination
-                .map(|(register, _)| machine.xregs()[usize::from(register)]),
+                .map(|(register, _)| machine.xreg_value(register).unwrap_or(0)),
         })))
     }
 
-    fn write_result(
-        &mut self,
-        data: C220LsuLoadValue,
-        machine: &mut ScalarMachine,
-    ) -> Result<(), C220LsuCommitError> {
+    fn write_result(&mut self, data: C220LsuLoadValue, machine: &mut ScalarMachine) {
         if let Some((register, _)) = data.operands.second_destination {
-            machine.set_xreg(register, data.second_value.expect("validated pair data"))?;
+            machine.write_existing_xreg(register, data.second_value.expect("validated pair data"));
         }
-        machine.set_xreg(data.operands.destination_register, data.value)?;
+        machine.write_existing_xreg(data.operands.destination_register, data.value);
         for register in data.operands.destinations() {
             self.owners.remove(&register);
         }
-        Ok(())
     }
 
     fn check_tick(&self, tick: u64) -> Result<(), C220LsuCommitError> {
@@ -511,11 +508,11 @@ impl C220LsuCommitLane {
         operands: C220LoadOperands,
     ) -> Result<(), C220LsuCommitError> {
         if machine.architecture() != Architecture::Dav2201
-            || usize::from(operands.destination_register) >= machine.xregs().len()
-            || usize::from(operands.base_register) >= machine.xregs().len()
+            || operands.destination_register >= 64
+            || operands.base_register >= 64
             || operands
                 .second_destination
-                .is_some_and(|(register, _)| usize::from(register) >= machine.xregs().len())
+                .is_some_and(|(register, _)| register >= 32)
         {
             Err(C220LsuCommitError::InvalidOperands)
         } else {
