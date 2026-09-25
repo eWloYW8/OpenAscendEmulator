@@ -1801,17 +1801,18 @@ fn scalar_conversion_retires_after_two_ticks_and_blocks_dependent_conversion() {
         core.step_word_at(17, add).unwrap(),
         C220CoreStep::Executed { .. }
     ));
-    assert_eq!(core.scalar_timing().pending_xreg_retirement(6), Some(19));
+    assert_eq!(core.scalar_timing().pending_xreg_retirement(6), Some(18));
+    assert_eq!(core.scalar_timing().pending_drain_tick(), Some(19));
     let read_result = 0x0200_0800 | (7 << 17) | (6 << 12);
-    let C220CoreStep::Stalled(stall) = core.step_word_at(18, read_result).unwrap() else {
-        panic!("earlier writer must remain pending");
-    };
-    assert_eq!(stall.resume_tick, 19);
     assert!(matches!(
-        core.step_word_at(19, read_result).unwrap(),
+        core.step_word_at(18, read_result).unwrap(),
         C220CoreStep::Executed { .. }
     ));
-    assert_eq!(core.scalar_timing().pending_xreg_retirement(7), Some(20));
+    assert_eq!(core.scalar_timing().pending_xreg_retirement(7), Some(19));
+    assert_eq!(
+        core.state().scalar().machine().xregs()[7],
+        core.state().scalar().machine().xregs()[6]
+    );
     let divide = (9 << 17) | (1 << 12) | (1 << 7) | 5;
     assert!(matches!(
         core.step_word_at(20, divide).unwrap(),

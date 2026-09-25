@@ -43,19 +43,25 @@ pub struct C220ScalarTimingTicket {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct C220ScalarTimingLane {
     pending_xreg_retirement: [Option<u64>; SCALAR_X_REGISTER_COUNT],
-    pending_no_xreg_retirement: Option<u64>,
-    variable_instructions: VecDeque<C220ScalarTimingTicket>,
+    fixed_drain_tick: Option<u64>,
+    variable_instructions: VecDeque<PendingVariable>,
     variable_events: Vec<u64>,
     pending_spr_retirement: BTreeMap<u16, u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingVariable {
+    ticket: C220ScalarTimingTicket,
+    destination_live: bool,
 }
 
 impl C220ScalarTimingLane {
     pub fn advance_to(&mut self, tick: u64) {
         if self
-            .pending_no_xreg_retirement
+            .fixed_drain_tick
             .is_some_and(|retirement| retirement <= tick)
         {
-            self.pending_no_xreg_retirement = None;
+            self.fixed_drain_tick = None;
         }
         self.pending_spr_retirement
             .retain(|_, retirement| *retirement > tick);
@@ -380,20 +386,34 @@ impl C220ScalarTimingLane {
     }
 
     pub(crate) fn issue(&mut self, ticket: C220ScalarTimingTicket) {
+        // Issue is called only after the dependency gate accepts the writer.
+        // Replaced results still retire, but no longer block register readers.
+        if let Some(destination) = ticket.destination_register {
+            self.pending_xreg_retirement[usize::from(destination)] = None;
+            for pending in &mut self.variable_instructions {
+                if pending.ticket.destination_register == Some(destination) {
+                    pending.destination_live = false;
+                }
+            }
+        }
         if ticket.class == C220ScalarTimingClass::Variable {
             let index = self
                 .variable_events
                 .partition_point(|event| *event <= ticket.retire_tick);
             self.variable_events.insert(index, ticket.retire_tick);
-            self.variable_instructions.push_back(ticket);
+            self.variable_instructions.push_back(PendingVariable {
+                ticket,
+                destination_live: true,
+            });
             return;
         }
-        let pending = if let Some(destination) = ticket.destination_register {
-            &mut self.pending_xreg_retirement[usize::from(destination)]
-        } else {
-            &mut self.pending_no_xreg_retirement
-        };
-        *pending = Some(pending.map_or(ticket.retire_tick, |prior| prior.max(ticket.retire_tick)));
+        if let Some(destination) = ticket.destination_register {
+            self.pending_xreg_retirement[usize::from(destination)] = Some(ticket.retire_tick);
+        }
+        self.fixed_drain_tick = Some(
+            self.fixed_drain_tick
+                .map_or(ticket.retire_tick, |prior| prior.max(ticket.retire_tick)),
+        );
     }
 
     pub(crate) fn issue_spr(&mut self, ticket: C220ScalarSprTimingTicket) {
@@ -411,9 +431,16 @@ impl C220ScalarTimingLane {
             .copied()
             .flatten()
             .into_iter()
-            .chain(self.variable_retirements().filter_map(|(ticket, tick)| {
-                (ticket.destination_register == Some(register)).then_some(tick)
-            }))
+            .chain(
+                self.variable_instructions
+                    .iter()
+                    .zip(self.variable_events.iter().copied())
+                    .filter_map(|(pending, tick)| {
+                        (pending.destination_live
+                            && pending.ticket.destination_register == Some(register))
+                        .then_some(tick)
+                    }),
+            )
             .max()
     }
 
@@ -421,6 +448,7 @@ impl C220ScalarTimingLane {
     pub fn variable_retirements(&self) -> impl Iterator<Item = (&C220ScalarTimingTicket, u64)> {
         self.variable_instructions
             .iter()
+            .map(|pending| &pending.ticket)
             .zip(self.variable_events.iter().copied())
     }
 
@@ -431,7 +459,7 @@ impl C220ScalarTimingLane {
             .copied()
             .chain(self.variable_events.iter().copied())
             .chain(self.pending_spr_retirement.values().copied())
-            .chain(self.pending_no_xreg_retirement)
+            .chain(self.fixed_drain_tick)
             .max()
     }
 }
@@ -479,6 +507,19 @@ mod tests {
         assert_eq!(lane.dependency_tick(divide, 16), Some(30));
         let independent_write = (5 << 17) | (1 << 12) | (2 << 7) | 1;
         assert_eq!(lane.dependency_tick(independent_write, 16), None);
+        lane.issue(
+            C220ScalarTimingRule::decode(independent_write)
+                .unwrap()
+                .ticket(16)
+                .unwrap(),
+        );
+        assert_eq!(lane.pending_xreg_retirement(5), Some(17));
+        assert_eq!(lane.pending_drain_tick(), Some(30));
+        assert_eq!(lane.variable_retirements().count(), 2);
+        lane.advance_to(17);
+        assert_eq!(lane.pending_xreg_retirement(5), None);
+        assert_eq!(lane.pending_xreg_retirement(6), Some(30));
+        assert_eq!(lane.dependency_tick(divide, 17), None);
         lane.advance_to(30);
         assert_eq!(lane.variable_retirements().count(), 0);
         assert_eq!(lane.pending_drain_tick(), None);
@@ -489,6 +530,27 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(lane.dependency_tick(divide, 31), Some(32));
+        lane.advance_to(32);
+        lane.issue(C220ScalarTimingTicket {
+            class: C220ScalarTimingClass::Fixed,
+            issue_tick: 40,
+            retire_tick: 50,
+            execution_stage: 2,
+            source_register: None,
+            destination_register: Some(5),
+        });
+        lane.issue(
+            C220ScalarTimingRule::decode(independent_write)
+                .unwrap()
+                .ticket(41)
+                .unwrap(),
+        );
+        assert_eq!(lane.pending_xreg_retirement(5), Some(42));
+        lane.advance_to(42);
+        assert_eq!(lane.pending_xreg_retirement(5), None);
+        assert_eq!(lane.pending_drain_tick(), Some(50));
+        lane.advance_to(50);
+        assert_eq!(lane.pending_drain_tick(), None);
     }
 
     #[test]
