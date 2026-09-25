@@ -7,83 +7,8 @@ use crate::sim::common::scalar::{ScalarMachine, ScalarMachineError};
 mod cached;
 pub use cached::C220StoreOperands;
 
-/// Atomic store inputs, captured before requests enter the LSU.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220AtomicStoreOperands {
-    pub pc: u64,
-    pub word: u32,
-    instruction: C220ScalarAtomicStore,
-    pub base_value: u64,
-    pub source_value: u64,
-    pub offset_value: u64,
-    pub effective_address: u64,
-    pub updated_base: Option<u64>,
-    pub control: u64,
-    pub atomic_control: u64,
-    pub local_root: u64,
-    bytes: [u8; 8],
-}
-
-impl C220AtomicStoreOperands {
-    pub fn capture(
-        machine: &ScalarMachine,
-        pc: u64,
-        word: u32,
-    ) -> Result<Self, ScalarMachineError> {
-        let instruction = C220ScalarAtomicStore::decode(word)
-            .filter(|_| machine.architecture() == Architecture::Dav2201)
-            .ok_or(ScalarMachineError::UnsupportedWord { pc, word })?;
-        let base_value = machine.xregs()[usize::from(instruction.base_register)];
-        let source_value = machine.xregs()[usize::from(instruction.source_register)];
-        let offset_value = match instruction.offset {
-            C220AtomicStoreOffset::Immediate(value) => value as i64 as u64,
-            C220AtomicStoreOffset::Register(register) => machine.xregs()[usize::from(register)]
-                .wrapping_mul(u64::from(instruction.width_bytes)),
-        };
-        let adjusted = base_value.wrapping_add(offset_value);
-        let spr = |spr| {
-            machine
-                .spr_value(spr)
-                .ok_or(ScalarMachineError::SprValueUnavailable { pc, spr })
-        };
-        Ok(Self {
-            pc,
-            word,
-            instruction,
-            base_value,
-            source_value,
-            offset_value,
-            effective_address: if instruction.post_index {
-                base_value
-            } else {
-                adjusted
-            },
-            updated_base: instruction.post_index.then_some(adjusted),
-            control: spr(3)?,
-            atomic_control: spr(90)?,
-            local_root: spr(67)?,
-            bytes: source_value.to_le_bytes(),
-        })
-    }
-
-    pub fn instruction(&self) -> C220ScalarAtomicStore {
-        self.instruction
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes[..usize::from(self.instruction.width_bytes)]
-    }
-
-    pub const fn data_type(&self) -> u8 {
-        (self.atomic_control & 7) as u8
-    }
-
-    pub const fn is_external(&self) -> bool {
-        self.effective_address & (1 << 24) != 0
-            || (self.effective_address & 0x0001_ffff_fe00_0000)
-                != (self.local_root & 0x0001_ffff_fe00_0000)
-    }
-}
+mod atomic;
+pub use atomic::{C220AtomicStoreError, C220AtomicStoreOperands, C220AtomicStoreResult};
 
 /// Operands captured after register dependencies clear, before LSU execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

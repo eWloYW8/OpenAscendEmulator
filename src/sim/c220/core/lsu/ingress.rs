@@ -13,6 +13,7 @@ pub struct C220CoreLsuAdmission {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum DispatchedLsu {
+    AtomicStore(C220CoreAtomicIssue),
     Load(C220CoreLoadIssue),
     DirectStore(C220CoreLsuIssue),
     Store(C220CoreStoreIssue),
@@ -22,6 +23,7 @@ pub(super) enum DispatchedLsu {
 impl DispatchedLsu {
     fn issue_tick(self) -> u64 {
         match self {
+            Self::AtomicStore(issue) => issue.tick,
             Self::Load(issue) => issue.tick,
             Self::Store(issue) => issue.tick,
             Self::DirectStore(issue) => issue.tick,
@@ -59,6 +61,28 @@ impl CoreLsu {
         else {
             return Ok(());
         };
+        if let DispatchedLsu::AtomicStore(issue) = head {
+            if let Some(request) = self
+                .scheduler
+                .admit_atomic_store(tick, issue.result.operands)?
+            {
+                self.atomics.insert(request, (issue, None));
+                self.admissions.push(C220CoreLsuAdmission {
+                    instruction_id: issue.instruction_id,
+                    request,
+                    second_request: None,
+                    tick,
+                    mapped: C220ScalarMappedAddress {
+                        address: issue.result.address,
+                        memory:
+                            crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory::External,
+                        stack: false,
+                    },
+                });
+                self.ingress.pop_front();
+            }
+            return Ok(());
+        }
         if let DispatchedLsu::Maintenance(issue) = head {
             if let Some(request) = self.scheduler.admit_maintenance(tick, issue.scope)? {
                 self.maintenance.insert(request, (issue, None));
@@ -70,7 +94,7 @@ impl CoreLsu {
             DispatchedLsu::Load(issue) => issue.operands.effective_address,
             DispatchedLsu::Store(issue) => issue.operands.effective_address,
             DispatchedLsu::DirectStore(issue) => issue.operands.effective_address,
-            DispatchedLsu::Maintenance(_) => unreachable!(),
+            DispatchedLsu::Maintenance(_) | DispatchedLsu::AtomicStore(_) => unreachable!(),
         };
         let roots = machine
             .spr_value(67)
@@ -84,7 +108,7 @@ impl CoreLsu {
             return Err(C220CoreError::UnsupportedTimedLsuAccess);
         }
         let (instruction_id, request, second_request) = match head {
-            DispatchedLsu::Maintenance(_) => unreachable!(),
+            DispatchedLsu::Maintenance(_) | DispatchedLsu::AtomicStore(_) => unreachable!(),
             DispatchedLsu::Load(issue) => {
                 let Some((request, second)) = self.scheduler.admit_load(
                     tick,

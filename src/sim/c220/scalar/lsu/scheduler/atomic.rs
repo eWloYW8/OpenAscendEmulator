@@ -66,6 +66,19 @@ impl C220LsuRequestScheduler {
         std::mem::take(&mut self.atomic_completions)
     }
 
+    pub fn deliver_atomic_completion(
+        &mut self,
+        tick: u64,
+        commits: &mut super::super::commit::C220LsuCommitLane,
+    ) -> Result<Option<C220LsuAtomicCompletion>, super::super::commit::C220LsuCommitError> {
+        let Some(completion) = self.atomic_completions.first().copied() else {
+            return Ok(None);
+        };
+        commits.complete_atomic_at(tick, completion.request)?;
+        self.atomic_completions.remove(0);
+        Ok(Some(completion))
+    }
+
     pub(super) fn validate_atomic_m2(&self, tick: u64) -> Result<(), C220LsuSchedulerError> {
         if let Some(pending) = self
             .pipeline

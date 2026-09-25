@@ -18,6 +18,8 @@ use crate::sim::common::scalar::ScalarInstructionError;
 #[derive(Debug, Error)]
 pub enum C220CoreError {
     #[error(transparent)]
+    AtomicStore(#[from] crate::sim::c220::scalar::C220AtomicStoreError),
+    #[error(transparent)]
     UbMemory(#[from] crate::memory::ub::UbMemoryError),
     #[error(transparent)]
     UbService(#[from] crate::sim::c220::memory::ub_service::C220UbServiceError),

@@ -4,7 +4,10 @@ mod load;
 mod store;
 pub use compare::{C220ScalarFp32CompareOutcome, execute_fp32_compare_word};
 pub use load::C220LoadOperands;
-pub use store::{C220AtomicStoreOperands, C220DirectStoreOperands, C220StoreOperands};
+pub use store::{
+    C220AtomicStoreError, C220AtomicStoreOperands, C220AtomicStoreResult, C220DirectStoreOperands,
+    C220StoreOperands,
+};
 mod float;
 pub use float::{C220ScalarFp32Outcome, execute_fp32_word};
 pub mod spr;

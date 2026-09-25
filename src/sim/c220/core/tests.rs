@@ -858,6 +858,7 @@ fn native_mte3_write_path(mode: u8) {
             ub_write_allocate: mode == 3,
             scalar_uses_vector_ports: mode == 3,
             refresh_atomic_on_writeback: false,
+            atomic_fp16_rounding: Default::default(),
         })
         .unwrap();
     }

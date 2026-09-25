@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
+mod atomic;
 mod cache;
+pub use atomic::{C220CoreAtomicCompletion, C220CoreAtomicIssue};
 mod ingress;
 mod maintenance;
 mod retirement;
@@ -47,6 +49,7 @@ pub struct C220CoreLsuConfig {
     pub scalar_uses_vector_ports: bool,
     /// Refresh atomic cache-line data from backing memory before maintenance writeback.
     pub refresh_atomic_on_writeback: bool,
+    pub atomic_fp16_rounding: crate::sim::c220::numeric::fp16::C220Fp16AddRounding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +69,14 @@ pub struct C220CoreLsuCompletion {
 }
 
 pub(super) struct CoreLsu {
+    atomics: BTreeMap<
+        C220LsuRequestId,
+        (
+            C220CoreAtomicIssue,
+            Option<crate::sim::c220::scalar::lsu::scheduler::C220LsuAtomicCompletion>,
+        ),
+    >,
+    atomic_completions: Vec<C220CoreAtomicCompletion>,
     commits: C220LsuCommitLane,
     stores: BTreeMap<C220LsuRequestId, C220CoreStoreIssue>,
     store_completions: Vec<C220CoreStoreCompletion>,
@@ -125,6 +136,8 @@ impl C220Core {
             commits: C220LsuCommitLane::new(C220LoadCommitMode::Retirement),
             stores: BTreeMap::new(),
             store_completions: Vec::new(),
+            atomics: BTreeMap::new(),
+            atomic_completions: Vec::new(),
             maintenance: BTreeMap::new(),
             maintenance_completions: Vec::new(),
             ingress: VecDeque::new(),
@@ -328,6 +341,12 @@ impl C220Core {
             )?;
         }
         for stage in [C220LsuStage::M2, C220LsuStage::M1, C220LsuStage::M0] {
+            while let Some(data) = scheduler.deliver_atomic_completion(tick, &mut lsu.commits)? {
+                lsu.atomics
+                    .get_mut(&data.request)
+                    .expect("issued atomic store")
+                    .1 = Some(data);
+            }
             let hazards = C220LsuExternalHazards {
                 maintenance_active: false,
                 maintenance_draining: scheduler.maintenance_head()
@@ -369,6 +388,7 @@ impl C220Core {
             && lsu.pending.is_empty()
             && lsu.stores.is_empty()
             && lsu.maintenance.is_empty()
+            && lsu.atomics.is_empty()
             && !scheduler.maintenance_active()
             && lsu.commits.pending_count() == 0
             && lsu.commits.retirement_occupancy() == 0

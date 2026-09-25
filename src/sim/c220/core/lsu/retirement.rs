@@ -17,6 +17,17 @@ impl CoreLsu {
         machine: &mut ScalarMachine,
     ) -> Result<(), C220CoreError> {
         match self.commits.retire_next_at(tick, machine)? {
+            Some(C220LsuRetirement::AtomicStore {
+                request,
+                retire_tick,
+            }) => {
+                let (issue, data) = self.atomics.remove(&request).expect("issued atomic store");
+                self.atomic_completions.push(C220CoreAtomicCompletion {
+                    issue,
+                    data: data.expect("completed atomic store"),
+                    retire_tick,
+                });
+            }
             Some(C220LsuRetirement::Maintenance {
                 request,
                 retire_tick,
