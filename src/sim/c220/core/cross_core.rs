@@ -13,6 +13,9 @@ impl C220Core {
         if self.state.scalar().is_halted() {
             return Err(crate::sim::c220::state::C220ExecutionError::ProgramEnded { pc }.into());
         }
+        if instruction.pipe_code == 3 {
+            return self.step_mte1_at(tick, pc, instruction.word);
+        }
         let (pending, cause) = match instruction.pipe_code {
             1 => (
                 self.vector.pending_drain_tick(),

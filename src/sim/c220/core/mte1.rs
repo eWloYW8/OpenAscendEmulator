@@ -21,7 +21,25 @@ impl C220Core {
         word: u32,
     ) -> Result<C220CoreStep, C220CoreError> {
         let registers = self.state.scalar().machine().xregs();
-        let command = if let Some(decoded) = C220Set2dInstruction::decode(word) {
+        let command = if let Some(instruction) =
+            crate::isa::c220::control::C220SetCrossCoreInstruction::decode(word)
+        {
+            if let Some(resume_tick) = self.mte1.next_event_tick() {
+                return Ok(C220CoreStep::Stalled(C220Stall {
+                    tick,
+                    pc,
+                    resume_tick: resume_tick
+                        .max(tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?),
+                    cause: C220StallCause::Mte1Dependency,
+                }));
+            }
+            Some(C220Mte1Command::CrossCore {
+                instruction,
+                payload: crate::sim::c220::sync::C220DeviceSync::from_value(
+                    registers[usize::from(instruction.source_register)],
+                ),
+            })
+        } else if let Some(decoded) = C220Set2dInstruction::decode(word) {
             let pattern = self
                 .state
                 .scalar()

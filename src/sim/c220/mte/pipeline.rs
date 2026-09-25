@@ -508,6 +508,7 @@ impl C220MtePipeline {
         }
         command.is_disabled()
             || (match command {
+                C220Mte1Command::CrossCore { .. } => true,
                 C220Mte1Command::Read(transfer) => self.generator(transfer.kind()).can_issue(),
                 C220Mte1Command::Set2d(_) => self.set2d.can_issue(),
             } && (self.selected_generator == Some(command.generator())
@@ -515,6 +516,7 @@ impl C220MtePipeline {
     }
     pub fn selected_generator_idle(&self) -> bool {
         self.selected_generator.is_none_or(|kind| match kind {
+            C220Mte1Generator::Load3d => true,
             C220Mte1Generator::Read(kind) => self.generator(kind).is_idle(),
             C220Mte1Generator::Set2d => self.set2d.is_idle(),
         })
@@ -1026,6 +1028,12 @@ impl C220MtePipeline {
             });
         }
         let issue = match command {
+            C220Mte1Command::CrossCore { .. } => C220Mte1Issue {
+                tick: self.events.tick(),
+                instruction_id,
+                uop_count: 0,
+                completion_ready: true,
+            },
             C220Mte1Command::Read(transfer) => {
                 let index = transfer.kind().index();
                 self.generator_events[index]

@@ -39,6 +39,7 @@ pub enum C220Mte1RuntimeError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1TransferResult {
+    CrossCore(crate::sim::c220::sync::C220DeviceSync),
     Load2dSparse(C220SparseTransferResult),
     Load2d(C220Load2dTransferResult),
     Load2dTranspose(C220Load2dTransferResult),
@@ -54,6 +55,24 @@ pub struct C220Mte1Outcome {
     pub hardware_flag_stall_ticks: u64,
     pub command: C220Mte1Command,
     pub result: C220Mte1TransferResult,
+}
+
+impl C220Mte1Outcome {
+    pub fn cross_core_reception(&self) -> Option<crate::sim::c220::sync::C220CrossCoreReception> {
+        let C220Mte1Command::CrossCore { instruction, .. } = self.command else {
+            return None;
+        };
+        let C220Mte1TransferResult::CrossCore(payload) = self.result else {
+            return None;
+        };
+        Some(crate::sim::c220::sync::C220CrossCoreReception {
+            instruction_id: self.instruction_id,
+            pc: self.pc,
+            tick: self.retire_tick,
+            instruction,
+            payload,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,19 +125,22 @@ impl Mte1Engine {
         flags: &mut C220HardwareFlagState,
     ) -> Result<C220Mte1Issue, C220Mte1RuntimeError> {
         let memory = match command {
+            C220Mte1Command::CrossCore { .. } => None,
             C220Mte1Command::Set2d(fill) => match fill.instruction.destination {
-                C220Set2dDestination::L0a => C220MatrixMemory::L0a,
-                C220Set2dDestination::L0b => C220MatrixMemory::L0b,
+                C220Set2dDestination::L0a => Some(C220MatrixMemory::L0a),
+                C220Set2dDestination::L0b => Some(C220MatrixMemory::L0b),
                 C220Set2dDestination::L1 => {
                     return Err(C220MtePipelineError::WrongCommandLane.into());
                 }
             },
-            C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(_)) => C220MatrixMemory::BiasTable,
-            C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dSparse(_)) => C220MatrixMemory::L0b,
+            C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(_)) => Some(C220MatrixMemory::BiasTable),
+            C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dSparse(_)) => {
+                Some(C220MatrixMemory::L0b)
+            }
             C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dTranspose(transfer)) => {
                 match transfer.instruction.destination {
-                    C220Load2dDestination::L0a => C220MatrixMemory::L0a,
-                    C220Load2dDestination::L0b => C220MatrixMemory::L0b,
+                    C220Load2dDestination::L0a => Some(C220MatrixMemory::L0a),
+                    C220Load2dDestination::L0b => Some(C220MatrixMemory::L0b),
                     destination => {
                         return Err(
                             C220Load2dTransferError::UnsupportedDestination(destination).into()
@@ -130,8 +152,8 @@ impl Mte1Engine {
                 .instruction
                 .destination
             {
-                C220Load2dDestination::L0a => C220MatrixMemory::L0a,
-                C220Load2dDestination::L0b => C220MatrixMemory::L0b,
+                C220Load2dDestination::L0a => Some(C220MatrixMemory::L0a),
+                C220Load2dDestination::L0b => Some(C220MatrixMemory::L0b),
                 destination => {
                     return Err(C220Load2dTransferError::UnsupportedDestination(destination).into());
                 }
@@ -144,7 +166,9 @@ impl Mte1Engine {
             .checked_add(1)
             .ok_or(C220Mte1RuntimeError::TimeOverflow)?;
         let issue = pipeline.issue_mte1(instruction_id, command)?;
-        let sets = flags.take_mte_sets(instruction_id, memory);
+        let sets = memory.map_or_else(VecDeque::new, |memory| {
+            flags.take_mte_sets(instruction_id, memory)
+        });
         self.pending.push_back(PendingCommand {
             state: C220Mte1CommandState {
                 instruction_id,
@@ -255,6 +279,9 @@ impl Mte1Engine {
                 return Ok(());
             }
             let result = match pending.command {
+                C220Mte1Command::CrossCore { payload, .. } => {
+                    C220Mte1TransferResult::CrossCore(payload)
+                }
                 C220Mte1Command::Set2d(fill) => {
                     C220Mte1TransferResult::Set2d(execute_c220_set2d(memory, fill)?)
                 }

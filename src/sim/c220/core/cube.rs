@@ -1707,5 +1707,53 @@ mod tests {
         bulk.advance_to(160).unwrap();
         assert!(bulk.mte_pipeline().unwrap().is_idle());
         assert_eq!(bulk.mte_pipeline(), incremental.mte_pipeline());
+        let cross = (2 << 29) | (15 << 21) | (4 << 18) | (3 << 10) | (6 << 2);
+        bulk.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(6, 0xa20)
+            .unwrap();
+        let mut flags = bulk.hardware_flags.clone();
+        let C220CoreStep::Executed {
+            instruction:
+                C220CoreInstruction::Mte1 {
+                    instruction_id,
+                    issue,
+                    ..
+                },
+            ..
+        } = bulk.step_word_at(161, cross).unwrap()
+        else {
+            panic!("MTE1 cross-core admission")
+        };
+        assert_eq!(issue.uop_count, 0);
+        assert!(issue.completion_ready);
+        assert_eq!(
+            bulk.mte_pipeline().unwrap().selected_generator(),
+            Some(crate::sim::c220::mte::mte1::C220Mte1Generator::Load3d)
+        );
+        assert!(bulk.last_mte1_outcomes().is_empty());
+        bulk.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(6, 0)
+            .unwrap();
+        bulk.advance_to(162).unwrap();
+        let outcome = bulk.last_mte1_outcomes().first().unwrap();
+        assert_eq!(outcome.instruction_id, instruction_id);
+        assert_eq!(outcome.retire_tick, 162);
+        let crate::sim::c220::mte::mte1::C220Mte1TransferResult::CrossCore(payload) =
+            outcome.result
+        else {
+            panic!("MTE1 cross-core retirement")
+        };
+        assert_eq!(payload.value, 0xa20);
+        assert_eq!((payload.mode, payload.flag_id), (2, 10));
+        let reception = outcome.cross_core_reception().unwrap();
+        assert_eq!(reception.tick, 162);
+        assert_eq!(reception.payload, payload);
+        flags.advance_to(162).unwrap();
+        assert_eq!(bulk.hardware_flags, flags);
+        assert!(bulk.pending_mte1_commands().next().is_none());
     }
 }
