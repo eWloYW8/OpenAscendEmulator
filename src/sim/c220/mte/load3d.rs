@@ -5,6 +5,8 @@ use crate::isa::c220::mte::load3d::{
 
 mod tiles;
 pub use tiles::{C220Load3dTile, C220Load3dTiles};
+mod coordinates;
+pub use coordinates::{C220Load3dCoordinate, C220Load3dCoordinateError, C220Load3dCoordinates};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("LOAD3Dv2 requires SPR {register}")]
@@ -46,6 +48,13 @@ pub struct C220Load3dV2Command {
 impl C220Load3dV2Command {
     pub fn tiles(self) -> C220Load3dTiles {
         C220Load3dTiles::new(self)
+    }
+
+    pub fn coordinates(
+        self,
+        tile: C220Load3dTile,
+    ) -> Result<C220Load3dCoordinates, C220Load3dCoordinateError> {
+        C220Load3dCoordinates::new(self, tile)
     }
 
     pub fn capture(
