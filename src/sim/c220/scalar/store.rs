@@ -2,6 +2,9 @@ use crate::architecture::Architecture;
 use crate::isa::c220::scalar::C220ScalarDirectStore;
 use crate::sim::common::scalar::{ScalarMachine, ScalarMachineError};
 
+mod cached;
+pub use cached::C220StoreOperands;
+
 /// Operands captured after register dependencies clear, before LSU execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220DirectStoreOperands {

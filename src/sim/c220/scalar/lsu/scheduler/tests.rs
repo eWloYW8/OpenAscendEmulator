@@ -6,6 +6,148 @@ use super::super::store_buffer::{C220LsuMemory, C220LsuStoreConfig};
 use super::*;
 
 #[test]
+fn captured_stores_coalesce_and_complete_through_cache_or_refill() {
+    use crate::architecture::Architecture;
+    use crate::sim::c220::scalar::{C220ScalarMappedAddress, C220StoreOperands};
+    use crate::sim::common::scalar::ScalarMachine;
+    for hit in [false, true] {
+        let mut scheduler = C220LsuRequestScheduler::new(
+            4,
+            2,
+            2,
+            2,
+            C220LsuMissBuffer::new(C220LsuMissConfig {
+                line_bytes: 64,
+                main_entries: 2,
+                sub_entries: 4,
+            })
+            .unwrap(),
+            C220LsuStoreBuffer::new(C220LsuStoreConfig {
+                line_bytes: 64,
+                main_entries: 2,
+                sub_entries: 4,
+                timeout_ticks: 3,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cache = C220DataCache::new(
+            C220CacheAddressLayout::new(6, 0, 6, u64::MAX).unwrap(),
+            64,
+            vec![
+                C220CacheSet::new(
+                    vec![C220CacheTag {
+                        valid: false,
+                        dirty: false,
+                        age: 0,
+                        memory: C220LsuMemory::External,
+                        tag: 0,
+                    }],
+                    None,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        if hit {
+            cache
+                .refill(0x100, 0x100, C220LsuMemory::External, &[0x55; 64], false)
+                .unwrap();
+        }
+        let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+        machine.set_xreg(5, 0x108).unwrap();
+        machine.set_xreg(6, 1).unwrap();
+        let first = C220StoreOperands::capture(
+            &machine,
+            0,
+            (20 << 24) | (3 << 22) | (5 << 17) | (5 << 12) | 8,
+        )
+        .unwrap();
+        assert_eq!(first.updated_base, Some(0x110));
+        assert_eq!(first.source_operand, Some((5, 0x108)));
+        assert_eq!(machine.xregs()[5], 0x108);
+        let second =
+            C220StoreOperands::capture(&machine, 4, (14 << 24) | (5 << 12) | (6 << 7) | 2).unwrap();
+        assert_eq!(second.effective_address, 0x109);
+        let mapped = |operands: C220StoreOperands| C220ScalarMappedAddress {
+            address: operands.effective_address,
+            memory: C220LsuMemory::External,
+            stack: false,
+        };
+        let a = scheduler
+            .admit_store(0, first, mapped(first), false)
+            .unwrap()
+            .unwrap();
+        let b = scheduler
+            .admit_store(0, second, mapped(second), false)
+            .unwrap()
+            .unwrap();
+        machine.set_xreg(5, u64::MAX).unwrap();
+        let hazards = C220LsuExternalHazards {
+            maintenance_active: false,
+            maintenance_draining: false,
+        };
+        for tick in 1..=6 {
+            scheduler.process_stores(tick, &mut cache).unwrap();
+            let before = scheduler.clone();
+            scheduler.process_stores(tick, &mut cache).unwrap();
+            assert_eq!(scheduler, before);
+            for stage in [C220LsuStage::M2, C220LsuStage::M1, C220LsuStage::M0] {
+                scheduler
+                    .advance_with_cache(stage, tick, hazards, &mut cache)
+                    .unwrap();
+            }
+            if tick < 6 {
+                assert!(scheduler.take_store_values().is_empty());
+            }
+            if tick == 4 {
+                assert_eq!(scheduler.stores.entries()[0].remaining_ticks(), 2);
+            }
+        }
+        let completion_tick = if hit {
+            6
+        } else {
+            assert!(
+                scheduler
+                    .reads
+                    .dispatch_clock(6, false, true)
+                    .unwrap()
+                    .is_empty()
+            );
+            let read = scheduler.reads.dispatch_clock(7, false, true).unwrap()[0];
+            scheduler
+                .apply_cached_read_response::<C220LsuSchedulerError>(
+                    read.id,
+                    &mut cache,
+                    |_, size| Ok(vec![0x55; size]),
+                )
+                .unwrap();
+            7
+        };
+        let values = scheduler.take_store_values();
+        assert_eq!(
+            values.iter().map(|value| value.request).collect::<Vec<_>>(),
+            [a, b]
+        );
+        assert!(values.iter().all(|value| value.tick == completion_tick
+            && value.path
+                == if hit {
+                    C220LsuStorePath::Cache
+                } else {
+                    C220LsuStorePath::Refill
+                }));
+        let location = cache.find_way(0x100, C220LsuMemory::External).unwrap();
+        let mut expected = [0x55; 64];
+        expected[8..16].copy_from_slice(&0x108_u64.to_le_bytes());
+        expected[9] = 0xff;
+        assert_eq!(cache.line(location).unwrap(), expected);
+        assert!(cache.sets()[0].ways()[0].dirty);
+        assert!(scheduler.stores.entries().is_empty());
+        assert!(scheduler.writes.requests().next().is_none());
+    }
+}
+
+#[test]
 fn response_ownership_controls_linked_completion_order_and_data() {
     for memory in [C220LsuMemory::Ub, C220LsuMemory::External] {
         let mut scheduler = C220LsuRequestScheduler::new(

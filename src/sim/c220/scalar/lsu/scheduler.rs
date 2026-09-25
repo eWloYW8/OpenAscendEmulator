@@ -26,6 +26,9 @@ mod tests;
 mod direct_store;
 use direct_store::PendingDirectStore;
 mod load;
+mod store;
+use store::PendingStore;
+pub use store::{C220LsuStorePath, C220LsuStoreValue};
 mod read;
 use load::PendingLoad;
 pub use load::{C220LsuLoadPath, C220LsuLoadValue};
@@ -84,10 +87,14 @@ pub enum C220LsuSchedulerError {
     UnexpectedReadResponse,
     #[error("external read response requires an allocated cache line")]
     MissingCacheLine,
-    #[error("load stages require the attached cache data path")]
-    LoadCacheRequired,
+    #[error("captured memory stages require the attached cache data path")]
+    CacheRequired,
     #[error("load has not completed its tag lookup")]
     MissingLoadLookup,
+    #[error("store stages require an external single-line cache access")]
+    UnsupportedStoreAccess,
+    #[error("store buffer request has no captured cache lookup")]
+    MissingStoreLookup,
     #[error("read response requires a fetching store entry")]
     UnexpectedStoreResponse,
     #[error(transparent)]
@@ -118,6 +125,9 @@ pub struct C220LsuRequestScheduler {
     pub reads: C220LsuReadQueue,
     pending_loads: BTreeMap<C220LsuRequestId, PendingLoad>,
     load_values: Vec<C220LsuLoadValue>,
+    pending_stores: BTreeMap<C220LsuRequestId, PendingStore>,
+    store_values: Vec<C220LsuStoreValue>,
+    store_next_tick: Option<u64>,
     eviction_data: BTreeMap<u64, Vec<u8>>,
 }
 
@@ -153,6 +163,9 @@ impl C220LsuRequestScheduler {
             reads,
             pending_loads: BTreeMap::new(),
             load_values: Vec::new(),
+            pending_stores: BTreeMap::new(),
+            store_values: Vec::new(),
+            store_next_tick: None,
             direct_events,
             direct_event,
             eviction_data: BTreeMap::new(),
@@ -250,12 +263,11 @@ impl C220LsuRequestScheduler {
         tick: u64,
         external: C220LsuExternalHazards,
     ) -> Result<C220LsuStageOutcome, C220LsuSchedulerError> {
-        if self
-            .pipeline
-            .head(stage)
-            .is_some_and(|head| self.pending_loads.contains_key(&head.request))
-        {
-            return Err(C220LsuSchedulerError::LoadCacheRequired);
+        if self.pipeline.head(stage).is_some_and(|head| {
+            self.pending_loads.contains_key(&head.request)
+                || self.pending_stores.contains_key(&head.request)
+        }) {
+            return Err(C220LsuSchedulerError::CacheRequired);
         }
         self.advance_impl(stage, tick, external)
     }

@@ -127,6 +127,9 @@ impl C220LsuRequestScheduler {
                     .map(|load| (head.request, load))
             });
         let mut result = None;
+        if stage == C220LsuStage::M2 {
+            self.validate_store_m2(tick)?;
+        }
         if let Some((id, pending)) = pending
             && stage == C220LsuStage::M2
             && self.hazard(self.requests[&id], external).is_none()
@@ -164,6 +167,9 @@ impl C220LsuRequestScheduler {
             }
         }
         let outcome = self.advance_impl(stage, tick, external)?;
+        if let C220LsuStageProgress::Advanced(id) = outcome.progress {
+            self.advance_store_data(stage, tick, id, cache)?;
+        }
         if let C220LsuStageProgress::Advanced(id) = outcome.progress
             && let Some((pending_id, pending)) = pending
         {
