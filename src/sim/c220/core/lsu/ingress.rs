@@ -1,5 +1,5 @@
 use super::*;
-use crate::sim::c220::scalar::lsu::load_commit::C220LoadId;
+use crate::sim::c220::scalar::lsu::commit::C220LoadId;
 use crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory;
 use crate::sim::common::scalar::ScalarMachine;
 
@@ -14,7 +14,8 @@ pub struct C220CoreLsuAdmission {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum DispatchedLsu {
     Load(C220CoreLoadIssue),
-    Store(C220CoreLsuIssue),
+    DirectStore(C220CoreLsuIssue),
+    Store(C220CoreStoreIssue),
 }
 
 impl DispatchedLsu {
@@ -22,6 +23,7 @@ impl DispatchedLsu {
         match self {
             Self::Load(issue) => issue.tick,
             Self::Store(issue) => issue.tick,
+            Self::DirectStore(issue) => issue.tick,
         }
     }
 }
@@ -57,6 +59,7 @@ impl CoreLsu {
         let address = match head {
             DispatchedLsu::Load(issue) => issue.operands.effective_address,
             DispatchedLsu::Store(issue) => issue.operands.effective_address,
+            DispatchedLsu::DirectStore(issue) => issue.operands.effective_address,
         };
         let roots = machine
             .spr_value(67)
@@ -78,14 +81,11 @@ impl CoreLsu {
                 else {
                     return Ok(());
                 };
-                self.loads
-                    .as_mut()
-                    .expect("configured load path")
-                    .commits
+                self.commits
                     .admit(tick, C220LoadId(issue.instruction_id), request)?;
                 (issue.instruction_id, request)
             }
-            DispatchedLsu::Store(issue) => {
+            DispatchedLsu::DirectStore(issue) => {
                 let Some(request) = self.scheduler.admit_direct_store(
                     tick,
                     issue.operands,
@@ -97,6 +97,19 @@ impl CoreLsu {
                     return Ok(());
                 };
                 self.pending.insert(request, issue);
+                (issue.instruction_id, request)
+            }
+            DispatchedLsu::Store(issue) => {
+                let Some(request) = self.scheduler.admit_store(
+                    tick,
+                    issue.operands,
+                    mapped,
+                    self.config.partition_stack,
+                )?
+                else {
+                    return Ok(());
+                };
+                self.stores.insert(request, issue);
                 (issue.instruction_id, request)
             }
         };

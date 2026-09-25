@@ -60,15 +60,17 @@ impl C220Core {
                     | ScalarInstruction::ScalarIndexedLoad { .. },
                 ) => return self.step_load_at(tick, word),
                 Some(
-                    ScalarInstruction::ScalarPairLoad { .. }
-                    | ScalarInstruction::ScalarPairStore { .. }
-                    | ScalarInstruction::ScalarIndexedStore { .. }
+                    ScalarInstruction::ScalarIndexedStore { .. }
                     | ScalarInstruction::ScalarIndexedImmediateStore { .. }
                     | ScalarInstruction::ScalarStoreImmediate { .. }
                     | ScalarInstruction::ScalarLoadStoreImmediate {
                         operation: ScalarLoadStoreOperation::Store,
                         ..
                     },
+                ) => return self.step_store_at(tick, word),
+                Some(
+                    ScalarInstruction::ScalarPairLoad { .. }
+                    | ScalarInstruction::ScalarPairStore { .. },
                 ) => {
                     return Err(C220CoreError::UnsupportedTimedLsuAccess);
                 }

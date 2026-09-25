@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use super::C220LsuRequestId;
-use super::scheduler::C220LsuLoadValue;
+use super::scheduler::{C220LsuLoadValue, C220LsuStoreValue};
+use super::write_queue::C220LsuWriteId;
 use crate::architecture::Architecture;
 use crate::sim::c220::scalar::C220LoadOperands;
 use crate::sim::common::scalar::{ScalarMachine, ScalarMachineError};
@@ -38,34 +39,60 @@ struct PendingLoad {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum C220LoadCommitError {
-    #[error("load commit clock moved backwards")]
+pub enum C220LsuCommitError {
+    #[error("LSU commit clock moved backwards")]
     TimeReversal,
-    #[error("load retirement clock overflow")]
+    #[error("LSU retirement clock overflow")]
     Overflow,
     #[error("load commit requires a C220 register file and valid captured operands")]
     InvalidOperands,
-    #[error("load request was already issued or its completion does not match")]
+    #[error("LSU request was already issued or its completion does not match")]
     InvalidRequest,
-    #[error("load retirement transport is full")]
+    #[error("LSU retirement transport is full")]
     RetirementFull,
     #[error(transparent)]
     Register(#[from] ScalarMachineError),
 }
 
-/// Register ownership and retirement transport for single-register loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220LsuRetirement {
+    Load(C220LoadRetirement),
+    Store {
+        data: C220LsuStoreValue,
+        retire_tick: u64,
+    },
+    DirectStore {
+        request: C220LsuRequestId,
+        write: C220LsuWriteId,
+        response_tick: u64,
+        retire_tick: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetirementToken {
+    Load(C220LoadId),
+    Store(C220LsuStoreValue),
+    DirectStore {
+        request: C220LsuRequestId,
+        write: C220LsuWriteId,
+        response_tick: u64,
+    },
+}
+
+/// Load register ownership and the shared scalar LSU retirement transport.
 /// The dispatcher must call `supersede` only after accepting a replacing writer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct C220LoadCommitLane {
+pub struct C220LsuCommitLane {
     mode: C220LoadCommitMode,
     tick: u64,
     pending: BTreeMap<C220LoadId, PendingLoad>,
     requests: BTreeMap<C220LsuRequestId, C220LoadId>,
     owners: BTreeMap<u8, C220LoadId>,
-    retirements: VecDeque<(u64, C220LoadId)>,
+    retirements: VecDeque<(u64, RetirementToken)>,
 }
 
-impl C220LoadCommitLane {
+impl C220LsuCommitLane {
     pub fn new(mode: C220LoadCommitMode) -> Self {
         Self {
             mode,
@@ -83,6 +110,75 @@ impl C220LoadCommitLane {
 
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+            + self
+                .retirements
+                .iter()
+                .filter(|(_, token)| !matches!(token, RetirementToken::Load(_)))
+                .count()
+    }
+
+    pub fn retirement_occupancy(&self) -> usize {
+        self.retirements.len()
+    }
+
+    pub fn check_retirement_send(&self, tick: u64) -> Result<(), C220LsuCommitError> {
+        self.check_tick(tick)?;
+        tick.checked_add(1).ok_or(C220LsuCommitError::Overflow)?;
+        if self.retirements.len() == 64 {
+            return Err(C220LsuCommitError::RetirementFull);
+        }
+        Ok(())
+    }
+
+    pub fn complete_store_at(
+        &mut self,
+        tick: u64,
+        data: C220LsuStoreValue,
+    ) -> Result<(), C220LsuCommitError> {
+        self.check_retirement_send(tick)?;
+        if data.tick > tick {
+            return Err(C220LsuCommitError::InvalidRequest);
+        }
+        self.check_store_request(data.request)?;
+        self.retirements
+            .push_back((tick + 1, RetirementToken::Store(data)));
+        self.tick = tick;
+        Ok(())
+    }
+
+    pub fn complete_direct_store_at(
+        &mut self,
+        tick: u64,
+        request: C220LsuRequestId,
+        write: C220LsuWriteId,
+    ) -> Result<(), C220LsuCommitError> {
+        self.check_retirement_send(tick)?;
+        self.check_store_request(request)?;
+        self.retirements.push_back((
+            tick + 1,
+            RetirementToken::DirectStore {
+                request,
+                write,
+                response_tick: tick,
+            },
+        ));
+        self.tick = tick;
+        Ok(())
+    }
+
+    fn check_store_request(&self, request: C220LsuRequestId) -> Result<(), C220LsuCommitError> {
+        if self.requests.contains_key(&request)
+            || self.retirements.iter().any(|(_, token)| match token {
+                RetirementToken::Store(data) => data.request == request,
+                RetirementToken::DirectStore {
+                    request: pending, ..
+                } => *pending == request,
+                RetirementToken::Load(_) => false,
+            })
+        {
+            return Err(C220LsuCommitError::InvalidRequest);
+        }
+        Ok(())
     }
 
     pub fn next_retirement_tick(&self) -> Option<u64> {
@@ -105,11 +201,11 @@ impl C220LoadCommitLane {
         instruction: C220LoadId,
         operands: C220LoadOperands,
         machine: &mut ScalarMachine,
-    ) -> Result<(), C220LoadCommitError> {
+    ) -> Result<(), C220LsuCommitError> {
         self.check_tick(tick)?;
         Self::check_machine(machine, operands)?;
         if self.pending.contains_key(&instruction) {
-            return Err(C220LoadCommitError::InvalidRequest);
+            return Err(C220LsuCommitError::InvalidRequest);
         }
         if let Some(base) = operands.updated_base {
             machine.set_xreg(operands.base_register, base)?;
@@ -138,14 +234,14 @@ impl C220LoadCommitLane {
         tick: u64,
         instruction: C220LoadId,
         request: C220LsuRequestId,
-    ) -> Result<(), C220LoadCommitError> {
+    ) -> Result<(), C220LsuCommitError> {
         self.check_tick(tick)?;
         let pending = self
             .pending
             .get_mut(&instruction)
-            .ok_or(C220LoadCommitError::InvalidRequest)?;
+            .ok_or(C220LsuCommitError::InvalidRequest)?;
         if pending.admission.is_some() || self.requests.contains_key(&request) {
-            return Err(C220LoadCommitError::InvalidRequest);
+            return Err(C220LsuCommitError::InvalidRequest);
         }
         pending.admission = Some((tick, request));
         self.requests.insert(request, instruction);
@@ -160,27 +256,27 @@ impl C220LoadCommitLane {
         tick: u64,
         data: C220LsuLoadValue,
         machine: &mut ScalarMachine,
-    ) -> Result<(), C220LoadCommitError> {
+    ) -> Result<(), C220LsuCommitError> {
         self.check_tick(tick)?;
         Self::check_machine(machine, data.operands)?;
-        let ready = tick.checked_add(1).ok_or(C220LoadCommitError::Overflow)?;
+        let ready = tick.checked_add(1).ok_or(C220LsuCommitError::Overflow)?;
         let instruction = *self
             .requests
             .get(&data.request)
-            .ok_or(C220LoadCommitError::InvalidRequest)?;
+            .ok_or(C220LsuCommitError::InvalidRequest)?;
         let pending = self
             .pending
             .get(&instruction)
-            .ok_or(C220LoadCommitError::InvalidRequest)?;
+            .ok_or(C220LsuCommitError::InvalidRequest)?;
         if pending.operands != data.operands
             || pending.data.is_some()
             || data.tick > tick
             || data.tick < pending.admission.expect("bound request").0
         {
-            return Err(C220LoadCommitError::InvalidRequest);
+            return Err(C220LsuCommitError::InvalidRequest);
         }
         if self.retirements.len() == 64 {
-            return Err(C220LoadCommitError::RetirementFull);
+            return Err(C220LsuCommitError::RetirementFull);
         }
         if self.mode == C220LoadCommitMode::DataBypass && !pending.suppressed {
             machine.set_xreg(data.operands.destination_register, data.value)?;
@@ -194,7 +290,8 @@ impl C220LoadCommitLane {
             .get_mut(&instruction)
             .expect("checked load")
             .data = Some(data);
-        self.retirements.push_back((ready, instruction));
+        self.retirements
+            .push_back((ready, RetirementToken::Load(instruction)));
         self.tick = tick;
         Ok(())
     }
@@ -204,9 +301,9 @@ impl C220LoadCommitLane {
         &mut self,
         tick: u64,
         machine: &mut ScalarMachine,
-    ) -> Result<Option<C220LoadRetirement>, C220LoadCommitError> {
+    ) -> Result<Option<C220LsuRetirement>, C220LsuCommitError> {
         self.check_tick(tick)?;
-        let Some((_, request)) = self
+        let Some((_, token)) = self
             .retirements
             .front()
             .copied()
@@ -214,6 +311,31 @@ impl C220LoadCommitLane {
         else {
             self.tick = tick;
             return Ok(None);
+        };
+        let request = match token {
+            RetirementToken::Load(request) => request,
+            RetirementToken::Store(data) => {
+                self.retirements.pop_front();
+                self.tick = tick;
+                return Ok(Some(C220LsuRetirement::Store {
+                    data,
+                    retire_tick: tick,
+                }));
+            }
+            RetirementToken::DirectStore {
+                request,
+                write,
+                response_tick,
+            } => {
+                self.retirements.pop_front();
+                self.tick = tick;
+                return Ok(Some(C220LsuRetirement::DirectStore {
+                    request,
+                    write,
+                    response_tick,
+                    retire_tick: tick,
+                }));
+            }
         };
         let pending = self.pending[&request];
         Self::check_machine(machine, pending.operands)?;
@@ -228,7 +350,7 @@ impl C220LoadCommitLane {
         self.pending.remove(&request);
         self.requests.remove(&data.request);
         self.tick = tick;
-        Ok(Some(C220LoadRetirement {
+        Ok(Some(C220LsuRetirement::Load(C220LoadRetirement {
             instruction: request,
             data,
             issue_tick: pending.issue_tick,
@@ -237,12 +359,12 @@ impl C220LoadCommitLane {
             retire_tick: tick,
             suppressed: pending.suppressed,
             register_value: machine.xregs()[usize::from(pending.operands.destination_register)],
-        }))
+        })))
     }
 
-    fn check_tick(&self, tick: u64) -> Result<(), C220LoadCommitError> {
+    fn check_tick(&self, tick: u64) -> Result<(), C220LsuCommitError> {
         if tick < self.tick {
-            Err(C220LoadCommitError::TimeReversal)
+            Err(C220LsuCommitError::TimeReversal)
         } else {
             Ok(())
         }
@@ -251,12 +373,12 @@ impl C220LoadCommitLane {
     fn check_machine(
         machine: &ScalarMachine,
         operands: C220LoadOperands,
-    ) -> Result<(), C220LoadCommitError> {
+    ) -> Result<(), C220LsuCommitError> {
         if machine.architecture() != Architecture::Dav2201
             || usize::from(operands.destination_register) >= machine.xregs().len()
             || usize::from(operands.base_register) >= machine.xregs().len()
         {
-            Err(C220LoadCommitError::InvalidOperands)
+            Err(C220LsuCommitError::InvalidOperands)
         } else {
             Ok(())
         }

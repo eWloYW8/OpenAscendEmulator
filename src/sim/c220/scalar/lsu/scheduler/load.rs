@@ -1,5 +1,5 @@
 use super::super::cache::{C220CacheLocation, C220DataCache};
-use super::super::load_commit::{C220LoadCommitError, C220LoadCommitLane};
+use super::super::commit::{C220LsuCommitError, C220LsuCommitLane};
 use super::super::store_buffer::C220LsuCompletion;
 use super::*;
 use crate::sim::c220::scalar::{C220LoadOperands, C220ScalarMappedAddress};
@@ -84,25 +84,34 @@ impl C220LsuRequestScheduler {
     /// Data availability, not architectural retirement. The core owns final
     /// register updates and release of dependent instructions.
     pub fn take_load_values(&mut self) -> Vec<C220LsuLoadValue> {
-        std::mem::take(&mut self.load_values)
+        let mut loads = Vec::new();
+        self.values.retain(|value| match value {
+            C220LsuValue::Load(data) => {
+                loads.push(*data);
+                false
+            }
+            C220LsuValue::Store(_) => true,
+        });
+        loads
     }
 
     /// Deliver completed data in order, retaining the rejected completion and
     /// its successors if register commit or retirement admission fails.
-    pub fn deliver_load_values(
+    pub fn deliver_values(
         &mut self,
         tick: u64,
-        commits: &mut C220LoadCommitLane,
+        commits: &mut C220LsuCommitLane,
         machine: &mut crate::sim::common::scalar::ScalarMachine,
-    ) -> Result<usize, C220LoadCommitError> {
-        for (accepted, data) in self.load_values.iter().copied().enumerate() {
-            if let Err(error) = commits.complete_data_at(tick, data, machine) {
-                self.load_values.drain(..accepted);
-                return Err(error);
+    ) -> Result<usize, C220LsuCommitError> {
+        let mut accepted = 0;
+        while let Some(value) = self.values.front().copied() {
+            match value {
+                C220LsuValue::Load(data) => commits.complete_data_at(tick, data, machine)?,
+                C220LsuValue::Store(data) => commits.complete_store_at(tick, data)?,
             }
+            self.values.pop_front();
+            accepted += 1;
         }
-        let accepted = self.load_values.len();
-        self.load_values.clear();
         Ok(accepted)
     }
 
@@ -208,14 +217,14 @@ impl C220LsuRequestScheduler {
         path: C220LsuLoadPath,
     ) {
         self.pending_loads.remove(&id);
-        self.load_values.push(C220LsuLoadValue {
+        self.values.push_back(C220LsuValue::Load(C220LsuLoadValue {
             request: id,
             tick,
             operands: pending.operands,
             mapped: pending.mapped,
             value,
             path,
-        });
+        }));
     }
 
     pub(super) fn resolve_load_values(

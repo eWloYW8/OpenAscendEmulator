@@ -1,6 +1,6 @@
 use super::write_queue::{C220LsuWriteError, C220LsuWriteQueue};
 use crate::sim::common::event::{EventDispatcher, EventError, EventId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use super::cache::C220CacheError;
 use super::direct_store::C220LsuDirectStoreBuffer;
@@ -29,6 +29,11 @@ mod load;
 mod store;
 use store::PendingStore;
 pub use store::{C220LsuStorePath, C220LsuStoreValue};
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220LsuValue {
+    Load(C220LsuLoadValue),
+    Store(C220LsuStoreValue),
+}
 mod read;
 use load::PendingLoad;
 pub use load::{C220LsuLoadPath, C220LsuLoadValue};
@@ -124,9 +129,8 @@ pub struct C220LsuRequestScheduler {
     pub writes: C220LsuWriteQueue,
     pub reads: C220LsuReadQueue,
     pending_loads: BTreeMap<C220LsuRequestId, PendingLoad>,
-    load_values: Vec<C220LsuLoadValue>,
+    values: VecDeque<C220LsuValue>,
     pending_stores: BTreeMap<C220LsuRequestId, PendingStore>,
-    store_values: Vec<C220LsuStoreValue>,
     store_next_tick: Option<u64>,
     eviction_data: BTreeMap<u64, Vec<u8>>,
 }
@@ -162,9 +166,8 @@ impl C220LsuRequestScheduler {
             writes,
             reads,
             pending_loads: BTreeMap::new(),
-            load_values: Vec::new(),
+            values: VecDeque::new(),
             pending_stores: BTreeMap::new(),
-            store_values: Vec::new(),
             store_next_tick: None,
             direct_events,
             direct_event,
@@ -174,6 +177,10 @@ impl C220LsuRequestScheduler {
 
     pub fn pipeline(&self) -> &C220LsuRequestPipeline {
         &self.pipeline
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &C220LsuValue> {
+        self.values.iter()
     }
 
     pub fn request(&self, id: C220LsuRequestId) -> Option<&C220LsuRequest> {

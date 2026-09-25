@@ -76,7 +76,15 @@ impl C220LsuRequestScheduler {
     }
 
     pub fn take_store_values(&mut self) -> Vec<C220LsuStoreValue> {
-        std::mem::take(&mut self.store_values)
+        let mut stores = Vec::new();
+        self.values.retain(|value| match value {
+            C220LsuValue::Store(data) => {
+                stores.push(*data);
+                false
+            }
+            C220LsuValue::Load(_) => true,
+        });
+        stores
     }
 
     pub fn pending_store(&self, request: C220LsuRequestId) -> Option<&C220StoreOperands> {
@@ -193,13 +201,14 @@ impl C220LsuRequestScheduler {
 
     fn finish_store(&mut self, request: C220LsuRequestId, tick: u64, path: C220LsuStorePath) {
         if let Some(pending) = self.pending_stores.remove(&request) {
-            self.store_values.push(C220LsuStoreValue {
-                request,
-                tick,
-                operands: pending.operands,
-                mapped: pending.mapped,
-                path,
-            });
+            self.values
+                .push_back(C220LsuValue::Store(C220LsuStoreValue {
+                    request,
+                    tick,
+                    operands: pending.operands,
+                    mapped: pending.mapped,
+                    path,
+                }));
         }
     }
 

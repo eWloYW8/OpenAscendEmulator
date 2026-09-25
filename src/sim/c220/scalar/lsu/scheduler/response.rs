@@ -176,8 +176,7 @@ impl C220LsuRequestScheduler {
             }
         }
         self.misses.remove(key);
-        self.resolve_load_values(self.reads.tick(), key, &notifications, &load_line);
-        self.resolve_store_values(self.reads.tick(), &notifications);
+        self.resolve_values(self.reads.tick(), key, &notifications, &load_line);
         Ok(C220LsuReadCompletion {
             key,
             load_line,
@@ -230,8 +229,7 @@ impl C220LsuRequestScheduler {
             self.misses.remove(key);
             None
         };
-        self.resolve_load_values(self.reads.tick(), key, &notifications, &load_line);
-        self.resolve_store_values(self.reads.tick(), &notifications);
+        self.resolve_values(self.reads.tick(), key, &notifications, &load_line);
         Ok(C220LsuReadCompletion {
             key,
             load_line,
@@ -267,5 +265,21 @@ impl C220LsuRequestScheduler {
             return Err(C220LsuSchedulerError::UnexpectedStoreResponse);
         }
         Ok(())
+    }
+
+    fn resolve_values(
+        &mut self,
+        tick: u64,
+        key: C220LsuLineKey,
+        notifications: &[C220LsuCompletion],
+        line: &[u8],
+    ) {
+        for notification in notifications {
+            let single = std::slice::from_ref(notification);
+            match notification {
+                C220LsuCompletion::Load(_) => self.resolve_load_values(tick, key, single, line),
+                C220LsuCompletion::Store(_) => self.resolve_store_values(tick, single),
+            }
+        }
     }
 }

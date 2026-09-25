@@ -54,7 +54,7 @@ fn connect_test_read_bus(core: &mut C220Core) {
 fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
     use crate::sim::c220::memory::biu_read::C220BiuReadCacheConfig;
     use crate::sim::c220::scalar::lsu::cache::*;
-    use crate::sim::c220::scalar::lsu::load_commit::C220LoadCommitMode;
+    use crate::sim::c220::scalar::lsu::commit::C220LoadCommitMode;
     use crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory;
     use std::num::NonZeroU32;
     let cache = C220DataCache::new(
@@ -77,7 +77,7 @@ fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
             .collect(),
     )
     .unwrap();
-    core.configure_lsu_loads(
+    core.configure_lsu_cache(
         cache,
         if bypass {
             C220LoadCommitMode::DataBypass
@@ -230,6 +230,93 @@ fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
     );
     assert_eq!(core.pending_load_instructions().count(), 0);
     assert_eq!(core.lsu_ingress_occupancy(), 0);
+    run_core_stores(core, tick + 102);
+}
+
+fn run_core_stores(core: &mut C220Core, mut tick: u64) {
+    use crate::sim::c220::scalar::lsu::scheduler::C220LsuStorePath;
+    use crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory;
+    for (address, path) in [
+        (0x2080, C220LsuStorePath::Cache),
+        (0x20c0, C220LsuStorePath::Refill),
+    ] {
+        if path == C220LsuStorePath::Refill {
+            core.memory.write_known_at(address, &[0x55; 64]).unwrap();
+        }
+        let backing = core.memory.read_known_at(address, 64).unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(5, address).unwrap();
+        machine.set_xreg(6, address).unwrap();
+        machine.set_xreg(9, 0x1122_3344).unwrap();
+        machine.set_xreg(10, 0xaabb_ccdd).unwrap();
+        let words = [
+            (20 << 24) | (3 << 22) | (9 << 17) | (5 << 12) | 8,
+            (4 << 24) | (3 << 22) | (10 << 17) | (5 << 12),
+            (3 << 24) | (3 << 22) | (7 << 17) | (6 << 12),
+        ];
+        let mut issues = Vec::new();
+        let mut stores = Vec::new();
+        let mut loads = Vec::new();
+        for word in words {
+            loop {
+                let step = core.step_word_at(tick, word).unwrap();
+                stores.extend(core.take_store_completions());
+                loads.extend(core.take_load_completions());
+                tick += 1;
+                if let C220CoreStep::Executed { instruction, .. } = step {
+                    if let C220CoreInstruction::Store(issue) = instruction {
+                        issues.push(issue);
+                        assert_eq!(core.state.scalar().machine().xregs()[5], address + 8);
+                    }
+                    break;
+                }
+            }
+        }
+        assert_eq!(issues.len(), 2);
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(9, 0).unwrap();
+        machine.set_xreg(10, 0).unwrap();
+        assert!(matches!(
+            core.step_word_at(tick, 0x40e0_1800).unwrap(),
+            C220CoreStep::Stalled(_)
+        ));
+        for now in tick + 1..tick + 150 {
+            core.advance_to(now).unwrap();
+            stores.extend(core.take_store_completions());
+            loads.extend(core.take_load_completions());
+            if stores.len() == 2 && loads.len() == 1 {
+                tick = now + 2;
+                break;
+            }
+        }
+        assert_eq!(stores.len(), 2);
+        assert_eq!(loads.len(), 1);
+        assert_eq!(stores[0].issue, issues[0]);
+        assert_eq!(stores[1].issue, issues[1]);
+        assert!(
+            stores
+                .iter()
+                .all(|store| store.data.path == path && store.retire_tick > store.data.tick)
+        );
+        assert_eq!(stores[0].data.tick, stores[1].data.tick);
+        assert_eq!(stores[1].retire_tick, stores[0].retire_tick + 1);
+        assert_ne!(loads[0].retirement.retire_tick, stores[0].retire_tick);
+        assert_ne!(loads[0].retirement.retire_tick, stores[1].retire_tick);
+        assert_eq!(core.state.scalar().machine().xregs()[7], 0x1122_3344);
+        let cache = core.data_cache().unwrap();
+        let location = cache.find_way(address, C220LsuMemory::External).unwrap();
+        let bytes = cache.line(location).unwrap();
+        assert_eq!(&bytes[..8], &0x1122_3344_u64.to_le_bytes());
+        assert_eq!(&bytes[8..16], &0xaabb_ccdd_u64.to_le_bytes());
+        assert_eq!(core.memory.read_known_at(address, 64).unwrap(), backing);
+        assert_eq!(core.pending_store_instructions().count(), 0);
+        assert_eq!(core.lsu_retirement_occupancy(), 0);
+        assert!(matches!(
+            core.step_word_at(tick, 0x40e0_1800).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        tick += 2;
+    }
 }
 
 #[test]
@@ -464,6 +551,7 @@ fn native_mte3_write_path(mode: u8) {
                 for completion in core.take_lsu_completions() {
                     assert_eq!(completion.issue, issue);
                     assert_eq!(completion.tick, tick);
+                    assert_eq!(completion.tick, completion.response_tick + 1);
                     let mut expected = vec![0; 64];
                     expected[3] = 0xab;
                     assert_eq!(core.memory().read_known_at(0x2080, 64).unwrap(), expected);

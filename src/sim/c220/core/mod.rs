@@ -23,6 +23,7 @@ mod cache;
 mod lsu;
 pub use lsu::{C220CoreLoadCompletion, C220CoreLoadIssue};
 pub use lsu::{C220CoreLsuAdmission, C220CoreLsuCompletion, C220CoreLsuConfig, C220CoreLsuIssue};
+pub use lsu::{C220CoreStoreCompletion, C220CoreStoreIssue};
 mod cube;
 mod decode;
 mod dispatch;

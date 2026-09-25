@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use thiserror::Error;
 
 pub mod cache;
+pub mod commit;
 pub mod direct_store;
-pub mod load_commit;
 pub mod miss_buffer;
 pub mod read_queue;
 pub mod scheduler;

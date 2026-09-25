@@ -5,11 +5,10 @@ use crate::sim::c220::memory::timed_memory::{C220MemoryReadCommand, C220MemoryRe
 use crate::sim::c220::mte::C220MtePipeline;
 use crate::sim::c220::scalar::C220LoadOperands;
 use crate::sim::c220::scalar::lsu::cache::C220DataCache;
-use crate::sim::c220::scalar::lsu::load_commit::{
-    C220LoadCommitLane, C220LoadCommitMode, C220LoadId, C220LoadRetirement,
+use crate::sim::c220::scalar::lsu::commit::{
+    C220LoadCommitMode, C220LoadId, C220LoadRetirement, C220LsuCommitLane,
 };
 use crate::sim::c220::scalar::lsu::read_queue::{C220LsuReadId, C220LsuReadRequest};
-use crate::sim::common::scalar::ScalarMachine;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CoreLoadIssue {
@@ -24,24 +23,23 @@ pub struct C220CoreLoadCompletion {
     pub retirement: C220LoadRetirement,
 }
 
-pub(super) struct CoreLoads {
+pub(super) struct CoreCache {
     pub(super) cache: C220DataCache,
-    pub(super) commits: C220LoadCommitLane,
     port: u32,
-    pending: BTreeMap<C220LoadId, C220CoreLoadIssue>,
+    pub(super) pending: BTreeMap<C220LoadId, C220CoreLoadIssue>,
     send_pending: Option<C220LsuReadRequest>,
-    completions: Vec<C220CoreLoadCompletion>,
+    pub(super) completions: Vec<C220CoreLoadCompletion>,
 }
 
 impl C220Core {
-    pub fn configure_lsu_loads(
+    pub fn configure_lsu_cache(
         &mut self,
         cache: C220DataCache,
         mode: C220LoadCommitMode,
         port: C220BiuReadCacheConfig,
     ) -> Result<(), C220CoreError> {
         let lsu = self.lsu.as_ref().ok_or(C220CoreError::LsuUnconfigured)?;
-        if lsu.loads.is_some() || lsu.next_tick.is_some() {
+        if lsu.cache.is_some() || lsu.next_tick.is_some() {
             return Err(C220CoreError::LsuAlreadyConfigured);
         }
         if cache.line_bytes() != lsu.config.misses.line_bytes || cache.layout() != lsu.config.layout
@@ -52,9 +50,9 @@ impl C220Core {
             return Err(C220CoreError::UnsupportedTimedLsuAccess);
         }
         let port = self.connect_cache_read_port(port)?;
-        self.lsu.as_mut().expect("configured LSU").loads = Some(CoreLoads {
+        self.lsu.as_mut().expect("configured LSU").commits = C220LsuCommitLane::new(mode);
+        self.lsu.as_mut().expect("configured LSU").cache = Some(CoreCache {
             cache,
-            commits: C220LoadCommitLane::new(mode),
             port,
             pending: BTreeMap::new(),
             send_pending: None,
@@ -64,20 +62,20 @@ impl C220Core {
     }
 
     pub fn data_cache(&self) -> Option<&C220DataCache> {
-        self.lsu.as_ref()?.loads.as_ref().map(|loads| &loads.cache)
+        self.lsu.as_ref()?.cache.as_ref().map(|cache| &cache.cache)
     }
 
     pub fn pending_load_instructions(&self) -> impl Iterator<Item = &C220CoreLoadIssue> {
         self.lsu
             .iter()
-            .flat_map(|lsu| lsu.loads.iter())
+            .flat_map(|lsu| lsu.cache.iter())
             .flat_map(|loads| loads.pending.values())
     }
 
     pub fn take_load_completions(&mut self) -> Vec<C220CoreLoadCompletion> {
         self.lsu
             .as_mut()
-            .and_then(|lsu| lsu.loads.as_mut())
+            .and_then(|lsu| lsu.cache.as_mut())
             .map(|loads| std::mem::take(&mut loads.completions))
             .unwrap_or_default()
     }
@@ -87,16 +85,16 @@ impl C220Core {
         word: u32,
         tick: u64,
     ) -> Option<u64> {
-        let loads = self.lsu.as_ref().and_then(|lsu| lsu.loads.as_ref());
+        let lsu = self.lsu.as_ref();
         self.scalar_timing
             .dependency_tick_with_loads(word, tick, |register| {
-                loads.is_some_and(|loads| loads.commits.pending_destination(register).is_some())
+                lsu.is_some_and(|lsu| lsu.commits.pending_destination(register).is_some())
             })
     }
 
     pub(in crate::sim::c220::core) fn supersede_load_destination(&mut self, register: u8) {
-        if let Some(loads) = self.lsu.as_mut().and_then(|lsu| lsu.loads.as_mut()) {
-            loads.commits.supersede(register);
+        if let Some(lsu) = self.lsu.as_mut() {
+            lsu.commits.supersede(register);
         }
     }
 
@@ -131,7 +129,7 @@ impl C220Core {
             }));
         }
         let lsu = self.lsu.as_mut().ok_or(C220CoreError::LsuUnconfigured)?;
-        let loads = lsu.loads.as_mut().ok_or(C220CoreError::LsuUnconfigured)?;
+        let loads = lsu.cache.as_mut().ok_or(C220CoreError::LsuUnconfigured)?;
         if lsu.ingress.len() == 2 {
             return Ok(C220CoreStep::Stalled(C220Stall {
                 tick,
@@ -141,7 +139,7 @@ impl C220Core {
             }));
         }
         let instruction = C220LoadId(self.next_instruction_id);
-        loads.commits.issue(
+        lsu.commits.issue(
             tick,
             instruction,
             operands,
@@ -168,7 +166,7 @@ impl C220Core {
     }
 }
 
-impl CoreLoads {
+impl CoreCache {
     pub(super) fn is_idle(&self) -> bool {
         self.pending.is_empty() && self.send_pending.is_none()
     }
@@ -179,16 +177,7 @@ impl CoreLoads {
         pipeline: &mut C220MtePipeline,
         scheduler: &mut C220LsuRequestScheduler,
         memory: &mut MappedMemory,
-        machine: &mut ScalarMachine,
     ) -> Result<(), C220CoreError> {
-        if let Some(retirement) = self.commits.retire_next_at(tick, machine)? {
-            let issue = self
-                .pending
-                .remove(&retirement.instruction)
-                .expect("issued load");
-            self.completions
-                .push(C220CoreLoadCompletion { issue, retirement });
-        }
         let Some(response) = pipeline
             .biu_bus_reads()
             .and_then(|bus| bus.cache_returns(C220BiuReadCacheKind::Data, self.port))
@@ -219,9 +208,7 @@ impl CoreLoads {
         tick: u64,
         pipeline: &mut C220MtePipeline,
         scheduler: &mut C220LsuRequestScheduler,
-        machine: &mut ScalarMachine,
     ) -> Result<(), C220CoreError> {
-        scheduler.deliver_load_values(tick, &mut self.commits, machine)?;
         if self.send_pending.is_none() {
             let ready = pipeline
                 .biu_bus_reads()

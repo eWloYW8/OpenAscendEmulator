@@ -393,8 +393,8 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
         memory: C220LsuMemory::External,
     };
     use crate::sim::c220::scalar::lsu::C220LsuStage;
-    use crate::sim::c220::scalar::lsu::load_commit::{
-        C220LoadCommitLane, C220LoadCommitMode, C220LoadId,
+    use crate::sim::c220::scalar::lsu::commit::{
+        C220LoadCommitMode, C220LoadId, C220LsuCommitLane, C220LsuRetirement,
     };
     use crate::sim::c220::scalar::{C220LoadOperands, C220ScalarMappedAddress};
     let mut load_machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
@@ -507,11 +507,11 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                 C220LoadCommitMode::Retirement,
             ] {
                 let mut machine = load_machine.clone();
-                let mut commits = C220LoadCommitLane::new(mode);
+                let mut commits = C220LsuCommitLane::new(mode);
                 let mut completed_lsu = completed_lsu.clone();
                 assert!(
                     completed_lsu
-                        .deliver_load_values(tick, &mut commits, &mut machine)
+                        .deliver_values(tick, &mut commits, &mut machine)
                         .is_err()
                 );
                 commits
@@ -520,13 +520,13 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                 commits.admit(0, C220LoadId(7), load).unwrap();
                 assert_eq!(
                     completed_lsu
-                        .deliver_load_values(tick, &mut commits, &mut machine)
+                        .deliver_values(tick, &mut commits, &mut machine)
                         .unwrap(),
                     1
                 );
                 assert_eq!(
                     completed_lsu
-                        .deliver_load_values(tick, &mut commits, &mut machine)
+                        .deliver_values(tick, &mut commits, &mut machine)
                         .unwrap(),
                     0
                 );
@@ -545,10 +545,13 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                         .unwrap()
                         .is_none()
                 );
-                let retired = commits
+                let C220LsuRetirement::Load(retired) = commits
                     .retire_next_at(tick + 1, &mut machine)
                     .unwrap()
-                    .unwrap();
+                    .unwrap()
+                else {
+                    panic!("load retirement");
+                };
                 assert_eq!(retired.register_value, values[0].value);
                 assert_eq!(
                     retired.writeback_tick,
@@ -670,7 +673,7 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
         ] {
             for suppressed in [false, true] {
                 let mut machine = load_machine.clone();
-                let mut commits = C220LoadCommitLane::new(mode);
+                let mut commits = C220LsuCommitLane::new(mode);
                 commits
                     .issue(tick, C220LoadId(7), operands, &mut machine)
                     .unwrap();
@@ -700,10 +703,13 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                         .unwrap()
                         .is_none()
                 );
-                let retired = commits
+                let C220LsuRetirement::Load(retired) = commits
                     .retire_next_at(tick + 4, &mut machine)
                     .unwrap()
-                    .unwrap();
+                    .unwrap()
+                else {
+                    panic!("load retirement");
+                };
                 assert_eq!(retired.data, values[0]);
                 assert_eq!(retired.instruction, C220LoadId(7));
                 assert_eq!(retired.admission_tick, tick + 1);
