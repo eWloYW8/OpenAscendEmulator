@@ -393,6 +393,7 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
         memory: C220LsuMemory::External,
     };
     use crate::sim::c220::scalar::lsu::C220LsuStage;
+    use crate::sim::c220::scalar::lsu::load_commit::{C220LoadCommitLane, C220LoadCommitMode};
     use crate::sim::c220::scalar::{C220LoadOperands, C220ScalarMappedAddress};
     let mut load_machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
     load_machine.set_xreg(5, line.address + 8).unwrap();
@@ -487,6 +488,7 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
             assert_eq!(cache.line(refill.location).unwrap(), result.load_line);
             assert_eq!(lsu.reads.outstanding(), 0);
             assert!(lsu.misses.entries().is_empty());
+            let completed_lsu = lsu.clone();
             let values = lsu.take_load_values();
             assert_eq!(values.len(), 1);
             assert_eq!(values[0].request, load);
@@ -498,6 +500,62 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                 u64::from_le_bytes(result.load_line[8..16].try_into().unwrap())
             );
             assert_eq!(load_machine.xregs()[7], u64::MAX);
+            for mode in [
+                C220LoadCommitMode::DataBypass,
+                C220LoadCommitMode::Retirement,
+            ] {
+                let mut machine = load_machine.clone();
+                let mut commits = C220LoadCommitLane::new(mode);
+                let mut completed_lsu = completed_lsu.clone();
+                assert!(
+                    completed_lsu
+                        .deliver_load_values(tick, &mut commits, &mut machine)
+                        .is_err()
+                );
+                commits.issue(0, load, operands, &mut machine).unwrap();
+                assert_eq!(
+                    completed_lsu
+                        .deliver_load_values(tick, &mut commits, &mut machine)
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    completed_lsu
+                        .deliver_load_values(tick, &mut commits, &mut machine)
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(commits.next_retirement_tick(), Some(tick + 1));
+                assert_eq!(
+                    machine.xregs()[7],
+                    if mode == C220LoadCommitMode::DataBypass {
+                        values[0].value
+                    } else {
+                        u64::MAX
+                    }
+                );
+                assert!(
+                    commits
+                        .retire_next_at(tick, &mut machine)
+                        .unwrap()
+                        .is_none()
+                );
+                let retired = commits
+                    .retire_next_at(tick + 1, &mut machine)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(retired.register_value, values[0].value);
+                assert_eq!(
+                    retired.writeback_tick,
+                    Some(if mode == C220LoadCommitMode::DataBypass {
+                        tick
+                    } else {
+                        tick + 1
+                    })
+                );
+                assert_eq!(commits.pending_destination(7), None);
+                assert_eq!(commits.pending_count(), 0);
+            }
             assert!(!cache_completed);
             cache_completed = true;
         }
@@ -551,11 +609,16 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
     ] {
         let tick = lsu.reads.tick() + 1;
         let mut mapped = mapped;
-        let mut operands = operands;
         if path == C220LsuLoadPath::StoreForward {
             mapped.address += 64;
-            operands.effective_address += 64;
         }
+        load_machine.set_xreg(7, mapped.address).unwrap();
+        let operands = C220LoadOperands::capture(
+            &load_machine,
+            0x4004,
+            (19 << 24) | (3 << 22) | (7 << 17) | (7 << 12) | 8,
+        )
+        .unwrap();
         let key = C220LsuLineKey {
             address: mapped.address / 64 * 64,
             memory: mapped.memory,
@@ -596,6 +659,55 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
         assert_eq!(values[0].tick, tick + 3);
         assert_eq!(values[0].value, u64::from_le_bytes(expected));
         assert_eq!(lsu.reads.requests().count(), 0);
+        for mode in [
+            C220LoadCommitMode::DataBypass,
+            C220LoadCommitMode::Retirement,
+        ] {
+            for suppressed in [false, true] {
+                let mut machine = load_machine.clone();
+                let mut commits = C220LoadCommitLane::new(mode);
+                commits
+                    .issue(tick, request, operands, &mut machine)
+                    .unwrap();
+                assert_eq!(machine.xregs()[7], mapped.address + 8);
+                assert_eq!(commits.pending_destination(7), Some(request));
+                if suppressed && mode == C220LoadCommitMode::DataBypass {
+                    commits.supersede(7);
+                    machine.set_xreg(7, 0x1234).unwrap();
+                }
+                commits
+                    .complete_data_at(tick + 3, values[0], &mut machine)
+                    .unwrap();
+                assert!(
+                    commits
+                        .complete_data_at(tick + 3, values[0], &mut machine)
+                        .is_err()
+                );
+                if suppressed && mode == C220LoadCommitMode::Retirement {
+                    commits.supersede(7);
+                    machine.set_xreg(7, 0x1234).unwrap();
+                }
+                assert!(
+                    commits
+                        .retire_next_at(tick + 3, &mut machine)
+                        .unwrap()
+                        .is_none()
+                );
+                let retired = commits
+                    .retire_next_at(tick + 4, &mut machine)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(retired.data, values[0]);
+                assert_eq!(retired.suppressed, suppressed);
+                assert_eq!(
+                    retired.register_value,
+                    if suppressed { 0x1234 } else { values[0].value }
+                );
+                assert_eq!(retired.writeback_tick.is_none(), suppressed);
+                assert_eq!(commits.pending_count(), 0);
+                assert_eq!(commits.pending_destination(7), None);
+            }
+        }
     }
     for segment in plan.descriptor_segments().unwrap() {
         let expected: Vec<_> = (0..segment.bytes)

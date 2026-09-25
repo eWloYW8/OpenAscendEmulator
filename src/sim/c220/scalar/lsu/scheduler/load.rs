@@ -1,4 +1,5 @@
 use super::super::cache::{C220CacheLocation, C220DataCache};
+use super::super::load_commit::{C220LoadCommitError, C220LoadCommitLane};
 use super::super::store_buffer::C220LsuCompletion;
 use super::*;
 use crate::sim::c220::scalar::{C220LoadOperands, C220ScalarMappedAddress};
@@ -84,6 +85,25 @@ impl C220LsuRequestScheduler {
     /// register updates and release of dependent instructions.
     pub fn take_load_values(&mut self) -> Vec<C220LsuLoadValue> {
         std::mem::take(&mut self.load_values)
+    }
+
+    /// Deliver completed data in order, retaining the rejected completion and
+    /// its successors if register commit or retirement admission fails.
+    pub fn deliver_load_values(
+        &mut self,
+        tick: u64,
+        commits: &mut C220LoadCommitLane,
+        machine: &mut crate::sim::common::scalar::ScalarMachine,
+    ) -> Result<usize, C220LoadCommitError> {
+        for (accepted, data) in self.load_values.iter().copied().enumerate() {
+            if let Err(error) = commits.complete_data_at(tick, data, machine) {
+                self.load_values.drain(..accepted);
+                return Err(error);
+            }
+        }
+        let accepted = self.load_values.len();
+        self.load_values.clear();
+        Ok(accepted)
     }
 
     pub fn advance_with_cache(
