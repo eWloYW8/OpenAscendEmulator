@@ -4142,12 +4142,26 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
         |spr: u32| (2 << 24) | ((spr & 0x60) << 17) | (5 << 17) | ((spr & 31) << 12) | (17 << 7);
     for spr in [17, 19, 57, 63, 74, 87] {
         assert_eq!(
-            core.spr_read_dependency(read_spr(spr)),
+            core.spr_dispatch_dependency(read_spr(spr)),
             Some((retirement, C220StallCause::VectorDependency))
         );
     }
     for spr in [16, 18, 54, 58, 62, 73, 75, 86, 88] {
-        assert_eq!(core.spr_read_dependency(read_spr(spr)), None);
+        assert_eq!(core.spr_dispatch_dependency(read_spr(spr)), None);
+    }
+    let write_spr = |spr: u32| (2 << 24) | (spr << 17) | (4 << 12) | (18 << 7);
+    for spr in [2, 48, 49, 50, 51] {
+        assert_eq!(
+            core.spr_dispatch_dependency(write_spr(spr)),
+            Some((retirement, C220StallCause::VectorDependency))
+        );
+        assert_eq!(
+            core.spr_dispatch_dependency((18 << 24) | (spr << 17) | 1),
+            None
+        );
+    }
+    for spr in [0, 1, 3, 47, 52] {
+        assert_eq!(core.spr_dispatch_dependency(write_spr(spr)), None);
     }
     let initial_trace = &core.vmsu_pipeline().trace().unwrap().repeats[0];
     assert_eq!(initial_trace.completion_tick, None);
@@ -4163,6 +4177,15 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     ));
     let mut standalone = core.vmsu_pipeline().clone();
     let waiting_pc = core.state().scalar().pc();
+    let prior_status = core.state().scalar().machine().spr_value(2);
+    assert!(matches!(
+        core.step_word_at(2, write_spr(2)).unwrap(),
+        C220CoreStep::Stalled(C220Stall {
+            cause: C220StallCause::VectorDependency,
+            ..
+        })
+    ));
+    assert_eq!(core.state().scalar().machine().spr_value(2), prior_status);
     assert!(matches!(
         core.step_word_at(2, read_spr(17)).unwrap(),
         C220CoreStep::Stalled(C220Stall {
@@ -4207,4 +4230,13 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
         C220CoreStep::Executed { .. }
     ));
     assert_eq!(core.state().scalar().machine().xregs()[5], 0);
+    assert!(matches!(
+        core.step_word_at(all_vector_retired + 1, write_spr(2))
+            .unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(
+        core.state().scalar().machine().spr_value(2),
+        Some(1 | (0xf << 8))
+    );
 }

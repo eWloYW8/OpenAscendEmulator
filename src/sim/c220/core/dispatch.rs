@@ -9,11 +9,21 @@ use crate::sim::c220::vector::dispatch::VectorStep;
 use crate::sim::common::scalar::{ScalarInstructionStep, ScalarProgramStep};
 
 impl C220Core {
-    pub(super) fn spr_read_dependency(&self, word: u32) -> Option<(u64, C220StallCause)> {
+    pub(super) fn spr_dispatch_dependency(&self, word: u32) -> Option<(u64, C220StallCause)> {
         use crate::isa::scalar::ScalarInstruction;
+        let instruction = ScalarInstruction::from_word(Architecture::Dav2201, word)?;
+        if matches!(
+            instruction,
+            ScalarInstruction::ScalarKey2MoveToSpr {
+                encoded_destination_spr: 2 | 48..=51,
+                ..
+            }
+        ) {
+            return self.pending_compute_drain();
+        }
         let ScalarInstruction::ScalarKey2MoveFromSpr {
             encoded_source_spr, ..
-        } = ScalarInstruction::from_word(Architecture::Dav2201, word)?
+        } = instruction
         else {
             return None;
         };
@@ -75,7 +85,7 @@ impl C220Core {
             }));
         }
         let pc = self.state.scalar().pc();
-        if let Some((ready, cause)) = self.spr_read_dependency(word) {
+        if let Some((ready, cause)) = self.spr_dispatch_dependency(word) {
             return Ok(C220CoreStep::Stalled(C220Stall {
                 tick,
                 pc,
