@@ -9,6 +9,27 @@ use crate::sim::c220::vector::dispatch::VectorStep;
 use crate::sim::common::scalar::{ScalarInstructionStep, ScalarProgramStep};
 
 impl C220Core {
+    pub(super) fn spr_read_dependency(&self, word: u32) -> Option<(u64, C220StallCause)> {
+        use crate::isa::scalar::ScalarInstruction;
+        let ScalarInstruction::ScalarKey2MoveFromSpr {
+            encoded_source_spr, ..
+        } = ScalarInstruction::from_word(Architecture::Dav2201, word)?
+        else {
+            return None;
+        };
+        match encoded_source_spr {
+            17 | 19 | 57 | 63 | 74 | 87 => self
+                .vector
+                .pending_drain_tick()
+                .map(|tick| (tick, C220StallCause::VectorDependency)),
+            54 => self
+                .mte1
+                .next_event_tick()
+                .map(|tick| (tick, C220StallCause::Mte1Dependency)),
+            _ => None,
+        }
+    }
+
     fn step_barrier_word(&mut self, word: u32) -> Result<ScalarProgramStep, C220ExecutionError> {
         let pc = self.state.scalar.pc();
         if self.state.scalar.is_halted() {
@@ -54,21 +75,12 @@ impl C220Core {
             }));
         }
         let pc = self.state.scalar().pc();
-        if matches!(
-            crate::isa::scalar::ScalarInstruction::from_word(Architecture::Dav2201, word),
-            Some(
-                crate::isa::scalar::ScalarInstruction::ScalarKey2MoveFromSpr {
-                    encoded_source_spr: 54,
-                    ..
-                }
-            )
-        ) && let Some(ready) = self.mte1.next_event_tick()
-        {
+        if let Some((ready, cause)) = self.spr_read_dependency(word) {
             return Ok(C220CoreStep::Stalled(C220Stall {
                 tick,
                 pc,
                 resume_tick: ready.max(tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?),
-                cause: C220StallCause::Mte1Dependency,
+                cause,
             }));
         }
         if let Some(instruction) =

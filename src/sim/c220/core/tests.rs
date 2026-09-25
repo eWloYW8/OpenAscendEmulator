@@ -4138,6 +4138,17 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     let visibility = core.vmsu_pipeline().pending_visibility_tick().unwrap();
     let retirement = core.vmsu_pipeline().pending_drain_tick().unwrap();
     assert!(retirement > visibility);
+    let read_spr =
+        |spr: u32| (2 << 24) | ((spr & 0x60) << 17) | (5 << 17) | ((spr & 31) << 12) | (17 << 7);
+    for spr in [17, 19, 57, 63, 74, 87] {
+        assert_eq!(
+            core.spr_read_dependency(read_spr(spr)),
+            Some((retirement, C220StallCause::VectorDependency))
+        );
+    }
+    for spr in [16, 18, 54, 58, 62, 73, 75, 86, 88] {
+        assert_eq!(core.spr_read_dependency(read_spr(spr)), None);
+    }
     let initial_trace = &core.vmsu_pipeline().trace().unwrap().repeats[0];
     assert_eq!(initial_trace.completion_tick, None);
     assert!(initial_trace.ub_cycles.is_empty());
@@ -4151,6 +4162,16 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
         }) if resume_tick == retirement
     ));
     let mut standalone = core.vmsu_pipeline().clone();
+    let waiting_pc = core.state().scalar().pc();
+    assert!(matches!(
+        core.step_word_at(2, read_spr(17)).unwrap(),
+        C220CoreStep::Stalled(C220Stall {
+            cause: C220StallCause::VectorDependency,
+            resume_tick,
+            ..
+        }) if resume_tick == retirement
+    ));
+    assert_eq!(core.state().scalar().pc(), waiting_pc);
     let mut standalone_state = core.state().clone();
     standalone
         .advance_to(retirement, &mut standalone_state)
@@ -4180,4 +4201,10 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     assert_eq!(core.vmsu_pipeline().trace(), standalone.trace());
     assert_eq!(core.state().ub(), standalone_state.ub());
     assert_eq!(core.state().scalar().machine().spr_value(17), Some(0));
+    let all_vector_retired = core.vector.pending_drain_tick().unwrap_or(retirement);
+    assert!(matches!(
+        core.step_word_at(all_vector_retired, read_spr(17)).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    assert_eq!(core.state().scalar().machine().xregs()[5], 0);
 }
