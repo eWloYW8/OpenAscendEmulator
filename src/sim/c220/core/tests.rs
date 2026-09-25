@@ -106,6 +106,8 @@ fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
     assert_eq!(core.state.scalar().pc(), pc + 4);
     assert_eq!(core.state.scalar().machine().xregs()[7], u64::MAX);
     assert_eq!(core.pending_load_instructions().count(), 1);
+    assert_eq!(core.lsu_ingress_occupancy(), 1);
+    assert!(core.take_lsu_admissions().is_empty());
     let read = 0x0200_0800 | (8 << 17) | (7 << 12);
     assert!(matches!(
         core.step_word_at(tick + 1, read).unwrap(),
@@ -126,6 +128,11 @@ fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
         })
         .expect("automatic load completion");
     assert_eq!(completion.issue, issue);
+    assert_eq!(completion.retirement.admission_tick, issue.tick + 1);
+    let admissions = core.take_lsu_admissions();
+    assert_eq!(admissions.len(), 1);
+    assert_eq!(admissions[0].instruction_id, issue.instruction_id);
+    assert_eq!(admissions[0].request, completion.retirement.data.request);
     assert_eq!(completion.retirement.data.value, 0xab00_0000);
     assert_eq!(core.state.scalar().machine().xregs()[8], 0xab00_0000);
     assert_eq!(read_tick, completion.retirement.writeback_tick);
@@ -158,17 +165,71 @@ fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
             ));
         }
         let prior = core.state.scalar().machine().xregs()[5];
-        core.advance_to(tick + 4).unwrap();
+        core.advance_to(tick + 5).unwrap();
         let completions = core.take_load_completions();
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].retirement.suppressed, suppressed);
-        assert_eq!(completions[0].retirement.data.tick, tick + 3);
+        assert_eq!(completions[0].retirement.data.tick, tick + 4);
         assert_eq!(
             core.state.scalar().machine().xregs()[5],
             if suppressed { prior } else { 0xab00_0000 }
         );
         tick += 6;
     }
+    core.take_lsu_admissions();
+    core.state
+        .scalar_mut()
+        .machine_mut()
+        .set_xreg(5, 0x2080)
+        .unwrap();
+    let mut completed = Vec::new();
+    let mut stalled = false;
+    for _ in 0..12 {
+        let pc = core.state.scalar().pc();
+        loop {
+            let step = core.step_word_at(tick, 0x03ce_5000).unwrap();
+            completed.extend(core.take_load_completions());
+            assert!(core.lsu_ingress_occupancy() <= 2);
+            tick += 1;
+            match step {
+                C220CoreStep::Executed { .. } => break,
+                C220CoreStep::Stalled(stall) => {
+                    assert_eq!(stall.cause, C220StallCause::LsuDependency);
+                    assert_eq!(core.lsu_ingress_occupancy(), 2);
+                    assert_eq!(core.state.scalar().pc(), pc);
+                    stalled = true;
+                }
+            }
+        }
+    }
+    assert!(stalled);
+    core.state
+        .scalar_mut()
+        .machine_mut()
+        .set_xreg(5, u64::MAX)
+        .unwrap();
+    core.advance_to(tick + 100).unwrap();
+    completed.extend(core.take_load_completions());
+    assert_eq!(completed.len(), 12);
+    assert!(
+        completed
+            .iter()
+            .all(|done| done.retirement.data.value == 0xab00_0000)
+    );
+    let admissions = core.take_lsu_admissions();
+    assert_eq!(admissions.len(), 12);
+    assert!(
+        admissions
+            .windows(2)
+            .all(|pair| pair[0].tick < pair[1].tick)
+    );
+    assert!(
+        completed
+            .iter()
+            .any(|done| done.retirement.admission_tick > done.issue.tick + 1)
+    );
+    assert_eq!(core.pending_load_instructions().count(), 0);
+    assert_eq!(core.lsu_ingress_occupancy(), 0);
 }
 
 #[test]
@@ -298,7 +359,7 @@ fn native_mte3_write_path(mode: u8) {
         use crate::sim::c220::scalar::lsu::miss_buffer::C220LsuMissConfig;
         use crate::sim::c220::scalar::lsu::store_buffer::C220LsuStoreConfig;
         core.configure_lsu(C220CoreLsuConfig {
-            request_capacity: 4,
+            request_capacity: 2,
             read_capacity: 2,
             write_capacity: 2,
             direct_store_capacity: 2,
@@ -366,12 +427,16 @@ fn native_mte3_write_path(mode: u8) {
             .machine_mut()
             .set_xreg(2, 0)
             .unwrap();
-        core.advance_to(10).unwrap();
+        core.advance_to(11).unwrap();
+        let admissions = core.take_lsu_admissions();
+        assert_eq!(admissions.len(), 1);
+        assert_eq!(admissions[0].instruction_id, issue.instruction_id);
+        assert_eq!(admissions[0].tick, issue.tick + 1);
         let lsu = core.lsu_scheduler().unwrap();
-        assert!(lsu.pending_direct_store(issue.request).is_none());
+        assert!(lsu.pending_direct_store(admissions[0].request).is_none());
         assert_eq!(lsu.pipeline().queued_requests(), 0);
         assert_eq!(lsu.direct_stores().entries().len(), 1);
-        core.advance_to(10).unwrap();
+        core.advance_to(11).unwrap();
         assert_eq!(
             core.lsu_scheduler()
                 .unwrap()
@@ -382,7 +447,7 @@ fn native_mte3_write_path(mode: u8) {
         );
         assert!(core.memory().read_known_at(0x2080, 64).is_err());
         assert!(matches!(
-            core.step_word_at(10, 0x40e0_1800).unwrap(),
+            core.step_word_at(11, 0x40e0_1800).unwrap(),
             C220CoreStep::Stalled(_)
         ));
         assert_eq!(core.state.scalar().pc(), pc + 4);
@@ -392,7 +457,7 @@ fn native_mte3_write_path(mode: u8) {
             .unwrap();
         let mut cache_done = false;
         let mut mte_done = false;
-        let retired = (11..160)
+        let retired = (12..160)
             .find(|&tick| {
                 core.advance_to(tick).unwrap();
                 mte_done |= !core.last_mte3_dma_outcomes().is_empty();

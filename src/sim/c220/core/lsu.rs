@@ -1,6 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
+mod ingress;
 mod load;
+pub use ingress::C220CoreLsuAdmission;
+use ingress::DispatchedLsu;
 use load::CoreLoads;
 pub use load::{C220CoreLoadCompletion, C220CoreLoadIssue};
 
@@ -34,20 +37,21 @@ pub struct C220CoreLsuConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CoreLsuIssue {
     pub instruction_id: u64,
-    pub request: C220LsuRequestId,
     pub tick: u64,
     pub operands: C220DirectStoreOperands,
-    pub mapped: C220ScalarMappedAddress,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CoreLsuCompletion {
     pub issue: C220CoreLsuIssue,
+    pub request: C220LsuRequestId,
     pub tick: u64,
     pub write: C220LsuWriteId,
 }
 
 pub(super) struct CoreLsu {
+    ingress: VecDeque<DispatchedLsu>,
+    admissions: Vec<C220CoreLsuAdmission>,
     scheduler: C220LsuRequestScheduler,
     config: C220CoreLsuConfig,
     port: u32,
@@ -82,6 +86,8 @@ impl C220Core {
         )?;
         let port = self.connect_cache_write_port()?;
         self.lsu = Some(CoreLsu {
+            ingress: VecDeque::new(),
+            admissions: Vec::new(),
             scheduler,
             config,
             port,
@@ -99,7 +105,14 @@ impl C220Core {
     }
 
     pub fn pending_lsu_instructions(&self) -> impl Iterator<Item = &C220CoreLsuIssue> {
-        self.lsu.iter().flat_map(|lsu| lsu.pending.values())
+        self.lsu.iter().flat_map(|lsu| {
+            lsu.pending
+                .values()
+                .chain(lsu.ingress.iter().filter_map(|entry| match entry {
+                    DispatchedLsu::Store(issue) => Some(issue),
+                    DispatchedLsu::Load(_) => None,
+                }))
+        })
     }
 
     pub fn take_lsu_completions(&mut self) -> Vec<C220CoreLsuCompletion> {
@@ -135,41 +148,21 @@ impl C220Core {
         let machine = self.state.scalar().machine();
         let operands = C220DirectStoreOperands::capture(machine, pc, word)
             .map_err(crate::sim::common::scalar::ScalarInstructionError::from)?;
-        let roots =
-            machine
-                .spr_value(67)
-                .zip(machine.spr_value(68))
-                .ok_or(C220CoreError::LsuAddress {
-                    address: operands.effective_address,
-                })?;
-        let mapped = C220ScalarMappedAddress::decode(operands.effective_address, roots.0, roots.1)
-            .ok_or(C220CoreError::LsuAddress {
-                address: operands.effective_address,
-            })?;
         let lsu = self.lsu.as_mut().ok_or(C220CoreError::LsuUnconfigured)?;
-        let Some(request) = lsu.scheduler.admit_direct_store(
-            tick,
-            operands,
-            mapped,
-            lsu.config.partition_stack,
-            lsu.config.layout,
-        )?
-        else {
+        if lsu.ingress.len() == 2 {
             return Ok(C220CoreStep::Stalled(C220Stall {
                 tick,
                 pc,
                 resume_tick: next_tick,
                 cause: C220StallCause::LsuDependency,
             }));
-        };
+        }
         let issue = C220CoreLsuIssue {
             instruction_id: self.next_instruction_id,
-            request,
             tick,
             operands,
-            mapped,
         };
-        lsu.pending.insert(request, issue);
+        lsu.ingress.push_back(DispatchedLsu::Store(issue));
         lsu.next_tick = Some(
             lsu.next_tick
                 .map_or(next_tick, |prior| prior.min(next_tick)),
@@ -192,6 +185,7 @@ impl C220Core {
             .mte_pipeline
             .as_mut()
             .ok_or(C220CoreError::LsuUnconfigured)?;
+        lsu.admit_ingress_at(tick, self.state.scalar().machine())?;
         let scheduler = &mut lsu.scheduler;
         scheduler
             .writes
@@ -223,8 +217,12 @@ impl C220Core {
             if let Some(C220LsuCompletion::Store(request)) = completion
                 && let Some(issue) = lsu.pending.remove(&request)
             {
-                lsu.completions
-                    .push(C220CoreLsuCompletion { issue, tick, write });
+                lsu.completions.push(C220CoreLsuCompletion {
+                    issue,
+                    request,
+                    tick,
+                    write,
+                });
             }
         }
         scheduler.process_direct_stores(tick)?;
@@ -273,7 +271,8 @@ impl C220Core {
                 lsu.send_pending = None;
             }
         }
-        lsu.next_tick = if lsu.pending.is_empty()
+        lsu.next_tick = if lsu.ingress.is_empty()
+            && lsu.pending.is_empty()
             && lsu.loads.as_ref().is_none_or(CoreLoads::is_idle)
             && scheduler.reads.requests().next().is_none()
             && scheduler.writes.requests().next().is_none()

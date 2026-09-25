@@ -6,19 +6,16 @@ use crate::sim::c220::mte::C220MtePipeline;
 use crate::sim::c220::scalar::C220LoadOperands;
 use crate::sim::c220::scalar::lsu::cache::C220DataCache;
 use crate::sim::c220::scalar::lsu::load_commit::{
-    C220LoadCommitLane, C220LoadCommitMode, C220LoadRetirement,
+    C220LoadCommitLane, C220LoadCommitMode, C220LoadId, C220LoadRetirement,
 };
 use crate::sim::c220::scalar::lsu::read_queue::{C220LsuReadId, C220LsuReadRequest};
-use crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory;
 use crate::sim::common::scalar::ScalarMachine;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CoreLoadIssue {
     pub instruction_id: u64,
-    pub request: C220LsuRequestId,
     pub tick: u64,
     pub operands: C220LoadOperands,
-    pub mapped: C220ScalarMappedAddress,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,9 +26,9 @@ pub struct C220CoreLoadCompletion {
 
 pub(super) struct CoreLoads {
     pub(super) cache: C220DataCache,
-    commits: C220LoadCommitLane,
+    pub(super) commits: C220LoadCommitLane,
     port: u32,
-    pending: BTreeMap<C220LsuRequestId, C220CoreLoadIssue>,
+    pending: BTreeMap<C220LoadId, C220CoreLoadIssue>,
     send_pending: Option<C220LsuReadRequest>,
     completions: Vec<C220CoreLoadCompletion>,
 }
@@ -133,36 +130,20 @@ impl C220Core {
                 cause: C220StallCause::ScalarDependency,
             }));
         }
-        let roots =
-            machine
-                .spr_value(67)
-                .zip(machine.spr_value(68))
-                .ok_or(C220CoreError::LsuAddress {
-                    address: operands.effective_address,
-                })?;
-        let mapped = C220ScalarMappedAddress::decode(operands.effective_address, roots.0, roots.1)
-            .ok_or(C220CoreError::LsuAddress {
-                address: operands.effective_address,
-            })?;
-        if mapped.memory != C220LsuMemory::External {
-            return Err(C220CoreError::UnsupportedTimedLsuAccess);
-        }
         let lsu = self.lsu.as_mut().ok_or(C220CoreError::LsuUnconfigured)?;
         let loads = lsu.loads.as_mut().ok_or(C220CoreError::LsuUnconfigured)?;
-        let Some(request) =
-            lsu.scheduler
-                .admit_load(tick, operands, mapped, lsu.config.partition_stack)?
-        else {
+        if lsu.ingress.len() == 2 {
             return Ok(C220CoreStep::Stalled(C220Stall {
                 tick,
                 pc,
                 resume_tick: next_tick,
                 cause: C220StallCause::LsuDependency,
             }));
-        };
+        }
+        let instruction = C220LoadId(self.next_instruction_id);
         loads.commits.issue(
             tick,
-            request,
+            instruction,
             operands,
             self.state.scalar_mut().machine_mut(),
         )?;
@@ -170,12 +151,11 @@ impl C220Core {
             .supersede_destination(operands.destination_register);
         let issue = C220CoreLoadIssue {
             instruction_id: self.next_instruction_id,
-            request,
             tick,
             operands,
-            mapped,
         };
-        loads.pending.insert(request, issue);
+        loads.pending.insert(instruction, issue);
+        lsu.ingress.push_back(DispatchedLsu::Load(issue));
         lsu.next_tick = Some(
             lsu.next_tick
                 .map_or(next_tick, |prior| prior.min(next_tick)),
@@ -204,7 +184,7 @@ impl CoreLoads {
         if let Some(retirement) = self.commits.retire_next_at(tick, machine)? {
             let issue = self
                 .pending
-                .remove(&retirement.data.request)
+                .remove(&retirement.instruction)
                 .expect("issued load");
             self.completions
                 .push(C220CoreLoadCompletion { issue, retirement });

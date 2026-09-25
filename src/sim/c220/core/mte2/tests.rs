@@ -393,7 +393,9 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
         memory: C220LsuMemory::External,
     };
     use crate::sim::c220::scalar::lsu::C220LsuStage;
-    use crate::sim::c220::scalar::lsu::load_commit::{C220LoadCommitLane, C220LoadCommitMode};
+    use crate::sim::c220::scalar::lsu::load_commit::{
+        C220LoadCommitLane, C220LoadCommitMode, C220LoadId,
+    };
     use crate::sim::c220::scalar::{C220LoadOperands, C220ScalarMappedAddress};
     let mut load_machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
     load_machine.set_xreg(5, line.address + 8).unwrap();
@@ -512,7 +514,10 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                         .deliver_load_values(tick, &mut commits, &mut machine)
                         .is_err()
                 );
-                commits.issue(0, load, operands, &mut machine).unwrap();
+                commits
+                    .issue(0, C220LoadId(7), operands, &mut machine)
+                    .unwrap();
+                commits.admit(0, C220LoadId(7), load).unwrap();
                 assert_eq!(
                     completed_lsu
                         .deliver_load_values(tick, &mut commits, &mut machine)
@@ -667,14 +672,16 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                 let mut machine = load_machine.clone();
                 let mut commits = C220LoadCommitLane::new(mode);
                 commits
-                    .issue(tick, request, operands, &mut machine)
+                    .issue(tick, C220LoadId(7), operands, &mut machine)
                     .unwrap();
                 assert_eq!(machine.xregs()[7], mapped.address + 8);
-                assert_eq!(commits.pending_destination(7), Some(request));
+                assert_eq!(commits.pending_destination(7), Some(C220LoadId(7)));
                 if suppressed && mode == C220LoadCommitMode::DataBypass {
                     commits.supersede(7);
                     machine.set_xreg(7, 0x1234).unwrap();
                 }
+                commits.admit(tick + 1, C220LoadId(7), request).unwrap();
+                assert!(commits.admit(tick + 1, C220LoadId(7), request).is_err());
                 commits
                     .complete_data_at(tick + 3, values[0], &mut machine)
                     .unwrap();
@@ -698,6 +705,8 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
                     .unwrap()
                     .unwrap();
                 assert_eq!(retired.data, values[0]);
+                assert_eq!(retired.instruction, C220LoadId(7));
+                assert_eq!(retired.admission_tick, tick + 1);
                 assert_eq!(retired.suppressed, suppressed);
                 assert_eq!(
                     retired.register_value,
