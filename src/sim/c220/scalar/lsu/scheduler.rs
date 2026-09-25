@@ -1,10 +1,12 @@
+use super::write_queue::{C220LsuWriteError, C220LsuWriteQueue};
+use crate::sim::common::event::{EventDispatcher, EventError, EventId};
 use std::collections::BTreeMap;
 
-use super::miss_buffer::{C220LsuMissBuffer, C220LsuMissError, C220LsuMissState};
-use super::store_buffer::{
-    C220LsuCompletion, C220LsuLineKey, C220LsuMemory, C220LsuStoreBuffer, C220LsuStoreError,
-    C220LsuStoreState,
-};
+use super::cache::C220CacheError;
+use super::direct_store::C220LsuDirectStoreBuffer;
+
+use super::miss_buffer::{C220LsuMissBuffer, C220LsuMissError};
+use super::store_buffer::{C220LsuLineKey, C220LsuStoreBuffer, C220LsuStoreError};
 use super::{
     C220LsuPipelineError, C220LsuRequestId, C220LsuRequestPipeline, C220LsuStage,
     C220LsuStageProgress,
@@ -20,18 +22,21 @@ pub enum C220LsuAccess {
 #[cfg(test)]
 mod tests;
 
+mod direct_store;
+mod response;
+mod write_response;
+pub use response::C220LsuReadCompletion;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220LsuRequest {
     pub line: C220LsuLineKey,
     pub access: C220LsuAccess,
 }
 
-/// Signals from cache eviction, direct stores and cache maintenance.
+/// Signals from cache maintenance.
 /// They must describe the current stage head at the current event tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220LsuExternalHazards {
-    pub eviction_conflict: bool,
-    pub direct_store_full: bool,
     pub maintenance_active: bool,
     pub maintenance_draining: bool,
 }
@@ -57,17 +62,6 @@ pub struct C220LsuStageOutcome {
     pub consumed: Option<C220LsuRequest>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct C220LsuReadCompletion {
-    pub key: C220LsuLineKey,
-    /// Data for completed loads: unmodified for miss-owned responses, merged
-    /// with store bytes for store-owned responses.
-    pub load_line: Vec<u8>,
-    pub notifications: Vec<C220LsuCompletion>,
-    pub pending_ub_write: Option<Vec<u8>>,
-    pub mark_cache_dirty: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220LsuSchedulerError {
     #[error(transparent)]
@@ -86,6 +80,14 @@ pub enum C220LsuSchedulerError {
     MissingCacheLine,
     #[error("read response requires a fetching store entry")]
     UnexpectedStoreResponse,
+    #[error(transparent)]
+    Cache(#[from] C220CacheError),
+    #[error(transparent)]
+    Write(#[from] C220LsuWriteError),
+    #[error("write response does not match the required data source")]
+    MissingWriteData,
+    #[error(transparent)]
+    Event(#[from] EventError),
 }
 
 /// Couples stage replay to live line-buffer hazards. The cache controller owns
@@ -96,22 +98,42 @@ pub struct C220LsuRequestScheduler {
     requests: BTreeMap<C220LsuRequestId, C220LsuRequest>,
     pub misses: C220LsuMissBuffer,
     pub stores: C220LsuStoreBuffer,
+    direct_stores: C220LsuDirectStoreBuffer,
+    direct_events: EventDispatcher<()>,
+    direct_event: EventId,
+    pub writes: C220LsuWriteQueue,
+    eviction_data: BTreeMap<u64, Vec<u8>>,
 }
 
 impl C220LsuRequestScheduler {
     pub fn new(
         capacity: u32,
+        write_capacity: u32,
+        direct_store_capacity: usize,
         misses: C220LsuMissBuffer,
         stores: C220LsuStoreBuffer,
     ) -> Result<Self, C220LsuSchedulerError> {
         if misses.line_bytes() != stores.line_bytes() {
             return Err(C220LsuSchedulerError::LineGeometry);
         }
+        let mut direct_events = EventDispatcher::new(0);
+        let direct_event = direct_events.add_event();
+        let process = direct_events.add_process((), false);
+        direct_events.subscribe(direct_event, process);
+        let writes = C220LsuWriteQueue::new(write_capacity, stores.line_bytes());
         Ok(Self {
             pipeline: C220LsuRequestPipeline::new(capacity)?,
             requests: BTreeMap::new(),
+            direct_stores: C220LsuDirectStoreBuffer::new(
+                stores.line_bytes(),
+                direct_store_capacity,
+            )?,
             misses,
             stores,
+            writes,
+            direct_events,
+            direct_event,
+            eviction_data: BTreeMap::new(),
         })
     }
 
@@ -121,153 +143,6 @@ impl C220LsuRequestScheduler {
 
     pub fn request(&self, id: C220LsuRequestId) -> Option<&C220LsuRequest> {
         self.requests.get(&id)
-    }
-
-    /// Complete an MSHR-owned read after cache refill. `cache_line` is required
-    /// for external memory and present for cacheable UB. The caller issues any
-    /// returned UB write and delivers notifications in order through the timed
-    /// completion port. Tag allocation and response ownership are caller-owned.
-    pub fn complete_miss_read(
-        &mut self,
-        key: C220LsuLineKey,
-        returned_line: &[u8],
-        mut cache_line: Option<&mut [u8]>,
-    ) -> Result<C220LsuReadCompletion, C220LsuSchedulerError> {
-        let width = self.misses.line_bytes();
-        if self.stores.line_bytes() != width {
-            return Err(C220LsuSchedulerError::LineGeometry);
-        }
-        if returned_line.len() != width
-            || cache_line.as_ref().is_some_and(|line| line.len() != width)
-        {
-            return Err(C220LsuMissError::InvalidLineSize.into());
-        }
-        if key.memory == C220LsuMemory::External && cache_line.is_none() {
-            return Err(C220LsuSchedulerError::MissingCacheLine);
-        }
-        let entry = self
-            .misses
-            .entry(key)
-            .ok_or(C220LsuMissError::MissingEntry)?;
-        if entry.state() != C220LsuMissState::Fetching {
-            return Err(C220LsuSchedulerError::UnexpectedReadResponse);
-        }
-        let load_line = if key.memory == C220LsuMemory::External {
-            cache_line
-                .as_deref()
-                .expect("validated external cache line")
-                .to_vec()
-        } else {
-            returned_line.to_vec()
-        };
-        let mut notifications: Vec<_> = entry
-            .requests()
-            .iter()
-            .copied()
-            .map(C220LsuCompletion::Load)
-            .collect();
-        self.misses.receive_line(key, returned_line)?;
-        let mut pending_ub_write = None;
-        let mut mark_cache_dirty = false;
-        if let Some(store) = self.stores.entry(key) {
-            if let Some(line) = cache_line.as_mut() {
-                store.write_valid_bytes(line)?;
-            }
-            self.stores.set_state(key, C220LsuStoreState::Ready)?;
-            if key.memory == C220LsuMemory::External {
-                mark_cache_dirty = true;
-                notifications.extend(
-                    self.stores
-                        .remove(key)
-                        .expect("linked store exists")
-                        .requests()
-                        .iter()
-                        .copied()
-                        .map(C220LsuCompletion::Store),
-                );
-            } else {
-                self.stores.merge_line(key, returned_line)?;
-                pending_ub_write = Some(
-                    self.stores
-                        .entry(key)
-                        .expect("linked store exists")
-                        .bytes()
-                        .to_vec(),
-                );
-            }
-        }
-        self.misses.remove(key);
-        Ok(C220LsuReadCompletion {
-            key,
-            load_line,
-            notifications,
-            pending_ub_write,
-            mark_cache_dirty,
-        })
-    }
-
-    /// Complete an STB-owned read into an allocated cache line when cacheable.
-    /// UB stores and their linked loads remain pending until the UB write reply.
-    pub fn complete_store_read(
-        &mut self,
-        key: C220LsuLineKey,
-        returned_line: &[u8],
-        cache_line: Option<&mut [u8]>,
-    ) -> Result<C220LsuReadCompletion, C220LsuSchedulerError> {
-        let width = self.stores.line_bytes();
-        if self.misses.line_bytes() != width {
-            return Err(C220LsuSchedulerError::LineGeometry);
-        }
-        if returned_line.len() != width
-            || cache_line.as_ref().is_some_and(|line| line.len() != width)
-        {
-            return Err(C220LsuMissError::InvalidLineSize.into());
-        }
-        if key.memory == C220LsuMemory::External && cache_line.is_none() {
-            return Err(C220LsuSchedulerError::MissingCacheLine);
-        }
-        if self
-            .stores
-            .entry(key)
-            .ok_or(C220LsuStoreError::MissingEntry)?
-            .state()
-            != C220LsuStoreState::Fetching
-        {
-            return Err(C220LsuSchedulerError::UnexpectedStoreResponse);
-        }
-        self.stores.merge_line(key, returned_line)?;
-        self.stores.set_state(key, C220LsuStoreState::Ready)?;
-        self.stores.set_forbidden(key, true)?;
-        let entry = self.stores.entry(key).expect("validated store response");
-        let load_line = entry.bytes().to_vec();
-        if let Some(line) = cache_line {
-            line.copy_from_slice(&load_line);
-        }
-        let mut notifications = Vec::new();
-        let pending_ub_write = if key.memory == C220LsuMemory::Ub {
-            Some(load_line.clone())
-        } else {
-            notifications.extend(
-                entry
-                    .requests()
-                    .iter()
-                    .copied()
-                    .map(C220LsuCompletion::Store),
-            );
-            if let Some(miss) = self.misses.entry(key) {
-                notifications.extend(miss.requests().iter().copied().map(C220LsuCompletion::Load));
-            }
-            self.stores.remove(key);
-            self.misses.remove(key);
-            None
-        };
-        Ok(C220LsuReadCompletion {
-            key,
-            load_line,
-            notifications,
-            pending_ub_write,
-            mark_cache_dirty: key.memory == C220LsuMemory::External,
-        })
     }
 
     pub fn admit(
@@ -285,7 +160,12 @@ impl C220LsuRequestScheduler {
                 return Err(C220LsuSchedulerError::UnalignedLine);
             }
         }
-        let Some(ids) = self.pipeline.admit(tick, second.is_some())? else {
+        self.writes.check_tick(tick)?;
+        self.direct_events.check_advance_to(tick)?;
+        let admitted = self.pipeline.admit(tick, second.is_some())?;
+        self.writes.advance_to(tick)?;
+        self.direct_events.advance_to(tick)?;
+        let Some(ids) = admitted else {
             return Ok(None);
         };
         self.requests.insert(ids.0, first);
@@ -298,7 +178,7 @@ impl C220LsuRequestScheduler {
     pub fn hazard(
         &self,
         request: C220LsuRequest,
-        external: C220LsuExternalHazards,
+        _external: C220LsuExternalHazards,
     ) -> Option<C220LsuStall> {
         let key = request.line;
         match request.access {
@@ -331,10 +211,10 @@ impl C220LsuRequestScheduler {
             }
             C220LsuAccess::Other => return None,
         }
-        if external.eviction_conflict {
+        if self.writes.has_hazard(key) {
             return Some(C220LsuStall::Eviction);
         }
-        if request.access == C220LsuAccess::Store && external.direct_store_full {
+        if request.access == C220LsuAccess::Store && self.direct_stores.full() {
             return Some(C220LsuStall::DirectStoreCapacity);
         }
         None
@@ -346,6 +226,8 @@ impl C220LsuRequestScheduler {
         tick: u64,
         external: C220LsuExternalHazards,
     ) -> Result<C220LsuStageOutcome, C220LsuSchedulerError> {
+        self.writes.check_tick(tick)?;
+        self.direct_events.check_advance_to(tick)?;
         let mut stall = self
             .pipeline
             .head(stage)
@@ -367,6 +249,8 @@ impl C220LsuRequestScheduler {
             C220LsuStage::M1 => self.pipeline.advance_m1(tick, stall.is_some())?,
             C220LsuStage::M2 => self.pipeline.advance_m2(tick, stall.is_some())?,
         };
+        self.writes.advance_to(tick)?;
+        self.direct_events.advance_to(tick)?;
         let consumed = match progress {
             C220LsuStageProgress::Advanced(id) if stage == C220LsuStage::M2 => {
                 self.requests.remove(&id)

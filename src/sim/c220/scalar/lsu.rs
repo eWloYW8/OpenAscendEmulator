@@ -2,9 +2,12 @@ use std::collections::VecDeque;
 
 use thiserror::Error;
 
+pub mod cache;
+pub mod direct_store;
 pub mod miss_buffer;
 pub mod scheduler;
 pub mod store_buffer;
+pub mod write_queue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220LsuStage {

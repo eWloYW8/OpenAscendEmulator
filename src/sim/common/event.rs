@@ -176,6 +176,12 @@ impl<T: Copy> EventDispatcher<T> {
     /// Advance across idle ticks only. Owners with clocked processes must
     /// enqueue their clock events; they cannot skip those evaluations.
     pub fn advance_to(&mut self, tick: u64) -> Result<(), EventError> {
+        self.check_advance_to(tick)?;
+        self.tick = tick;
+        Ok(())
+    }
+
+    pub fn check_advance_to(&self, tick: u64) -> Result<(), EventError> {
         if tick < self.tick {
             return Err(EventError::TimeReversed {
                 previous: self.tick,
@@ -187,7 +193,6 @@ impl<T: Copy> EventDispatcher<T> {
         {
             return Err(EventError::PendingEvents { tick: pending });
         }
-        self.tick = tick;
         Ok(())
     }
 

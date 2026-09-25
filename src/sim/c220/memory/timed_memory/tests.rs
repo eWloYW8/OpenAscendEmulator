@@ -1,8 +1,5 @@
 use super::*;
 use crate::sim::c220::mte::interface::biu_read::C220BiuSubcore;
-use crate::sim::c220::mte::interface::biu_write::{
-    C220BiuWriteDataReady, C220BiuWriteSourceRequest,
-};
 
 #[test]
 fn reads_share_ddr_credits_and_pending_slots_with_writes() {
@@ -44,7 +41,7 @@ fn reads_share_ddr_credits_and_pending_slots_with_writes() {
         .unwrap();
         let tag = NonZeroU32::new(1).unwrap();
         memory.transactions.insert(
-            tag,
+            C220MemoryWriteId::Mte(tag),
             Transaction {
                 region: 0,
                 bytes: 128,
@@ -53,21 +50,9 @@ fn reads_share_ddr_credits_and_pending_slots_with_writes() {
         memory
             .push_data(
                 0,
-                C220BiuWriteData {
-                    subcore: C220BiuSubcore::Vector0,
-                    sent_tick: 0,
+                C220MemoryWriteTransfer {
                     ready_tick: 0,
-                    source: C220BiuWriteDataReady {
-                        ready_tick: 0,
-                        request: C220BiuWriteSourceRequest {
-                            tag,
-                            instruction_id: 1,
-                            source_address: 0,
-                            bytes: 128,
-                            gather_stride: None,
-                            last_in_instruction: true,
-                        },
-                    },
+                    tag: C220MemoryWriteId::Mte(tag),
                 },
             )
             .unwrap();
@@ -177,7 +162,10 @@ fn exact_credit_boundary_and_service_slot_release() {
         0,
     )
     .unwrap();
-    let tag = NonZeroU32::new(1).unwrap();
+    let tag = C220MemoryWriteId::Cache {
+        port: 0,
+        transaction: 1,
+    };
     memory.transactions.insert(
         tag,
         Transaction {
@@ -187,25 +175,7 @@ fn exact_credit_boundary_and_service_slot_release() {
     );
     memory.credits[0] = 128;
     memory
-        .push_data(
-            0,
-            C220BiuWriteData {
-                subcore: C220BiuSubcore::Vector0,
-                sent_tick: 0,
-                ready_tick: 0,
-                source: C220BiuWriteDataReady {
-                    ready_tick: 0,
-                    request: C220BiuWriteSourceRequest {
-                        tag,
-                        instruction_id: 0,
-                        source_address: 0,
-                        bytes: 128,
-                        gather_stride: None,
-                        last_in_instruction: true,
-                    },
-                },
-            },
-        )
+        .push_data(0, C220MemoryWriteTransfer { ready_tick: 0, tag })
         .unwrap();
     memory.advance(1).unwrap();
     assert_eq!(memory.input_occupancy(), [0, 1, 0]);
@@ -220,5 +190,44 @@ fn exact_credit_boundary_and_service_slot_release() {
     assert_eq!(memory.front(8, kind), Some(tag));
     assert!(!memory.is_idle());
     memory.pop(kind);
+    assert!(memory.is_idle());
+    let tags = [tag, C220MemoryWriteId::Mte(NonZeroU32::new(1).unwrap())];
+    for tag in tags {
+        memory
+            .push_command(
+                8,
+                C220MemoryWriteCommand {
+                    ready_tick: 8,
+                    tag,
+                    address: 0,
+                    bytes: 1,
+                },
+            )
+            .unwrap();
+    }
+    memory.advance(9).unwrap();
+    memory.advance(11).unwrap();
+    for tag in tags {
+        assert_eq!(memory.front(12, C220BiuWriteReturnKind::Dbid), Some(tag));
+        memory.pop(C220BiuWriteReturnKind::Dbid);
+        memory
+            .push_data(
+                12,
+                C220MemoryWriteTransfer {
+                    ready_tick: 12,
+                    tag,
+                },
+            )
+            .unwrap();
+    }
+    let mut completed = Vec::new();
+    for tick in 13..=20 {
+        memory.advance(tick).unwrap();
+        while let Some(tag) = memory.front(tick, kind) {
+            completed.push(tag);
+            memory.pop(kind);
+        }
+    }
+    assert_eq!(completed, tags);
     assert!(memory.is_idle());
 }

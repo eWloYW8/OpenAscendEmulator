@@ -1,5 +1,8 @@
 use super::{C220BiuSubcore, C220MtePipeline, C220MtePipelineError, C220MtePipelineEvent};
 use crate::sim::c220::memory::biu_write::{C220BiuMteBusWrites, C220BiuWriteReturnKind};
+use crate::sim::c220::memory::timed_memory::{
+    C220MemoryWriteCommand, C220MemoryWriteId, C220MemoryWriteTransfer,
+};
 use crate::sim::c220::mte::interface::biu_write::command::{
     C220BiuWriteCommandTransfer, C220BiuWriteCommands, C220BiuWriteConfig, C220BiuWriteInput,
 };
@@ -192,7 +195,7 @@ impl C220MtePipeline {
                 C220BiuWriteReturnKind::Dbid,
                 C220BiuWriteReturnKind::Completion,
             ] {
-                while let Some(tag) = memory.front(tick, kind) {
+                while let Some(C220MemoryWriteId::Mte(tag)) = memory.front(tick, kind) {
                     if !bus.receive(tick, kind, tag)? {
                         break;
                     }
@@ -239,12 +242,27 @@ impl C220MtePipeline {
             if memory.can_push(C220BiuWriteReturnKind::Dbid)
                 && let Some(command) = bus.take_command(tick)
             {
-                memory.push_command(tick, command)?;
+                let request = command.command.input.generated.request;
+                memory.push_command(
+                    tick,
+                    C220MemoryWriteCommand {
+                        ready_tick: tick,
+                        tag: C220MemoryWriteId::Mte(command.command.tag),
+                        address: request.destination_address,
+                        bytes: request.bytes,
+                    },
+                )?;
             }
             if memory.can_push(C220BiuWriteReturnKind::Completion)
                 && let Some(data) = bus.take_data(tick)
             {
-                memory.push_data(tick, data)?;
+                memory.push_data(
+                    tick,
+                    C220MemoryWriteTransfer {
+                        ready_tick: tick,
+                        tag: C220MemoryWriteId::Mte(data.source.request.tag),
+                    },
+                )?;
             }
         }
         Ok(())

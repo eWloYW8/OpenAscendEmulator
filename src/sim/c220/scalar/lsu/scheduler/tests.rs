@@ -1,4 +1,7 @@
+use super::super::cache::C220DataCache;
+use super::super::cache::{C220CacheAddressLayout, C220CacheSet, C220CacheTag};
 use super::super::miss_buffer::C220LsuMissConfig;
+use super::super::store_buffer::{C220LsuCompletion, C220LsuStoreState};
 use super::super::store_buffer::{C220LsuMemory, C220LsuStoreConfig};
 use super::*;
 
@@ -7,6 +10,8 @@ fn response_ownership_controls_linked_completion_order_and_data() {
     for memory in [C220LsuMemory::Ub, C220LsuMemory::External] {
         let mut scheduler = C220LsuRequestScheduler::new(
             4,
+            2,
+            2,
             C220LsuMissBuffer::new(C220LsuMissConfig {
                 line_bytes: 64,
                 main_entries: 2,
@@ -49,14 +54,67 @@ fn response_ownership_controls_linked_completion_order_and_data() {
         let before = scheduler.clone();
         assert!(scheduler.complete_miss_read(line, &[0; 8], None).is_err());
         assert_eq!(scheduler, before);
-        let mut cache = [0x33; 64];
-        let completion = scheduler
-            .complete_miss_read(line, &[0x33; 64], Some(&mut cache))
+        let mut cache_ram = C220DataCache::new(
+            C220CacheAddressLayout::new(6, 0, 6, u64::MAX).unwrap(),
+            64,
+            vec![
+                C220CacheSet::new(
+                    vec![C220CacheTag {
+                        valid: false,
+                        dirty: false,
+                        age: 0,
+                        memory,
+                        tag: 0,
+                    }],
+                    None,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        cache_ram
+            .refill(128, 128, C220LsuMemory::External, &[0x77; 64], true)
             .unwrap();
+        let cache_before = cache_ram.clone();
+        assert!(
+            scheduler
+                .complete_cached_miss_read(line, line.address, &[0; 8], &mut cache_ram)
+                .is_err()
+        );
+        assert_eq!(cache_ram, cache_before);
+        assert_eq!(scheduler, before);
+        let (completion, refill) = scheduler
+            .complete_cached_miss_read(line, line.address, &[0x33; 64], &mut cache_ram)
+            .unwrap();
+        let evicted = refill.writeback.unwrap();
+        assert_eq!(evicted.address, 128);
+        assert_eq!(evicted.bytes, [0x77; 64]);
+        assert_eq!(evicted.memory, C220LsuMemory::External);
+        let mut cache: [u8; 64] = cache_ram.line(refill.location).unwrap().try_into().unwrap();
+        assert_eq!(
+            cache_ram.sets()[0].ways()[0].dirty,
+            memory == C220LsuMemory::External
+        );
+        assert_eq!(
+            cache_ram.lookup(line.address, memory),
+            Some(refill.location)
+        );
         assert_eq!(completion.load_line, [0x33; 64]);
         assert_eq!(cache[7], 0xaa);
         assert_eq!(cache[6], 0x33);
         assert!(scheduler.misses.entries().is_empty());
+        assert_eq!(scheduler.evicted_line(128), Some([0x77; 64].as_slice()));
+        let sent = scheduler.writes.dispatch_clock(1, true, true).unwrap();
+        let eviction = sent
+            .iter()
+            .find(|request| request.line.memory == C220LsuMemory::External)
+            .unwrap();
+        let mut old_backing = [0; 64];
+        scheduler
+            .complete_eviction_write(eviction.id, &mut old_backing)
+            .unwrap();
+        assert_eq!(old_backing, [0x77; 64]);
+        assert!(scheduler.evicted_line(128).is_none());
         if memory == C220LsuMemory::External {
             assert_eq!(
                 completion.notifications,
@@ -83,16 +141,20 @@ fn response_ownership_controls_linked_completion_order_and_data() {
                 C220LsuStoreState::Ready
             );
             let mut ub = [0x44; 64];
+            let ub_id = sent
+                .iter()
+                .find(|request| request.line.memory == C220LsuMemory::Ub)
+                .unwrap()
+                .id;
             let written = scheduler
-                .stores
-                .complete_ub_write(line, true, &mut ub, &mut scheduler.misses)
+                .complete_ub_store_write(ub_id, true, &mut ub)
                 .unwrap();
             assert_eq!(written.notifications, vec![C220LsuCompletion::Store(store)]);
             assert_eq!(ub, cache);
         }
         let (store, load) = scheduler
             .admit(
-                0,
+                1,
                 C220LsuRequest {
                     line,
                     access: C220LsuAccess::Store,
@@ -117,7 +179,8 @@ fn response_ownership_controls_linked_completion_order_and_data() {
             .misses
             .push(line, load, &mut scheduler.stores)
             .unwrap();
-        let completion = scheduler
+        let mut buffer_only = scheduler.clone();
+        let expected_completion = buffer_only
             .complete_store_read(
                 line,
                 &[0x55; 64],
@@ -128,30 +191,80 @@ fn response_ownership_controls_linked_completion_order_and_data() {
                 },
             )
             .unwrap();
+        let before = scheduler.clone();
+        let cache_before = cache_ram.clone();
+        assert!(
+            scheduler
+                .complete_cached_store_read(line, line.address, &[0; 8], &mut cache_ram)
+                .is_err()
+        );
+        assert_eq!(scheduler, before);
+        assert_eq!(cache_ram, cache_before);
+        let (completion, refill) = scheduler
+            .complete_cached_store_read(line, line.address, &[0x55; 64], &mut cache_ram)
+            .unwrap();
+        assert_eq!(completion, expected_completion);
+        assert_eq!(scheduler.misses, buffer_only.misses);
+        assert_eq!(scheduler.stores, buffer_only.stores);
+        assert_eq!(
+            cache_ram.line(refill.location).unwrap(),
+            completion.load_line
+        );
+        assert_eq!(
+            cache_ram.sets()[0].ways()[0].dirty,
+            memory == C220LsuMemory::External
+        );
+        assert_eq!(
+            refill.writeback.is_some(),
+            memory == C220LsuMemory::External
+        );
         let expected = vec![
             C220LsuCompletion::Store(store),
             C220LsuCompletion::Load(load),
         ];
         assert_eq!(completion.load_line[9], 0xbb);
         assert_eq!(completion.load_line[8], 0x55);
+        let sent = scheduler.writes.dispatch_clock(2, true, true).unwrap();
+        assert_eq!(sent.len(), 1);
         if memory == C220LsuMemory::External {
             assert_eq!(completion.notifications, expected);
             assert_eq!(completion.load_line, cache);
             assert!(completion.mark_cache_dirty);
+            let mut backing = [0; 64];
+            scheduler
+                .complete_eviction_write(sent[0].id, &mut backing)
+                .unwrap();
+            assert_eq!(backing[7], 0xaa);
+            assert_eq!(backing[9], 0x33);
         } else {
             assert!(completion.notifications.is_empty());
             assert!(scheduler.stores.entry(line).unwrap().forbidden());
             assert!(scheduler.misses.entry(line).is_some());
             let mut ub = [0x66; 64];
             let completed = scheduler
-                .stores
-                .complete_ub_write(line, true, &mut ub, &mut scheduler.misses)
+                .complete_ub_store_write(sent[0].id, true, &mut ub)
                 .unwrap();
             assert_eq!(completed.notifications, expected);
             assert_eq!(completed.line, completion.load_line);
         }
         assert!(scheduler.misses.entries().is_empty());
         assert!(scheduler.stores.entries().is_empty());
+        assert_eq!(scheduler.writes.outstanding(), 0);
+        assert_eq!(scheduler.writes.requests().count(), 0);
+        if memory == C220LsuMemory::Ub {
+            let write = scheduler.writes.enqueue(line).unwrap();
+            scheduler.writes.dispatch_clock(3, true, false).unwrap();
+            cache_ram.line_mut(refill.location).unwrap()[9] = 0xcc;
+            let mut backing = [0; 64];
+            assert_eq!(
+                scheduler
+                    .complete_ub_write_response(write, true, &mut backing, &cache_ram)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(backing[9], 0xcc);
+            assert!(!scheduler.writes.has_hazard(line));
+        }
     }
 }
 
@@ -159,6 +272,8 @@ fn response_ownership_controls_linked_completion_order_and_data() {
 fn live_miss_hazards_replay_stores_until_the_line_is_released() {
     let mut scheduler = C220LsuRequestScheduler::new(
         4,
+        2,
+        2,
         C220LsuMissBuffer::new(C220LsuMissConfig {
             line_bytes: 64,
             main_entries: 2,
@@ -175,8 +290,6 @@ fn live_miss_hazards_replay_stores_until_the_line_is_released() {
     )
     .unwrap();
     let external = C220LsuExternalHazards {
-        eviction_conflict: false,
-        direct_store_full: false,
         maintenance_active: false,
         maintenance_draining: false,
     };
@@ -247,4 +360,138 @@ fn live_miss_hazards_replay_stores_until_the_line_is_released() {
     );
     assert_eq!(scheduler.pipeline().queued_requests(), 0);
     assert!(scheduler.request(store_id).is_none());
+    let external_line = C220LsuLineKey {
+        memory: C220LsuMemory::External,
+        ..line
+    };
+    let external_write = scheduler.writes.enqueue(external_line).unwrap();
+    let next_write = scheduler.writes.enqueue(external_line).unwrap();
+    assert_eq!(scheduler.writes.next_ready_tick(), Some(8));
+    assert!(
+        scheduler
+            .writes
+            .dispatch_clock(7, true, true)
+            .unwrap()
+            .is_empty()
+    );
+    scheduler.writes.advance_to(8).unwrap();
+    let ub_write = scheduler.writes.enqueue(line).unwrap();
+    assert_eq!(
+        scheduler.hazard(load, external),
+        Some(C220LsuStall::Eviction)
+    );
+    assert_eq!(scheduler.writes.outstanding(), 0);
+    let sent = scheduler.writes.dispatch_clock(8, true, true).unwrap();
+    assert_eq!(
+        sent.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![ub_write, external_write]
+    );
+    assert_eq!(scheduler.writes.outstanding(), 2);
+    assert!(
+        scheduler
+            .writes
+            .dispatch_clock(8, true, true)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(scheduler.writes.begin_response(next_write).is_err());
+    scheduler.writes.begin_response(ub_write).unwrap();
+    assert_eq!(scheduler.writes.outstanding(), 1);
+    assert_eq!(
+        scheduler.hazard(load, external),
+        Some(C220LsuStall::Eviction)
+    );
+    scheduler.writes.finish_response(ub_write).unwrap();
+    assert_eq!(scheduler.hazard(load, external), None);
+    assert!(scheduler.writes.has_hazard(external_line));
+    assert!(
+        scheduler
+            .writes
+            .dispatch_clock(8, false, true)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        scheduler.writes.dispatch_clock(9, false, true).unwrap()[0].id,
+        next_write
+    );
+    scheduler.writes.begin_response(external_write).unwrap();
+    scheduler.writes.finish_response(external_write).unwrap();
+    assert!(scheduler.writes.has_hazard(external_line));
+    scheduler.writes.begin_response(next_write).unwrap();
+    scheduler.writes.finish_response(next_write).unwrap();
+    assert!(!scheduler.writes.has_hazard(external_line));
+    assert_eq!(scheduler.writes.outstanding(), 0);
+    let layout = C220CacheAddressLayout::new(6, 3, 8, 0xffffffffff).unwrap();
+    scheduler
+        .push_direct_store(9, 0xffff_0000_0000_0003, store_id, &[0xab], layout)
+        .unwrap();
+    scheduler
+        .push_direct_store(9, 5, load_id, &[0xcd], layout)
+        .unwrap();
+    assert_eq!(scheduler.next_direct_store_tick(), Some(10));
+    assert!(scheduler.process_direct_stores(9).unwrap().is_empty());
+    assert!(scheduler.direct_stores.full());
+    assert_eq!(
+        scheduler.hazard(store, external),
+        Some(C220LsuStall::DirectStoreCapacity)
+    );
+    let generated = scheduler.process_direct_stores(10).unwrap();
+    assert_eq!(generated.len(), 2);
+    assert!(scheduler.process_direct_stores(10).unwrap().is_empty());
+    assert_eq!(scheduler.next_direct_store_tick(), None);
+    let first = generated[0];
+    let second = generated[1];
+    assert!(
+        scheduler
+            .writes
+            .dispatch_clock(10, false, true)
+            .unwrap()
+            .is_empty()
+    );
+    let sent = scheduler.writes.dispatch_clock(11, false, true).unwrap();
+    assert_eq!(sent[0].byte_len, 64);
+    assert_eq!(sent[0].line.address, 0);
+    let mut backing = [0xff; 64];
+    assert_eq!(
+        scheduler
+            .complete_external_write_response(first, &mut backing)
+            .unwrap(),
+        Some(C220LsuCompletion::Store(store_id))
+    );
+    assert_eq!(backing[3], 0xab);
+    assert_eq!(backing[5], 0);
+    assert!(!scheduler.direct_stores.full());
+    assert_eq!(scheduler.direct_stores.entries().len(), 1);
+    scheduler.writes.dispatch_clock(12, false, true).unwrap();
+    assert_eq!(
+        scheduler
+            .complete_external_write_response(second, &mut backing)
+            .unwrap(),
+        Some(C220LsuCompletion::Store(load_id))
+    );
+    assert_eq!(backing[3], 0);
+    assert_eq!(backing[5], 0xcd);
+    assert!(scheduler.direct_stores.entries().is_empty());
+    assert_eq!(scheduler.writes.outstanding(), 0);
+    scheduler
+        .push_direct_store(12, 64, store_id, &[1], layout)
+        .unwrap();
+    let before = scheduler.clone();
+    assert!(scheduler.advance(C220LsuStage::M0, 14, external).is_err());
+    assert_eq!(scheduler, before);
+    assert_eq!(scheduler.process_direct_stores(13).unwrap().len(), 1);
+    scheduler
+        .push_direct_store(13, 128, load_id, &[2], layout)
+        .unwrap();
+    let repeated = scheduler.process_direct_stores(14).unwrap();
+    assert_eq!(repeated.len(), 2);
+    assert_eq!(
+        scheduler.writes.request(repeated[0]).unwrap().line.address,
+        64
+    );
+    assert_eq!(
+        scheduler.writes.request(repeated[1]).unwrap().line.address,
+        128
+    );
 }

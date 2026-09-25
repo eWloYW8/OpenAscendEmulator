@@ -2,11 +2,31 @@ use std::collections::{BTreeMap, VecDeque};
 use std::num::{NonZeroU32, NonZeroU64};
 
 use super::biu_read::{C220BiuReadCommandTransfer, C220BiuReadReturn};
-use super::biu_write::{C220BiuWriteReturn, C220BiuWriteReturnKind};
+use super::biu_write::C220BiuWriteReturnKind;
 use crate::sim::c220::mte::interface::biu_read::C220BiuReadRequest;
 use crate::sim::c220::mte::interface::biu_read::returns::C220BiuReadBeat;
-use crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteCommandTransfer;
-use crate::sim::c220::mte::interface::biu_write::data::C220BiuWriteData;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum C220MemoryWriteId {
+    Mte(NonZeroU32),
+    Cache { port: u32, transaction: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220MemoryWriteCommand {
+    pub ready_tick: u64,
+    pub tag: C220MemoryWriteId,
+    pub address: u64,
+    pub bytes: u32,
+}
+
+/// Timing-only data/response token. Memory bytes are applied by the owning
+/// execution unit at completion, independently of transport payload lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220MemoryWriteTransfer {
+    pub ready_tick: u64,
+    pub tag: C220MemoryWriteId,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220MemoryLatency {
@@ -83,15 +103,15 @@ pub struct C220TimedMemory {
     credits: [u32; 3],
     credit_epoch: u64,
     pending: u32,
-    commands: VecDeque<C220BiuWriteCommandTransfer>,
-    data: VecDeque<C220BiuWriteData>,
+    commands: VecDeque<C220MemoryWriteCommand>,
+    data: VecDeque<C220MemoryWriteTransfer>,
     reads: VecDeque<C220BiuReadCommandTransfer>,
     read_admissions: Vec<C220MemoryReadAdmission>,
     scheduled_reads: BTreeMap<u64, VecDeque<C220BiuReadBeat>>,
     ready_reads: VecDeque<C220BiuReadReturn>,
-    scheduled: [BTreeMap<u64, VecDeque<NonZeroU32>>; 2],
-    ready: [VecDeque<C220BiuWriteReturn>; 2],
-    transactions: BTreeMap<NonZeroU32, Transaction>,
+    scheduled: [BTreeMap<u64, VecDeque<C220MemoryWriteId>>; 2],
+    ready: [VecDeque<C220MemoryWriteTransfer>; 2],
+    transactions: BTreeMap<C220MemoryWriteId, Transaction>,
 }
 
 impl C220TimedMemory {
@@ -140,13 +160,16 @@ impl C220TimedMemory {
     pub fn input_occupancy(&self) -> [usize; 3] {
         [self.commands.len(), self.data.len(), self.reads.len()]
     }
-    pub fn ready_returns(&self, kind: C220BiuWriteReturnKind) -> &VecDeque<C220BiuWriteReturn> {
+    pub fn ready_returns(
+        &self,
+        kind: C220BiuWriteReturnKind,
+    ) -> &VecDeque<C220MemoryWriteTransfer> {
         &self.ready[index(kind)]
     }
     pub fn scheduled_returns(
         &self,
         kind: C220BiuWriteReturnKind,
-    ) -> &BTreeMap<u64, VecDeque<NonZeroU32>> {
+    ) -> &BTreeMap<u64, VecDeque<C220MemoryWriteId>> {
         &self.scheduled[index(kind)]
     }
     pub fn is_idle(&self) -> bool {
@@ -208,7 +231,7 @@ impl C220TimedMemory {
     pub(crate) fn push_command(
         &mut self,
         tick: u64,
-        mut command: C220BiuWriteCommandTransfer,
+        mut command: C220MemoryWriteCommand,
     ) -> Result<(), C220TimedMemoryError> {
         command.ready_tick = add(tick, 1)?;
         self.commands.push_back(command);
@@ -218,7 +241,7 @@ impl C220TimedMemory {
     pub(crate) fn push_data(
         &mut self,
         tick: u64,
-        mut data: C220BiuWriteData,
+        mut data: C220MemoryWriteTransfer,
     ) -> Result<(), C220TimedMemoryError> {
         data.ready_tick = add(tick, 1)?;
         self.data.push_back(data);
@@ -244,21 +267,19 @@ impl C220TimedMemory {
             .copied()
             .filter(|head| head.ready_tick <= tick)
         {
-            let request = command.command.input.generated.request;
-            let address = request.destination_address;
-            let region = self.address_region(address);
+            let region = self.address_region(command.address);
             let ready = add(tick, self.region(region).dbid.deterministic_ticks().into())?;
             self.transactions.insert(
-                command.command.tag,
+                command.tag,
                 Transaction {
                     region,
-                    bytes: request.bytes,
+                    bytes: command.bytes,
                 },
             );
             self.scheduled[0]
                 .entry(ready)
                 .or_default()
-                .push_back(command.command.tag);
+                .push_back(command.tag);
             self.commands.pop_front();
         }
         // Responses release pending service slots at preparation, independently
@@ -300,7 +321,7 @@ impl C220TimedMemory {
             let Some(data) = self.data.front().filter(|head| head.ready_tick <= tick) else {
                 break;
             };
-            let tag = data.source.request.tag;
+            let tag = data.tag;
             let transaction = self.transactions[&tag];
             if transaction.bytes >= self.credits[transaction.region] {
                 break;
@@ -350,14 +371,18 @@ impl C220TimedMemory {
                 }
                 self.ready[channel].extend(
                     tags.into_iter()
-                        .map(|tag| C220BiuWriteReturn { ready_tick, tag }),
+                        .map(|tag| C220MemoryWriteTransfer { ready_tick, tag }),
                 );
             }
         }
         Ok(())
     }
 
-    pub(crate) fn front(&self, tick: u64, kind: C220BiuWriteReturnKind) -> Option<NonZeroU32> {
+    pub(crate) fn front(
+        &self,
+        tick: u64,
+        kind: C220BiuWriteReturnKind,
+    ) -> Option<C220MemoryWriteId> {
         self.ready[index(kind)]
             .front()
             .filter(|head| head.ready_tick <= tick)
