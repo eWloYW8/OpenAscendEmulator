@@ -1,3 +1,30 @@
+pub(super) const fn special_flow_form(word: u32) -> Option<u8> {
+    if word >> 29 != 2 || (word >> 27) & 3 == 1 || (word >> 21) & 15 != 15 {
+        return None;
+    }
+    Some(((word >> 18) & 7) as u8)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220SetCrossCoreInstruction {
+    pub word: u32,
+    pub source_register: u8,
+    pub pipe_code: u8,
+}
+
+impl C220SetCrossCoreInstruction {
+    pub const fn decode(word: u32) -> Option<Self> {
+        if !matches!(special_flow_form(word), Some(4 | 5)) {
+            return None;
+        }
+        Some(Self {
+            word,
+            source_register: ((word >> 2) & 31) as u8,
+            pipe_code: ((word >> 10) & 15) as u8,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220ControlElement {
     Byte,

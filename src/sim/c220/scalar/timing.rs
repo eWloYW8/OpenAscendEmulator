@@ -132,6 +132,12 @@ impl C220ScalarTimingLane {
             return resume_tick;
         }
         if let Some(instruction) =
+            crate::isa::c220::control::C220SetCrossCoreInstruction::decode(word)
+        {
+            include(instruction.source_register);
+            return resume_tick;
+        }
+        if let Some(instruction) =
             crate::isa::c220::hflag::C220HardwareFlagInstruction::decode(word)
         {
             if let crate::isa::c220::hflag::C220HardwareEventSource::Register(register) =
@@ -679,6 +685,44 @@ mod tests {
         for form in 0..4 {
             let flag = (2 << 29) | (15 << 21) | (3 << 15) | (10 << 10) | (2 << 7) | (form << 5);
             assert_eq!(lane.dependency_tick(flag | 6, 1), (form >= 2).then_some(4));
+            for special in 0..8 {
+                let word = flag | (special << 18) | 6;
+                assert_eq!(
+                    crate::isa::c220::hflag::C220HardwareFlagInstruction::decode(word).is_some(),
+                    matches!(special, 0 | 2 | 6 | 7)
+                );
+                assert!(
+                    crate::isa::c220::hflag::C220HardwareFlagInstruction::decode(word | (1 << 27))
+                        .is_none()
+                );
+            }
+        }
+        for special in 0..8 {
+            for register in 0..32 {
+                for pipe in 0..16 {
+                    let word =
+                        (2 << 29) | (15 << 21) | (special << 18) | (pipe << 10) | (register << 2);
+                    let instruction =
+                        crate::isa::c220::control::C220SetCrossCoreInstruction::decode(word);
+                    assert_eq!(instruction.is_some(), matches!(special, 4 | 5));
+                    if let Some(instruction) = instruction {
+                        assert_eq!(instruction.source_register, register as u8);
+                        assert_eq!(instruction.pipe_code, pipe as u8);
+                        assert_eq!(lane.dependency_tick(word, 1), (register == 6).then_some(4));
+                        assert_eq!(lane.dependency_tick(word, 4), None);
+                        assert_eq!(
+                            lane.dependency_tick_with_loads(word, 1, |r| r == register as u8),
+                            Some(if register == 6 { 4 } else { 2 })
+                        );
+                    }
+                    assert!(
+                        crate::isa::c220::control::C220SetCrossCoreInstruction::decode(
+                            word | (1 << 27)
+                        )
+                        .is_none()
+                    );
+                }
+            }
         }
     }
 }

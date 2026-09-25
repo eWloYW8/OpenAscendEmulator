@@ -47,7 +47,7 @@ pub struct C220HardwareFlagStep {
 
 impl C220HardwareFlagInstruction {
     pub const fn decode(word: u32) -> Option<Self> {
-        if word >> 29 != 2 || (word >> 21) & 0xf != 0xf {
+        if !matches!(super::control::special_flow_form(word), Some(0 | 2 | 6 | 7)) {
             return None;
         }
         let form = ((word >> 5) & 3) as u8;
