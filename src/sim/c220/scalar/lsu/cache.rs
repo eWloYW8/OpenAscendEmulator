@@ -5,11 +5,35 @@ pub use data::{C220CacheLocation, C220CacheRefill, C220DataCache};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CacheTag {
+    pub atomic: bool,
     pub valid: bool,
     pub dirty: bool,
     pub age: u32,
     pub memory: C220LsuMemory,
     pub tag: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220CacheMaintenanceTarget {
+    All,
+    Ub,
+    External,
+    Atomic,
+}
+
+impl C220CacheMaintenanceTarget {
+    pub const fn matches(self, tag: C220CacheTag) -> bool {
+        match self {
+            Self::All => true,
+            Self::Ub => matches!(tag.memory, C220LsuMemory::Ub),
+            Self::External => matches!(tag.memory, C220LsuMemory::External),
+            Self::Atomic => tag.atomic,
+        }
+    }
+
+    pub const fn cleans(self, tag: C220CacheTag) -> bool {
+        tag.dirty && (!tag.atomic || matches!(self, Self::All | Self::Atomic))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +214,7 @@ impl C220CacheSet {
         let entry = self.ways.get_mut(way).ok_or(C220CacheError::InvalidWay)?;
         let previous = *entry;
         *entry = C220CacheTag {
+            atomic: false,
             valid: true,
             dirty,
             age: entry.age.wrapping_add(1),
@@ -207,6 +232,7 @@ mod tests {
     #[test]
     fn replacement_partition_and_hit_counters_have_distinct_rules() {
         let empty = C220CacheTag {
+            atomic: false,
             valid: false,
             dirty: false,
             age: 0,

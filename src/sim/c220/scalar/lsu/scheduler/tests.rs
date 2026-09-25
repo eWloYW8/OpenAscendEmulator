@@ -33,6 +33,7 @@ fn maintenance_write_samples_live_data_and_retries_before_resetting_tags() {
         vec![
             C220CacheSet::new(
                 vec![C220CacheTag {
+                    atomic: true,
                     valid: true,
                     dirty: true,
                     age: 7,
@@ -46,6 +47,40 @@ fn maintenance_write_samples_live_data_and_retries_before_resetting_tags() {
     )
     .unwrap();
     let location = super::super::cache::C220CacheLocation { index: 0, way: 0 };
+    use super::super::cache::C220CacheMaintenanceTarget;
+    for (target, cleaned) in [
+        (C220CacheMaintenanceTarget::External, false),
+        (C220CacheMaintenanceTarget::Atomic, true),
+        (C220CacheMaintenanceTarget::All, true),
+    ] {
+        let mut staged = scheduler.clone();
+        let mut ram = cache.clone();
+        staged
+            .admit_maintenance(0, C220LsuMaintenanceScope::All { target })
+            .unwrap()
+            .unwrap();
+        for tick in 1..5 {
+            for stage in [C220LsuStage::M2, C220LsuStage::M1, C220LsuStage::M0] {
+                staged
+                    .advance_with_cache(
+                        stage,
+                        tick,
+                        C220LsuExternalHazards {
+                            maintenance_active: false,
+                            maintenance_draining: false,
+                        },
+                        &mut ram,
+                    )
+                    .unwrap();
+            }
+        }
+        let completed = staged.take_maintenance_completions();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].invalidated, [location]);
+        assert_eq!(completed[0].writes.len(), usize::from(cleaned));
+        assert!(!ram.tag(location).unwrap().valid);
+        assert!(ram.tag(location).unwrap().atomic);
+    }
     let pending = scheduler
         .invalidate_external_line(0, &mut cache, location)
         .unwrap()
@@ -88,6 +123,7 @@ fn maintenance_write_samples_live_data_and_retries_before_resetting_tags() {
     assert_eq!(
         cache.tag(location).unwrap(),
         C220CacheTag {
+            atomic: false,
             valid: true,
             dirty: false,
             age: 0,
@@ -138,6 +174,7 @@ fn captured_stores_coalesce_and_complete_through_cache_or_refill() {
             vec![
                 C220CacheSet::new(
                     vec![C220CacheTag {
+                        atomic: false,
                         valid: false,
                         dirty: false,
                         age: 0,
@@ -326,6 +363,7 @@ fn response_ownership_controls_linked_completion_order_and_data() {
             vec![
                 C220CacheSet::new(
                     vec![C220CacheTag {
+                        atomic: false,
                         valid: false,
                         dirty: false,
                         age: 0,

@@ -64,6 +64,7 @@ fn run_core_loads(core: &mut C220Core, mut tick: u64, bypass: bool) {
             .map(|_| {
                 C220CacheSet::new(
                     vec![C220CacheTag {
+                        atomic: false,
                         valid: false,
                         dirty: false,
                         age: 0,
@@ -856,6 +857,7 @@ fn native_mte3_write_path(mode: u8) {
             cache_ub: mode == 3,
             ub_write_allocate: mode == 3,
             scalar_uses_vector_ports: mode == 3,
+            refresh_atomic_on_writeback: false,
         })
         .unwrap();
     }

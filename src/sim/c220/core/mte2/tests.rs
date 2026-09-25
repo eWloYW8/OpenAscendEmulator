@@ -417,6 +417,7 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
         vec![
             C220CacheSet::new(
                 vec![C220CacheTag {
+                    atomic: false,
                     valid: false,
                     dirty: false,
                     age: 0,

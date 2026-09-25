@@ -59,6 +59,7 @@ impl C220DataCache {
             .get_mut(location.way)
             .ok_or(C220CacheError::InvalidWay)?;
         *entry = super::C220CacheTag {
+            atomic: false,
             valid: true,
             dirty: false,
             age: 0,
@@ -123,13 +124,16 @@ impl C220DataCache {
     }
 
     /// Whole-cache scans exclude the stack partition and visit way before index.
-    pub fn maintenance_lines(&self, memory: Option<C220LsuMemory>) -> Vec<C220CacheLocation> {
+    pub fn maintenance_lines(
+        &self,
+        target: super::C220CacheMaintenanceTarget,
+    ) -> Vec<C220CacheLocation> {
         let first = &self.sets[0];
         let mut selected = Vec::new();
         for way in first.partition(0) {
             for (index, set) in self.sets.iter().enumerate() {
                 let tag = set.ways[way];
-                if tag.valid && memory.is_none_or(|memory| memory == tag.memory) {
+                if tag.valid && target.matches(tag) {
                     selected.push(C220CacheLocation {
                         index: index as u32,
                         way,

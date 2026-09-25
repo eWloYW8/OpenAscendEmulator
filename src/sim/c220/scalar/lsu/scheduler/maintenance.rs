@@ -1,4 +1,4 @@
-use super::super::cache::{C220CacheLocation, C220DataCache};
+use super::super::cache::{C220CacheLocation, C220CacheMaintenanceTarget, C220DataCache};
 use super::super::store_buffer::{C220LsuLineKey, C220LsuMemory};
 use super::super::write_queue::C220LsuWriteId;
 use super::{C220LsuAccess, C220LsuRequest, C220LsuRequestId, C220LsuStage};
@@ -11,7 +11,7 @@ pub enum C220LsuMaintenanceScope {
         partition_address: u64,
     },
     All {
-        memory: Option<C220LsuMemory>,
+        target: C220CacheMaintenanceTarget,
     },
 }
 
@@ -103,7 +103,7 @@ impl C220LsuRequestScheduler {
     ) -> Vec<C220CacheLocation> {
         match pending.scope {
             C220LsuMaintenanceScope::Line { .. } => pending.location.into_iter().collect(),
-            C220LsuMaintenanceScope::All { memory } => cache.maintenance_lines(memory),
+            C220LsuMaintenanceScope::All { target } => cache.maintenance_lines(target),
         }
     }
 
@@ -151,10 +151,11 @@ impl C220LsuRequestScheduler {
             let mut dirty = 0;
             for location in Self::maintenance_locations(*pending, cache) {
                 let tag = cache.tag(location)?;
-                if tag.dirty && tag.memory != C220LsuMemory::External {
+                let clean = Self::maintenance_cleans(*pending, tag);
+                if clean && tag.memory != C220LsuMemory::External {
                     return Err(C220LsuSchedulerError::MissingWriteData);
                 }
-                dirty += u64::from(tag.valid && tag.dirty);
+                dirty += u64::from(tag.valid && clean);
             }
             self.writes.check_enqueue(dirty)?;
             tick.checked_add(1).ok_or(super::EventError::TimeOverflow)?;
@@ -179,7 +180,10 @@ impl C220LsuRequestScheduler {
                 let invalidated = Self::maintenance_locations(pending, cache);
                 let mut writes = Vec::new();
                 for &location in &invalidated {
-                    if cache.tag(location)?.memory == C220LsuMemory::External {
+                    let tag = cache.tag(location)?;
+                    if tag.memory == C220LsuMemory::External
+                        && Self::maintenance_cleans(pending, tag)
+                    {
                         if let Some(write) = self.invalidate_external_line(tick, cache, location)? {
                             writes.push(write);
                         }
@@ -211,6 +215,16 @@ impl C220LsuRequestScheduler {
 
     pub fn maintenance_writes(&self) -> impl Iterator<Item = &C220LsuMaintenanceWrite> {
         self.maintenance_writes.values()
+    }
+
+    fn maintenance_cleans(
+        pending: PendingMaintenance,
+        tag: super::super::cache::C220CacheTag,
+    ) -> bool {
+        match pending.scope {
+            C220LsuMaintenanceScope::Line { .. } => tag.dirty,
+            C220LsuMaintenanceScope::All { target } => target.cleans(tag),
+        }
     }
 
     /// Execute the data action for an already selected external cache line.
@@ -255,13 +269,14 @@ impl C220LsuRequestScheduler {
         Ok(pending)
     }
 
-    /// Sample live data on response. A failed sink retains the pending entry
-    /// and can be retried without releasing transport credit twice.
+    /// Release transport credit before updating and writing live cache data.
+    /// A failed data action retains ownership and can be retried without
+    /// releasing transport credit twice.
     pub fn apply_maintenance_write_response<E>(
         &mut self,
         id: C220LsuWriteId,
         cache: &mut C220DataCache,
-        write: impl FnOnce(C220LsuLineKey, &[u8]) -> Result<(), E>,
+        write: impl FnOnce(C220LsuLineKey, &mut [u8]) -> Result<(), E>,
     ) -> Result<C220LsuMaintenanceWrite, E>
     where
         E: From<C220LsuSchedulerError>,
@@ -272,7 +287,7 @@ impl C220LsuRequestScheduler {
             .ok_or(C220LsuSchedulerError::MissingWriteData)?;
         self.enter_write_response(id)?;
         let bytes = cache
-            .line(pending.location)
+            .line_mut(pending.location)
             .map_err(C220LsuSchedulerError::from)?;
         write(pending.line, bytes)?;
         cache

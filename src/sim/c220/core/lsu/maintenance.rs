@@ -1,9 +1,9 @@
 use super::*;
 use crate::isa::flow::{DcciInstruction, DcciStep};
+use crate::sim::c220::scalar::lsu::cache::C220CacheMaintenanceTarget;
 use crate::sim::c220::scalar::lsu::scheduler::{
     C220LsuMaintenanceCompletion, C220LsuMaintenanceScope,
 };
-use crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CoreMaintenanceIssue {
@@ -55,11 +55,11 @@ impl C220Core {
         let step = instruction.resolve(pc, machine.xregs());
         let scope = if step.entire_cache {
             C220LsuMaintenanceScope::All {
-                memory: match step.operation_field {
-                    0 => None,
-                    1 => Some(C220LsuMemory::Ub),
-                    2 => Some(C220LsuMemory::External),
-                    _ => return Err(C220CoreError::UnsupportedTimedLsuAccess),
+                target: match step.operation_field {
+                    0 => C220CacheMaintenanceTarget::All,
+                    1 => C220CacheMaintenanceTarget::Ub,
+                    2 => C220CacheMaintenanceTarget::External,
+                    _ => C220CacheMaintenanceTarget::Atomic,
                 },
             }
         } else {

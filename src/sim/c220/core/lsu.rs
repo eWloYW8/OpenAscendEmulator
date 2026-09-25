@@ -45,6 +45,8 @@ pub struct C220CoreLsuConfig {
     pub ub_write_allocate: bool,
     /// Block scalar UB access while the corresponding Vector request port is occupied.
     pub scalar_uses_vector_ports: bool,
+    /// Refresh atomic cache-line data from backing memory before maintenance writeback.
+    pub refresh_atomic_on_writeback: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,15 +267,27 @@ impl C220Core {
             pipeline.cache_write_completion(lsu.port)
         {
             let write = C220LsuWriteId::from_sequence(transaction);
-            if scheduler
+            let maintenance = scheduler
                 .maintenance_writes()
-                .any(|pending| pending.write == write)
-            {
+                .find(|pending| pending.write == write)
+                .copied();
+            if let Some(pending) = maintenance {
                 let cache = lsu.cache.as_mut().ok_or(C220CoreError::LsuUnconfigured)?;
+                let refresh = lsu.config.refresh_atomic_on_writeback
+                    && cache
+                        .cache
+                        .tag(pending.location)
+                        .map_err(C220LsuSchedulerError::from)?
+                        .atomic;
                 scheduler.apply_maintenance_write_response::<C220CoreError>(
                     write,
                     &mut cache.cache,
                     |key, bytes| {
+                        if refresh {
+                            bytes.copy_from_slice(
+                                &self.memory.read_known_at(key.address, bytes.len())?,
+                            );
+                        }
                         self.memory.write_known_at(key.address, bytes)?;
                         Ok(())
                     },
