@@ -708,6 +708,72 @@ fn run_core_maintenance(core: &mut C220Core, mut tick: u64) {
         );
         tick = done.retire_tick + 102;
     }
+    run_core_atomic_stores(core, tick);
+}
+
+fn run_core_atomic_stores(core: &mut C220Core, mut tick: u64) {
+    for post_index in [false, true] {
+        let address = 0x20d0;
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_spr_value(90, 4).unwrap();
+        machine.set_xreg(5, address).unwrap();
+        machine.set_xreg(9, 1).unwrap();
+        core.memory
+            .write_known_at(address, &0xff_u32.to_le_bytes())
+            .unwrap();
+        let word = ((22 + u32::from(post_index)) << 24)
+            | (2 << 22)
+            | (9 << 17)
+            | (5 << 12)
+            | if post_index { 4 } else { 0 };
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::AtomicStore(issue),
+            ..
+        } = core.step_word_at(tick, word).unwrap()
+        else {
+            panic!("atomic store issues");
+        };
+        assert_eq!(issue.operands.bytes(), 1_u32.to_le_bytes());
+        assert_eq!(
+            core.memory.read_known_at(address, 4).unwrap(),
+            0xff_u32.to_le_bytes()
+        );
+        assert_eq!(
+            core.state.scalar().machine().xregs()[5],
+            address + if post_index { 4 } else { 0 }
+        );
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(9, 99).unwrap();
+        machine.set_spr_value(90, 5).unwrap();
+        core.memory
+            .write_known_at(address, &0x1ff_u32.to_le_bytes())
+            .unwrap();
+        let done = (tick + 1..tick + 200)
+            .find_map(|now| {
+                core.advance_to(now).unwrap();
+                let completion = core.take_atomic_store_completions().into_iter().next();
+                if completion.is_none() {
+                    assert_eq!(
+                        core.memory.read_known_at(address, 4).unwrap(),
+                        0x1ff_u32.to_le_bytes()
+                    );
+                }
+                completion
+            })
+            .expect("atomic store retires");
+        assert_eq!(done.issue, issue);
+        assert_eq!(done.result.previous_bytes(), 0x1ff_u32.to_le_bytes());
+        assert_eq!(done.result.stored_bytes(), 0x100_u32.to_le_bytes());
+        assert_eq!(done.retire_tick, done.data.tick + 1);
+        assert_eq!(core.pending_atomic_store_instructions().count(), 0);
+        core.advance_to(done.retire_tick + 100).unwrap();
+        assert!(core.take_atomic_store_completions().is_empty());
+        assert_eq!(
+            core.memory.read_known_at(address, 4).unwrap(),
+            0x100_u32.to_le_bytes()
+        );
+        tick = done.retire_tick + 102;
+    }
 }
 
 #[test]

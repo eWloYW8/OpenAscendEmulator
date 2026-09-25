@@ -340,6 +340,21 @@ impl C220LsuCommitLane {
         Ok(())
     }
 
+    /// Inspect the ready atomic head without consuming its notification.
+    pub fn ready_atomic_at(
+        &self,
+        tick: u64,
+    ) -> Result<Option<C220LsuRequestId>, C220LsuCommitError> {
+        self.check_tick(tick)?;
+        Ok(self
+            .retirements
+            .front()
+            .and_then(|(ready, token)| match token {
+                RetirementToken::AtomicStore(request) if *ready <= tick => Some(*request),
+                _ => None,
+            }))
+    }
+
     /// Consume one ready notification. The event scheduler controls invocation order.
     pub fn retire_next_at(
         &mut self,

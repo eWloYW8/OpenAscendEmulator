@@ -15,15 +15,45 @@ impl CoreLsu {
         &mut self,
         tick: u64,
         machine: &mut ScalarMachine,
+        memory: &mut crate::memory::mapped::MappedMemory,
     ) -> Result<(), C220CoreError> {
+        let atomic_result = self
+            .commits
+            .ready_atomic_at(tick)?
+            .map(|request| {
+                let mut operands = self.atomics[&request].0.operands;
+                let spr = |spr| {
+                    machine.spr_value(spr).ok_or(
+                        crate::sim::common::scalar::ScalarInstructionError::from(
+                            crate::sim::common::scalar::ScalarMachineError::SprValueUnavailable {
+                                pc: operands.pc,
+                                spr,
+                            },
+                        ),
+                    )
+                };
+                operands.control = spr(3)?;
+                operands.atomic_control = spr(90)?;
+                operands.local_root = spr(67)?;
+                let result = operands.execute(memory, self.config.atomic_fp16_rounding)?;
+                Ok::<_, C220CoreError>(result)
+            })
+            .transpose()?;
         match self.commits.retire_next_at(tick, machine)? {
             Some(C220LsuRetirement::AtomicStore {
                 request,
                 retire_tick,
             }) => {
                 let (issue, data) = self.atomics.remove(&request).expect("issued atomic store");
+                let result = atomic_result.expect("ready atomic result");
+                if let Some(base) = issue.operands.updated_base {
+                    machine
+                        .set_xreg(issue.operands.instruction().base_register, base)
+                        .map_err(crate::sim::common::scalar::ScalarInstructionError::from)?;
+                }
                 self.atomic_completions.push(C220CoreAtomicCompletion {
                     issue,
+                    result,
                     data: data.expect("completed atomic store"),
                     retire_tick,
                 });

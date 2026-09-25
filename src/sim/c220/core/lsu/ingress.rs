@@ -62,10 +62,7 @@ impl CoreLsu {
             return Ok(());
         };
         if let DispatchedLsu::AtomicStore(issue) = head {
-            if let Some(request) = self
-                .scheduler
-                .admit_atomic_store(tick, issue.result.operands)?
-            {
+            if let Some(request) = self.scheduler.admit_atomic_store(tick, issue.operands)? {
                 self.atomics.insert(request, (issue, None));
                 self.admissions.push(C220CoreLsuAdmission {
                     instruction_id: issue.instruction_id,
@@ -73,7 +70,7 @@ impl CoreLsu {
                     second_request: None,
                     tick,
                     mapped: C220ScalarMappedAddress {
-                        address: issue.result.address,
+                        address: issue.operands.effective_address & 0x0000_ffff_ffff_ffff,
                         memory:
                             crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory::External,
                         stack: false,

@@ -6,12 +6,13 @@ use crate::sim::c220::scalar::{C220AtomicStoreOperands, C220AtomicStoreResult};
 pub struct C220CoreAtomicIssue {
     pub instruction_id: u64,
     pub tick: u64,
-    pub result: C220AtomicStoreResult,
+    pub operands: C220AtomicStoreOperands,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CoreAtomicCompletion {
     pub issue: C220CoreAtomicIssue,
+    pub result: C220AtomicStoreResult,
     pub data: C220LsuAtomicCompletion,
     pub retire_tick: u64,
 }
@@ -78,7 +79,14 @@ impl C220Core {
                 cause: C220StallCause::LsuDependency,
             }));
         }
-        let result = operands.execute(&mut self.memory, lsu.config.atomic_fp16_rounding)?;
+        if !operands.is_external() {
+            return Err(
+                crate::sim::c220::scalar::C220AtomicStoreError::LocalAddress(
+                    operands.effective_address,
+                )
+                .into(),
+            );
+        }
         if let Some(base) = operands.updated_base {
             self.state
                 .scalar_mut()
@@ -89,7 +97,7 @@ impl C220Core {
         let issue = C220CoreAtomicIssue {
             instruction_id: self.next_instruction_id,
             tick,
-            result,
+            operands,
         };
         lsu.ingress.push_back(DispatchedLsu::AtomicStore(issue));
         lsu.next_tick = Some(lsu.next_tick.map_or(next, |prior| prior.min(next)));

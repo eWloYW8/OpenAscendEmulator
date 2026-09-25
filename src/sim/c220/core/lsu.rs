@@ -244,7 +244,11 @@ impl C220Core {
             .mte_pipeline
             .as_mut()
             .ok_or(C220CoreError::LsuUnconfigured)?;
-        lsu.retire_at(tick, self.state.scalar_mut().machine_mut())?;
+        lsu.retire_at(
+            tick,
+            self.state.scalar_mut().machine_mut(),
+            &mut self.memory,
+        )?;
         lsu.admit_ingress_at(
             tick,
             self.state.scalar().machine(),
