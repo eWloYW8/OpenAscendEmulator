@@ -101,6 +101,13 @@ impl C220MtePipeline {
         Ok(&self.ub_memory[Self::ub_read_index(core)?])
     }
 
+    pub(crate) fn ub_memory_mut(
+        &mut self,
+        core: C220BiuSubcore,
+    ) -> Result<&mut C220UbService, C220MtePipelineError> {
+        Ok(&mut self.ub_memory[Self::ub_read_index(core)?])
+    }
+
     /// Runs after this tick's higher-priority Vector grants. Each vector
     /// subcore owns a separate UB; the connected core supplies only its mask.
     pub fn advance_ub_service<'a>(

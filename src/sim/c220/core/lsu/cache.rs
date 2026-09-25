@@ -1,8 +1,11 @@
 use super::*;
 use crate::memory::mapped::MappedMemory;
+use crate::memory::ub::UbMemory;
 use crate::sim::c220::memory::biu_read::{C220BiuReadCacheConfig, C220BiuReadCacheKind};
 use crate::sim::c220::memory::timed_memory::{C220MemoryReadCommand, C220MemoryReadId};
+use crate::sim::c220::memory::ub_service::{C220UbServicePort, C220UbServiceRequest};
 use crate::sim::c220::mte::C220MtePipeline;
+use crate::sim::c220::mte::interface::biu_read::C220BiuSubcore;
 use crate::sim::c220::scalar::C220LoadOperands;
 use crate::sim::c220::scalar::lsu::cache::C220DataCache;
 use crate::sim::c220::scalar::lsu::commit::C220RepeatedLoadNotification;
@@ -10,6 +13,7 @@ use crate::sim::c220::scalar::lsu::commit::{
     C220LoadCommitMode, C220LoadId, C220LoadRetirement, C220LsuCommitLane,
 };
 use crate::sim::c220::scalar::lsu::read_queue::{C220LsuReadId, C220LsuReadRequest};
+use crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CoreLoadIssue {
@@ -29,6 +33,7 @@ pub(super) struct CoreCache {
     port: u32,
     pub(super) pending: BTreeMap<C220LoadId, C220CoreLoadIssue>,
     send_pending: Option<C220LsuReadRequest>,
+    ub_transport: VecDeque<(u64, C220LsuReadRequest)>,
     pub(super) completions: Vec<C220CoreLoadCompletion>,
     pub(super) repeated_notifications: Vec<C220RepeatedLoadNotification>,
 }
@@ -58,6 +63,7 @@ impl C220Core {
             port,
             pending: BTreeMap::new(),
             send_pending: None,
+            ub_transport: VecDeque::new(),
             completions: Vec::new(),
             repeated_notifications: Vec::new(),
         });
@@ -189,7 +195,7 @@ impl C220Core {
 
 impl CoreCache {
     pub(super) fn is_idle(&self) -> bool {
-        self.pending.is_empty() && self.send_pending.is_none()
+        self.pending.is_empty() && self.send_pending.is_none() && self.ub_transport.is_empty()
     }
 
     pub(super) fn receive_at(
@@ -198,7 +204,42 @@ impl CoreCache {
         pipeline: &mut C220MtePipeline,
         scheduler: &mut C220LsuRequestScheduler,
         memory: &mut MappedMemory,
+        ub: &UbMemory,
+        cache_ub: bool,
     ) -> Result<(), C220CoreError> {
+        let subcore = pipeline.ub_vector_subcore();
+        // Cube cores have no UB connection; external reads remain independent.
+        if subcore != C220BiuSubcore::Cube {
+            let service = pipeline.ub_memory_mut(subcore)?;
+            if let Some(response) = service
+                .transport(C220UbServicePort::ScalarRead)
+                .front()
+                .filter(|response| response.ready_tick <= tick)
+                .copied()
+            {
+                scheduler.apply_read_response::<C220CoreError>(
+                    C220LsuReadId::from_sequence(response.request.id),
+                    cache_ub.then_some(&mut self.cache),
+                    |key, size| Ok(ub.read_known(key.address, size)?),
+                )?;
+                let consumed = service.take_response(tick, C220UbServicePort::ScalarRead)?;
+                debug_assert_eq!(consumed, Some(response));
+            }
+            if let Some((ready, request)) = self.ub_transport.front().copied()
+                && ready <= tick
+                && service.receive(
+                    tick,
+                    C220UbServicePort::ScalarRead,
+                    C220UbServiceRequest {
+                        id: request.id.sequence(),
+                        address: request.line.address,
+                        bytes: request.byte_len as u32,
+                    },
+                )?
+            {
+                self.ub_transport.pop_front();
+            }
+        }
         let Some(response) = pipeline
             .biu_bus_reads()
             .and_then(|bus| bus.cache_returns(C220BiuReadCacheKind::Data, self.port))
@@ -214,9 +255,9 @@ impl CoreCache {
         if response.beat.transaction_id != 0 {
             return Err(C220CoreError::InvalidCacheRead);
         }
-        scheduler.apply_cached_read_response::<C220CoreError>(
+        scheduler.apply_read_response::<C220CoreError>(
             C220LsuReadId::from_sequence(transaction),
-            &mut self.cache,
+            Some(&mut self.cache),
             |key, size| Ok(memory.read_known_at(key.address, size)?),
         )?;
         let consumed = pipeline.take_cache_read_return(C220BiuReadCacheKind::Data, self.port);
@@ -230,16 +271,24 @@ impl CoreCache {
         pipeline: &mut C220MtePipeline,
         scheduler: &mut C220LsuRequestScheduler,
     ) -> Result<(), C220CoreError> {
-        if self.send_pending.is_none() {
+        {
             let ready = pipeline
                 .biu_bus_reads()
-                .is_some_and(|bus| bus.cache_can_send(C220BiuReadCacheKind::Data, self.port));
-            self.send_pending = scheduler
+                .is_some_and(|bus| bus.cache_can_send(C220BiuReadCacheKind::Data, self.port))
+                && self.send_pending.is_none();
+            let ub_ready =
+                pipeline.ub_vector_subcore() != C220BiuSubcore::Cube && self.ub_transport.len() < 2;
+            let receive_tick = tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?;
+            for request in scheduler
                 .reads
-                .dispatch_clock(tick, false, ready)
+                .dispatch_clock(tick, ub_ready, ready)
                 .map_err(C220LsuSchedulerError::from)?
-                .into_iter()
-                .next();
+            {
+                match request.line.memory {
+                    C220LsuMemory::Ub => self.ub_transport.push_back((receive_tick, request)),
+                    C220LsuMemory::External => self.send_pending = Some(request),
+                }
+            }
         }
         if let Some(request) = self.send_pending
             && pipeline.send_cache_read(C220MemoryReadCommand {

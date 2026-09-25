@@ -101,11 +101,15 @@ impl C220Core {
             .advance_to(tick)
             .map_err(C220LsuSchedulerError::from)?;
         let (completion, refill) =
-            lsu.apply_cached_read_response::<C220CoreError>(id, cache, |key, size| {
+            lsu.apply_read_response::<C220CoreError>(id, Some(cache), |key, size| {
                 Ok(self.memory.read_known_at(key.address, size)?)
             })?;
         let consumed = pipeline.take_cache_read_return(C220BiuReadCacheKind::Data, port);
         debug_assert_eq!(consumed, Some(response.beat));
-        Ok(Some((id, completion, refill)))
+        Ok(Some((
+            id,
+            completion,
+            refill.expect("external cache refill"),
+        )))
     }
 }

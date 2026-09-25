@@ -49,20 +49,24 @@ impl C220LsuRequestScheduler {
             .enqueue(line, partition_address, C220LsuReadOwner::Store)?)
     }
 
-    /// Read backing storage at response time, then refill and notify the
-    /// initiating buffer. Failed storage reads retain ownership for retry.
-    pub fn apply_cached_read_response<E>(
+    /// Read backing storage at response time, optionally refill cache RAM,
+    /// then notify the initiating buffer. Uncached responses are UB-only.
+    /// Failed storage reads retain ownership for retry.
+    pub fn apply_read_response<E>(
         &mut self,
         id: C220LsuReadId,
-        cache: &mut C220DataCache,
+        cache: Option<&mut C220DataCache>,
         read: impl FnOnce(C220LsuLineKey, usize) -> Result<Vec<u8>, E>,
-    ) -> Result<(C220LsuReadCompletion, C220CacheRefill), E>
+    ) -> Result<(C220LsuReadCompletion, Option<C220CacheRefill>), E>
     where
         E: From<C220LsuSchedulerError>,
     {
         let request = *self.reads.request(id).ok_or(C220LsuSchedulerError::Read(
             C220LsuReadError::MissingRequest,
         ))?;
+        if cache.is_none() && request.line.memory != super::super::store_buffer::C220LsuMemory::Ub {
+            return Err(C220LsuSchedulerError::MissingCacheLine.into());
+        }
         match request.state {
             C220LsuReadState::InFlight => {
                 self.reads
@@ -75,20 +79,29 @@ impl C220LsuRequestScheduler {
             }
         }
         let bytes = read(request.line, request.byte_len)?;
-        let result = match request.owner {
-            C220LsuReadOwner::Miss => self.complete_cached_miss_read(
-                request.line,
-                request.partition_address,
-                &bytes,
-                cache,
-            ),
-            C220LsuReadOwner::Store => self.complete_cached_store_read(
-                request.line,
-                request.partition_address,
-                &bytes,
-                cache,
-            ),
-        }?;
+        let result = if let Some(cache) = cache {
+            match request.owner {
+                C220LsuReadOwner::Miss => self.complete_cached_miss_read(
+                    request.line,
+                    request.partition_address,
+                    &bytes,
+                    cache,
+                ),
+                C220LsuReadOwner::Store => self.complete_cached_store_read(
+                    request.line,
+                    request.partition_address,
+                    &bytes,
+                    cache,
+                ),
+            }
+            .map(|(completion, refill)| (completion, Some(refill)))?
+        } else {
+            let completion = match request.owner {
+                C220LsuReadOwner::Miss => self.complete_miss_read(request.line, &bytes, None),
+                C220LsuReadOwner::Store => self.complete_store_read(request.line, &bytes, None),
+            }?;
+            (completion, None)
+        };
         self.reads
             .finish_response(id)
             .map_err(C220LsuSchedulerError::from)?;

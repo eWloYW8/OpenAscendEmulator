@@ -36,6 +36,9 @@ pub struct C220CoreLsuConfig {
     pub stores: C220LsuStoreConfig,
     pub layout: C220CacheAddressLayout,
     pub partition_stack: bool,
+    /// Refill UB responses into cache RAM. Existing valid tags still participate
+    /// in lookup when refills are disabled.
+    pub cache_ub: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +116,10 @@ impl C220Core {
 
     pub fn lsu_scheduler(&self) -> Option<&C220LsuRequestScheduler> {
         self.lsu.as_ref().map(|lsu| &lsu.scheduler)
+    }
+
+    pub fn lsu_config(&self) -> Option<C220CoreLsuConfig> {
+        self.lsu.as_ref().map(|lsu| lsu.config)
     }
 
     pub fn pending_lsu_instructions(&self) -> impl Iterator<Item = &C220CoreLsuIssue> {
@@ -197,7 +204,12 @@ impl C220Core {
             .as_mut()
             .ok_or(C220CoreError::LsuUnconfigured)?;
         lsu.retire_at(tick, self.state.scalar_mut().machine_mut())?;
-        lsu.admit_ingress_at(tick, self.state.scalar().machine())?;
+        lsu.admit_ingress_at(
+            tick,
+            self.state.scalar().machine(),
+            pipeline.ub_vector_subcore()
+                != crate::sim::c220::mte::interface::biu_read::C220BiuSubcore::Cube,
+        )?;
         let scheduler = &mut lsu.scheduler;
         scheduler
             .writes
@@ -208,7 +220,14 @@ impl C220Core {
             .advance_to(tick)
             .map_err(C220LsuSchedulerError::from)?;
         if let Some(loads) = &mut lsu.cache {
-            loads.receive_at(tick, pipeline, scheduler, &mut self.memory)?;
+            loads.receive_at(
+                tick,
+                pipeline,
+                scheduler,
+                &mut self.memory,
+                &self.state.ub,
+                lsu.config.cache_ub,
+            )?;
             scheduler.deliver_values(
                 tick,
                 &mut lsu.commits,

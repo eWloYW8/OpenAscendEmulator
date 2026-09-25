@@ -17,6 +17,10 @@ use crate::sim::common::scalar::ScalarInstructionError;
 
 #[derive(Debug, Error)]
 pub enum C220CoreError {
+    #[error(transparent)]
+    UbMemory(#[from] crate::memory::ub::UbMemoryError),
+    #[error(transparent)]
+    UbService(#[from] crate::sim::c220::memory::ub_service::C220UbServiceError),
     #[error("timed scalar LSU does not yet support this access or cache geometry")]
     UnsupportedTimedLsuAccess,
     #[error(transparent)]

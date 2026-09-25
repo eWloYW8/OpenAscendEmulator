@@ -1,6 +1,5 @@
 use super::*;
 use crate::sim::c220::scalar::lsu::commit::C220LoadId;
-use crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory;
 use crate::sim::common::scalar::ScalarMachine;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +47,7 @@ impl CoreLsu {
         &mut self,
         tick: u64,
         machine: &ScalarMachine,
+        ub_connected: bool,
     ) -> Result<(), C220CoreError> {
         let Some(head) = self
             .ingress
@@ -68,11 +68,13 @@ impl CoreLsu {
             .ok_or(C220CoreError::LsuAddress { address })?;
         let mapped = C220ScalarMappedAddress::decode(address, roots.0, roots.1)
             .ok_or(C220CoreError::LsuAddress { address })?;
+        if mapped.memory == crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory::Ub
+            && !ub_connected
+        {
+            return Err(C220CoreError::UnsupportedTimedLsuAccess);
+        }
         let (instruction_id, request, second_request) = match head {
             DispatchedLsu::Load(issue) => {
-                if mapped.memory != C220LsuMemory::External {
-                    return Err(C220CoreError::UnsupportedTimedLsuAccess);
-                }
                 let Some((request, second)) = self.scheduler.admit_load(
                     tick,
                     issue.operands,

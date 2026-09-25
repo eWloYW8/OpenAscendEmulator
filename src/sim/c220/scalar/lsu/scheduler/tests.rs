@@ -123,9 +123,9 @@ fn captured_stores_coalesce_and_complete_through_cache_or_refill() {
             );
             let read = scheduler.reads.dispatch_clock(7, false, true).unwrap()[0];
             scheduler
-                .apply_cached_read_response::<C220LsuSchedulerError>(
+                .apply_read_response::<C220LsuSchedulerError>(
                     read.id,
-                    &mut cache,
+                    Some(&mut cache),
                     |_, size| Ok(vec![0x55; size]),
                 )
                 .unwrap();
@@ -250,19 +250,17 @@ fn response_ownership_controls_linked_completion_order_and_data() {
         assert_eq!(scheduler, before);
         assert!(
             scheduler
-                .apply_cached_read_response::<C220LsuSchedulerError>(
-                    read,
-                    &mut cache_ram,
-                    |_, _| { Err(C220LsuSchedulerError::MissingCacheLine) }
-                )
+                .apply_read_response::<C220LsuSchedulerError>(read, Some(&mut cache_ram), |_, _| {
+                    Err(C220LsuSchedulerError::MissingCacheLine)
+                })
                 .is_err()
         );
         assert_eq!(scheduler.reads.outstanding(), 0);
         assert!(scheduler.reads.request(read).is_some());
         let (completion, refill) = scheduler
-            .apply_cached_read_response::<C220LsuSchedulerError>(
+            .apply_read_response::<C220LsuSchedulerError>(
                 read,
-                &mut cache_ram,
+                Some(&mut cache_ram),
                 |key, size| {
                     assert_eq!(key, line);
                     assert_eq!(size, 64);
@@ -271,6 +269,7 @@ fn response_ownership_controls_linked_completion_order_and_data() {
             )
             .unwrap();
         assert!(scheduler.reads.request(read).is_none());
+        let refill = refill.unwrap();
         let evicted = refill.writeback.unwrap();
         assert_eq!(evicted.address, 128);
         assert_eq!(evicted.bytes, [0x77; 64]);
@@ -390,11 +389,12 @@ fn response_ownership_controls_linked_completion_order_and_data() {
         assert_eq!(scheduler, before);
         assert_eq!(cache_ram, cache_before);
         let (completion, refill) = scheduler
-            .apply_cached_read_response::<C220LsuSchedulerError>(read, &mut cache_ram, |_, size| {
+            .apply_read_response::<C220LsuSchedulerError>(read, Some(&mut cache_ram), |_, size| {
                 Ok(vec![0x55; size])
             })
             .unwrap();
         assert_eq!(completion, expected_completion);
+        let refill = refill.unwrap();
         assert_eq!(scheduler.misses, buffer_only.misses);
         assert_eq!(scheduler.stores, buffer_only.stores);
         assert_eq!(

@@ -490,6 +490,82 @@ fn run_core_stores(core: &mut C220Core, mut tick: u64) {
         }
         tick = end + 2;
     }
+    run_core_ub_loads(core, tick);
+}
+
+fn run_core_ub_loads(core: &mut C220Core, mut tick: u64) {
+    use crate::sim::c220::scalar::lsu::scheduler::C220LsuLoadPath;
+    use crate::sim::c220::scalar::lsu::store_buffer::C220LsuMemory;
+    let cache_ub = core.lsu_config().unwrap().cache_ub;
+    core.state
+        .ub
+        .write_states(0, &vec![MemoryByteState::Known(0x11); 128])
+        .unwrap();
+    let machine = core.state.scalar_mut().machine_mut();
+    machine.set_spr_value(67, 0).unwrap();
+    machine.set_spr_value(68, 0).unwrap();
+    machine.set_xreg(5, 0x80038).unwrap();
+    let word = (9 << 24) | (3 << 22) | (7 << 17) | (5 << 12) | (9 << 7);
+    for repeat in 0..2 {
+        assert!(matches!(
+            core.step_word_at(tick, word).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Load(_),
+                ..
+            }
+        ));
+        if repeat == 0 {
+            core.advance_to(tick + 8).unwrap();
+            assert!(core.take_load_completions().is_empty());
+            // The read requests are already in flight; data is sampled on return.
+            core.state
+                .ub
+                .write_states(0, &vec![MemoryByteState::Known(0x22); 128])
+                .unwrap();
+        }
+        let done = (tick + if repeat == 0 { 9 } else { 1 }..tick + 100)
+            .find_map(|now| {
+                core.advance_to(now).unwrap();
+                core.take_load_completions().into_iter().next()
+            })
+            .expect("UB pair load completes");
+        let byte = if repeat == 0 || cache_ub { 0x22 } else { 0x33 };
+        assert_eq!(done.retirement.data.value, u64::from_le_bytes([byte; 8]));
+        assert_eq!(
+            done.retirement.data.second_value,
+            Some(u64::from_le_bytes([byte; 8]))
+        );
+        assert_eq!(done.retirement.data.mapped.memory, C220LsuMemory::Ub);
+        assert!(
+            done.retirement
+                .responses
+                .iter()
+                .flatten()
+                .all(|response| response.path
+                    == if repeat == 1 && cache_ub {
+                        C220LsuLoadPath::Cache
+                    } else {
+                        C220LsuLoadPath::Refill
+                    })
+        );
+        tick = done.retirement.retire_tick + 2;
+        core.advance_to(tick).unwrap();
+        core.state
+            .ub
+            .write_states(0, &vec![MemoryByteState::Known(0x33); 128])
+            .unwrap();
+    }
+    core.advance_to(tick + 100).unwrap();
+    assert_eq!(core.pending_load_instructions().count(), 0);
+    assert_eq!(core.lsu_scheduler().unwrap().reads.outstanding(), 0);
+    assert!(
+        core.lsu_scheduler()
+            .unwrap()
+            .reads
+            .requests()
+            .next()
+            .is_none()
+    );
 }
 
 #[test]
@@ -636,6 +712,7 @@ fn native_mte3_write_path(mode: u8) {
             },
             layout: C220CacheAddressLayout::new(6, 3, 8, 0xffffffffff).unwrap(),
             partition_stack: false,
+            cache_ub: mode == 3,
         })
         .unwrap();
     }
