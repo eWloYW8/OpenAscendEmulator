@@ -887,6 +887,64 @@ fn run_core_extended_loads(core: &mut C220Core, mut tick: u64) {
         assert_eq!(core.pending_load_instructions().count(), 0);
         tick = done.retirement.retire_tick + 2;
     }
+    run_core_device_loads(core, tick);
+}
+
+fn run_core_device_loads(core: &mut C220Core, mut tick: u64) {
+    use crate::sim::c220::scalar::lsu::scheduler::C220LsuLoadPath;
+    let machine = core.state.scalar_mut().machine_mut();
+    machine.set_xreg(5, 0x2040).unwrap();
+    let word = 0x402c_0002 | (5 << 12);
+    assert!(matches!(
+        core.step_word_at(tick, word).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    let maintenance = (tick + 1..tick + 200)
+        .find_map(|now| {
+            core.advance_to(now).unwrap();
+            core.take_maintenance_completions().into_iter().next()
+        })
+        .expect("device load setup drains cache line");
+    tick = maintenance.retire_tick + 100;
+    core.advance_to(tick).unwrap();
+    let value = 0xabcd_ef12_3456_0730_u64;
+    core.memory
+        .write_known_at(0x2040, &value.to_le_bytes())
+        .unwrap();
+    for (key, expected, path) in [
+        (26, value, C220LsuLoadPath::Refill),
+        (27, 0, C220LsuLoadPath::Cache),
+    ] {
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(5, 0x2048).unwrap();
+        machine.set_xreg(7, u64::MAX).unwrap();
+        let word = (key << 24) | (3 << 22) | (7 << 17) | (5 << 12) | 0xff8;
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Load(issue),
+            ..
+        } = core.step_word_at(tick, word).unwrap()
+        else {
+            panic!("device load issues");
+        };
+        assert!(issue.operands.is_device_load());
+        assert_eq!(issue.operands.effective_address, 0x2040);
+        assert_eq!(issue.operands.updated_base, None);
+        let done = (tick + 1..tick + 200)
+            .find_map(|now| {
+                core.advance_to(now).unwrap();
+                core.take_load_completions().into_iter().next()
+            })
+            .expect("device load retires");
+        assert_eq!(done.retirement.data.path, path);
+        assert_eq!(done.retirement.data.value, expected);
+        assert_eq!(core.state.scalar().machine().xregs()[7], expected);
+        assert_eq!(core.state.scalar().machine().xregs()[5], 0x2048);
+        let sync = done.device_sync().unwrap();
+        assert_eq!(sync.value, expected);
+        assert_eq!(sync.mode, if key == 26 { 3 } else { 0 });
+        assert_eq!(sync.flag_id, if key == 26 { 7 } else { 0 });
+        tick = done.retirement.retire_tick + 2;
+    }
 }
 
 #[test]

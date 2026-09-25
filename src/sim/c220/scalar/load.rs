@@ -130,6 +130,10 @@ impl C220LoadOperands {
             .chain(self.second_destination.map(|(register, _)| register))
     }
 
+    pub fn is_device_load(&self) -> bool {
+        crate::isa::c220::scalar::C220ScalarDeviceLoad::decode(self.word).is_some()
+    }
+
     /// Encoded registers absent from the C220 register file. Reads produce
     /// zero and writes are discarded; the operand IDs remain observable.
     pub fn missing_registers(&self) -> impl Iterator<Item = u8> {

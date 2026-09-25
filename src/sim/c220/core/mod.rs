@@ -21,6 +21,7 @@ use crate::sim::c220::vector::vmsu::C220VmsuPipeline;
 mod advance;
 mod cache;
 mod lsu;
+pub use lsu::C220DeviceSync;
 pub use lsu::{C220CoreAtomicCompletion, C220CoreAtomicIssue};
 pub use lsu::{C220CoreLoadCompletion, C220CoreLoadIssue};
 pub use lsu::{C220CoreLsuAdmission, C220CoreLsuCompletion, C220CoreLsuConfig, C220CoreLsuIssue};

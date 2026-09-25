@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
 mod atomic;
+mod device;
+pub use device::C220DeviceSync;
 mod preload;
 pub use preload::{C220CorePreloadCompletion, C220CorePreloadIssue};
 mod cache;

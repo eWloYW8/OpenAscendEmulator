@@ -36,7 +36,11 @@ impl PendingLoad {
         covered: usize,
     ) -> Result<([u64; 2], bool), C220LsuSchedulerError> {
         let width = usize::from(self.operands.width_bytes);
-        let mut values = line.map(|line| self.read_line(line)).unwrap_or([0; 2]);
+        let mut values = if self.operands.is_device_load() {
+            [0; 2]
+        } else {
+            line.map(|line| self.read_line(line)).unwrap_or([0; 2])
+        };
         let Some(store) = store else {
             return Ok((values, false));
         };
@@ -123,6 +127,24 @@ mod tests {
                 }
                 assert_eq!(forwarded, overlay);
                 assert_eq!(values, expected.map(u64::from_le_bytes));
+                let device_word = (26 << 24) | (dtype << 22) | (7 << 17) | (5 << 12);
+                let device = PendingLoad {
+                    operands: C220LoadOperands::capture(&machine, 0, device_word).unwrap(),
+                    ..pending
+                };
+                let (values, forwarded) = device
+                    .read_data(Some(&[0x55; 64]), stores.entry(key), covered.min(width))
+                    .unwrap();
+                let mut expected = [0; 8];
+                expected[..covered.min(width)].fill(0xaa);
+                assert_eq!(values, [u64::from_le_bytes(expected), 0]);
+                assert_eq!(forwarded, covered != 0);
+                let mut refill = [0; 8];
+                refill[..width].fill(0x55);
+                assert_eq!(
+                    device.read_line(&[0x55; 64]),
+                    [u64::from_le_bytes(refill), 0]
+                );
             }
         }
     }

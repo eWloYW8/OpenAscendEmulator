@@ -315,6 +315,17 @@ impl ScalarInstruction {
         match AicClass::from_word(word) {
             AicClass::Scalar
                 if matches!(architecture, Architecture::Dav2201)
+                    && crate::isa::c220::scalar::C220ScalarDeviceLoad::decode(word).is_some() =>
+            {
+                Some(scalar_load_store_hint(
+                    word,
+                    ScalarLoadStoreOperation::Load,
+                    false,
+                    Some(false),
+                ))
+            }
+            AicClass::Scalar
+                if matches!(architecture, Architecture::Dav2201)
                     && ((word >> 24) & 0x1f) == 1
                     && word & 0x70 == 0x20 =>
             {

@@ -46,6 +46,9 @@ pub struct C220LoadRetirement {
     pub suppressed: bool,
     pub register_value: u64,
     pub second_register_value: Option<u64>,
+    /// Device synchronization observes the instruction result, except when a
+    /// suppressed retirement-mode writer refreshes it from the live register.
+    pub device_sync_value: Option<u64>,
     /// Individual request responses, in operand order for a split load.
     pub responses: [Option<C220LoadResponse>; 2],
 }
@@ -482,6 +485,15 @@ impl C220LsuCommitLane {
                 .operands
                 .second_destination
                 .map(|(register, _)| machine.xreg_value(register).unwrap_or(0)),
+            device_sync_value: pending.operands.is_device_load().then(|| {
+                if pending.suppressed && self.mode == C220LoadCommitMode::Retirement {
+                    machine
+                        .xreg_value(pending.operands.destination_register)
+                        .unwrap_or(0)
+                } else {
+                    data.value
+                }
+            }),
         })))
     }
 

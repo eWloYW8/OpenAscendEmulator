@@ -970,6 +970,19 @@ fn c220_immediate_post_index_aliases_commit_loaded_data_last() {
             let step = machine.execute_memory_word(0x104, store, &mut bus).unwrap();
             assert_eq!(&bus.bytes[..width], &0x3000_u64.to_le_bytes()[..width]);
             assert_eq!(machine.xregs()[5], step.updated_base.unwrap());
+            for key in [26, 27] {
+                let device = (word & !(0x1f << 24)) | (key << 24);
+                machine
+                    .set_xreg(5, 0x3000_u64.wrapping_sub(offset as i64 as u64))
+                    .unwrap();
+                let step = machine
+                    .execute_memory_word(0x108, device, &mut bus)
+                    .unwrap();
+                assert_eq!(step.effective_address, 0x3000);
+                assert_eq!(step.updated_base, None);
+                assert_eq!(step.width_bytes, width as u8);
+                assert_eq!(machine.xregs()[5], step.data_value);
+            }
         }
     }
 }

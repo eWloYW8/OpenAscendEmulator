@@ -74,6 +74,28 @@ impl C220ScalarAtomicStore {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220ScalarDeviceLoad {
+    pub destination_register: u8,
+    pub base_register: u8,
+    pub width_bytes: u8,
+    pub offset_bytes: i16,
+}
+
+impl C220ScalarDeviceLoad {
+    pub const fn decode(word: u32) -> Option<Self> {
+        if word >> 29 != 0 || (word >> 25) & 0xf != 13 {
+            return None;
+        }
+        Some(Self {
+            destination_register: ((word >> 17) & 31) as u8,
+            base_register: ((word >> 12) & 31) as u8,
+            width_bytes: 1 << ((word >> 22) & 3),
+            offset_bytes: ((word as i16) << 4) >> 4,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220ScalarDirectStore {
     pub source_register: u8,
     pub base_register: u8,
