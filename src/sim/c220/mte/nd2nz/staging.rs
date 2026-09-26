@@ -281,19 +281,38 @@ impl C220Nd2NzStaging {
         rows: u32,
         destination_ready: bool,
     ) -> Result<bool, C220Nd2NzStagingError> {
+        let ready = self.write_ready(tick, rows)? && destination_ready;
+        self.observe(tick)?;
+        self.write_tick = Some(tick);
+        if ready {
+            for bytes in &mut self.alignment[..rows as usize] {
+                *bytes -= 32;
+            }
+        }
+        Ok(ready)
+    }
+
+    pub(crate) fn write_ready(&self, tick: u64, rows: u32) -> Result<bool, C220Nd2NzStagingError> {
         if rows == 0 || rows > self.config.rows.get() {
             return Err(C220Nd2NzStagingError::InvalidWriteRows(rows));
         }
-        self.observe(tick)?;
-        Self::callback(&mut self.write_tick, tick, "write")?;
-        let occupancy = &mut self.alignment[..rows as usize];
-        if !destination_ready || occupancy.iter().any(|&bytes| bytes < 32) {
-            return Ok(false);
+        if let Some(previous) = self.observed_tick
+            && tick < previous
+        {
+            return Err(C220Nd2NzStagingError::TimeReversed {
+                previous,
+                requested: tick,
+            });
         }
-        for bytes in occupancy {
-            *bytes -= 32;
+        if self.write_tick == Some(tick) {
+            return Err(C220Nd2NzStagingError::RepeatedCallback {
+                callback: "write",
+                tick,
+            });
         }
-        Ok(true)
+        Ok(self.alignment[..rows as usize]
+            .iter()
+            .all(|&bytes| bytes >= 32))
     }
 
     fn fits(&self, row: usize, bytes: u32) -> bool {
