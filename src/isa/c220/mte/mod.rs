@@ -9,6 +9,7 @@ pub mod load3d;
 pub mod out_to_l1;
 mod registers;
 pub mod set2d;
+pub mod smask;
 pub mod spr;
 
 pub use registers::read_register_mask;
