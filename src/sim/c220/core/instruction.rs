@@ -118,7 +118,7 @@ pub enum C220CoreInstruction {
     },
     VectorQueued(crate::sim::c220::vector::C220VectorQueuedInstruction),
     VectorBarrier(crate::sim::c220::vector::C220VectorBarrierOutcome),
-    VectorToScalarFlag(FlagStep),
+    ScalarFlag(FlagStep),
     Mte3 {
         step: C220Mte3Step,
         ticket: C220Mte3Ticket,

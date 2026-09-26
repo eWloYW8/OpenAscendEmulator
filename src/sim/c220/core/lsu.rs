@@ -51,6 +51,8 @@ pub struct C220CoreLsuConfig {
     pub ub_write_allocate: bool,
     /// Block scalar UB access while the corresponding Vector request port is occupied.
     pub scalar_uses_vector_ports: bool,
+    /// Make idle store-buffer entries eligible for writeout while Scalar SET waits.
+    pub flush_on_scalar_set_flag: bool,
     /// Refresh atomic cache-line data from backing memory before maintenance writeback.
     pub refresh_atomic_on_writeback: bool,
     pub atomic_fp16_rounding: crate::sim::c220::numeric::fp16::C220Fp16AddRounding,
@@ -114,6 +116,12 @@ pub(super) struct CoreLsu {
 }
 
 impl CoreLsu {
+    pub(super) fn trigger_set_flag_flush(&mut self) {
+        if self.config.flush_on_scalar_set_flag {
+            self.scheduler.stores.trigger_idle_flush();
+        }
+    }
+
     pub(super) fn is_idle(&self) -> bool {
         self.ingress.is_empty()
             && self.preloads.is_empty()

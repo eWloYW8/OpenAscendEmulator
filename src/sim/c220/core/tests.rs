@@ -1095,6 +1095,7 @@ fn native_mte3_write_path(mode: u8) {
             cache_ub: mode == 3,
             ub_write_allocate: mode == 3,
             scalar_uses_vector_ports: mode == 3,
+            flush_on_scalar_set_flag: false,
             refresh_atomic_on_writeback: false,
             atomic_fp16_rounding: Default::default(),
         })
@@ -1423,7 +1424,7 @@ fn reduction_state_waits_for_both_repeats() {
             matches!(
                 core.step_word_at(tick, 0x40c0_0400).unwrap(),
                 C220CoreStep::Executed {
-                    instruction: C220CoreInstruction::VectorToScalarFlag(_),
+                    instruction: C220CoreInstruction::ScalarFlag(_),
                     ..
                 }
             )

@@ -252,30 +252,14 @@ impl C220Core {
         if decoded_word.kind == C220DispatchKind::Mte3 {
             return self.step_mte3_at(tick, pc, word, decoded_word.flow_flag);
         }
+        if decoded_word.kind == C220DispatchKind::ScalarFlag {
+            return self.step_scalar_flag_at(
+                tick,
+                pc,
+                decoded_word.flow_flag.expect("scalar flag route"),
+            );
+        }
         let instruction = match word {
-            _ if decoded_word
-                .flow_flag
-                .is_some_and(|flag| flag.source_pipe_code == 1 && flag.trigger_pipe_code == 0) =>
-            {
-                let flag = decoded_word
-                    .flow_flag
-                    .expect("matched vector-to-scalar flag")
-                    .resolve(pc, self.state.scalar().machine().xregs());
-                if self
-                    .pipeline_events
-                    .consume(self.next_instruction_id, flag, tick)
-                    .is_none()
-                {
-                    return Ok(C220CoreStep::Stalled(C220Stall {
-                        tick,
-                        pc,
-                        resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
-                        cause: C220StallCause::PipelineEventDependency,
-                    }));
-                }
-                self.state.commit_c220_sequential_issue();
-                C220CoreInstruction::VectorToScalarFlag(flag)
-            }
             _ if matches!(
                 PipelineBarrierStep::decode(Architecture::Dav2201, pc, word),
                 Some(PipelineBarrierStep {

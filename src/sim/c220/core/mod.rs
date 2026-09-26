@@ -42,6 +42,7 @@ mod factor;
 mod fixp;
 mod fixp_barrier;
 mod fixp_frontend;
+mod scalar_flag;
 pub use external_fixp::C220CoreFixpConfig;
 pub use factor::{C220FactorOutcome, C220FactorReadConfig};
 pub use fixp_barrier::C220FixpBarrier;

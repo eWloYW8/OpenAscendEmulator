@@ -305,6 +305,14 @@ impl C220LsuStoreBuffer {
         }
     }
 
+    pub fn trigger_idle_flush(&mut self) {
+        for entry in &mut self.entries {
+            if entry.state == C220LsuStoreState::Idle {
+                entry.remaining_ticks = 0;
+            }
+        }
+    }
+
     pub fn ready_to_flush(&self) -> impl Iterator<Item = &C220LsuStoreEntry> {
         self.entries.iter().filter(|entry| {
             entry.state == C220LsuStoreState::Idle
@@ -605,6 +613,16 @@ mod tests {
         assert_eq!(stores.entry(key).unwrap().remaining_ticks(), 2);
         assert!(!stores.entry(key).unwrap().cache_hit());
         assert_eq!(stores.ready_to_flush().count(), 0);
+        let mut triggered = stores.clone();
+        triggered.trigger_idle_flush();
+        assert_eq!(triggered.entry(key).unwrap().remaining_ticks(), 0);
+        assert_eq!(triggered.ready_to_flush().count(), 1);
+        let mut fetching = stores.clone();
+        fetching
+            .set_state(key, C220LsuStoreState::Fetching)
+            .unwrap();
+        fetching.trigger_idle_flush();
+        assert_eq!(fetching.entry(key).unwrap().remaining_ticks(), 2);
         let mut data = [0xee; 8];
         assert_eq!(
             stores

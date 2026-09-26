@@ -165,11 +165,7 @@ impl C220Core {
         if self.state.scalar().is_halted() {
             return Err(C220ExecutionError::ProgramEnded { pc }.into());
         }
-        let flag = FlagInstruction::decode(Architecture::Dav2201, word);
-        let inline_wait = flag.is_some_and(|flag| {
-            flag.operation == FlagOperation::Wait && flag.trigger_pipe_code == 0
-        });
-        if self.mte_pipeline.is_some() && !inline_wait {
+        if self.mte_pipeline.is_some() {
             if let Some(cause) = self.mte2_accept_blocker() {
                 return self.mte2_stall(tick, pc, cause);
             }
