@@ -559,6 +559,7 @@ mod tests {
                 },
                 main_transpose_slots: 8,
                 total_transpose_slots: 16,
+                write_outstanding_limit: 4,
             },
             C220LocalBuffer::new(4096),
             &[

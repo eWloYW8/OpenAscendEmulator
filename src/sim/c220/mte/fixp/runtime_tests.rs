@@ -81,6 +81,7 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
             },
             8,
             16,
+            1,
         )
         .unwrap();
         let mut l0c = C220L0c::new(131072, 12).unwrap();
@@ -238,6 +239,37 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
         assert_eq!(engine.instruction_fifo().len(), 1);
         assert_eq!(engine.retirement_fifo().len(), 2);
         assert_eq!(engine.shared_engine().outstanding_external_commands(), 1);
+        {
+            let mut gated = engine.clone();
+            let mut stores = C220FixpStoreBuffer::default();
+            let write = stores.publish(crate::sim::c220::mte::interface::C220MteOutputFragment {
+                instruction_id: 99,
+                request_id: 0,
+                destination_address: 8192,
+                bytes: 32,
+                last_in_uop: true,
+                last_in_instruction: true,
+            });
+            assert!(matches!(
+                gated.generate_read(6).unwrap(),
+                C220FixpReadProgress::Advanced(_)
+            ));
+            assert_eq!(
+                gated.send_read(9, &stores, true).unwrap(),
+                C220FixpReadProgress::DestinationBackpressure
+            );
+            assert_eq!(gated.read_pipeline().dispatch_queue().len(), 1);
+            let mut source = C220FixpStoreRead::new(write.token, NonZeroU32::new(32).unwrap());
+            assert!(source.probe(&mut stores));
+            assert_eq!(
+                gated.send_read(10, &stores, true).unwrap(),
+                C220FixpReadProgress::HardwareSync
+            );
+            assert!(matches!(
+                gated.send_read(11, &stores, false).unwrap(),
+                C220FixpReadProgress::Advanced(_)
+            ));
+        }
         pipeline
             .bind_external_fixp_stages(&[
                 GenerateRead,

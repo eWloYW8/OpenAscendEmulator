@@ -51,8 +51,9 @@ struct Batch {
     ready_tick: u64,
 }
 
-/// Read-side generation and dispatch. Instruction admission/retirement and
-/// downstream response processing remain owned by the surrounding scheduler.
+/// Per-engine read generation and dispatch. Separate source engines reuse this
+/// implementation but own independent queues and callback slots. Instruction
+/// admission/retirement and responses belong to the surrounding scheduler.
 #[derive(Debug, Clone, Default)]
 pub struct C220FixpReadPipeline {
     generated: VecDeque<Batch>,
@@ -145,9 +146,9 @@ impl C220FixpReadPipeline {
         )
     }
 
-    /// Both sources consume the same dispatch head. The owner supplies current
-    /// destination credit and the L1 port-1 enqueue operation; rejected heads
-    /// remain in place. Hardware read waits apply only to the L0C source.
+    /// Dispatches this engine's head to its source interface. The owner supplies
+    /// current destination credit and L1 port-1 enqueue operation; rejected
+    /// heads remain in place. Hardware waits apply only to the L0C source.
     pub fn send_routed(
         &mut self,
         tick: u64,

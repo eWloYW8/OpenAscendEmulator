@@ -10,6 +10,7 @@ pub struct C220CoreFixpConfig {
     pub frontend: super::C220FixpFrontendConfig,
     pub main_transpose_slots: u32,
     pub total_transpose_slots: usize,
+    pub write_outstanding_limit: u32,
 }
 
 pub(super) struct CoreExternalFixp {
@@ -41,6 +42,7 @@ impl C220Core {
             config.engine,
             config.main_transpose_slots,
             config.total_transpose_slots,
+            config.write_outstanding_limit,
         )?;
         let pipeline = self
             .mte_pipeline

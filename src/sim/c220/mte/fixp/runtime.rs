@@ -50,6 +50,7 @@ pub enum C220FixpRuntimeError {
 pub struct C220FixpRuntime {
     shared: C220FixpEngine,
     main_slots: u32,
+    write_outstanding_limit: u32,
     operands: BTreeMap<u64, C220FixpExternalCommand>,
     staging: C220FixpNz2ndStaging,
     output: C220FixpExternalOutput,
@@ -60,10 +61,12 @@ impl C220FixpRuntime {
         config: C220FixpEngineConfig,
         main_slots: u32,
         total_slots: usize,
+        write_outstanding_limit: u32,
     ) -> Result<Self, C220FixpRuntimeError> {
         Ok(Self {
             shared: C220FixpEngine::new(config)?,
             main_slots,
+            write_outstanding_limit,
             operands: BTreeMap::new(),
             staging: C220FixpNz2ndStaging::new(total_slots)?,
             output: C220FixpExternalOutput::default(),
@@ -117,6 +120,9 @@ impl C220FixpRuntime {
     }
     pub fn output(&self) -> &C220FixpExternalOutput {
         &self.output
+    }
+    pub const fn write_outstanding_limit(&self) -> u32 {
+        self.write_outstanding_limit
     }
     pub fn write_pipeline(&self) -> &C220FixpDispatchPipeline {
         &self.shared.datapath.write
@@ -284,9 +290,22 @@ impl C220FixpRuntime {
     pub fn send_read(
         &mut self,
         tick: u64,
+        stores: &C220FixpStoreBuffer,
         sync: impl C220FixpSync,
     ) -> Result<C220FixpReadProgress, C220FixpRuntimeError> {
-        Ok(self.shared.send_read(tick, sync)?)
+        let ready = stores.below_limit(self.write_outstanding_limit);
+        Ok(self
+            .shared
+            .datapath
+            .read
+            .send_routed(
+                tick,
+                &mut self.shared.datapath.input,
+                |_| Err(C220FixpReadPipelineError::L1Disconnected),
+                |id| !self.operands.contains_key(&id) || ready,
+                sync,
+            )
+            .map_err(C220FixpEngineError::from)?)
     }
     pub fn send_l0c(
         &mut self,
@@ -363,6 +382,7 @@ impl C220FixpRuntime {
     pub fn slice(
         &mut self,
         tick: u64,
+        stores: &C220FixpStoreBuffer,
     ) -> Result<Option<C220FixpConversionEntry>, C220FixpRuntimeError> {
         let Some(head) = self.shared.datapath.conversion.entries().front() else {
             return Ok(None);
@@ -376,6 +396,9 @@ impl C220FixpRuntime {
                 return Ok(self
                     .staging
                     .receive(tick, &mut self.shared.datapath.conversion)?);
+            }
+            if !stores.below_limit(self.write_outstanding_limit) {
+                return Ok(None);
             }
             let policy = operands
                 .output_policy()
@@ -400,7 +423,11 @@ impl C220FixpRuntime {
     pub fn align(
         &mut self,
         tick: u64,
+        stores: &C220FixpStoreBuffer,
     ) -> Result<Option<C220FixpNz2ndStagingEntry>, C220FixpRuntimeError> {
+        if !stores.below_limit(self.write_outstanding_limit) {
+            return Ok(None);
+        }
         let Some(head) = self.staging.alignment().front() else {
             return Ok(None);
         };

@@ -30,6 +30,11 @@ impl C220FixpStoreBuffer {
         self.available.is_empty()
     }
 
+    /// Credits track published source tokens, not BIU tags or final responses.
+    pub fn below_limit(&self, limit: u32) -> bool {
+        self.available.len() < limit as usize
+    }
+
     pub(super) fn publish(&mut self, fragment: C220MteOutputFragment) -> C220FixpStoreWrite {
         self.sequence = self.sequence.wrapping_add(1).max(1);
         let token = NonZeroU32::new(self.sequence).expect("nonzero sequence");
@@ -125,6 +130,9 @@ mod tests {
             last_in_instruction: true,
         });
         let tag = NonZeroU32::new(3).unwrap();
+        assert!(!stores.below_limit(0));
+        assert!(!stores.below_limit(1));
+        assert!(stores.below_limit(2));
         let mut source = C220BiuCubeWriteSource::default();
         source
             .register(
@@ -161,12 +169,15 @@ mod tests {
         );
         for tick in 5..8 {
             assert!(source.egress(tick, &mut stores).unwrap().is_none());
+            assert!(!stores.below_limit(1));
         }
         let ready = source.egress(8, &mut stores).unwrap().unwrap();
         assert_eq!(ready.ready_tick, 9);
         assert!(ready.request.last_in_instruction);
         assert!(stores.is_empty());
         assert!(!source.is_idle());
+        assert!(stores.below_limit(1));
+        assert!(!stores.below_limit(0));
         assert!(source.take_data_ready(8).unwrap().is_none());
         let mut port = C220BiuWriteDataPort::default();
         assert!(

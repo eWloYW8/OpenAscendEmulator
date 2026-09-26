@@ -122,9 +122,11 @@ impl C220MtePipeline {
             GenerateRead => C220FixpRuntimeEvent::Read(C220FixpEvent::GeneratedRead(
                 engine.generate_read(tick)?,
             )),
-            SendRead => {
-                C220FixpRuntimeEvent::Read(C220FixpEvent::SentRead(engine.send_read(tick, gates)?))
-            }
+            SendRead => C220FixpRuntimeEvent::Read(C220FixpEvent::SentRead(engine.send_read(
+                tick,
+                &self.fixp_stores,
+                gates,
+            )?)),
             SendL0c => C220FixpRuntimeEvent::Read(C220FixpEvent::SentL0c(
                 engine.send_l0c(tick, memory.l0c)?,
             )),
@@ -146,9 +148,11 @@ impl C220MtePipeline {
             Convert => {
                 C220FixpRuntimeEvent::Read(C220FixpEvent::Converted(engine.convert(tick, gates)?))
             }
-            Slice => C220FixpRuntimeEvent::Read(C220FixpEvent::Sliced(engine.slice(tick)?)),
+            Slice => C220FixpRuntimeEvent::Read(C220FixpEvent::Sliced(
+                engine.slice(tick, &self.fixp_stores)?,
+            )),
             Transpose => C220FixpRuntimeEvent::Transposed(engine.transpose(tick)?),
-            Align => C220FixpRuntimeEvent::Aligned(engine.align(tick)?),
+            Align => C220FixpRuntimeEvent::Aligned(engine.align(tick, &self.fixp_stores)?),
             Packetize => C220FixpRuntimeEvent::Packetized(engine.packetize(self)?),
             GenerateWrite => C220FixpRuntimeEvent::GeneratedWrite(engine.generate_write(tick)?),
             SendWrite => C220FixpRuntimeEvent::SentWrite(engine.send_write(self)?),
