@@ -1022,6 +1022,19 @@ impl C220MtePipeline {
         self.mte3.take_output()
     }
 
+    pub fn issue_mte3_mov_pad(
+        &mut self,
+        instruction_id: u64,
+        command: super::mov_pad::C220MovPadCommand,
+    ) -> Result<C220Mte3Record, C220MtePipelineError> {
+        Ok(self.mte3_events.issue_command(
+            &mut self.events,
+            &mut self.mte3,
+            instruction_id,
+            super::mte3::frontend::C220Mte3Command::MovPad(command),
+        )?)
+    }
+
     pub(crate) fn issue_mte3_cross_core(
         &mut self,
         instruction_id: u64,

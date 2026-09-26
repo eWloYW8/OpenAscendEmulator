@@ -221,6 +221,22 @@ impl C220Core {
                 let step = instruction.resolve(pc, self.state.scalar().machine().xregs());
                 return self.enqueue_mte3_at(tick, pc, word, super::C220Mte3Operation::Flag(step));
             } else {
+                if crate::isa::c220::mte::mov_pad::C220MovPadInstruction::decode(word).is_some() {
+                    let command = crate::sim::c220::mte::mov_pad::C220MovPadCommand::capture(
+                        self.state.scalar.machine(),
+                        pc,
+                        word,
+                        self.state.isa_instance_index,
+                    )?;
+                    return self.enqueue_mte3_at(
+                        tick,
+                        pc,
+                        word,
+                        super::C220Mte3Operation::Command(
+                            crate::sim::c220::mte::mte3::frontend::C220Mte3Command::MovPad(command),
+                        ),
+                    );
+                }
                 let plan = decode_mte3_transfer(
                     self.state.scalar.machine(),
                     pc,

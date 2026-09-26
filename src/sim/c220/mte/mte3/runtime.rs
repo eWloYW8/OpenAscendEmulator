@@ -25,6 +25,8 @@ pub enum C220Mte3RuntimeError {
     Pipeline(#[from] C220MtePipelineError),
     #[error(transparent)]
     Transfer(#[from] C220TransferError),
+    #[error(transparent)]
+    MovPad(#[from] crate::sim::c220::mte::mov_pad::C220MovPadError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,8 +120,23 @@ impl Mte3Engine {
             .native_commands
             .get(&record.instruction_id)
             .ok_or(C220Mte3RuntimeError::UnknownCommand(record.instruction_id))?;
-        let plan = match record.command {
-            super::frontend::C220Mte3Command::Dma(plan) => plan,
+        let result = match record.command {
+            super::frontend::C220Mte3Command::Dma(plan) => copy_c220_mov_ub_to_hbm(
+                ub,
+                memory,
+                plan.descriptor,
+                plan.source_address,
+                plan.destination_address,
+            )?,
+            super::frontend::C220Mte3Command::MovPad(command) => {
+                crate::sim::c220::mte::mov_pad::prepare_c220_mov_pad(
+                    command.transfer,
+                    memory,
+                    ub,
+                    command.padding,
+                )?
+                .commit_to_external(memory)?
+            }
             super::frontend::C220Mte3Command::CrossCore {
                 instruction,
                 payload,
@@ -137,13 +154,6 @@ impl Mte3Engine {
                 return Ok(Some(record.instruction_id));
             }
         };
-        let result = copy_c220_mov_ub_to_hbm(
-            ub,
-            memory,
-            plan.descriptor,
-            plan.source_address,
-            plan.destination_address,
-        )?;
         pipeline.retire_mte3(record.instruction_id)?;
         self.native_commands.remove(&record.instruction_id);
         self.dma_outcomes.push(C220Mte3DmaOutcome {

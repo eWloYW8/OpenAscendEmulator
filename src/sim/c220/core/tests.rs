@@ -950,13 +950,13 @@ fn run_core_device_loads(core: &mut C220Core, mut tick: u64) {
 #[test]
 fn native_mte3_waits_for_responses_and_reads_ub_at_retirement() {
     for mode in 0..4 {
-        for byte_mode in [false, true] {
-            native_mte3_write_path(mode, byte_mode);
+        for encoding in 0..3 {
+            native_mte3_write_path(mode, encoding);
         }
     }
 }
 
-fn native_mte3_write_path(mode: u8, byte_mode: bool) {
+fn native_mte3_write_path(mode: u8, encoding: u8) {
     let bus = mode != 0;
     use crate::isa::c220::mte::C220MovInstruction;
     use crate::sim::c220::memory::biu_write::C220BiuWriteReturnKind::{Completion, Dbid};
@@ -965,8 +965,19 @@ fn native_mte3_write_path(mode: u8, byte_mode: bool) {
     use crate::sim::c220::mte::set2d::C220Set2dBandwidths;
     use std::num::NonZeroU32;
 
-    let word = CAPTURED_C220_MOV_UB_TO_OUT_WORD | u32::from(byte_mode);
-    let operands = C220MovInstruction::decode(word).unwrap();
+    let operands = C220MovInstruction::decode(CAPTURED_C220_MOV_UB_TO_OUT_WORD).unwrap();
+    let word = if encoding == 2 {
+        (3 << 29)
+            | (1 << 27)
+            | (15 << 22)
+            | (u32::from(operands.destination_register) << 17)
+            | (u32::from(operands.source_register) << 12)
+            | (u32::from(operands.descriptor_register) << 7)
+            | (31 << 2)
+            | 2
+    } else {
+        CAPTURED_C220_MOV_UB_TO_OUT_WORD | u32::from(encoding)
+    };
     let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
     machine.set_xreg(operands.source_register, 0).unwrap();
     machine
@@ -975,9 +986,13 @@ fn native_mte3_write_path(mode: u8, byte_mode: bool) {
     machine
         .set_xreg(
             operands.descriptor_register,
-            ((if byte_mode { 128 } else { 4 }) << 16) | (1 << 4) | 15,
+            ((if encoding == 0 { 4 } else { 128 }) << 16) | (1 << 4) | 15,
         )
         .unwrap();
+    if encoding == 2 {
+        machine.set_xreg(31, 0).unwrap();
+        machine.set_spr_value(70, 0x44332211).unwrap();
+    }
     let one = NonZeroU64::new(1).unwrap();
     let mut core = C220Core::new(
         C220State::new(ScalarStepper::new(machine, 0), UbMemory::new(256, 256)),
@@ -1124,6 +1139,18 @@ fn native_mte3_write_path(mode: u8, byte_mode: bool) {
         .machine_mut()
         .set_xreg(19, 0)
         .unwrap();
+    if encoding == 2 {
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(31, u64::MAX)
+            .unwrap();
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_spr_value(70, u64::MAX)
+            .unwrap();
+    }
     core.step_word_at(1, C220_MTE3_TO_VECTOR_SET_FLAG_WORD)
         .unwrap();
     core.advance_to(6).unwrap();

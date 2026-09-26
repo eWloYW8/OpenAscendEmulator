@@ -91,7 +91,16 @@ impl C220DecodedWord {
             C220DispatchKind::Cube(instruction)
         } else if is_vector_word(word) {
             C220DispatchKind::Vector
-        } else if C220DmaMovDescriptor::is_word(word) {
+        } else if C220DmaMovDescriptor::is_word(word)
+            || crate::isa::c220::mte::mov_pad::C220MovPadInstruction::decode(word).is_some_and(
+                |instruction| {
+                    matches!(
+                        instruction.direction,
+                        crate::isa::c220::mte::C220MovDirection::UbToHbm
+                    )
+                },
+            )
+        {
             C220DispatchKind::Mte3
         } else {
             C220DispatchKind::Scalar

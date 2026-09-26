@@ -29,6 +29,7 @@ pub enum C220Mte3FrontendEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte3Command {
     Dma(C220Mte3TransferPlan),
+    MovPad(crate::sim::c220::mte::mov_pad::C220MovPadCommand),
     CrossCore {
         instruction: crate::isa::c220::control::C220SetCrossCoreInstruction,
         payload: crate::sim::c220::sync::C220DeviceSync,
@@ -65,6 +66,8 @@ pub enum C220Mte3FrontendError {
     TimeOverflow,
     #[error("MTE3 completion is owned by the connected BIU")]
     BiuOwnedCompletion,
+    #[error("MTE3 MOV_PAD requires a UB-to-external transfer")]
+    WrongMovPadDirection,
     #[error("MTE3 BIU retirement notification is invalid for instruction {0}")]
     UnexpectedBiuRetirement(u64),
     #[error(transparent)]
@@ -340,6 +343,17 @@ impl C220Mte3Events {
             .ok_or(C220Mte3FrontendError::TimeOverflow)?;
         let requests = match command {
             C220Mte3Command::Dma(transfer) => Some(mte3_uops(transfer)?),
+            C220Mte3Command::MovPad(command) => {
+                if command.transfer.is_input() {
+                    return Err(C220Mte3FrontendError::WrongMovPadDirection);
+                }
+                Some(crate::sim::c220::mte::uop::mov_pad_uops(
+                    command.transfer,
+                    crate::sim::c220::mte::uop::C220DmaUopMode::from_mode_word(
+                        command.dma_mode_word,
+                    ),
+                )?)
+            }
             C220Mte3Command::CrossCore { .. } => None,
         };
         let record = C220Mte3Record {

@@ -131,4 +131,5 @@ pub enum C220CoreInstruction {
         step: C220Mte3Step,
         record: crate::sim::c220::mte::mte3::frontend::C220Mte3Record,
     },
+    Mte3MovPad(crate::sim::c220::mte::mte3::frontend::C220Mte3Record),
 }

@@ -449,12 +449,21 @@ impl C220MtePipeline {
                 .find(|record| record.instruction_id == generated.instruction_id)
                 .expect("generated command record")
                 .command;
-            let super::super::mte3::frontend::C220Mte3Command::Dma(transfer) = command else {
-                unreachable!("only DMA commands generate write requests");
+            use super::super::mte3::frontend::C220Mte3Command;
+            let (biu_mode_word, source_stride) = match command {
+                C220Mte3Command::Dma(transfer) => (
+                    transfer.biu_mode_word,
+                    transfer.descriptor.source_stride_bytes(),
+                ),
+                C220Mte3Command::MovPad(command) => {
+                    (command.biu_mode_word, command.transfer.source_stride())
+                }
+                C220Mte3Command::CrossCore { .. } => {
+                    unreachable!("cross-core commands do not generate write requests")
+                }
             };
             let gather_stride = if generated.request.route == C220DmaUopRoute::SourceGapGather {
-                let descriptor = transfer.descriptor;
-                Some(descriptor.source_stride_bytes())
+                Some(source_stride)
             } else {
                 None
             };
@@ -464,9 +473,7 @@ impl C220MtePipeline {
                     store_token: None,
                     subcore: self.biu_subcore,
                     generated: super::C220DmaGenerated {
-                        mode: super::super::uop::C220DmaUopMode::from_mode_word(
-                            transfer.biu_mode_word
-                        ),
+                        mode: super::super::uop::C220DmaUopMode::from_mode_word(biu_mode_word),
                         ..generated
                     },
                     gather_stride

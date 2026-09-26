@@ -2,6 +2,47 @@ use crate::isa::c220::mte::mov_pad::C220MovPadTransfer;
 use crate::memory::mapped::{MappedMemory, MappedMemoryError};
 use crate::memory::sparse::MemoryByteState;
 use crate::memory::ub::{UbMemory, UbMemoryError, UbTransferResult};
+use crate::sim::c220::state::C220ExecutionError;
+use crate::sim::common::scalar::ScalarMachine;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220MovPadCommand {
+    pub transfer: C220MovPadTransfer,
+    pub padding: u32,
+    pub biu_mode_word: u64,
+    pub dma_mode_word: u64,
+}
+
+impl C220MovPadCommand {
+    pub fn capture(
+        machine: &ScalarMachine,
+        pc: u64,
+        word: u32,
+        isa_instance_index: u32,
+    ) -> Result<Self, C220ExecutionError> {
+        if machine.architecture() != crate::architecture::Architecture::Dav2201 {
+            return Err(C220ExecutionError::UnsupportedWord { pc, word });
+        }
+        let instruction = crate::isa::c220::mte::mov_pad::C220MovPadInstruction::decode(word)
+            .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
+        let spr = |index| {
+            machine
+                .spr_value(index)
+                .ok_or(C220ExecutionError::MissingSpr { pc, index })
+        };
+        let (biu_mode_word, dma_mode_word) = if isa_instance_index == 0 {
+            (0, 0)
+        } else {
+            (spr(93)?, spr(94)?)
+        };
+        Ok(Self {
+            transfer: instruction.capture(machine.xregs()),
+            padding: spr(70)? as u32,
+            biu_mode_word,
+            dma_mode_word,
+        })
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220MovPadError {
