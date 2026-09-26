@@ -48,6 +48,7 @@ pub struct C220Load2dExternalRequests {
     aligned_source: bool,
     mode: C220DmaUopMode,
     destination: C220Load2dDestination,
+    layout: crate::sim::c220::mte::uop::C220DmaDestinationLayout,
 }
 
 impl C220Load2dExternalRequests {
@@ -63,7 +64,22 @@ impl C220Load2dExternalRequests {
             aligned_source: transfer.source_base.is_multiple_of(512),
             mode,
             destination: transfer.instruction.destination,
+            layout: crate::sim::c220::mte::uop::C220DmaDestinationLayout {
+                base: transfer.destination_base,
+                burst_bytes: 512,
+                burst_stride: u64::from(transfer.descriptor.destination_stride_blocks()) * 512,
+            },
         })
+    }
+
+    pub(crate) fn dma_metadata(
+        &self,
+    ) -> (
+        crate::sim::c220::mte::uop::C220DmaDestinationLayout,
+        C220DmaUopMode,
+        bool,
+    ) {
+        (self.layout, self.mode, self.aligned_source)
     }
 }
 

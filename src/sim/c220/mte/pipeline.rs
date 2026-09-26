@@ -113,6 +113,7 @@ enum Callback {
     Set2d(C220MteGeneratorCallback),
     Set2dL1(C220MteGeneratorCallback),
     Dma(C220MteGeneratorCallback),
+    ExternalLoad2d(C220MteGeneratorCallback),
     Mte3(C220Mte3Callback),
     BiuRead(C220BiuReadCallback),
     BiuReturn(C220BiuReturnCallback),
@@ -141,6 +142,7 @@ pub enum C220MtePipelineEvent {
     Set2d(C220Set2dEventOutcome),
     Set2dL1(C220Set2dEventOutcome),
     Dma(C220DmaEventOutcome),
+    ExternalLoad2d(C220DmaEventOutcome),
     Mte3(C220Mte3FrontendEvent),
     BiuRead(C220BiuReadEvent),
     BiuReturn(C220BiuReturnEvent),
@@ -165,6 +167,8 @@ pub enum C220MtePipelineEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220MtePipelineError {
+    #[error(transparent)]
+    Load2d(#[from] crate::isa::c220::mte::load2d::C220Load2dError),
     #[error("MTE cycle {active} must finish before advancing to {requested}")]
     UnfinishedCycle { active: u64, requested: u64 },
     #[error("FIX frontend must resolve its pending dispatch before resuming the MTE cycle")]
@@ -285,6 +289,7 @@ pub enum C220MtePipelineError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mte2Generator {
+    ExternalLoad2d,
     Default,
     Load3d,
     Dma,
@@ -293,6 +298,7 @@ enum Mte2Generator {
 
 mod cache;
 mod external_fixp;
+mod load2d;
 mod memory;
 mod read;
 mod smask;
@@ -328,6 +334,7 @@ pub struct C220MtePipeline {
     set2d_events: C220Set2dEvents,
     set2d_l1_events: C220Set2dEvents,
     dma_events: C220DmaEvents,
+    load2d_events: C220DmaEvents,
     mte3_events: C220Mte3Events,
     mte3: C220Mte3Frontend,
     core_kind: crate::sim::c220::device::C220CoreKind,
@@ -342,6 +349,8 @@ pub struct C220MtePipeline {
     set2d: C220Set2dFrontend,
     set2d_l1: C220Set2dFrontend,
     dma: C220DmaFrontend,
+    external_load2d: C220DmaFrontend,
+    load2d_destinations: std::collections::BTreeMap<u64, C220BiuWriteDestination>,
     dma_connected: bool,
     dma_output: Option<C220DmaGenerated>,
     biu_read: Option<C220BiuReadFrontend>,
@@ -541,8 +550,9 @@ impl C220MtePipeline {
             })
         });
         let set2d_events = C220Set2dEvents::register(&mut events, clock, Callback::Set2d);
-        let set2d_l1_events = C220Set2dEvents::register(&mut events, clock, Callback::Set2dL1);
         let dma_events = C220DmaEvents::register(&mut events, clock, Callback::Dma);
+        let load2d_events = C220DmaEvents::register(&mut events, clock, Callback::ExternalLoad2d);
+        let set2d_l1_events = C220Set2dEvents::register(&mut events, clock, Callback::Set2dL1);
         let biu_events = C220BiuReadEvents::register(&mut events, clock, Callback::BiuRead);
         let biu_return_events =
             C220BiuReturnEvents::register(&mut events, clock, Callback::BiuReturn);
@@ -575,6 +585,7 @@ impl C220MtePipeline {
             set2d_events,
             set2d_l1_events,
             dma_events,
+            load2d_events,
             mte3_events,
             mte3: C220Mte3Frontend::default(),
             biu_events,
@@ -600,6 +611,8 @@ impl C220MtePipeline {
             set2d: C220Set2dFrontend::new(config.set2d_bandwidths),
             set2d_l1: C220Set2dFrontend::new(config.set2d_bandwidths),
             dma: C220DmaFrontend::default(),
+            external_load2d: C220DmaFrontend::external_load2d(),
+            load2d_destinations: Default::default(),
             dma_connected: false,
             dma_output: None,
             biu_read: None,
@@ -696,6 +709,8 @@ impl C220MtePipeline {
             && self.generators.iter().all(C220MteReadFrontend::is_idle)
             && self.set2d.is_idle()
             && self.set2d_l1.is_idle()
+            && self.external_load2d.is_idle()
+            && self.load2d_destinations.is_empty()
             && self.dma.is_idle()
             && self.mte3.is_idle()
             && self.dma_output.is_none()
@@ -1060,6 +1075,7 @@ impl C220MtePipeline {
     pub(crate) fn mte2_generator_idle(&self) -> bool {
         self.selected_mte2_generator
             .is_none_or(|generator| match generator {
+                Mte2Generator::ExternalLoad2d => self.external_load2d.is_idle(),
                 Mte2Generator::Default => self.generator(C220MteReadKind::Default).is_idle(),
                 Mte2Generator::Dma => self.dma.is_idle(),
                 Mte2Generator::L1Fill => self.set2d_l1.is_idle(),
@@ -1545,6 +1561,7 @@ impl C220MtePipeline {
                         self.trace.push(C220MtePipelineEvent::Mte3(outcome));
                     }
                 }
+                Callback::ExternalLoad2d(phase) => self.advance_external_load2d(phase)?,
                 Callback::Dma(phase) => {
                     let output_ready = self
                         .biu_read
@@ -1614,13 +1631,14 @@ impl C220MtePipeline {
                     }
                 }
                 Callback::BiuReturn(phase) => {
+                    let cube_ready = self.cube_read_output_ready();
                     if let Some(returns) = &mut self.biu_returns {
                         let outcome = self.biu_return_events.handle(
                             phase,
                             &mut self.events,
                             returns,
                             [
-                                self.write_interface.can_push(C220MteL1WritePort::Port0),
+                                cube_ready,
                                 self.ub_write[0].can_push(),
                                 self.ub_write[1].can_push(),
                             ],
@@ -1630,11 +1648,26 @@ impl C220MtePipeline {
                         {
                             match send.core {
                                 C220BiuSubcore::Cube => {
-                                    assert!(self.write_interface.push(
-                                        tick,
-                                        C220MteL1WritePort::Port0,
-                                        fragment.output_fragment(),
-                                    )?);
+                                    match fragment.output.request.input.destination {
+                                        C220BiuWriteDestination::L0A => assert!(self.l0[0].push(
+                                            tick,
+                                            C220L0WritePort::Port2,
+                                            fragment.output_fragment()
+                                        )?),
+                                        C220BiuWriteDestination::L0B => assert!(self.l0[1].push(
+                                            tick,
+                                            C220L0WritePort::Port2,
+                                            fragment.output_fragment()
+                                        )?),
+                                        C220BiuWriteDestination::L1 => {
+                                            assert!(self.write_interface.push(
+                                                tick,
+                                                C220MteL1WritePort::Port0,
+                                                fragment.output_fragment()
+                                            )?)
+                                        }
+                                        _ => unreachable!("cube destination"),
+                                    }
                                 }
                                 C220BiuSubcore::Vector0 => {
                                     assert!(self.ub_write[0].push(tick, fragment)?)
@@ -1726,6 +1759,7 @@ impl C220MtePipeline {
                         C220MteL1WriteEventOutcome::Acknowledged(Some(ack)) => {
                             if let Some(id) = ack.retired_instruction() {
                                 if ack.request.port == C220MteL1WritePort::Port0 {
+                                    self.load2d_destinations.remove(&id);
                                     self.dma_completions.push(id);
                                 } else {
                                     self.l1_fill_completions.push(id);
@@ -1761,7 +1795,11 @@ impl C220MtePipeline {
                     if let C220L0WriteEventOutcome::Acknowledged(Some(ack)) = outcome
                         && let Some(id) = ack.retired_instruction()
                     {
-                        self.completions.push(id);
+                        if self.load2d_destinations.remove(&id).is_some() {
+                            self.dma_completions.push(id);
+                        } else {
+                            self.completions.push(id);
+                        }
                     }
                     if outcome != C220L0WriteEventOutcome::Readiness {
                         self.trace.push(if b {

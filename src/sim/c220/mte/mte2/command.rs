@@ -6,6 +6,10 @@ use crate::sim::c220::mte::set2d::{C220Set2dIssue, C220Set2dResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte2Command {
+    Load2d {
+        transfer: crate::isa::c220::mte::load2d::C220Load2dTransfer,
+        mode: crate::sim::c220::mte::uop::C220DmaUopMode,
+    },
     WriteSpr(crate::sim::common::scalar::ScalarSprStep),
     CrossCore {
         instruction: crate::isa::c220::control::C220SetCrossCoreInstruction,
@@ -65,6 +69,7 @@ pub struct C220Mte2CommandState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220Mte2Result {
+    Load2d(crate::sim::c220::mte::load2d::C220Load2dTransferResult),
     WriteSpr(crate::sim::common::scalar::ScalarSprStep),
     CrossCore(crate::sim::c220::sync::C220DeviceSync),
     MovOutToUb(UbTransferResult),

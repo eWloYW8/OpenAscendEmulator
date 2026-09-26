@@ -5,8 +5,8 @@ use super::uop::{C220DmaDestinationLayout, C220DmaUopMode, C220DmaUopRequest, C2
 use crate::sim::common::event::{EventDispatcher, EventId};
 
 const COMMAND_TICKS: u64 = 1;
-const GENERATED_TICKS: u64 = 3;
-const GENERATED_CAPACITY: usize = 4;
+mod requests;
+use requests::Requests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220DmaGenerated {
@@ -44,6 +44,8 @@ pub struct C220DmaSend {
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220DmaFrontendError {
+    #[error("request stream does not belong to this DMA generation engine")]
+    WrongGenerator,
     #[error("DMA generator cannot accept another command")]
     CommandBusy,
     #[error("DMA generator time reversed from {previous} to {requested}")]
@@ -59,7 +61,7 @@ struct Generation {
     instruction_id: u64,
     ready_tick: u64,
     next_index: u64,
-    requests: C220DmaUops,
+    requests: Requests,
 }
 
 /// Ordinary DMA generation, independent of the destination response path.
@@ -67,6 +69,7 @@ struct Generation {
 /// the command. The consumer supplies output credit and synchronization gates.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct C220DmaFrontend {
+    load2d: bool,
     generation: Option<Generation>,
     generated: VecDeque<C220DmaGenerated>,
     observed_tick: Option<u64>,
@@ -75,12 +78,26 @@ pub struct C220DmaFrontend {
 }
 
 impl C220DmaFrontend {
+    pub fn external_load2d() -> Self {
+        Self {
+            load2d: true,
+            ..Self::default()
+        }
+    }
+
+    fn generated_ticks(&self) -> u64 {
+        if self.load2d { 2 } else { 3 }
+    }
+
+    fn generated_capacity(&self) -> usize {
+        self.generated_ticks() as usize + 1
+    }
     pub fn is_idle(&self) -> bool {
         self.generation.is_none() && self.generated.is_empty()
     }
 
     pub fn can_issue(&self) -> bool {
-        self.generation.is_none() && self.generated.len() < GENERATED_CAPACITY
+        self.generation.is_none() && self.generated.len() < self.generated_capacity()
     }
 
     pub fn generated(&self) -> &VecDeque<C220DmaGenerated> {
@@ -96,6 +113,30 @@ impl C220DmaFrontend {
         tick: u64,
         instruction_id: u64,
         requests: C220DmaUops,
+    ) -> Result<C220DmaIssue, C220DmaFrontendError> {
+        if self.load2d {
+            return Err(C220DmaFrontendError::WrongGenerator);
+        }
+        self.issue_requests(tick, instruction_id, Requests::Dma(requests))
+    }
+
+    pub fn issue_load2d(
+        &mut self,
+        tick: u64,
+        instruction_id: u64,
+        requests: super::load2d::C220Load2dExternalRequests,
+    ) -> Result<C220DmaIssue, C220DmaFrontendError> {
+        if !self.load2d {
+            return Err(C220DmaFrontendError::WrongGenerator);
+        }
+        self.issue_requests(tick, instruction_id, Requests::Load2d(requests))
+    }
+
+    fn issue_requests(
+        &mut self,
+        tick: u64,
+        instruction_id: u64,
+        requests: Requests,
     ) -> Result<C220DmaIssue, C220DmaFrontendError> {
         self.check_time(tick)?;
         if !self.can_issue() {
@@ -130,10 +171,10 @@ impl C220DmaFrontend {
             .generation
             .as_ref()
             .is_some_and(|g| g.ready_tick <= tick)
-            && self.generated.len() < GENERATED_CAPACITY;
+            && self.generated.len() < self.generated_capacity();
         let entry = if eligible {
             let ready_tick = tick
-                .checked_add(GENERATED_TICKS)
+                .checked_add(self.generated_ticks())
                 .ok_or(C220DmaFrontendError::TimeOverflow)?;
             let generation = self.generation.as_mut().expect("eligible command");
             let request = generation.requests.next().expect("nonempty command");
@@ -143,9 +184,9 @@ impl C220DmaFrontend {
                 uop_index: generation.next_index,
                 ready_tick,
                 request,
-                destination: generation.requests.destination(),
-                mode: generation.requests.mode(),
-                out_of_order: generation.requests.out_of_order(),
+                destination: generation.requests.metadata().0,
+                mode: generation.requests.metadata().1,
+                out_of_order: generation.requests.metadata().2,
                 last_in_instruction,
             };
             generation.next_index += 1;
@@ -235,6 +276,19 @@ pub struct C220DmaEvents {
 }
 
 impl C220DmaEvents {
+    pub fn issue_load2d<T: Copy>(
+        &self,
+        events: &mut EventDispatcher<T>,
+        frontend: &mut C220DmaFrontend,
+        instruction_id: u64,
+        requests: super::load2d::C220Load2dExternalRequests,
+    ) -> Result<C220DmaIssue, C220DmaFrontendError> {
+        let issue = frontend.issue_load2d(events.tick(), instruction_id, requests)?;
+        if !issue.completion_ready {
+            self.queues.arm_instruction(events);
+        }
+        Ok(issue)
+    }
     pub fn register<T: Copy>(
         events: &mut EventDispatcher<T>,
         clock: EventId,

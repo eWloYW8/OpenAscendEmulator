@@ -80,6 +80,146 @@ fn configured_dma_core() -> C220Core {
 }
 
 #[test]
+fn external_load2d_retires_only_after_its_selected_local_destination() {
+    use crate::sim::c220::mte::interface::biu_read::write::{
+        C220BiuWriteBandwidths, C220BiuWriteDestination,
+    };
+    use crate::sim::c220::mte::interface::{C220L0WriteEventOutcome, C220MteL1WriteEventOutcome};
+    use crate::sim::c220::mte::{C220MtePipelineEvent, dma::C220DmaEventOutcome};
+    use std::collections::VecDeque;
+
+    for destination in 0..=2 {
+        for offset in [0, 7] {
+            let mut core = configured_dma_core();
+            let width = NonZeroU32::new(32).unwrap();
+            core.connect_mte2_biu(
+                C220BiuReadConfig {
+                    outstanding: NonZeroU32::new(2).unwrap(),
+                    weights: [1; 3],
+                    group_vector_returns: true,
+                    write_bandwidths: C220BiuWriteBandwidths {
+                        l1: width,
+                        l0a: width,
+                        l0b: width,
+                        ub: width,
+                    },
+                },
+                C220BiuSubcore::Cube,
+            )
+            .unwrap();
+            core.state.isa_instance_index = 1;
+            let machine = core.state.scalar_mut().machine_mut();
+            machine.set_spr_value(93, 5).unwrap();
+            machine.set_xreg(1, 1024).unwrap();
+            machine.set_xreg(2, 0x2000 + offset).unwrap();
+            machine
+                .set_xreg(3, (2 << 16) | (1 << 24) | (1 << 44))
+                .unwrap();
+            let transpose = destination != 2;
+            let word = (3 << 29)
+                | (1 << 17)
+                | (2 << 12)
+                | (3 << 7)
+                | 16
+                | destination
+                | (u32::from(transpose) << 2);
+            core.step_word_at(0, word).unwrap();
+            for register in 1..=3 {
+                core.state
+                    .scalar_mut()
+                    .machine_mut()
+                    .set_xreg(register, 0)
+                    .unwrap();
+            }
+            let input: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+            core.memory.write_known_at(0x2000 + offset, &input).unwrap();
+            let mut responses = VecDeque::new();
+            let mut generated = 0;
+            let mut acknowledged = None;
+            let mut retired = None;
+            for tick in 1..300 {
+                core.advance_to(tick).unwrap();
+                assert!(core.mte_pipeline().unwrap().mte1_completions().is_empty());
+                for event in core.mte_pipeline().unwrap().last_events() {
+                    match event {
+                        C220MtePipelineEvent::ExternalLoad2d(C220DmaEventOutcome::Generated(
+                            Some(request),
+                        )) => {
+                            assert_eq!(request.ready_tick, tick + 2);
+                            generated += 1;
+                        }
+                        C220MtePipelineEvent::L0a(C220L0WriteEventOutcome::Acknowledged(Some(
+                            ack,
+                        )))
+                        | C220MtePipelineEvent::L0b(C220L0WriteEventOutcome::Acknowledged(Some(
+                            ack,
+                        ))) if ack.retired_instruction().is_some() => acknowledged = Some(tick),
+                        C220MtePipelineEvent::L1Write(
+                            C220MteL1WriteEventOutcome::Acknowledged(Some(ack)),
+                        ) if ack.retired_instruction().is_some() => acknowledged = Some(tick),
+                        _ => {}
+                    }
+                }
+                if let Some(request) = core.take_mte2_biu_request() {
+                    assert_eq!(
+                        request.input.destination,
+                        [
+                            C220BiuWriteDestination::L0A,
+                            C220BiuWriteDestination::L0B,
+                            C220BiuWriteDestination::L1
+                        ][destination as usize]
+                    );
+                    responses.extend(
+                        (0..request.input.generated.request.bytes.div_ceil(128))
+                            .rev()
+                            .map(|transaction_id| C220BiuReadBeat {
+                                tag: request.tag,
+                                transaction_id,
+                            }),
+                    );
+                }
+                if let Some(outcome) = core.mte2.last_outcomes().first() {
+                    retired = Some(outcome.clone());
+                    break;
+                }
+                if core
+                    .receive_mte2_biu_at(tick, [responses.front().copied(), None])
+                    .unwrap()[0]
+                {
+                    responses.pop_front();
+                }
+            }
+            let retired = retired.expect("LOAD2D completed");
+            assert_eq!(retired.retire_tick, acknowledged.unwrap() + 1);
+            assert_eq!(generated, if offset == 0 { 8 } else { 2 });
+            let target = match destination {
+                0 => core.local_memory.l0a(),
+                1 => core.local_memory.l0b(),
+                _ => core.local_memory.l1(),
+            };
+            for block in 0..2 {
+                let actual = target
+                    .read_initialized_linear(1024 + block * 1024, 512)
+                    .unwrap();
+                for (index, byte) in input[block as usize * 512..(block as usize + 1) * 512]
+                    .iter()
+                    .enumerate()
+                {
+                    let out = if transpose {
+                        (index / 32 + ((index / 2) % 16) * 16) * 2 + index % 2
+                    } else {
+                        index
+                    };
+                    assert_eq!(actual[out], *byte);
+                }
+            }
+            assert!(!core.mte2_is_busy());
+            assert!(core.mte_pipeline().unwrap().is_idle());
+        }
+    }
+}
+
+#[test]
 fn external_smask_uses_default_generation_and_ordered_local_retirement() {
     use crate::sim::c220::mte::C220MtePipelineEvent;
     use crate::sim::c220::mte::interface::C220MteL1EventOutcome;

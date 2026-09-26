@@ -18,6 +18,8 @@ use crate::sim::c220::mte::{C220MtePipeline, C220MtePipelineError, C220TransferE
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220Mte2RuntimeError {
+    #[error(transparent)]
+    Load2d(#[from] crate::sim::c220::mte::load2d::C220Load2dTransferError),
     #[error(
         "DMA completion for command {instruction_id} precedes its request tail or does not match an active transfer"
     )]
@@ -143,7 +145,7 @@ impl C220Mte2Pipeline {
         })
     }
 
-    fn check_physical_generator_switch(&self) -> Result<(), C220Mte2RuntimeError> {
+    pub(crate) fn check_physical_generator_switch(&self) -> Result<(), C220Mte2RuntimeError> {
         if self
             .pending
             .iter()
@@ -305,6 +307,43 @@ impl C220Mte2Pipeline {
         })
     }
 
+    pub(crate) fn issue_load2d(
+        &mut self,
+        pipeline: &mut C220MtePipeline,
+        instruction_id: u64,
+        pc: u64,
+        transfer: crate::isa::c220::mte::load2d::C220Load2dTransfer,
+        mode: crate::sim::c220::mte::uop::C220DmaUopMode,
+    ) -> Result<C220Mte2Issue, C220Mte2RuntimeError> {
+        if transfer.descriptor.repeat_count != 0 {
+            self.check_physical_generator_switch()?;
+        }
+        self.now
+            .checked_add(1)
+            .ok_or(C220Mte2RuntimeError::TimeOverflow)?;
+        let timing = pipeline.issue_external_load2d(instruction_id, transfer, mode)?;
+        let command = C220Mte2Command::Load2d { transfer, mode };
+        self.pending.push_back(C220Mte2CommandState {
+            instruction_id,
+            pc,
+            issue_tick: timing.tick,
+            command,
+            completion: if timing.completion_ready {
+                C220Mte2Completion::Observed { tick: timing.tick }
+            } else {
+                C220Mte2Completion::AwaitingDma {
+                    tail_delivered: false,
+                }
+            },
+        });
+        Ok(C220Mte2Issue {
+            instruction_id,
+            pc,
+            command,
+            timing: C220Mte2IssueTiming::Dma(timing),
+        })
+    }
+
     pub(crate) fn issue_dma(
         &mut self,
         pipeline: Option<&mut C220MtePipeline>,
@@ -444,6 +483,14 @@ impl C220Mte2Pipeline {
             }
         {
             let result = match command.command {
+                C220Mte2Command::Load2d { transfer, .. } => {
+                    let prepared = crate::sim::c220::mte::load2d::prepare_c220_external_load2d(
+                        source, transfer,
+                    )?;
+                    let result = prepared.result;
+                    prepared.commit(local)?;
+                    C220Mte2Result::Load2d(result)
+                }
                 C220Mte2Command::MovOutToSmask(transfer) => C220Mte2Result::MovOutToSmask(
                     crate::sim::c220::mte::smask::execute_c220_mov_out_to_smask(
                         local, source, transfer,
@@ -503,4 +550,6 @@ pub(crate) fn is_mte2_transfer(word: u32) -> bool {
         || crate::isa::c220::mte::out_to_l1::C220MovOutToL1Instruction::decode(word).is_some()
         || crate::isa::c220::mte::smask::C220MovSmaskInstruction::decode(word)
             .is_some_and(|instruction| instruction.source_mode == 0)
+        || crate::isa::c220::mte::load2d::C220Load2dInstruction::decode(word)
+            .is_some_and(|instruction| instruction.is_external())
 }

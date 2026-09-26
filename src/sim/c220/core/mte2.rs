@@ -138,6 +138,23 @@ impl C220Core {
                 .filter(|instruction| instruction.source_mode == 0)
         {
             C220Mte2Command::MovOutToSmask(decoded.capture(machine.xregs()))
+        } else if let Some(decoded) =
+            crate::isa::c220::mte::load2d::C220Load2dInstruction::decode(word)
+                .filter(|instruction| instruction.is_external())
+        {
+            let mode_word = if self.state.isa_instance_index == 0 {
+                0
+            } else {
+                machine
+                    .spr_value(93)
+                    .ok_or(C220ExecutionError::MissingSpr { pc, index: 93 })?
+            };
+            C220Mte2Command::Load2d {
+                transfer: decoded
+                    .capture(machine.xregs())
+                    .map_err(crate::sim::c220::mte::load2d::C220Load2dTransferError::from)?,
+                mode: crate::sim::c220::mte::uop::C220DmaUopMode::from_mode_word(mode_word),
+            }
         } else if let Some(decoded) = C220Set2dInstruction::decode(word) {
             let pattern = machine
                 .spr_value(15)
@@ -238,6 +255,19 @@ impl C220Core {
     ) -> Result<bool, C220CoreError> {
         use crate::sim::c220::mte::mte2::C220Mte2Command;
         Ok(match command {
+            C220Mte2Command::Load2d { transfer, .. } => {
+                let pipeline = self
+                    .mte_pipeline
+                    .as_ref()
+                    .ok_or(C220CoreError::MteUnconfigured)?;
+                if transfer.descriptor.repeat_count == 0 {
+                    true
+                } else {
+                    self.mte2.check_physical_generator_switch()?;
+                    pipeline.validate_external_load2d_connection()?;
+                    pipeline.can_issue_external_load2d()
+                }
+            }
             C220Mte2Command::MovOutToSmask(transfer) => self.mte2.can_issue_smask(
                 self.mte_pipeline
                     .as_ref()
@@ -294,6 +324,15 @@ impl C220Core {
     ) -> Result<crate::sim::c220::mte::mte2::C220Mte2Issue, C220CoreError> {
         use crate::sim::c220::mte::mte2::C220Mte2Command;
         Ok(match command {
+            C220Mte2Command::Load2d { transfer, mode } => self.mte2.issue_load2d(
+                self.mte_pipeline
+                    .as_mut()
+                    .ok_or(C220CoreError::MteUnconfigured)?,
+                id,
+                pc,
+                transfer,
+                mode,
+            )?,
             C220Mte2Command::MovOutToSmask(transfer) => self.mte2.issue_smask(
                 self.mte_pipeline
                     .as_mut()
