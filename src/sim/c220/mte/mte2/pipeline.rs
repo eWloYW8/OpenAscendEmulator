@@ -19,6 +19,8 @@ use crate::sim::c220::mte::{C220MtePipeline, C220MtePipelineError, C220TransferE
 #[derive(Debug, thiserror::Error)]
 pub enum C220Mte2RuntimeError {
     #[error(transparent)]
+    MovPad(#[from] crate::sim::c220::mte::mov_pad::C220MovPadError),
+    #[error(transparent)]
     Load2d(#[from] crate::sim::c220::mte::load2d::C220Load2dTransferError),
     #[error(
         "DMA completion for command {instruction_id} precedes its request tail or does not match an active transfer"
@@ -307,6 +309,46 @@ impl C220Mte2Pipeline {
         })
     }
 
+    pub(crate) fn issue_mov_pad(
+        &mut self,
+        pipeline: &mut C220MtePipeline,
+        instruction_id: u64,
+        pc: u64,
+        captured: crate::sim::c220::mte::mov_pad::C220MovPadCommand,
+    ) -> Result<C220Mte2Issue, C220Mte2RuntimeError> {
+        if !captured.transfer.is_disabled() {
+            self.check_physical_generator_switch()?;
+        }
+        self.now
+            .checked_add(1)
+            .ok_or(C220Mte2RuntimeError::TimeOverflow)?;
+        let timing = pipeline.issue_mte2_mov_pad(instruction_id, captured)?;
+        let command = C220Mte2Command::MovPad(captured);
+        self.pending.push_back(C220Mte2CommandState {
+            instruction_id,
+            pc,
+            issue_tick: timing.tick,
+            command,
+            completion: if timing.completion_ready {
+                C220Mte2Completion::Observed { tick: timing.tick }
+            } else {
+                C220Mte2Completion::AwaitingDma {
+                    tail_delivered: false,
+                }
+            },
+        });
+        Ok(C220Mte2Issue {
+            instruction_id,
+            pc,
+            command,
+            timing: if timing.completion_ready {
+                C220Mte2IssueTiming::Disabled
+            } else {
+                C220Mte2IssueTiming::Dma(timing)
+            },
+        })
+    }
+
     pub(crate) fn issue_load2d(
         &mut self,
         pipeline: &mut C220MtePipeline,
@@ -483,6 +525,15 @@ impl C220Mte2Pipeline {
             }
         {
             let result = match command.command {
+                C220Mte2Command::MovPad(captured) => C220Mte2Result::MovPad(
+                    crate::sim::c220::mte::mov_pad::prepare_c220_mov_pad(
+                        captured.transfer,
+                        source,
+                        ub,
+                        captured.padding,
+                    )?
+                    .commit_to_ub(ub)?,
+                ),
                 C220Mte2Command::Load2d { transfer, .. } => {
                     let prepared = crate::sim::c220::mte::load2d::prepare_c220_external_load2d(
                         source, transfer,
@@ -547,6 +598,14 @@ impl C220Mte2Pipeline {
 
 pub(crate) fn is_mte2_transfer(word: u32) -> bool {
     crate::isa::c220::mte::C220MovOutToUbDescriptor::is_word(word)
+        || crate::isa::c220::mte::mov_pad::C220MovPadInstruction::decode(word).is_some_and(
+            |instruction| {
+                matches!(
+                    instruction.direction,
+                    crate::isa::c220::mte::C220MovDirection::HbmToUb
+                )
+            },
+        )
         || crate::isa::c220::mte::out_to_l1::C220MovOutToL1Instruction::decode(word).is_some()
         || crate::isa::c220::mte::smask::C220MovSmaskInstruction::decode(word)
             .is_some_and(|instruction| instruction.source_mode == 0)

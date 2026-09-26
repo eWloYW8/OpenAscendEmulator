@@ -171,8 +171,18 @@ impl WriteAligner {
         if output.request.input.destination.subcore() != output.request.input.subcore {
             return Err(C220BiuWriteError::WrongSubcore);
         }
-        let collapsed = request.route == C220DmaUopRoute::DestinationGapCollapse;
-        let chunk = if request.route.padded_unit_bytes().is_some() {
+        let collapsed = matches!(
+            request.route,
+            C220DmaUopRoute::DestinationGapCollapse
+                | C220DmaUopRoute::MovPadDestinationGapCollapse { .. }
+        );
+        let chunk = if let C220DmaUopRoute::MovPadDestinationGapCollapse { burst_bytes } =
+            request.route
+        {
+            NonZeroU32::new(burst_bytes.wrapping_mul(32)).ok_or(C220BiuWriteError::EmptyBurst)?
+        } else if request.route.padded_unit_bytes().is_some()
+            || matches!(request.route, C220DmaUopRoute::MovPadBatch { .. })
+        {
             NonZeroU32::new(32).unwrap()
         } else if collapsed {
             NonZeroU32::new(generated.destination.burst_bytes)
@@ -237,8 +247,21 @@ impl WriteAligner {
             }
             return Ok(plan);
         }
-        let available = request.bytes.wrapping_add(state.buffered_bytes);
-        let input_chunk = request.route.padded_unit_bytes().unwrap_or(chunk.get());
+        let padding = match request.route {
+            C220DmaUopRoute::MovPad { padding_bytes } if request.last_in_burst => padding_bytes,
+            _ => 0,
+        };
+        let available = request
+            .bytes
+            .wrapping_add(state.buffered_bytes)
+            .wrapping_add(padding);
+        let input_chunk = if let C220DmaUopRoute::MovPadBatch { burst_bytes } = request.route {
+            NonZeroU32::new(burst_bytes)
+                .ok_or(C220BiuWriteError::EmptyBurst)?
+                .get()
+        } else {
+            request.route.padded_unit_bytes().unwrap_or(chunk.get())
+        };
         let full_packets = available / input_chunk;
         let remainder = available % input_chunk;
         let stride = if collapsed {

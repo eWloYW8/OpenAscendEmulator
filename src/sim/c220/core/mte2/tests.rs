@@ -80,6 +80,158 @@ fn configured_dma_core() -> C220Core {
 }
 
 #[test]
+fn mov_pad_input_counts_padding_traffic_and_retires_after_ub_ack() {
+    use crate::memory::sparse::MemoryByteState;
+    use crate::sim::c220::mte::interface::biu_read::write::C220BiuWriteBandwidths;
+    use crate::sim::c220::mte::mte2::C220Mte2Result;
+    use crate::sim::c220::mte::{C220MtePipelineEvent, dma::C220DmaEventOutcome};
+    use std::collections::VecDeque;
+
+    for (length, padding, gap, expected_written) in [
+        (17, 0, 0, 64),
+        (128, 0, 0, 256),
+        (513, 1, 1, 1088),
+        (64, 0, 1, 128),
+    ] {
+        let mut core = configured_dma_core();
+        let width = NonZeroU32::new(32).unwrap();
+        core.connect_mte2_biu(
+            C220BiuReadConfig {
+                outstanding: NonZeroU32::new(2).unwrap(),
+                weights: [1; 3],
+                group_vector_returns: true,
+                write_bandwidths: C220BiuWriteBandwidths {
+                    l1: width,
+                    l0a: width,
+                    l0b: width,
+                    ub: width,
+                },
+            },
+            C220BiuSubcore::Vector0,
+        )
+        .unwrap();
+        core.state.set_isa_instance_index(1);
+        let word =
+            (3 << 29) | (1 << 27) | (14 << 22) | (1 << 17) | (2 << 12) | (3 << 7) | (4 << 2) | 2;
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(1, 0).unwrap();
+        machine.set_xreg(2, 0x2000).unwrap();
+        machine
+            .set_xreg(
+                3,
+                9 | (2 << 4) | (length << 16) | (padding << 48) | (padding << 54),
+            )
+            .unwrap();
+        machine.set_xreg(4, gap << 32).unwrap();
+        machine.set_spr_value(70, 0x44332211).unwrap();
+        machine.set_spr_value(93, 5).unwrap();
+        machine.set_spr_value(94, 7).unwrap();
+        let captured =
+            crate::sim::c220::mte::mov_pad::C220MovPadCommand::capture(machine, 0, word, 1)
+                .unwrap();
+        core.step_word_at(0, word).unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(3, 0).unwrap();
+        machine.set_xreg(4, u64::MAX).unwrap();
+        machine.set_spr_value(70, 0).unwrap();
+        machine.set_spr_value(93, 0).unwrap();
+        let mut responses = VecDeque::new();
+        let mut traffic = 0;
+        let mut last_response = None;
+        let mut acknowledged = None;
+        let mut retired = None;
+        for tick in 1..500 {
+            core.advance_to(tick).unwrap();
+            for event in core.mte_pipeline().unwrap().last_events() {
+                match event {
+                    C220MtePipelineEvent::Dma(C220DmaEventOutcome::Generated(Some(request))) => {
+                        assert_eq!(request.ready_tick, tick + 3);
+                        assert_eq!(request.sid, Some(9));
+                    }
+                    C220MtePipelineEvent::UbRequest(_, request) => {
+                        traffic += request.fragment.bytes
+                    }
+                    C220MtePipelineEvent::UbResponse(_, request)
+                        if request.fragment.last_in_instruction =>
+                    {
+                        last_response = Some(tick)
+                    }
+                    C220MtePipelineEvent::UbWrite(
+                        _,
+                        crate::sim::c220::mte::interface::ub_write::C220UbWriteEvent::Acknowledged(
+                            Some(ack),
+                        ),
+                    ) if ack.retired_instruction().is_some() => acknowledged = Some(tick),
+                    _ => {}
+                }
+            }
+            if let Some(request) = core.take_mte2_biu_request() {
+                assert_eq!(request.input.generated.sid, Some(9));
+                assert!(request.input.generated.request.bytes <= 128);
+                responses.push_back(C220BiuReadBeat {
+                    tag: request.tag,
+                    transaction_id: 0,
+                });
+            }
+            if let Some(outcome) = core.mte2.last_outcomes().first() {
+                retired = Some(outcome.clone());
+                break;
+            }
+            assert_eq!(core.state.ub.tracked_bytes(), 0);
+            if core
+                .receive_mte2_biu_at(tick, [responses.front().copied(), None])
+                .unwrap()[0]
+            {
+                responses.pop_front();
+            }
+        }
+        let retired = retired.expect("MOV_PAD input retires");
+        assert!(retired.retire_tick > last_response.unwrap());
+        assert_eq!(retired.retire_tick, acknowledged.unwrap() + 1);
+        assert_eq!(traffic, expected_written);
+        let C220Mte2Result::MovPad(result) = retired.result else {
+            panic!("MOV_PAD result")
+        };
+        assert_eq!(result.bytes, captured.transfer.output_bytes() as usize * 2);
+        for segment in captured.transfer.segments() {
+            let bytes = core
+                .state
+                .ub
+                .read_known(segment.destination_address, segment.output_bytes as usize)
+                .unwrap();
+            let left = padding as usize * 4;
+            assert_eq!(
+                &bytes[left..left + length as usize],
+                vec![7; length as usize]
+            );
+            if padding != 0 {
+                assert_eq!(&bytes[..4], &[0x11, 0x22, 0x33, 0x44]);
+            }
+            if gap != 0 {
+                assert_eq!(
+                    core.state
+                        .ub
+                        .read_states(
+                            segment.destination_address + u64::from(segment.output_bytes),
+                            1
+                        )
+                        .unwrap(),
+                    [MemoryByteState::Unknown]
+                );
+            }
+        }
+        assert!(core.mte_pipeline().unwrap().is_idle());
+        assert!(!core.mte2_is_busy());
+        let tracked = core.state.ub.tracked_bytes();
+        core.step_word_at(retired.retire_tick + 1, word).unwrap();
+        core.advance_to(retired.retire_tick + 15).unwrap();
+        assert!(!core.mte2_is_busy());
+        assert!(core.mte_pipeline().unwrap().is_idle());
+        assert_eq!(core.state.ub.tracked_bytes(), tracked);
+    }
+}
+
+#[test]
 fn external_load2d_retires_only_after_its_selected_local_destination() {
     use crate::sim::c220::mte::interface::biu_read::write::{
         C220BiuWriteBandwidths, C220BiuWriteDestination,

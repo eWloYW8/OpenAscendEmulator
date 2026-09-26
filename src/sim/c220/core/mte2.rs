@@ -155,6 +155,13 @@ impl C220Core {
                     .map_err(crate::sim::c220::mte::load2d::C220Load2dTransferError::from)?,
                 mode: crate::sim::c220::mte::uop::C220DmaUopMode::from_mode_word(mode_word),
             }
+        } else if crate::isa::c220::mte::mov_pad::C220MovPadInstruction::decode(word).is_some() {
+            C220Mte2Command::MovPad(crate::sim::c220::mte::mov_pad::C220MovPadCommand::capture(
+                machine,
+                pc,
+                word,
+                self.state.isa_instance_index,
+            )?)
         } else if let Some(decoded) = C220Set2dInstruction::decode(word) {
             let pattern = machine
                 .spr_value(15)
@@ -255,6 +262,23 @@ impl C220Core {
     ) -> Result<bool, C220CoreError> {
         use crate::sim::c220::mte::mte2::C220Mte2Command;
         Ok(match command {
+            C220Mte2Command::MovPad(command) => {
+                if command.transfer.is_disabled() {
+                    true
+                } else {
+                    self.mte2.check_physical_generator_switch()?;
+                    let pipeline = self
+                        .mte_pipeline
+                        .as_ref()
+                        .ok_or(C220CoreError::MteUnconfigured)?;
+                    if !pipeline.mte2_dma_connected() {
+                        return Err(
+                            crate::sim::c220::mte::C220MtePipelineError::DmaDisconnected.into()
+                        );
+                    }
+                    pipeline.can_issue_mte2_dma()
+                }
+            }
             C220Mte2Command::Load2d { transfer, .. } => {
                 let pipeline = self
                     .mte_pipeline
@@ -324,6 +348,14 @@ impl C220Core {
     ) -> Result<crate::sim::c220::mte::mte2::C220Mte2Issue, C220CoreError> {
         use crate::sim::c220::mte::mte2::C220Mte2Command;
         Ok(match command {
+            C220Mte2Command::MovPad(command) => self.mte2.issue_mov_pad(
+                self.mte_pipeline
+                    .as_mut()
+                    .ok_or(C220CoreError::MteUnconfigured)?,
+                id,
+                pc,
+                command,
+            )?,
             C220Mte2Command::Load2d { transfer, mode } => self.mte2.issue_load2d(
                 self.mte_pipeline
                     .as_mut()

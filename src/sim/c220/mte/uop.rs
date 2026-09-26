@@ -49,6 +49,9 @@ impl C220DmaUopMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220DmaUopRoute {
     Ordinary,
+    MovPad { padding_bytes: u32 },
+    MovPadBatch { burst_bytes: u32 },
+    MovPadDestinationGapCollapse { burst_bytes: u32 },
     ContiguousBatch,
     DestinationGapCollapse,
     SourceGapGather,
@@ -502,10 +505,20 @@ pub fn mov_pad_uops(
             split_on_destination: !transfer.is_input(),
             split_enabled,
         },
-        if batch {
-            C220DmaUopRoute::ContiguousBatch
+        if transfer.is_input() && batch {
+            C220DmaUopRoute::MovPadBatch {
+                burst_bytes: length,
+            }
         } else if collapse {
-            C220DmaUopRoute::DestinationGapCollapse
+            C220DmaUopRoute::MovPadDestinationGapCollapse {
+                burst_bytes: length,
+            }
+        } else if transfer.is_input() {
+            C220DmaUopRoute::MovPad {
+                padding_bytes: transfer.padded_bytes() - length,
+            }
+        } else if batch {
+            C220DmaUopRoute::ContiguousBatch
         } else if gather {
             C220DmaUopRoute::SourceGapGather
         } else {

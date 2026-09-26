@@ -167,6 +167,8 @@ pub enum C220MtePipelineEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220MtePipelineError {
+    #[error("MTE2 MOV_PAD requires an external-to-UB transfer")]
+    WrongMovPadDirection,
     #[error(transparent)]
     Load2d(#[from] crate::isa::c220::mte::load2d::C220Load2dError),
     #[error("MTE cycle {active} must finish before advancing to {requested}")]
@@ -1143,6 +1145,31 @@ impl C220MtePipeline {
             source_address,
             destination_address,
             dma_mode_word,
+        )?;
+        self.issue_dma_requests(instruction_id, requests)
+    }
+
+    pub fn issue_mte2_mov_pad(
+        &mut self,
+        instruction_id: u64,
+        command: super::mov_pad::C220MovPadCommand,
+    ) -> Result<C220DmaIssue, C220MtePipelineError> {
+        if !command.transfer.is_input() {
+            return Err(C220MtePipelineError::WrongMovPadDirection);
+        }
+        if command.transfer.is_disabled() {
+            return Ok(C220DmaIssue {
+                tick: self.events.tick(),
+                instruction_id,
+                completion_ready: true,
+            });
+        }
+        if self.biu_read.is_some() && self.biu_subcore == C220BiuSubcore::Cube {
+            return Err(C220MtePipelineError::BiuUbSubcoreRequired);
+        }
+        let requests = super::uop::mov_pad_uops(
+            command.transfer,
+            super::uop::C220DmaUopMode::from_mode_word(command.biu_mode_word),
         )?;
         self.issue_dma_requests(instruction_id, requests)
     }
