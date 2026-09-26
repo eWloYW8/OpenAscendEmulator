@@ -13,6 +13,7 @@ pub enum C220Mte2Command {
     },
     MovOutToUb(C220Mte2TransferPlan),
     MovOutToL1(C220Mte2L1TransferPlan),
+    MovOutToSmask(crate::isa::c220::mte::smask::C220SmaskTransfer),
     Set2d(C220Set2dFill),
 }
 
@@ -31,6 +32,8 @@ pub enum C220Mte2IssueTiming {
     Dma(crate::sim::c220::mte::dma::C220DmaIssue),
     /// Completion is observed from the shared L1 write path.
     L1(C220Set2dIssue),
+    /// Completion is observed from the shared L1 read output path.
+    Read(crate::sim::c220::mte::read::C220MteReadIssue),
     /// Completion uses caller-supplied rates until a physical DMA path is available.
     AggregateDma(C220Mte2Ticket),
 }
@@ -66,6 +69,7 @@ pub enum C220Mte2Result {
     CrossCore(crate::sim::c220::sync::C220DeviceSync),
     MovOutToUb(UbTransferResult),
     MovOutToL1(C220L1DmaResult),
+    MovOutToSmask(crate::sim::c220::mte::smask::C220SmaskTransferResult),
     Set2d(C220Set2dResult),
 }
 

@@ -133,6 +133,11 @@ impl C220Core {
                     machine.xregs()[usize::from(instruction.source_register)],
                 ),
             }
+        } else if let Some(decoded) =
+            crate::isa::c220::mte::smask::C220MovSmaskInstruction::decode(word)
+                .filter(|instruction| instruction.source_mode == 0)
+        {
+            C220Mte2Command::MovOutToSmask(decoded.capture(machine.xregs()))
         } else if let Some(decoded) = C220Set2dInstruction::decode(word) {
             let pattern = machine
                 .spr_value(15)
@@ -233,6 +238,12 @@ impl C220Core {
     ) -> Result<bool, C220CoreError> {
         use crate::sim::c220::mte::mte2::C220Mte2Command;
         Ok(match command {
+            C220Mte2Command::MovOutToSmask(transfer) => self.mte2.can_issue_smask(
+                self.mte_pipeline
+                    .as_ref()
+                    .ok_or(C220CoreError::MteUnconfigured)?,
+                transfer,
+            )?,
             C220Mte2Command::WriteSpr(_) => self
                 .mte_pipeline
                 .as_ref()
@@ -259,9 +270,7 @@ impl C220Core {
                             pipeline.can_issue_mte2_dma()
                         }
                         pipeline => {
-                            pipeline
-                                .as_ref()
-                                .is_none_or(|p| p.l1_fill_generator().is_idle())
+                            pipeline.as_ref().is_none_or(|p| p.mte2_generator_idle())
                                 && tick >= self.mte2.next_mte2_issue_tick()
                         }
                     }
@@ -285,6 +294,14 @@ impl C220Core {
     ) -> Result<crate::sim::c220::mte::mte2::C220Mte2Issue, C220CoreError> {
         use crate::sim::c220::mte::mte2::C220Mte2Command;
         Ok(match command {
+            C220Mte2Command::MovOutToSmask(transfer) => self.mte2.issue_smask(
+                self.mte_pipeline
+                    .as_mut()
+                    .ok_or(C220CoreError::MteUnconfigured)?,
+                id,
+                pc,
+                transfer,
+            )?,
             C220Mte2Command::WriteSpr(step) => self.mte2.issue_spr(
                 self.mte_pipeline
                     .as_ref()

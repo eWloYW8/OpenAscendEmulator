@@ -441,7 +441,9 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
                     }
                 };
                 let (binding, frontend, index) = match kind {
-                    C220MteReadKind::Load3dv2 | C220MteReadKind::Smask => {
+                    C220MteReadKind::Default
+                    | C220MteReadKind::Load3dv2
+                    | C220MteReadKind::Smask => {
                         unreachable!("not registered in this test")
                     }
                     C220MteReadKind::Load2d => (&load_events, &mut load, 0),

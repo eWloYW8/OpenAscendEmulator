@@ -285,6 +285,7 @@ pub enum C220MtePipelineError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mte2Generator {
+    Default,
     Load3d,
     Dma,
     L1Fill,
@@ -294,6 +295,7 @@ mod cache;
 mod external_fixp;
 mod memory;
 mod read;
+mod smask;
 mod sync;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,7 +324,7 @@ pub struct C220MtePipeline {
     interface_events: C220MteL1Events,
     write_events: C220MteL1WriteEvents,
     l0_events: [C220L0WriteEvents; 2],
-    generator_events: [C220MteReadEvents; 4],
+    generator_events: [C220MteReadEvents; 5],
     set2d_events: C220Set2dEvents,
     set2d_l1_events: C220Set2dEvents,
     dma_events: C220DmaEvents,
@@ -336,7 +338,7 @@ pub struct C220MtePipeline {
     interface: C220MteL1Interface<C220MteReadPayload>,
     write_interface: C220MteL1WriteInterface,
     l0: [C220L0WritePipeline; 2],
-    generators: [C220MteReadFrontend; 4],
+    generators: [C220MteReadFrontend; 5],
     set2d: C220Set2dFrontend,
     set2d_l1: C220Set2dFrontend,
     dma: C220DmaFrontend,
@@ -366,6 +368,7 @@ pub struct C220MtePipeline {
     selected_generator: Option<C220Mte1Generator>,
     completions: Vec<u64>,
     l1_fill_completions: Vec<u64>,
+    mte2_read_completions: Vec<u64>,
     dma_completions: Vec<u64>,
     trace: Vec<C220MtePipelineEvent>,
     last_advance: Option<u64>,
@@ -614,6 +617,7 @@ impl C220MtePipeline {
             l1_prefetch_blocked: false,
             completions: Vec::new(),
             l1_fill_completions: Vec::new(),
+            mte2_read_completions: Vec::new(),
             dma_completions: Vec::new(),
             trace: Vec::new(),
             last_advance: None,
@@ -652,6 +656,7 @@ impl C220MtePipeline {
             return self.selected_generator_idle();
         }
         if matches!(command, C220Mte1Command::Set2d(fill) if fill.instruction.destination == C220Set2dDestination::L1)
+            || matches!(command, C220Mte1Command::Read(super::read::C220MteReadTransfer::Smask(transfer)) if transfer.instruction.source_mode != 2)
         {
             return false;
         }
@@ -1055,6 +1060,7 @@ impl C220MtePipeline {
     pub(crate) fn mte2_generator_idle(&self) -> bool {
         self.selected_mte2_generator
             .is_none_or(|generator| match generator {
+                Mte2Generator::Default => self.generator(C220MteReadKind::Default).is_idle(),
                 Mte2Generator::Dma => self.dma.is_idle(),
                 Mte2Generator::L1Fill => self.set2d_l1.is_idle(),
                 Mte2Generator::Load3d => true,
@@ -1190,6 +1196,9 @@ impl C220MtePipeline {
     pub fn mte1_completions(&self) -> &[u64] {
         &self.completions
     }
+    pub fn mte2_read_completions(&self) -> &[u64] {
+        &self.mte2_read_completions
+    }
     pub fn last_events(&self) -> &[C220MtePipelineEvent] {
         &self.trace
     }
@@ -1200,6 +1209,7 @@ impl C220MtePipeline {
         command: C220Mte1Command,
     ) -> Result<C220Mte1Issue, C220MtePipelineError> {
         if matches!(command, C220Mte1Command::Set2d(fill) if fill.instruction.destination == C220Set2dDestination::L1)
+            || matches!(command, C220Mte1Command::Read(super::read::C220MteReadTransfer::Smask(transfer)) if transfer.instruction.source_mode != 2)
         {
             return Err(C220MtePipelineError::WrongCommandLane);
         }
@@ -1326,6 +1336,7 @@ impl C220MtePipeline {
             self.completions.clear();
             self.fixp_completions.clear();
             self.l1_fill_completions.clear();
+            self.mte2_read_completions.clear();
             self.dma_completions.clear();
             self.trace.clear();
             if let Some((engine, _, _)) = fixp.as_mut() {
@@ -1817,6 +1828,12 @@ impl C220MtePipeline {
                             if output.fragment.last_in_instruction =>
                         {
                             match output.payload.operation.payload {
+                                C220MteReadPayload::Read(C220MteReadUop::Smask(uop))
+                                    if uop.source_mode == 0 =>
+                                {
+                                    self.mte2_read_completions
+                                        .push(output.fragment.instruction_id)
+                                }
                                 C220MteReadPayload::Read(_) => {
                                     self.completions.push(output.fragment.instruction_id)
                                 }

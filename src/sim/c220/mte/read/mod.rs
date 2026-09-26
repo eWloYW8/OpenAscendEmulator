@@ -25,6 +25,7 @@ pub use events::{C220MteReadEventOutcome, C220MteReadEvents};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220MteReadKind {
+    Default,
     Load3dv2,
     Load2d,
     Bt,
@@ -32,11 +33,17 @@ pub enum C220MteReadKind {
 }
 
 impl C220MteReadKind {
-    pub(in crate::sim::c220::mte) const ALL: [Self; 4] =
-        [Self::Load3dv2, Self::Load2d, Self::Bt, Self::Smask];
+    pub(in crate::sim::c220::mte) const ALL: [Self; 5] = [
+        Self::Default,
+        Self::Load3dv2,
+        Self::Load2d,
+        Self::Bt,
+        Self::Smask,
+    ];
 
     const fn generated_ticks(self) -> u64 {
         match self {
+            Self::Default => 6,
             Self::Load3dv2 => 19,
             _ => GENERATED_TICKS,
         }
@@ -44,6 +51,7 @@ impl C220MteReadKind {
 
     const fn generated_capacity(self) -> usize {
         match self {
+            Self::Default => 7,
             Self::Load3dv2 => 20,
             _ => GENERATED_CAPACITY,
         }
@@ -51,10 +59,11 @@ impl C220MteReadKind {
 
     pub(in crate::sim::c220::mte) const fn index(self) -> usize {
         match self {
-            Self::Load3dv2 => 0,
-            Self::Load2d => 1,
-            Self::Bt => 2,
-            Self::Smask => 3,
+            Self::Default => 0,
+            Self::Load3dv2 => 1,
+            Self::Load2d => 2,
+            Self::Bt => 3,
+            Self::Smask => 4,
         }
     }
 }
@@ -96,6 +105,9 @@ impl C220MteReadTransfer {
                 C220MteReadKind::Load2d
             }
             Self::Bt(_) => C220MteReadKind::Bt,
+            Self::Smask(transfer) if transfer.instruction.source_mode == 0 => {
+                C220MteReadKind::Default
+            }
             Self::Smask(_) => C220MteReadKind::Smask,
         }
     }
@@ -395,7 +407,7 @@ impl C220MteReadFrontend {
         }
         let plan = match transfer {
             C220MteReadTransfer::Smask(transfer) => Plan::Smask(
-                C220SmaskRequestPlan::new(transfer, self.access_width).map_err(|_| {
+                C220SmaskRequestPlan::for_source(transfer, self.access_width).map_err(|_| {
                     C220MteReadFrontendError::SmaskSource(transfer.instruction.source_mode)
                 })?,
             ),
@@ -551,9 +563,9 @@ impl C220MteReadFrontend {
             .generation
             .as_ref()
             .is_some_and(|g| g.ready_tick <= tick)
-            && self.generated.len() - usize::from(dispatch) < GENERATED_CAPACITY;
+            && self.generated.len() - usize::from(dispatch) < self.kind.generated_capacity();
         if generate {
-            tick.checked_add(GENERATED_TICKS)
+            tick.checked_add(self.kind.generated_ticks())
                 .ok_or(C220MteReadFrontendError::TimeOverflow)?;
         }
         let queued = self.send(tick, hardware_sync_blocked, interface)?.queued;

@@ -13,7 +13,7 @@ pub enum C220MteReadEventOutcome {
     Sent(C220MteReadSend),
 }
 
-/// One binding per LOAD2D or BT generator; both may feed the same L1 interface.
+/// One binding per read generator, all feeding the shared L1 interface.
 /// Registration order determines producer callback order on the shared clock.
 /// Do not mix direct frontend callbacks with this binding for the same engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

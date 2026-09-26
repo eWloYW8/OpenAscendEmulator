@@ -10,6 +10,7 @@ use crate::sim::c220::mte::interface::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220SmaskReadUop {
+    pub source_mode: u8,
     pub source_address: u64,
     pub input_offset: u32,
     pub input_bytes: u32,
@@ -52,6 +53,32 @@ pub struct C220SmaskRequestPlan {
 }
 
 impl C220SmaskRequestPlan {
+    pub(in crate::sim::c220::mte) fn for_source(
+        transfer: C220SmaskTransfer,
+        access_width: NonZeroU32,
+    ) -> Result<Self, C220SmaskTransferError> {
+        if transfer.instruction.source_mode == 0 {
+            Self::new_external(transfer, access_width)
+        } else {
+            Self::new(transfer, access_width)
+        }
+    }
+
+    pub fn new_external(
+        transfer: C220SmaskTransfer,
+        access_width: NonZeroU32,
+    ) -> Result<Self, C220SmaskTransferError> {
+        if transfer.instruction.source_mode != 0 {
+            return Err(C220SmaskTransferError::NotExternal(
+                transfer.instruction.source_mode,
+            ));
+        }
+        Ok(Self {
+            transfer,
+            offset: 0,
+            access_width,
+        })
+    }
     pub fn new(
         transfer: C220SmaskTransfer,
         access_width: NonZeroU32,
@@ -79,6 +106,7 @@ impl Iterator for C220SmaskRequestPlan {
         }
         let bytes = (total - self.offset).min(self.access_width.get());
         let request = C220SmaskReadUop {
+            source_mode: self.transfer.instruction.source_mode,
             source_address: self
                 .transfer
                 .source_base

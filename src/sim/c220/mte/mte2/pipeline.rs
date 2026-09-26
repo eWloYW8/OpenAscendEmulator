@@ -8,6 +8,7 @@ use super::{
     C220Mte2TransferPlan, copy_c220_mov_out_to_ub,
 };
 use crate::isa::c220::mte::set2d::C220Set2dFill;
+use crate::isa::c220::mte::smask::C220SmaskTransfer;
 use crate::memory::mapped::MappedMemory;
 use crate::memory::ub::UbMemory;
 use crate::sim::c220::memory::{C220LocalBufferError, C220LocalMemory};
@@ -23,9 +24,7 @@ pub enum C220Mte2RuntimeError {
     InvalidDmaCompletion { instruction_id: u64 },
     #[error("MTE2 command generator is busy")]
     Busy,
-    #[error(
-        "switching from an outstanding aggregate DMA to L1 fill requires a physical DMA generator model"
-    )]
+    #[error("switching from an outstanding aggregate DMA requires a physical DMA generator model")]
     UnmodeledDmaGeneratorSwitch,
     #[error("MTE2 time reversed from {previous} to {requested}")]
     TimeReversed { previous: u64, requested: u64 },
@@ -41,6 +40,8 @@ pub enum C220Mte2RuntimeError {
     LocalMemory(#[from] C220LocalBufferError),
     #[error(transparent)]
     L1Transfer(#[from] C220L1DmaError),
+    #[error(transparent)]
+    Smask(#[from] crate::sim::c220::mte::smask::C220SmaskTransferError),
 }
 
 /// MTE2 command ownership and ordered functional retirement. The physical L1
@@ -97,18 +98,69 @@ impl C220Mte2Pipeline {
         })
     }
 
+    pub(crate) fn can_issue_smask(
+        &self,
+        pipeline: &C220MtePipeline,
+        transfer: C220SmaskTransfer,
+    ) -> Result<bool, C220Mte2RuntimeError> {
+        if !transfer.descriptor.is_empty() {
+            self.check_physical_generator_switch()?;
+        }
+        Ok(pipeline.can_issue_external_smask(transfer))
+    }
+
+    pub(crate) fn issue_smask(
+        &mut self,
+        pipeline: &mut C220MtePipeline,
+        instruction_id: u64,
+        pc: u64,
+        transfer: C220SmaskTransfer,
+    ) -> Result<C220Mte2Issue, C220Mte2RuntimeError> {
+        if !self.can_issue_smask(pipeline, transfer)? {
+            return Err(C220Mte2RuntimeError::Busy);
+        }
+        self.now
+            .checked_add(1)
+            .ok_or(C220Mte2RuntimeError::TimeOverflow)?;
+        let timing = pipeline.issue_external_smask(instruction_id, transfer)?;
+        let command = C220Mte2Command::MovOutToSmask(transfer);
+        self.pending.push_back(C220Mte2CommandState {
+            instruction_id,
+            pc,
+            issue_tick: timing.tick,
+            command,
+            completion: if timing.completion_ready {
+                C220Mte2Completion::Observed { tick: timing.tick }
+            } else {
+                C220Mte2Completion::AwaitingDestination
+            },
+        });
+        Ok(C220Mte2Issue {
+            instruction_id,
+            pc,
+            command,
+            timing: C220Mte2IssueTiming::Read(timing),
+        })
+    }
+
+    fn check_physical_generator_switch(&self) -> Result<(), C220Mte2RuntimeError> {
+        if self
+            .pending
+            .iter()
+            .any(|p| matches!(p.completion, C220Mte2Completion::Estimated { .. }))
+        {
+            return Err(C220Mte2RuntimeError::UnmodeledDmaGeneratorSwitch);
+        }
+        Ok(())
+    }
+
     pub(crate) fn can_issue_l1_fill(
         &self,
         pipeline: &C220MtePipeline,
         fill: C220Set2dFill,
     ) -> Result<bool, C220Mte2RuntimeError> {
-        if !fill.descriptor.is_disabled()
-            && self.pending.iter().any(|p| {
-                matches!(p.command, C220Mte2Command::MovOutToUb(_))
-                    && matches!(p.completion, C220Mte2Completion::Estimated { .. })
-            })
-        {
-            return Err(C220Mte2RuntimeError::UnmodeledDmaGeneratorSwitch);
+        if !fill.descriptor.is_disabled() {
+            self.check_physical_generator_switch()?;
         }
         Ok(pipeline.can_issue_l1_fill(fill))
     }
@@ -392,6 +444,11 @@ impl C220Mte2Pipeline {
             }
         {
             let result = match command.command {
+                C220Mte2Command::MovOutToSmask(transfer) => C220Mte2Result::MovOutToSmask(
+                    crate::sim::c220::mte::smask::execute_c220_mov_out_to_smask(
+                        local, source, transfer,
+                    )?,
+                ),
                 C220Mte2Command::WriteSpr(step) => C220Mte2Result::WriteSpr(step),
                 C220Mte2Command::CrossCore { payload, .. } => C220Mte2Result::CrossCore(payload),
                 C220Mte2Command::MovOutToL1(plan) => {
@@ -444,4 +501,6 @@ impl C220Mte2Pipeline {
 pub(crate) fn is_mte2_transfer(word: u32) -> bool {
     crate::isa::c220::mte::C220MovOutToUbDescriptor::is_word(word)
         || crate::isa::c220::mte::out_to_l1::C220MovOutToL1Instruction::decode(word).is_some()
+        || crate::isa::c220::mte::smask::C220MovSmaskInstruction::decode(word)
+            .is_some_and(|instruction| instruction.source_mode == 0)
 }

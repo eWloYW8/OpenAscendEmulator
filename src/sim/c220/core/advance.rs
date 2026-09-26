@@ -161,6 +161,8 @@ impl C220Core {
                     .observe_completions(event_tick, pipeline.mte1_completions());
                 self.mte2
                     .observe_l1_completions(event_tick, pipeline.l1_fill_completions());
+                self.mte2
+                    .observe_l1_completions(event_tick, pipeline.mte2_read_completions());
                 for id in pipeline.take_dma_tails() {
                     self.mte2.observe_dma_tail(id);
                 }

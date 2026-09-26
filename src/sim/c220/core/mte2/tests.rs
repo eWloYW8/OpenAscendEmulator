@@ -80,6 +80,102 @@ fn configured_dma_core() -> C220Core {
 }
 
 #[test]
+fn external_smask_uses_default_generation_and_ordered_local_retirement() {
+    use crate::sim::c220::mte::C220MtePipelineEvent;
+    use crate::sim::c220::mte::interface::C220MteL1EventOutcome;
+    use crate::sim::c220::mte::mte2::C220Mte2Result;
+    use crate::sim::c220::mte::read::{C220MteReadEventOutcome, C220MteReadKind};
+
+    let mut core = configured_dma_core();
+    core.advance_to(300).unwrap();
+    let machine = core.state.scalar_mut().machine_mut();
+    machine.set_xreg(10, 511).unwrap();
+    machine.set_xreg(11, 0x2000).unwrap();
+    machine.set_xreg(12, 65).unwrap();
+    let word = (3 << 29) | (17 << 22) | (10 << 17) | (11 << 12) | (12 << 2);
+    assert!(matches!(
+        core.step_word_at(301, word).unwrap(),
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Mte2Queued(_),
+            ..
+        }
+    ));
+    for register in 10..=12 {
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(register, 0)
+            .unwrap();
+    }
+    let input: Vec<u8> = (0..130).collect();
+    core.memory.write_known_at(0x2000, &input).unwrap();
+    let mut generated = 0;
+    let mut tail = None;
+    let mut completion = None;
+    let mut retired = None;
+    for tick in 302..400 {
+        core.advance_to(tick).unwrap();
+        let pipeline = core.mte_pipeline().unwrap();
+        assert!(pipeline.mte1_completions().is_empty());
+        assert!(pipeline.dma_output().is_none());
+        for event in pipeline.last_events() {
+            match event {
+                C220MtePipelineEvent::Generator(
+                    C220MteReadKind::Default,
+                    C220MteReadEventOutcome::Generated(Some(request)),
+                ) => {
+                    assert_eq!(request.ready_tick, tick + 6);
+                    generated += 1;
+                }
+                C220MtePipelineEvent::Interface(C220MteL1EventOutcome::Output(output))
+                    if output
+                        .sent
+                        .is_some_and(|sent| sent.fragment.last_in_instruction) =>
+                {
+                    tail = Some(tick);
+                }
+                _ => {}
+            }
+        }
+        if !pipeline.mte2_read_completions().is_empty() {
+            completion = Some(tick);
+        }
+        if let Some(outcome) = core.mte2.last_outcomes().first() {
+            retired = Some(outcome.clone());
+            break;
+        }
+        assert_eq!(core.local_memory.smask().read_byte(512), 0);
+    }
+    let retired = retired.expect("external SMASK retired");
+    assert_eq!(generated, 5);
+    assert_eq!(completion.unwrap(), tail.unwrap() + 5);
+    assert_eq!(retired.retire_tick, completion.unwrap() + 1);
+    let C220Mte2Result::MovOutToSmask(result) = retired.result else {
+        panic!("SMASK result")
+    };
+    assert_eq!(result.bytes, 130);
+    let mut first = [0; 2];
+    core.local_memory
+        .smask()
+        .read_into(511, &mut first)
+        .unwrap();
+    assert_eq!(first, input[..2]);
+    let mut rest = [0; 128];
+    core.local_memory.smask().read_into(1, &mut rest).unwrap();
+    assert_eq!(rest, input[2..]);
+    assert!(!core.mte2_is_busy());
+    assert!(core.mte_pipeline().unwrap().is_idle());
+
+    let tick = retired.retire_tick + 1;
+    core.step_word_at(tick, word).unwrap();
+    core.advance_to(tick + 10).unwrap();
+    assert!(!core.mte2_is_busy());
+    assert!(core.mte_pipeline().unwrap().is_idle());
+    core.local_memory.smask().read_into(1, &mut rest).unwrap();
+    assert_eq!(rest, input[2..]);
+}
+
+#[test]
 fn shared_spr_write_requires_both_queues_and_retires_on_both_pipes() {
     use crate::sim::c220::core::{C220Mte1Operation, C220Mte2Operation};
     use crate::sim::c220::mte::mte2::{C220Mte2Command, C220Mte2Result};
