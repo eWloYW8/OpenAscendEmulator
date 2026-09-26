@@ -31,17 +31,43 @@ impl BurstLayout {
         source: u64,
         destination: u64,
     ) -> Option<impl ExactSizeIterator<Item = BurstSegment> + Clone> {
+        self.segments_with_strides(
+            source,
+            destination,
+            C220_MOV_UB_TO_OUT_UNIT_BYTES as u32,
+            (u32::from(self.length) + u32::from(self.source_gap)) * 32,
+            (u64::from(self.length) + u64::from(self.destination_gap)) * 32,
+        )
+    }
+
+    pub(super) fn segments_with_strides(
+        self,
+        source: u64,
+        destination: u64,
+        unit_bytes: u32,
+        source_stride: u32,
+        destination_stride: u64,
+    ) -> Option<impl ExactSizeIterator<Item = BurstSegment> + Clone> {
         let units = usize::from(self.count) * usize::from(self.length);
+        let source_at = move |burst: u16, unit: u16| {
+            let offset = u64::from(u32::from(burst).wrapping_mul(source_stride))
+                + u64::from(unit) * u64::from(unit_bytes);
+            let address = source.checked_add(offset)?;
+            address.checked_add(u64::from(unit_bytes))?;
+            Some(address)
+        };
+        let destination_at = move |burst: u16, unit: u16| {
+            let offset =
+                u64::from(burst) * destination_stride + u64::from(unit) * u64::from(unit_bytes);
+            let address = destination.checked_add(offset)?;
+            address.checked_add(u64::from(unit_bytes))?;
+            Some(address)
+        };
         if units != 0 {
             for burst in 0..self.count {
-                self.source_address(source, burst, self.length - 1)?;
+                source_at(burst, self.length - 1)?;
             }
-            self.address(
-                destination,
-                self.count - 1,
-                self.length - 1,
-                self.destination_gap,
-            )?;
+            destination_at(self.count - 1, self.length - 1)?;
         }
         Some((0..units).map(move |index| {
             let burst_index = (index / usize::from(self.length)) as u16;
@@ -49,31 +75,10 @@ impl BurstLayout {
             BurstSegment {
                 burst_index,
                 unit_index,
-                source: self
-                    .source_address(source, burst_index, unit_index)
-                    .expect("validated extent"),
-                destination: self
-                    .address(destination, burst_index, unit_index, self.destination_gap)
-                    .expect("validated extent"),
-                bytes: C220_MOV_UB_TO_OUT_UNIT_BYTES as u32,
+                source: source_at(burst_index, unit_index).expect("validated extent"),
+                destination: destination_at(burst_index, unit_index).expect("validated extent"),
+                bytes: unit_bytes,
             }
         }))
-    }
-
-    fn address(self, base: u64, burst: u16, unit: u16, gap: u16) -> Option<u64> {
-        let offset = (u64::from(burst) * (u64::from(self.length) + u64::from(gap))
-            + u64::from(unit))
-            * C220_MOV_UB_TO_OUT_UNIT_BYTES;
-        let address = base.checked_add(offset)?;
-        address.checked_add(C220_MOV_UB_TO_OUT_UNIT_BYTES)?;
-        Some(address)
-    }
-
-    fn source_address(self, base: u64, burst: u16, unit: u16) -> Option<u64> {
-        let stride = (u32::from(self.length) + u32::from(self.source_gap)) * 32;
-        let offset = u64::from(u32::from(burst).wrapping_mul(stride)) + u64::from(unit) * 32;
-        let address = base.checked_add(offset)?;
-        address.checked_add(C220_MOV_UB_TO_OUT_UNIT_BYTES)?;
-        Some(address)
     }
 }

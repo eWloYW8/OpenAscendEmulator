@@ -364,7 +364,7 @@ pub fn mte3_requests(
 
 pub fn mte3_uops(transfer: C220Mte3TransferPlan) -> Result<C220DmaUops, C220DmaUopError> {
     let mut requests = mte3_request_stream(transfer)?;
-    requests.sid = (transfer.descriptor.xm & 0xf) as u8;
+    requests.sid = transfer.descriptor.sid();
     Ok(requests)
 }
 
@@ -374,13 +374,13 @@ fn mte3_request_stream(transfer: C220Mte3TransferPlan) -> Result<C220DmaUops, C2
     if descriptor != transfer.descriptor {
         return Err(C220DmaMovError::InconsistentDescriptor.into());
     }
-    let expected_bytes =
-        usize::from(descriptor.burst_count) * usize::from(descriptor.burst_length) * 32;
-    if transfer.bytes != expected_bytes {
+    if transfer.bytes != descriptor.byte_count() {
         return Err(C220DmaUopError::PlanSizeMismatch);
     }
     let _ = descriptor.segment_iter(transfer.source_address, transfer.destination_address)?;
-    let batch = descriptor.source_gap == 0 && descriptor.destination_gap == 0;
+    let batch = descriptor.source_gap == 0
+        && descriptor.destination_gap == 0
+        && (!descriptor.byte_mode() || descriptor.burst_bytes().is_multiple_of(32));
     let gather = !batch
         && transfer.source_address.is_multiple_of(32)
         && transfer.destination_address.is_multiple_of(64)
@@ -397,13 +397,10 @@ fn mte3_request_stream(transfer: C220Mte3TransferPlan) -> Result<C220DmaUops, C2
             burst_bytes: if flatten {
                 u64::from(transfer.bytes as u32)
             } else {
-                u64::from(descriptor.burst_length) * 32
+                u64::from(descriptor.burst_bytes())
             },
-            source_stride: (u64::from(descriptor.burst_length) + u64::from(descriptor.source_gap))
-                * 32,
-            destination_stride: (u64::from(descriptor.burst_length)
-                + u64::from(descriptor.destination_gap))
-                * 32,
+            source_stride: u64::from(descriptor.source_stride_bytes()),
+            destination_stride: descriptor.destination_stride_bytes(),
             split_on_destination: true,
             split_enabled: true,
         },

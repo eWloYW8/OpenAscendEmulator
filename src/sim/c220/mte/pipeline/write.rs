@@ -454,7 +454,7 @@ impl C220MtePipeline {
             };
             let gather_stride = if generated.request.route == C220DmaUopRoute::SourceGapGather {
                 let descriptor = transfer.descriptor;
-                Some((u32::from(descriptor.burst_length) + u32::from(descriptor.source_gap)) * 32)
+                Some(descriptor.source_stride_bytes())
             } else {
                 None
             };

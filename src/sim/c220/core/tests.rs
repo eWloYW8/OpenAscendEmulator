@@ -950,11 +950,13 @@ fn run_core_device_loads(core: &mut C220Core, mut tick: u64) {
 #[test]
 fn native_mte3_waits_for_responses_and_reads_ub_at_retirement() {
     for mode in 0..4 {
-        native_mte3_write_path(mode);
+        for byte_mode in [false, true] {
+            native_mte3_write_path(mode, byte_mode);
+        }
     }
 }
 
-fn native_mte3_write_path(mode: u8) {
+fn native_mte3_write_path(mode: u8, byte_mode: bool) {
     let bus = mode != 0;
     use crate::isa::c220::mte::C220MovInstruction;
     use crate::sim::c220::memory::biu_write::C220BiuWriteReturnKind::{Completion, Dbid};
@@ -963,7 +965,7 @@ fn native_mte3_write_path(mode: u8) {
     use crate::sim::c220::mte::set2d::C220Set2dBandwidths;
     use std::num::NonZeroU32;
 
-    let word = CAPTURED_C220_MOV_UB_TO_OUT_WORD;
+    let word = CAPTURED_C220_MOV_UB_TO_OUT_WORD | u32::from(byte_mode);
     let operands = C220MovInstruction::decode(word).unwrap();
     let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
     machine.set_xreg(operands.source_register, 0).unwrap();
@@ -971,7 +973,10 @@ fn native_mte3_write_path(mode: u8) {
         .set_xreg(operands.destination_register, 0x2000)
         .unwrap();
     machine
-        .set_xreg(operands.descriptor_register, (4 << 16) | (1 << 4))
+        .set_xreg(
+            operands.descriptor_register,
+            ((if byte_mode { 128 } else { 4 }) << 16) | (1 << 4) | 15,
+        )
         .unwrap();
     let one = NonZeroU64::new(1).unwrap();
     let mut core = C220Core::new(

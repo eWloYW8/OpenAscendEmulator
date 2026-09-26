@@ -56,7 +56,7 @@ impl C220MovInstruction {
         }
         let direction = match (((word >> 23) & 0xf), word & 0x7f) {
             (2, 0x08) => C220MovDirection::HbmToUb,
-            (1, 0x10) => C220MovDirection::UbToHbm,
+            (1, 0x10 | 0x11) => C220MovDirection::UbToHbm,
             _ => return None,
         };
         Some(Self {
@@ -206,8 +206,6 @@ impl C220MovOutToUbDescriptor {
 pub enum C220DmaMovError {
     #[error("unsupported C220 MOV_UB_TO_OUT word {word:#010x}")]
     UnsupportedWord { word: u32 },
-    #[error("unsupported C220 MOV_UB_TO_OUT low mode bits {mode:#x}")]
-    UnsupportedMode { mode: u8 },
     #[error("cannot allocate C220 MOV_UB_TO_OUT segment records")]
     AllocationFailed,
     #[error("C220 MOV_UB_TO_OUT descriptor fields disagree with XM")]
@@ -217,6 +215,34 @@ pub enum C220DmaMovError {
 }
 
 impl C220DmaMovDescriptor {
+    pub const fn sid(self) -> u8 {
+        (self.xm & 0xf) as u8
+    }
+
+    pub const fn byte_mode(self) -> bool {
+        self.instruction_word & 1 != 0
+    }
+
+    pub const fn unit_bytes(self) -> u32 {
+        if self.byte_mode() { 1 } else { 32 }
+    }
+
+    pub const fn burst_bytes(self) -> u32 {
+        self.burst_length as u32 * self.unit_bytes()
+    }
+
+    pub const fn byte_count(self) -> usize {
+        self.burst_count as usize * self.burst_bytes() as usize
+    }
+
+    pub const fn source_stride_bytes(self) -> u32 {
+        self.burst_bytes().div_ceil(32) * 32 + self.source_gap as u32 * 32
+    }
+
+    pub const fn destination_stride_bytes(self) -> u64 {
+        self.burst_bytes() as u64 + self.destination_gap as u64 * 32
+    }
+
     pub const fn is_word(word: u32) -> bool {
         matches!(
             C220MovInstruction::decode(word),
@@ -232,10 +258,6 @@ impl C220DmaMovDescriptor {
             return Err(C220DmaMovError::UnsupportedWord {
                 word: instruction_word,
             });
-        }
-        let mode = (xm & 0xf) as u8;
-        if mode != 0 {
-            return Err(C220DmaMovError::UnsupportedMode { mode });
         }
         let layout = BurstLayout::decode(xm);
         Ok(Self {
@@ -286,7 +308,13 @@ impl C220DmaMovDescriptor {
             destination_gap: self.destination_gap,
         };
         Ok(layout
-            .segments(source_local, destination_hbm)
+            .segments_with_strides(
+                source_local,
+                destination_hbm,
+                self.unit_bytes(),
+                self.source_stride_bytes(),
+                self.destination_stride_bytes(),
+            )
             .ok_or(C220DmaMovError::AddressOverflow)?
             .map(|segment| C220DmaMovSegment {
                 burst_index: segment.burst_index,
@@ -337,13 +365,17 @@ mod tests {
     fn descriptor_modes_empty_commands_and_full_size_range() {
         let word = CAPTURED_C220_MOV_UB_TO_OUT_WORD;
         assert!(matches!(
-            C220DmaMovDescriptor::decode(word ^ 1, 0x40010),
+            C220DmaMovDescriptor::decode(word ^ 8, 0x40010),
             Err(C220DmaMovError::UnsupportedWord { .. })
         ));
-        assert!(matches!(
-            C220DmaMovDescriptor::decode(word, 0x40011),
-            Err(C220DmaMovError::UnsupportedMode { .. })
-        ));
+        for sid in 0..16 {
+            assert_eq!(
+                C220DmaMovDescriptor::decode(word, 0x40010 | sid)
+                    .unwrap()
+                    .sid(),
+                sid as u8
+            );
+        }
         for xm in [0, 0x10, 0x10000] {
             let disabled = C220DmaMovDescriptor::decode(word, xm).unwrap();
             assert!(disabled.is_disabled());
@@ -506,7 +538,7 @@ mod tests {
                 ..descriptor
             }
             .segments(0, 0),
-            Err(C220DmaMovError::UnsupportedMode { mode: 1 })
+            descriptor.segments(0, 0)
         );
     }
 }
