@@ -43,6 +43,8 @@ pub use fixp_frontend::C220FixpFrontendConfig;
 mod cross_core;
 mod hflag;
 mod mte1;
+mod mte1_frontend;
+pub use mte1_frontend::C220Mte1QueuedCommand;
 mod mte2;
 mod mte3;
 
@@ -122,6 +124,7 @@ pub struct C220Core {
     scalar_timing: C220ScalarTimingLane,
     lsu: Option<lsu::CoreLsu>,
     mte1: Mte1Engine,
+    mte1_frontend: mte1_frontend::Mte1Frontend,
     mte_pipeline: Option<C220MtePipeline>,
     fixp: Option<fixp::CoreFixp>,
     external_fixp: Option<external_fixp::CoreExternalFixp>,
@@ -170,6 +173,7 @@ impl C220Core {
             scalar_timing: C220ScalarTimingLane::default(),
             lsu: None,
             mte1: Mte1Engine::default(),
+            mte1_frontend: mte1_frontend::Mte1Frontend::default(),
             mte_pipeline: None,
             fixp: None,
             external_fixp: None,
@@ -445,8 +449,7 @@ impl C220Core {
                 .pipeline
                 .pending_drain_tick()
                 .map(|tick| (tick, C220StallCause::CubeDependency)),
-            self.mte1
-                .next_event_tick()
+            self.pending_mte1_tick()
                 .map(|tick| (tick, C220StallCause::Mte1Dependency)),
             self.mte2
                 .next_event_tick()

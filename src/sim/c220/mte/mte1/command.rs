@@ -11,6 +11,7 @@ pub enum C220Mte1Generator {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1Command {
+    HardwareFlag(crate::isa::c220::hflag::C220HardwareFlagStep),
     WriteSpr(crate::sim::common::scalar::ScalarSprStep),
     CrossCore {
         instruction: crate::isa::c220::control::C220SetCrossCoreInstruction,
@@ -23,7 +24,7 @@ pub enum C220Mte1Command {
 impl C220Mte1Command {
     pub const fn generator(self) -> Option<C220Mte1Generator> {
         match self {
-            Self::WriteSpr(_) => None,
+            Self::WriteSpr(_) | Self::HardwareFlag(_) => None,
             Self::CrossCore { .. } => Some(C220Mte1Generator::Load3d),
             Self::Read(transfer) => Some(C220Mte1Generator::Read(transfer.kind())),
             Self::Set2d(_) => Some(C220Mte1Generator::Set2d),
@@ -33,7 +34,7 @@ impl C220Mte1Command {
     /// Disabled commands bypass generation and leave the selected engine intact.
     pub const fn is_disabled(self) -> bool {
         match self {
-            Self::CrossCore { .. } | Self::WriteSpr(_) => false,
+            Self::CrossCore { .. } | Self::WriteSpr(_) | Self::HardwareFlag(_) => false,
             Self::Read(transfer) => transfer.is_empty(),
             Self::Set2d(fill) => fill.descriptor.is_disabled(),
         }

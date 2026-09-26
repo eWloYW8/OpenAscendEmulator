@@ -33,8 +33,7 @@ impl C220Core {
                 .pending_drain_tick()
                 .map(|tick| (tick, C220StallCause::VectorDependency)),
             54 => self
-                .mte1
-                .next_event_tick()
+                .pending_mte1_tick()
                 .map(|tick| (tick, C220StallCause::Mte1Dependency)),
             _ => None,
         }
@@ -168,7 +167,7 @@ impl C220Core {
                 {
                     self.step_fixp_at(tick, pc, word)
                 } else {
-                    self.step_hardware_flag_at(tick, pc, instruction)
+                    self.step_mte1_at(tick, pc, word)
                 };
             }
             _ => {}

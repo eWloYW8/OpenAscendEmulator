@@ -92,6 +92,8 @@ enum Callback {
     FixpIssueTransfer,
     FixpCommandProbe,
     FixpCommandDispatch,
+    Mte1CommandProbe,
+    Mte1CommandDispatch,
     FixpExternal(usize, C220FixpCallback),
     Fixp(usize, C220FixpCallback),
     FixpWrite(C220FixpL1WriteCallback),
@@ -159,6 +161,8 @@ pub enum C220MtePipelineError {
     UnfinishedCycle { active: u64, requested: u64 },
     #[error("FIX frontend must resolve its pending dispatch before resuming the MTE cycle")]
     FixpDispatchPending,
+    #[error("MTE1 frontend must resolve its pending dispatch before resuming the MTE cycle")]
+    Mte1DispatchPending,
     #[error(transparent)]
     FixpExternal(Box<super::fixp::C220FixpRuntimeError>),
     #[error("external FIX event binding requires each of the eleven stages exactly once")]
@@ -350,6 +354,9 @@ pub struct C220MtePipeline {
     last_advance: Option<u64>,
     active_cycle: Option<u64>,
     fixp_command_valid: EventId,
+    mte1_command_valid: EventId,
+    mte1_command_ready: Option<u64>,
+    mte1_dispatch_pending: bool,
     fixp_command_ready: Option<u64>,
     fixp_head_is_convert: bool,
     fixp_dispatch_pending: bool,
@@ -359,6 +366,18 @@ pub struct C220MtePipeline {
 }
 
 impl C220MtePipeline {
+    pub(crate) fn set_mte1_command_head(&mut self, ready: Option<u64>) {
+        self.mte1_command_ready = ready;
+    }
+
+    pub(crate) fn mte1_dispatch_pending(&self) -> bool {
+        self.mte1_dispatch_pending
+    }
+
+    pub(crate) fn finish_mte1_dispatch(&mut self) {
+        self.mte1_dispatch_pending = false;
+    }
+
     pub(crate) fn set_fixp_issue_head(&mut self, ready: Option<u64>) {
         self.fixp_issue_ready = ready;
     }
@@ -398,6 +417,11 @@ impl C220MtePipeline {
         let dispatch = events.add_process(Callback::FixpCommandDispatch, false);
         events.subscribe(clock, probe);
         events.subscribe(fixp_command_valid, dispatch);
+        let mte1_command_valid = events.add_event();
+        let probe = events.add_process(Callback::Mte1CommandProbe, false);
+        let dispatch = events.add_process(Callback::Mte1CommandDispatch, false);
+        events.subscribe(clock, probe);
+        events.subscribe(mte1_command_valid, dispatch);
         let memory_events = C220L1Events::register(&mut events, clock, Callback::Memory);
         let fixp_write_events =
             C220FixpL1WriteEvents::register(&mut events, clock, Callback::FixpWrite);
@@ -493,6 +517,9 @@ impl C220MtePipeline {
             last_advance: None,
             active_cycle: None,
             fixp_command_valid,
+            mte1_command_valid,
+            mte1_command_ready: None,
+            mte1_dispatch_pending: false,
             fixp_command_ready: None,
             fixp_head_is_convert: false,
             fixp_dispatch_pending: false,
@@ -503,6 +530,9 @@ impl C220MtePipeline {
     }
 
     pub fn can_issue_mte1(&self, command: C220Mte1Command) -> bool {
+        if matches!(command, C220Mte1Command::HardwareFlag(_)) {
+            return true;
+        }
         if matches!(command, C220Mte1Command::WriteSpr(_)) {
             return self.selected_generator_idle();
         }
@@ -513,7 +543,9 @@ impl C220MtePipeline {
         command.is_disabled()
             || (match command {
                 C220Mte1Command::CrossCore { .. } => true,
-                C220Mte1Command::WriteSpr(_) => unreachable!("handled above"),
+                C220Mte1Command::WriteSpr(_) | C220Mte1Command::HardwareFlag(_) => {
+                    unreachable!("handled above")
+                }
                 C220Mte1Command::Read(transfer) => self.generator(transfer.kind()).can_issue(),
                 C220Mte1Command::Set2d(_) => self.set2d.can_issue(),
             } && (self.selected_generator == command.generator()
@@ -531,6 +563,7 @@ impl C220MtePipeline {
     }
     pub fn is_idle(&self) -> bool {
         self.fixp_command_ready.is_none()
+            && self.mte1_command_ready.is_none()
             && self.fixp_issue_ready.is_none()
             && self.active_cycle.is_none()
             && self.fixp_write.is_idle()
@@ -1063,7 +1096,9 @@ impl C220MtePipeline {
             });
         }
         let issue = match command {
-            C220Mte1Command::CrossCore { .. } | C220Mte1Command::WriteSpr(_) => C220Mte1Issue {
+            C220Mte1Command::CrossCore { .. }
+            | C220Mte1Command::WriteSpr(_)
+            | C220Mte1Command::HardwareFlag(_) => C220Mte1Issue {
                 tick: self.events.tick(),
                 instruction_id,
                 uop_count: 0,
@@ -1138,6 +1173,9 @@ impl C220MtePipeline {
             }
             if self.fixp_dispatch_pending || self.fixp_issue_pending {
                 return Err(C220MtePipelineError::FixpDispatchPending);
+            }
+            if self.mte1_dispatch_pending {
+                return Err(C220MtePipelineError::Mte1DispatchPending);
             }
         } else {
             let active = !self.is_idle()
@@ -1217,6 +1255,15 @@ impl C220MtePipeline {
                 }
                 Callback::FixpCommandDispatch => {
                     self.fixp_dispatch_pending = true;
+                    return Ok(());
+                }
+                Callback::Mte1CommandProbe => {
+                    if self.mte1_command_ready.is_some_and(|ready| ready <= tick) {
+                        self.events.notify_at(self.mte1_command_valid, tick);
+                    }
+                }
+                Callback::Mte1CommandDispatch => {
+                    self.mte1_dispatch_pending = true;
                     return Ok(());
                 }
                 Callback::FixpExternal(index, phase) => {

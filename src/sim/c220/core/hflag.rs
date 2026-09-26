@@ -1,6 +1,5 @@
 use crate::isa::c220::hflag::{
-    C220HardwareFlagInstruction, C220HardwareFlagOperation, C220HardwareFlagSourcePipe,
-    C220MatrixMemory,
+    C220HardwareFlagOperation, C220HardwareFlagSourcePipe, C220MatrixMemory,
 };
 use crate::sim::c220::sync::{C220HardwareFlagEvent, C220HardwareFlagTimingError};
 
@@ -9,20 +8,6 @@ use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
 
 impl C220Core {
-    pub(super) fn step_hardware_flag_at(
-        &mut self,
-        tick: u64,
-        pc: u64,
-        instruction: C220HardwareFlagInstruction,
-    ) -> Result<C220CoreStep, C220CoreError> {
-        let step = instruction.resolve(pc, self.state.scalar().machine().xregs())?;
-        let result = self.dispatch_hardware_flag_at(tick, self.next_instruction_id, step)?;
-        if matches!(result, C220CoreStep::Executed { .. }) {
-            self.state.commit_c220_sequential_issue();
-        }
-        Ok(result)
-    }
-
     pub(super) fn dispatch_hardware_flag_at(
         &mut self,
         tick: u64,

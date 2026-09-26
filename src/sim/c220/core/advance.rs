@@ -4,6 +4,7 @@ impl C220Core {
     pub(super) fn advance_engines_to(&mut self, tick: u64) -> Result<(), C220CoreError> {
         self.cube.begin_advance();
         self.mte1.begin_advance();
+        self.mte1_frontend.outcomes.clear();
         self.mte2.begin_advance();
         self.mte3.begin_advance();
         self.vector.begin_advance();
@@ -108,6 +109,10 @@ impl C220Core {
                 }
                 if pipeline.fixp_dispatch_pending() {
                     self.dispatch_fixp_head_at(event_tick)?;
+                    continue;
+                }
+                if pipeline.mte1_dispatch_pending() {
+                    self.dispatch_mte1_head_at(event_tick)?;
                     continue;
                 }
                 self.mte1

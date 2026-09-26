@@ -41,8 +41,28 @@ impl C220Core {
         pc: u64,
         word: u32,
     ) -> Result<C220CoreStep, C220CoreError> {
+        let flow_flag = FlagInstruction::decode(Architecture::Dav2201, word);
+        if flow_flag.is_none() {
+            if self.mte_pipeline.is_none() {
+                return Err(C220CoreError::MteUnconfigured);
+            }
+            if let Some(cause) = self.mte1_accept_blocker() {
+                return Ok(C220CoreStep::Stalled(C220Stall {
+                    tick,
+                    pc,
+                    resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+                    cause,
+                }));
+            }
+        }
         let registers = self.state.scalar().machine().xregs();
-        let command = if let Some(instruction) = C220Mte1SprWrite::decode(word) {
+        let command = if let Some(instruction) =
+            crate::isa::c220::hflag::C220HardwareFlagInstruction::decode(word)
+        {
+            Some(C220Mte1Command::HardwareFlag(
+                instruction.resolve(pc, registers)?,
+            ))
+        } else if let Some(instruction) = C220Mte1SprWrite::decode(word) {
             Some(C220Mte1Command::WriteSpr(
                 crate::sim::c220::mte::mte1::spr::capture_write(
                     self.state.scalar().machine(),
@@ -55,7 +75,7 @@ impl C220Core {
         } else if let Some(instruction) =
             crate::isa::c220::control::C220SetCrossCoreInstruction::decode(word)
         {
-            if let Some(resume_tick) = self.mte1.next_event_tick() {
+            if let Some(resume_tick) = self.pending_mte1_tick() {
                 return Ok(C220CoreStep::Stalled(C220Stall {
                     tick,
                     pc,
@@ -104,47 +124,24 @@ impl C220Core {
             })
         };
         let instruction = if let Some(command) = command {
-            let pipeline = self
-                .mte_pipeline
-                .as_mut()
-                .ok_or(C220CoreError::MteUnconfigured)?;
-            if !self.mte1.can_issue(pipeline, command) {
-                return Ok(C220CoreStep::Stalled(C220Stall {
-                    tick,
-                    pc,
-                    resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
-                    cause: C220StallCause::Mte1IssueRate,
-                }));
-            }
-            let issue = self.mte1.issue(
-                pipeline,
-                self.next_instruction_id,
-                pc,
-                command,
-                &mut self.hardware_flags,
-            )?;
-            if let C220Mte1Command::WriteSpr(step) = command {
-                self.state
-                    .scalar_mut()
-                    .machine_mut()
-                    .set_spr_value(step.destination_spr, step.value)
-                    .map_err(C220CoreError::MteSpr)?;
-            }
-            self.state.commit_c220_sequential_issue();
-            C220CoreInstruction::Mte1 {
-                instruction_id: self.next_instruction_id,
-                pc,
-                command,
-                issue,
-            }
+            return self.enqueue_mte1_at(tick, pc, word, command);
         } else {
-            let flag = FlagInstruction::decode(Architecture::Dav2201, word)
+            let flag = flow_flag
                 .expect("matched C220 MTE1 flag")
                 .resolve(pc, self.state.scalar().machine().xregs());
             match flag.instruction.operation {
-                FlagOperation::Set => self.mte1.set_event(flag.flag_id),
+                FlagOperation::Set => self.mte1.set_event(
+                    flag.flag_id,
+                    self.mte1_frontend.commands.back().map(|c| c.instruction_id),
+                ),
                 FlagOperation::Wait => {
-                    if !self.mte1.wait_event(flag.flag_id) {
+                    if !self.mte1.wait_event(
+                        flag.flag_id,
+                        self.mte1_frontend
+                            .commands
+                            .front()
+                            .map(|c| c.instruction_id),
+                    ) {
                         return Ok(C220CoreStep::Stalled(C220Stall {
                             tick,
                             pc,

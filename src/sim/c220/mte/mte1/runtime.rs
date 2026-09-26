@@ -41,6 +41,7 @@ pub enum C220Mte1RuntimeError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1TransferResult {
+    HardwareFlag(crate::isa::c220::hflag::C220HardwareFlagStep),
     WriteSpr(crate::sim::common::scalar::ScalarSprStep),
     Load3dv2(crate::sim::c220::mte::load3d::C220Load3dExecutionReport),
     CrossCore(crate::sim::c220::sync::C220DeviceSync),
@@ -139,7 +140,9 @@ impl Mte1Engine {
                     }
                 })
             }
-            C220Mte1Command::CrossCore { .. } | C220Mte1Command::WriteSpr(_) => None,
+            C220Mte1Command::CrossCore { .. }
+            | C220Mte1Command::WriteSpr(_)
+            | C220Mte1Command::HardwareFlag(_) => None,
             C220Mte1Command::Set2d(fill) => match fill.instruction.destination {
                 C220Set2dDestination::L0a => Some(C220MatrixMemory::L0a),
                 C220Set2dDestination::L0b => Some(C220MatrixMemory::L0b),
@@ -211,15 +214,20 @@ impl Mte1Engine {
         (!self.pending.is_empty()).then(|| self.now.saturating_add(1))
     }
 
-    pub(in crate::sim::c220) fn set_event(&mut self, event_id: u32) {
-        let dependency = self.pending.back().map(|p| p.state.instruction_id);
+    pub(in crate::sim::c220) fn set_event(&mut self, event_id: u32, queued_tail: Option<u64>) {
+        let dependency =
+            queued_tail.or_else(|| self.pending.back().map(|p| p.state.instruction_id));
         self.events
             .entry(event_id)
             .or_default()
             .push_back(dependency);
     }
 
-    pub(in crate::sim::c220) fn wait_event(&mut self, event_id: u32) -> bool {
+    pub(in crate::sim::c220) fn wait_event(
+        &mut self,
+        event_id: u32,
+        queued_head: Option<u64>,
+    ) -> bool {
         let Some(tokens) = self.events.get_mut(&event_id) else {
             return false;
         };
@@ -227,9 +235,11 @@ impl Mte1Engine {
             return false;
         };
         if target.is_some_and(|target| {
-            self.pending
-                .iter()
-                .any(|p| p.state.instruction_id <= target)
+            queued_head.is_some_and(|id| id <= target)
+                || self
+                    .pending
+                    .iter()
+                    .any(|p| p.state.instruction_id <= target)
         }) {
             return false;
         }
@@ -294,6 +304,7 @@ impl Mte1Engine {
             }
             let result = match pending.command {
                 C220Mte1Command::WriteSpr(step) => C220Mte1TransferResult::WriteSpr(step),
+                C220Mte1Command::HardwareFlag(step) => C220Mte1TransferResult::HardwareFlag(step),
                 C220Mte1Command::Read(C220Mte1ReadTransfer::Load3dv2(command)) => {
                     C220Mte1TransferResult::Load3dv2(command.execute(memory)?)
                 }
@@ -430,11 +441,11 @@ mod tests {
             .unwrap();
         assert_eq!(issue.uop_count, 2);
         assert!(!engine.can_issue(&pipeline, command));
-        engine.set_event(7);
-        engine.set_event(7);
-        engine.set_event(8);
-        assert!(!engine.wait_event(7));
-        assert!(!engine.wait_event(8));
+        engine.set_event(7, None);
+        engine.set_event(7, None);
+        engine.set_event(8, None);
+        assert!(!engine.wait_event(7, None));
+        assert!(!engine.wait_event(8, None));
         memory.l1_mut().write_known(0, &[7; 512]).unwrap();
         let completed = (1..100)
             .find(|&tick| {
@@ -450,7 +461,7 @@ mod tests {
             .expect("destination completion");
         assert!(pipeline.selected_generator_idle());
         assert_eq!(memory.l0a().tracked_bytes(), 0);
-        assert!(!engine.wait_event(7));
+        assert!(!engine.wait_event(7, None));
         for tick in completed + 1..=completed + 3 {
             advance(&mut engine, &mut pipeline, tick, &mut memory, &mut flags).unwrap();
             assert!(engine.outcomes.is_empty());
@@ -505,10 +516,10 @@ mod tests {
         assert_eq!(engine.outcomes[0].hardware_flag_stall_ticks, 3);
         assert_eq!(memory.l0a().read_known(0, 512).unwrap(), vec![9; 512]);
         assert!(engine.pending_commands().next().is_none());
-        assert!(engine.wait_event(7));
-        assert!(engine.wait_event(7));
-        assert!(engine.wait_event(8));
-        assert!(!engine.wait_event(7));
+        assert!(engine.wait_event(7, None));
+        assert!(engine.wait_event(7, None));
+        assert!(engine.wait_event(8, None));
+        assert!(!engine.wait_event(7, None));
         flags.advance_to(completed + 5).unwrap();
         assert_eq!(flags.count(2, C220MatrixMemory::L0a, 0), 32);
         assert_eq!(flags.count(2, C220MatrixMemory::L0a, 1), 1);
@@ -532,8 +543,8 @@ mod tests {
             .unwrap();
         assert!(issue.completion_ready);
         assert_eq!(issue.uop_count, 0);
-        engine.set_event(9);
-        assert!(!engine.wait_event(9));
+        engine.set_event(9, None);
+        assert!(!engine.wait_event(9, None));
         advance(
             &mut engine,
             &mut pipeline,
@@ -542,7 +553,7 @@ mod tests {
             &mut flags,
         )
         .unwrap();
-        assert!(engine.wait_event(9));
+        assert!(engine.wait_event(9, None));
         let outcome = engine.outcomes.last().unwrap();
         assert_eq!(outcome.instruction_id, 3);
         assert!(
