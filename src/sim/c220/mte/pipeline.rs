@@ -905,6 +905,8 @@ impl C220MtePipeline {
         self.biu_subcore = subcore;
         if subcore != C220BiuSubcore::Cube {
             self.nd2nz = None;
+        } else if self.nd2nz.is_none() {
+            self.nd2nz = Some(C220Nd2NzEngine::new(Default::default())?);
         }
         self.dma_connected = true;
         Ok(())

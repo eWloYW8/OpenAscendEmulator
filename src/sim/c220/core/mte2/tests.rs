@@ -108,13 +108,15 @@ fn nd2nz_runs_through_core_events_and_retires_after_l1_ack() {
             C220BiuSubcore::Cube,
         )
         .unwrap();
-        core.configure_nd2nz(C220Nd2NzStagingConfig {
-            rows: NonZeroU32::new(8).unwrap(),
-            alignment_depth: 256,
-            small_data_capacity: NonZeroU32::new(256).unwrap(),
-            receive_bandwidth: width,
-        })
-        .unwrap();
+        assert_eq!(
+            core.mte_pipeline()
+                .unwrap()
+                .nd2nz_engine()
+                .unwrap()
+                .staging()
+                .config(),
+            C220Nd2NzStagingConfig::default()
+        );
         let word = (3 << 29) | (1 << 27) | (12 << 22) | (1 << 17) | (2 << 12) | (3 << 7) | (4 << 2);
         let machine = core.state.scalar_mut().machine_mut();
         for (reg, value) in [

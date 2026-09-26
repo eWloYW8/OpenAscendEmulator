@@ -10,6 +10,17 @@ pub struct C220Nd2NzStagingConfig {
     pub receive_bandwidth: NonZeroU32,
 }
 
+impl Default for C220Nd2NzStagingConfig {
+    fn default() -> Self {
+        Self {
+            rows: NonZeroU32::new(8).unwrap(),
+            alignment_depth: 256,
+            small_data_capacity: NonZeroU32::new(448).unwrap(),
+            receive_bandwidth: NonZeroU32::new(256).unwrap(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220Nd2NzStagingError {
     #[error("ND2NZ supports at most eight row buffers, requested {0}")]
