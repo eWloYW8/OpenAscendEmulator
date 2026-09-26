@@ -2,6 +2,7 @@ pub mod bias;
 mod burst;
 pub mod factor;
 pub mod fixp;
+pub mod l1_to_out;
 pub mod load2d;
 pub mod load2d_sparse;
 pub mod load2d_transpose;

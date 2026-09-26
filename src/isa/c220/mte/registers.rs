@@ -27,6 +27,7 @@ pub const fn read_register_mask(word: u32) -> Option<u32> {
     {
         Some(xd | xn | xm | xt)
     } else if C220MovInstruction::decode(word).is_some()
+        || super::l1_to_out::C220MovL1ToOutInstruction::decode(word).is_some()
         || C220MovOutToL1Instruction::decode(word).is_some()
         || C220Load2dInstruction::decode(word).is_some()
         || C220Load2dSparseInstruction::decode(word).is_some()
