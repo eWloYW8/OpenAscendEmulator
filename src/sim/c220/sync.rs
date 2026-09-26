@@ -240,7 +240,10 @@ impl C220HardwareFlagState {
             });
         }
         let delay = if event.timestamp == 0 {
-            visibility_ticks(step.instruction.memory)
+            visibility_ticks(
+                step.instruction.memory,
+                step.instruction.destination_pipe_code,
+            )?
         } else {
             1
         };
@@ -444,6 +447,11 @@ impl C220HardwareFlagState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum C220HardwareFlagTimingError {
+    #[error("unsupported hardware flag destination {destination_pipe_code} for {memory:?}")]
+    UnsupportedDestination {
+        memory: C220MatrixMemory,
+        destination_pipe_code: u8,
+    },
     #[error("C220 hardware flag timing computation overflowed")]
     TimeOverflow,
     #[error("hardware flag tick {requested} precedes observed tick {previous}")]
@@ -458,10 +466,18 @@ pub enum C220HardwareFlagTimingError {
     InstructionOrder,
 }
 
-const fn visibility_ticks(memory: C220MatrixMemory) -> u64 {
-    match memory {
-        C220MatrixMemory::L0a | C220MatrixMemory::L0b | C220MatrixMemory::L0c => 1,
-        C220MatrixMemory::BiasTable => 2,
+const fn visibility_ticks(
+    memory: C220MatrixMemory,
+    destination_pipe_code: u8,
+) -> Result<u64, C220HardwareFlagTimingError> {
+    use C220MatrixMemory::{BiasTable, L0a, L0b, L0c};
+    match (memory, destination_pipe_code) {
+        (L0a | L0b | L0c, 2) | (BiasTable, 3) => Ok(1),
+        (L0a | L0b, 3..=5) | (L0c, 10) | (BiasTable, 2) => Ok(2),
+        _ => Err(C220HardwareFlagTimingError::UnsupportedDestination {
+            memory,
+            destination_pipe_code,
+        }),
     }
 }
 

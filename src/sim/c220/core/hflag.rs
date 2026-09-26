@@ -8,14 +8,43 @@ use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
 
 impl C220Core {
-    pub(super) fn step_cube_hardware_wait_at(
+    pub(super) fn step_cube_hardware_flag_at(
         &mut self,
         tick: u64,
         pc: u64,
         instruction: crate::isa::c220::hflag::C220HardwareFlagInstruction,
     ) -> Result<C220CoreStep, C220CoreError> {
         let step = instruction.resolve(pc, self.state.scalar().machine().xregs())?;
-        let result = self.dispatch_cube_hardware_wait_at(tick, self.next_instruction_id, step)?;
+        let result = if instruction.operation == C220HardwareFlagOperation::Set {
+            if !instruction.trigger {
+                return Err(C220CoreError::UnsupportedHardwareFlagCheckpoint {
+                    source_pipe: instruction.source_pipe,
+                    memory: instruction.memory,
+                });
+            }
+            let ready = match self.hardware_flags.schedule_set(step, tick) {
+                Ok(ready) => ready,
+                Err(C220HardwareFlagTimingError::AlmostFull { .. }) => {
+                    return Ok(C220CoreStep::Stalled(C220Stall {
+                        tick,
+                        pc,
+                        resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+                        cause: C220StallCause::HardwareFlagDependency,
+                    }));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            C220CoreStep::Executed {
+                tick,
+                instruction: C220CoreInstruction::HardwareFlag {
+                    instruction_id: self.next_instruction_id,
+                    step,
+                    token_ready_tick: Some(ready),
+                },
+            }
+        } else {
+            self.dispatch_cube_hardware_wait_at(tick, self.next_instruction_id, step)?
+        };
         if matches!(result, C220CoreStep::Executed { .. }) {
             self.state.commit_c220_sequential_issue();
         }
@@ -73,17 +102,18 @@ impl C220Core {
     ) -> Result<C220CoreStep, C220CoreError> {
         let instruction = step.instruction;
         let pc = step.pc;
-        if instruction.operation == C220HardwareFlagOperation::Wait {
+        if instruction.execution_pipe_code() == 2 {
             return self.dispatch_cube_hardware_wait_at(tick, instruction_id, step);
         }
-        let trigger_blocked = match instruction.source_pipe {
-            C220HardwareFlagSourcePipe::Mte1 => self
+        let trigger_blocked = match instruction.execution_pipe_code() {
+            3 => self
                 .mte_pipeline
                 .as_ref()
                 .is_some_and(|p| !p.selected_generator_idle()),
-            C220HardwareFlagSourcePipe::Fix => self
+            10 => self
                 .fixp_engine()
                 .is_some_and(|engine| !engine.hardware_flag_trigger_ready()),
+            _ => unreachable!("MTE hardware flag dispatch requires MTE1 or FIX"),
         };
         if instruction.trigger && trigger_blocked {
             return Ok(C220CoreStep::Stalled(C220Stall {
@@ -135,7 +165,34 @@ impl C220Core {
                     }
                 }
             }
-            C220HardwareFlagOperation::Wait => unreachable!("Cube wait handled above"),
+            C220HardwareFlagOperation::Wait => {
+                if !instruction.trigger {
+                    if instruction.destination_pipe_code != 10 {
+                        return Err(C220CoreError::UnsupportedHardwareFlagCheckpoint {
+                            source_pipe: instruction.source_pipe,
+                            memory: instruction.memory,
+                        });
+                    }
+                    self.hardware_flags
+                        .enqueue_mte_flag(instruction_id, step, tick)?;
+                } else {
+                    match self.hardware_flags.consume_wait(step) {
+                        Ok(()) => {}
+                        Err(C220HardwareFlagTimingError::MissingToken { .. }) => {
+                            return Ok(C220CoreStep::Stalled(C220Stall {
+                                tick,
+                                pc,
+                                resume_tick: tick
+                                    .checked_add(1)
+                                    .ok_or(C220CoreError::TimeOverflow)?,
+                                cause: C220StallCause::HardwareFlagDependency,
+                            }));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                None
+            }
         };
         Ok(C220CoreStep::Executed {
             tick,

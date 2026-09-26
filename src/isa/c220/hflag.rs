@@ -14,6 +14,7 @@ pub enum C220HardwareEventSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220HardwareFlagSourcePipe {
+    Cube,
     Mte1,
     Fix,
 }
@@ -50,6 +51,7 @@ impl C220HardwareFlagInstruction {
         match self.operation {
             C220HardwareFlagOperation::Wait => self.destination_pipe_code,
             C220HardwareFlagOperation::Set => match self.source_pipe {
+                C220HardwareFlagSourcePipe::Cube => 2,
                 C220HardwareFlagSourcePipe::Mte1 => 3,
                 C220HardwareFlagSourcePipe::Fix => 10,
             },
@@ -72,14 +74,12 @@ impl C220HardwareFlagInstruction {
             C220HardwareEventSource::Register((word & 0x1f) as u8)
         };
         let source_pipe = match (word >> 10) & 0xf {
+            2 => C220HardwareFlagSourcePipe::Cube,
             3 => C220HardwareFlagSourcePipe::Mte1,
             10 => C220HardwareFlagSourcePipe::Fix,
             _ => return None,
         };
         let destination_pipe_code = (((word >> 7) & 7) | (((word >> 14) & 1) << 3)) as u8;
-        if destination_pipe_code != 2 {
-            return None;
-        }
         let memory = match (word >> 15) & 7 {
             1 => C220MatrixMemory::L0a,
             2 => C220MatrixMemory::L0b,
@@ -88,11 +88,18 @@ impl C220HardwareFlagInstruction {
             _ => return None,
         };
         if !matches!(
-            (source_pipe, memory),
+            (source_pipe, destination_pipe_code, memory),
             (
                 C220HardwareFlagSourcePipe::Mte1,
+                2,
                 C220MatrixMemory::L0a | C220MatrixMemory::L0b | C220MatrixMemory::BiasTable
-            ) | (C220HardwareFlagSourcePipe::Fix, C220MatrixMemory::L0c)
+            ) | (C220HardwareFlagSourcePipe::Fix, 2, C220MatrixMemory::L0c)
+                | (
+                    C220HardwareFlagSourcePipe::Cube,
+                    3,
+                    C220MatrixMemory::L0a | C220MatrixMemory::L0b | C220MatrixMemory::BiasTable
+                )
+                | (C220HardwareFlagSourcePipe::Cube, 10, C220MatrixMemory::L0c)
         ) {
             return None;
         }

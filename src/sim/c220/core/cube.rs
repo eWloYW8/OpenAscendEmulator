@@ -823,6 +823,83 @@ mod tests {
     }
 
     #[test]
+    fn cube_triggered_signals_reach_mte_and_fix_destinations() {
+        use crate::isa::c220::hflag::C220MatrixMemory;
+        use crate::sim::c220::memory::C220LocalBuffer;
+        use crate::sim::c220::mte::fixp::{C220FixpEngineConfig, C220FixpStage::*};
+
+        let mut core = matrix_core();
+        core.advance_to(300).unwrap();
+        core.configure_fixp_l1(
+            C220FixpEngineConfig {
+                instruction_fifo_depth: 1,
+                read_bandwidth: 256,
+                read_bank_count: 32,
+                read_data_latency: 4,
+                l0c_capacity: core.local_memory.l0c().buffer().capacity(),
+            },
+            super::super::C220FixpFrontendConfig {
+                issue_queue_depth: NonZeroU32::new(2).unwrap(),
+                outstanding_limit: NonZeroU32::new(2).unwrap(),
+            },
+            C220LocalBuffer::new(4096),
+            &[
+                GenerateRead,
+                SendRead,
+                SendL0c,
+                ReceiveL0c,
+                Convert,
+                Slice,
+                Packetize,
+                GenerateWrite,
+                SendWrite,
+            ],
+        )
+        .unwrap();
+        for (index, (code, memory, destination, delay)) in [
+            (1, C220MatrixMemory::L0a, 3, 2),
+            (2, C220MatrixMemory::L0b, 3, 2),
+            (5, C220MatrixMemory::BiasTable, 3, 1),
+            (3, C220MatrixMemory::L0c, 10, 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tick = 301 + index as u64 * 20;
+            let word = (2 << 29)
+                | (15 << 21)
+                | (1 << 19)
+                | (code << 15)
+                | ((destination >> 3) << 14)
+                | (2 << 10)
+                | ((destination & 7) << 7);
+            assert!(matches!(core.step_word_at(tick, word).unwrap(),
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::HardwareFlag {
+                        token_ready_tick: Some(ready), ..
+                    }, ..
+                } if ready == tick + delay));
+            assert_eq!(core.hardware_flags.count(destination as u8, memory, 0), 0);
+            core.advance_to(tick + delay).unwrap();
+            assert_eq!(core.hardware_flags.count(destination as u8, memory, 0), 1);
+            assert!(matches!(
+                core.step_word_at(tick + 3, word | (1 << 5)).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+            core.advance_to(tick + 15).unwrap();
+            assert_eq!(core.hardware_flags.count(destination as u8, memory, 0), 0);
+        }
+        let pc = core.state.scalar().pc();
+        let deferred_wait = (2 << 29) | (15 << 21) | (1 << 15) | (2 << 10) | (3 << 7) | (1 << 5);
+        assert!(matches!(
+            core.step_word_at(400, deferred_wait),
+            Err(C220CoreError::UnsupportedHardwareFlagCheckpoint { .. })
+        ));
+        assert_eq!(core.state.scalar().pc(), pc);
+        assert!(core.queued_mte1_commands().next().is_none());
+    }
+
+    #[test]
     fn cube_control_instructions_use_their_own_pipeline() {
         use crate::sim::c220::schedule::{C220Stall, C220StallCause};
         let mut core = matrix_core();
