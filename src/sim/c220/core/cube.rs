@@ -823,6 +823,69 @@ mod tests {
     }
 
     #[test]
+    fn mte1_deferred_waits_gate_sends_and_disabled_decode() {
+        use crate::isa::c220::hflag::C220MatrixMemory;
+        for disabled in [false, true] {
+            let mut core = matrix_core();
+            core.advance_to(300).unwrap();
+            let signal = (2 << 29) | (15 << 21) | (1 << 19) | (1 << 15) | (2 << 10) | (3 << 7);
+            let wait = (signal & !(1 << 19)) | (1 << 5);
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_xreg(6, 2048)
+                .unwrap();
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_xreg(7, 512)
+                .unwrap();
+            if disabled {
+                core.state
+                    .scalar_mut()
+                    .machine_mut()
+                    .set_xreg(8, 0)
+                    .unwrap();
+            }
+            core.local_memory
+                .l0a_mut()
+                .write_known(2048, &[0; 512])
+                .unwrap();
+            let load = (3 << 29) | (6 << 17) | (7 << 12) | (8 << 7) | 8;
+            for (tick, word) in [(301, signal | 1), (302, wait), (303, wait | 1), (304, load)] {
+                assert!(matches!(
+                    core.step_word_at(tick, word).unwrap(),
+                    C220CoreStep::Executed { .. }
+                ));
+            }
+            core.advance_to(340).unwrap();
+            assert_eq!(core.hardware_flags.count(3, C220MatrixMemory::L0a, 1), 0);
+            assert_eq!(
+                core.local_memory.l0a().read_known(2048, 512).unwrap(),
+                [0; 512]
+            );
+            assert_eq!(core.queued_mte1_commands().count(), usize::from(disabled));
+            assert!(core.pending_compute_drain().is_some());
+            assert!(matches!(
+                core.step_word_at(341, signal).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+            core.advance_to(500).unwrap();
+            assert_eq!(core.hardware_flags.count(3, C220MatrixMemory::L0a, 0), 0);
+            assert!(core.pending_compute_drain().is_none());
+            let expected = if disabled {
+                vec![0; 512]
+            } else {
+                0x4200_u16.to_le_bytes().repeat(256)
+            };
+            assert_eq!(
+                core.local_memory.l0a().read_known(2048, 512).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn cube_deferred_signals_follow_uop_checkpoints() {
         use crate::isa::c220::hflag::C220MatrixMemory;
         let mut core = matrix_core();
@@ -979,14 +1042,16 @@ mod tests {
             core.advance_to(tick + 15).unwrap();
             assert_eq!(core.hardware_flags.count(destination as u8, memory, 0), 0);
         }
-        let pc = core.state.scalar().pc();
         let deferred_wait = (2 << 29) | (15 << 21) | (1 << 15) | (2 << 10) | (3 << 7) | (1 << 5);
         assert!(matches!(
-            core.step_word_at(400, deferred_wait),
-            Err(C220CoreError::UnsupportedHardwareFlagCheckpoint { .. })
+            core.step_word_at(400, deferred_wait).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Mte1Queued(_),
+                ..
+            }
         ));
-        assert_eq!(core.state.scalar().pc(), pc);
-        assert!(core.queued_mte1_commands().next().is_none());
+        core.advance_to(410).unwrap();
+        assert_eq!(core.hardware_flags.pending_mte_flags().count(), 1);
     }
 
     #[test]

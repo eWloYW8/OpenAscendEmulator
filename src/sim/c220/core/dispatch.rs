@@ -165,16 +165,6 @@ impl C220Core {
             }
             C220DispatchKind::Mte2 => return self.step_mte2_at(tick, pc, word),
             C220DispatchKind::HardwareFlag(instruction) => {
-                if !instruction.trigger
-                    && instruction.execution_pipe_code() == 3
-                    && instruction.operation
-                        == crate::isa::c220::hflag::C220HardwareFlagOperation::Wait
-                {
-                    return Err(C220CoreError::UnsupportedHardwareFlagCheckpoint {
-                        source_pipe: instruction.source_pipe,
-                        memory: instruction.memory,
-                    });
-                }
                 return match instruction.execution_pipe_code() {
                     2 => self.step_cube_hardware_flag_at(tick, pc, instruction),
                     10 => self.step_fixp_at(tick, pc, word),

@@ -175,7 +175,7 @@ impl C220Core {
             }
             C220HardwareFlagOperation::Wait => {
                 if !instruction.trigger {
-                    if instruction.destination_pipe_code != 10 {
+                    if !matches!(instruction.destination_pipe_code, 3 | 10) {
                         return Err(C220CoreError::UnsupportedHardwareFlagCheckpoint {
                             source_pipe: instruction.source_pipe,
                             memory: instruction.memory,

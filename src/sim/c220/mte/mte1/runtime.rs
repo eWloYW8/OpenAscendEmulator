@@ -121,14 +121,9 @@ impl Mte1Engine {
         pipeline.can_issue_mte1(command) && self.pending.len() < C220_MTE1_OUTSTANDING_LIMIT
     }
 
-    pub(in crate::sim::c220) fn issue(
-        &mut self,
-        pipeline: &mut C220MtePipeline,
-        instruction_id: u64,
-        pc: u64,
+    fn synchronization_memory(
         command: C220Mte1Command,
-        flags: &mut C220HardwareFlagState,
-    ) -> Result<C220Mte1Issue, C220Mte1RuntimeError> {
+    ) -> Result<Option<C220MatrixMemory>, C220Mte1RuntimeError> {
         let memory = match command {
             C220Mte1Command::Read(C220Mte1ReadTransfer::Load3dv2(command)) => {
                 Some(match command.operands.instruction.destination {
@@ -176,16 +171,44 @@ impl Mte1Engine {
                 }
             },
         };
+        Ok(memory)
+    }
+
+    pub(in crate::sim::c220) fn prepare_flags(
+        &self,
+        pipeline: &mut C220MtePipeline,
+        instruction_id: u64,
+        command: C220Mte1Command,
+        flags: &mut C220HardwareFlagState,
+    ) -> Result<bool, C220Mte1RuntimeError> {
+        if let Some(memory) = Self::synchronization_memory(command)? {
+            pipeline.capture_mte1_flags(instruction_id, memory, flags);
+        }
+        Ok(
+            !command.is_disabled()
+                || !pipeline.disabled_mte1_sync_blocked(instruction_id, flags)?,
+        )
+    }
+
+    pub(in crate::sim::c220) fn issue(
+        &mut self,
+        pipeline: &mut C220MtePipeline,
+        instruction_id: u64,
+        pc: u64,
+        command: C220Mte1Command,
+        flags: &mut C220HardwareFlagState,
+    ) -> Result<C220Mte1Issue, C220Mte1RuntimeError> {
         if !self.can_issue(pipeline, command) {
             return Err(C220Mte1RuntimeError::Busy);
         }
         self.now
             .checked_add(1)
             .ok_or(C220Mte1RuntimeError::TimeOverflow)?;
+        if !self.prepare_flags(pipeline, instruction_id, command, flags)? {
+            return Err(C220Mte1RuntimeError::Busy);
+        }
         let issue = pipeline.issue_mte1(instruction_id, command)?;
-        let sets = memory.map_or_else(VecDeque::new, |memory| {
-            flags.take_mte_sets(instruction_id, memory)
-        });
+        let sets = pipeline.take_mte1_sets(instruction_id);
         self.pending.push_back(PendingCommand {
             state: C220Mte1CommandState {
                 instruction_id,

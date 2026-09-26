@@ -163,6 +163,10 @@ pub enum C220MtePipelineError {
     FixpDispatchPending,
     #[error("MTE1 frontend must resolve its pending dispatch before resuming the MTE cycle")]
     Mte1DispatchPending,
+    #[error("MTE1 synchronization callback must be resolved before resuming the cycle")]
+    Mte1SyncPending,
+    #[error(transparent)]
+    HardwareFlag(#[from] crate::sim::c220::sync::C220HardwareFlagTimingError),
     #[error(transparent)]
     FixpExternal(Box<super::fixp::C220FixpRuntimeError>),
     #[error("external FIX event binding requires each of the eleven stages exactly once")]
@@ -278,6 +282,7 @@ mod cache;
 mod external_fixp;
 mod memory;
 mod read;
+mod sync;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220MteReadPayload {
@@ -357,6 +362,7 @@ pub struct C220MtePipeline {
     mte1_command_valid: EventId,
     mte1_command_ready: Option<u64>,
     mte1_dispatch_pending: bool,
+    mte1_sync: sync::Mte1Sync,
     fixp_command_ready: Option<u64>,
     fixp_head_is_convert: bool,
     fixp_dispatch_pending: bool,
@@ -520,6 +526,7 @@ impl C220MtePipeline {
             mte1_command_valid,
             mte1_command_ready: None,
             mte1_dispatch_pending: false,
+            mte1_sync: sync::Mte1Sync::default(),
             fixp_command_ready: None,
             fixp_head_is_convert: false,
             fixp_dispatch_pending: false,
@@ -1177,6 +1184,9 @@ impl C220MtePipeline {
             if self.mte1_dispatch_pending {
                 return Err(C220MtePipelineError::Mte1DispatchPending);
             }
+            if self.mte1_sync_pending() {
+                return Err(C220MtePipelineError::Mte1SyncPending);
+            }
         } else {
             let active = !self.is_idle()
                 || fixp
@@ -1563,18 +1573,11 @@ impl C220MtePipeline {
                         self.trace.push(C220MtePipelineEvent::L1Write(outcome));
                     }
                 }
-                Callback::Set2d(phase) => {
-                    let [l0a, l0b] = &mut self.l0;
-                    let outcome = self.set2d_events.handle(
-                        phase,
-                        &mut self.events,
-                        &mut self.set2d,
-                        C220Set2dGates::default(),
-                        C220Set2dOutputs::L0 { l0a, l0b },
-                    )?;
-                    if outcome != C220Set2dEventOutcome::Readiness {
-                        self.trace.push(C220MtePipelineEvent::Set2d(outcome));
+                callback @ (Callback::Set2d(_) | Callback::Generator(_, _)) => {
+                    if self.defer_mte1_sync(callback, tick) {
+                        return Ok(());
                     }
+                    self.handle_mte1_send_callback(callback, false)?;
                 }
                 Callback::Memory(phase) => {
                     let outcome =
@@ -1582,20 +1585,6 @@ impl C220MtePipeline {
                             .handle(phase, &mut self.events, &mut self.memory)?;
                     if outcome != C220L1EventOutcome::Readiness {
                         self.trace.push(C220MtePipelineEvent::Memory(outcome));
-                    }
-                }
-                Callback::Generator(kind, phase) => {
-                    let outcome = self.generator_events[kind.index()].handle_mapped(
-                        phase,
-                        &mut self.events,
-                        &mut self.generators[kind.index()],
-                        false,
-                        &mut self.interface,
-                        C220MteReadPayload::Mte1,
-                    )?;
-                    if outcome != C220Mte1ReadEventOutcome::Readiness {
-                        self.trace
-                            .push(C220MtePipelineEvent::Generator(kind, outcome));
                     }
                 }
                 Callback::L0(b, phase) => {

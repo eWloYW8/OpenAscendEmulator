@@ -105,6 +105,24 @@ impl C220Core {
                 cause: C220StallCause::Mte1IssueRate,
             })
         } else {
+            let pipeline = self.mte_pipeline.as_mut().expect("armed MTE1 dispatch");
+            if !self.mte1.prepare_flags(
+                pipeline,
+                queued.instruction_id,
+                queued.command,
+                &mut self.hardware_flags,
+            )? {
+                self.mte1_frontend
+                    .outcomes
+                    .push(C220CoreStep::Stalled(C220Stall {
+                        tick,
+                        pc: queued.pc,
+                        resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+                        cause: C220StallCause::HardwareFlagDependency,
+                    }));
+                pipeline.finish_mte1_dispatch();
+                return Ok(());
+            }
             let control = if let C220Mte1Command::HardwareFlag(step) = queued.command {
                 Some(self.dispatch_hardware_flag_at(tick, queued.instruction_id, step)?)
             } else {

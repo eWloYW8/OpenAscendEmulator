@@ -132,34 +132,15 @@ impl C220HardwareFlagState {
         self.mte_flags.iter().map(|pending| pending.event)
     }
 
-    pub(in crate::sim::c220) fn take_mte_sets(
-        &mut self,
-        instruction_id: u64,
-        memory: C220MatrixMemory,
-    ) -> VecDeque<C220HardwareFlagEvent> {
-        self.take_mte_flags_matching(instruction_id, memory, Some(C220HardwareFlagOperation::Set))
-    }
-
     pub(in crate::sim::c220) fn take_mte_flags(
         &mut self,
         instruction_id: u64,
         memory: C220MatrixMemory,
     ) -> VecDeque<C220HardwareFlagEvent> {
-        self.take_mte_flags_matching(instruction_id, memory, None)
-    }
-
-    fn take_mte_flags_matching(
-        &mut self,
-        instruction_id: u64,
-        memory: C220MatrixMemory,
-        operation: Option<C220HardwareFlagOperation>,
-    ) -> VecDeque<C220HardwareFlagEvent> {
         let mut attached = VecDeque::new();
         self.mte_flags.retain(|pending| {
             if pending.instruction_id < instruction_id
                 && pending.event.step.instruction.memory == memory
-                && operation
-                    .is_none_or(|operation| pending.event.step.instruction.operation == operation)
             {
                 attached.push_back(pending.event);
                 false
@@ -632,7 +613,7 @@ mod tests {
         flags.enqueue_mte_flag(1, set, 5).unwrap();
         flags.enqueue_mte_flag(2, set, 6).unwrap();
         let event = flags
-            .take_mte_sets(3, C220MatrixMemory::BiasTable)
+            .take_mte_flags(3, C220MatrixMemory::BiasTable)
             .pop_front()
             .unwrap();
         assert_eq!(event.timestamp, 5);
