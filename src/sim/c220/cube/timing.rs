@@ -496,11 +496,7 @@ impl C220CubePipeline {
                     )?;
                     flight.ticket.last_uop_tick = Some(ready_tick);
                     self.previous_last_uop_tick = ready_tick;
-                    self.next_accept_tick = self.next_accept_tick.max(
-                        ready_tick
-                            .checked_add(1)
-                            .ok_or(C220CubeTimingError::TimeOverflow)?,
-                    );
+                    self.next_accept_tick = self.next_accept_tick.max(ready_tick);
                 } else if flight.next_uop_tick.is_none() {
                     return Err(C220CubeTimingError::TimeOverflow);
                 }
@@ -626,11 +622,13 @@ impl C220CubePipeline {
 }
 
 fn next_instruction_tick(ticket: C220CubeTicket) -> Result<u64, C220CubeTimingError> {
-    ticket
-        .last_uop_tick
-        .unwrap_or(ticket.accept_tick)
-        .checked_add(1)
-        .ok_or(C220CubeTimingError::TimeOverflow)
+    match ticket.last_uop_tick {
+        Some(tick) => Ok(tick),
+        None => ticket
+            .accept_tick
+            .checked_add(1)
+            .ok_or(C220CubeTimingError::TimeOverflow),
+    }
 }
 
 fn delay_ticket_from_uop(
@@ -1080,8 +1078,23 @@ mod tests {
             crate::sim::c220::cube::C220CubeV0UopPlanner::new(ticket, instruction, parameters);
         let mut l0c = C220L0c::new(1 << 20, 12).unwrap();
         pipeline.issue(ticket, uops, 0, &mut l0c).unwrap();
-        assert_eq!(pipeline.next_accept_tick(), 14);
+        assert_eq!(pipeline.next_accept_tick(), 13);
         assert_eq!(pipeline.pending_drain_tick(), Some(34));
+        let mut flags = C220HardwareFlagState::default();
+        pipeline.advance_to(13, &mut l0c, &mut flags).unwrap();
+        let next = pipeline
+            .preview_issue(13, instruction, parameters, timing_control(0))
+            .unwrap();
+        assert_eq!(next.first_uop_tick, Some(14));
+        pipeline
+            .issue(
+                next,
+                crate::sim::c220::cube::C220CubeV0UopPlanner::new(next, instruction, parameters),
+                1,
+                &mut l0c,
+            )
+            .unwrap();
+        assert_eq!(pipeline.pending_retirement_count(), 2);
     }
 
     #[test]
