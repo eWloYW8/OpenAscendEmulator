@@ -193,9 +193,11 @@ mod tests {
     #[test]
     fn l1_responses_forward_whole_transactions_with_shared_head_backpressure() {
         use crate::sim::c220::memory::l1::{C220L1Geometry, C220L1Port, C220L1Transport};
-        use crate::sim::c220::mte::fixp::C220FixpExternalOutput;
+        use crate::sim::c220::mte::fixp::{
+            C220FixpExternalOutput, C220FixpReadPipeline, C220FixpReadProgress, C220FixpReadStream,
+        };
         use crate::sim::c220::mte::interface::{
-            C220MteL1Interface, C220MteL1OutputCredits, C220MteL1ReadPort,
+            C220MteL0cReadInterface, C220MteL1Interface, C220MteL1OutputCredits, C220MteL1ReadPort,
         };
 
         let instruction =
@@ -207,12 +209,22 @@ mod tests {
             destination_address: 4096,
             xm: (1 << 4) | (16 << 16),
         };
-        let mut reads = C220L1OutputReadPlan::new(
+        let reads = C220L1OutputReadPlan::new(
             transfer,
             C220DmaUopMode::Wide512,
             NonZeroU32::new(32).unwrap(),
-        )
-        .peekable();
+        );
+        let mut pipeline = C220FixpReadPipeline::default();
+        pipeline
+            .submit(
+                0,
+                C220FixpReadStream::L1Output {
+                    instruction_id: 7,
+                    reads,
+                },
+            )
+            .unwrap();
+        let mut l0c = C220MteL0cReadInterface::new(32, 0).unwrap();
         let mut interface = C220MteL1Interface::default();
         let mut memory = C220L1Transport::new(C220L1Geometry::new(32, 1, 1, 0).unwrap());
         let mut output = C220FixpExternalOutput::default();
@@ -220,13 +232,25 @@ mod tests {
         let mut forwarded = Vec::new();
         let mut blocked = false;
         for tick in 0..200 {
-            if interface.can_push(C220MteL1ReadPort::Port1)
-                && let Some(read) = reads.next()
-            {
-                interface
-                    .push(tick, C220MteL1ReadPort::Port1, read.l1_operation(7))
-                    .unwrap()
-                    .unwrap();
+            let generated = pipeline.generate(tick).unwrap();
+            if tick < 2 {
+                assert_eq!(generated, C220FixpReadProgress::Delayed { ready_tick: 2 });
+            }
+            let progress = pipeline
+                .send_routed(
+                    tick,
+                    &mut l0c,
+                    |operation| {
+                        Ok(interface
+                            .push(tick, C220MteL1ReadPort::Port1, operation)?
+                            .is_some())
+                    },
+                    |_| tick >= 10,
+                    true,
+                )
+                .unwrap();
+            if (5..10).contains(&tick) {
+                assert_eq!(progress, C220FixpReadProgress::DestinationBackpressure);
             }
             memory.advance(tick).unwrap();
             let sent = interface
@@ -286,6 +310,8 @@ mod tests {
         assert_eq!(responses, 16);
         assert!(memory.is_idle());
         assert!(interface.is_idle());
+        assert!(pipeline.is_idle());
+        assert!(l0c.input().is_empty());
         assert_eq!(forwarded.len(), 1);
         assert_eq!(forwarded[0].bytes, 512);
         assert!(forwarded[0].last_in_instruction);

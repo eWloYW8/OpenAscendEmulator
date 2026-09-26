@@ -2,16 +2,18 @@ use std::collections::VecDeque;
 use std::iter::Peekable;
 
 use super::{
-    C220FixpReadStream, C220FixpReadUop, C220FixpSync, C220FixpSyncPoint, C220FixpSyncRequest,
+    C220FixpReadPacket, C220FixpReadStream, C220FixpSync, C220FixpSyncPoint, C220FixpSyncRequest,
 };
 use crate::sim::c220::mte::interface::{C220MteL0cReadError, C220MteL0cReadInterface};
+use crate::sim::c220::mte::interface::{C220MteL1Error, C220MteL1ReadOperation};
+use crate::sim::c220::mte::l1_to_out::C220L1OutputRead;
 
 mod events;
 pub use events::{C220FixpReadEventOutcome, C220FixpReadEvents};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220FixpReadEntry {
-    pub uop: C220FixpReadUop,
+    pub uop: C220FixpReadPacket,
     pub ready_tick: u64,
 }
 
@@ -21,7 +23,8 @@ pub enum C220FixpReadProgress {
     Delayed { ready_tick: u64 },
     QueueFull,
     HardwareSync,
-    Advanced(C220FixpReadUop),
+    DestinationBackpressure,
+    Advanced(C220FixpReadPacket),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +39,10 @@ pub enum C220FixpReadPipelineError {
     TimeOverflow,
     #[error(transparent)]
     Interface(#[from] C220MteL0cReadError),
+    #[error(transparent)]
+    L1(#[from] C220MteL1Error),
+    #[error("L1 output read requires a connected L1 source interface")]
+    L1Disconnected,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +134,28 @@ impl C220FixpReadPipeline {
         &mut self,
         tick: u64,
         input: &mut C220MteL0cReadInterface,
+        sync: impl C220FixpSync,
+    ) -> Result<C220FixpReadProgress, C220FixpReadPipelineError> {
+        self.send_routed(
+            tick,
+            input,
+            |_| Err(C220FixpReadPipelineError::L1Disconnected),
+            |_| true,
+            sync,
+        )
+    }
+
+    /// Both sources consume the same dispatch head. The owner supplies current
+    /// destination credit and the L1 port-1 enqueue operation; rejected heads
+    /// remain in place. Hardware read waits apply only to the L0C source.
+    pub fn send_routed(
+        &mut self,
+        tick: u64,
+        input: &mut C220MteL0cReadInterface,
+        mut send_l1: impl FnMut(
+            C220MteL1ReadOperation<C220L1OutputRead>,
+        ) -> Result<bool, C220FixpReadPipelineError>,
+        mut destination_ready: impl FnMut(u64) -> bool,
         mut sync: impl C220FixpSync,
     ) -> Result<C220FixpReadProgress, C220FixpReadPipelineError> {
         self.begin(tick, 1, "send")?;
@@ -138,18 +167,30 @@ impl C220FixpReadPipeline {
                 ready_tick: entry.ready_tick,
             });
         }
-        if !input.can_enqueue() {
-            return Ok(C220FixpReadProgress::QueueFull);
+        if !destination_ready(entry.uop.instruction_id()) {
+            return Ok(C220FixpReadProgress::DestinationBackpressure);
         }
-        if sync.blocked(C220FixpSyncRequest {
-            tick,
-            instruction_id: entry.uop.operation.instruction_id,
-            point: C220FixpSyncPoint::ReadWait,
-        })? {
-            return Ok(C220FixpReadProgress::HardwareSync);
-        }
-        if !input.enqueue(tick, entry.uop.operation)? {
-            return Ok(C220FixpReadProgress::QueueFull);
+        match entry.uop {
+            C220FixpReadPacket::L0c(uop) => {
+                if !input.can_enqueue() {
+                    return Ok(C220FixpReadProgress::QueueFull);
+                }
+                if sync.blocked(C220FixpSyncRequest {
+                    tick,
+                    instruction_id: uop.operation.instruction_id,
+                    point: C220FixpSyncPoint::ReadWait,
+                })? {
+                    return Ok(C220FixpReadProgress::HardwareSync);
+                }
+                if !input.enqueue(tick, uop.operation)? {
+                    return Ok(C220FixpReadProgress::QueueFull);
+                }
+            }
+            C220FixpReadPacket::L1(operation) => {
+                if !send_l1(operation)? {
+                    return Ok(C220FixpReadProgress::QueueFull);
+                }
+            }
         }
         self.dispatch.pop_front();
         Ok(C220FixpReadProgress::Advanced(entry.uop))
@@ -215,7 +256,7 @@ mod tests {
         let mut pipeline = C220FixpReadPipeline::default();
         let mut input = C220MteL0cReadInterface::new(32, 0).unwrap();
         let packets = C220FixpReadGenerator::new(command, 1, 1, 256).unwrap();
-        let expected: Vec<_> = packets.clone().collect();
+        let expected: Vec<_> = packets.clone().map(C220FixpReadPacket::L0c).collect();
         binding.submit(&mut events, &mut pipeline, packets).unwrap();
         let mut generated = Vec::new();
         let mut sent = Vec::new();

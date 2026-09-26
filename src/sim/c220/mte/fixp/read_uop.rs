@@ -2,11 +2,32 @@ use super::{C220FixpCommand, C220FixpLayoutError};
 use crate::sim::c220::cube::C220CubeL0cAccess;
 use crate::sim::c220::memory::{C220L0cFragmentRequest, C220L0cReadRequest};
 use crate::sim::c220::mte::interface::C220MteL0cReadOperation;
+use crate::sim::c220::mte::interface::C220MteL1ReadOperation;
+use crate::sim::c220::mte::l1_to_out::{C220L1OutputRead, C220L1OutputReadPlan};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C220FixpReadPacket {
+    L0c(C220FixpReadUop),
+    L1(C220MteL1ReadOperation<C220L1OutputRead>),
+}
+
+impl C220FixpReadPacket {
+    pub const fn instruction_id(self) -> u64 {
+        match self {
+            Self::L0c(uop) => uop.operation.instruction_id,
+            Self::L1(operation) => operation.instruction_id,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum C220FixpReadStream {
     Columns(C220FixpReadGenerator),
     Nz2nd(super::C220FixpNz2ndReadGenerator),
+    L1Output {
+        instruction_id: u64,
+        reads: C220L1OutputReadPlan,
+    },
 }
 
 impl From<C220FixpReadGenerator> for C220FixpReadStream {
@@ -22,12 +43,18 @@ impl From<super::C220FixpNz2ndReadGenerator> for C220FixpReadStream {
 }
 
 impl Iterator for C220FixpReadStream {
-    type Item = C220FixpReadUop;
+    type Item = C220FixpReadPacket;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::Columns(generator) => generator.next(),
-            Self::Nz2nd(generator) => generator.next(),
+            Self::Columns(generator) => generator.next().map(C220FixpReadPacket::L0c),
+            Self::Nz2nd(generator) => generator.next().map(C220FixpReadPacket::L0c),
+            Self::L1Output {
+                instruction_id,
+                reads,
+            } => reads
+                .next()
+                .map(|read| C220FixpReadPacket::L1(read.l1_operation(*instruction_id))),
         }
     }
 }

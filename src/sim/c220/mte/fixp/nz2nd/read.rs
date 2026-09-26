@@ -209,7 +209,7 @@ mod tests {
     use super::*;
     use crate::isa::c220::mte::fixp::C220FixpDescriptor;
     use crate::sim::c220::mte::fixp::{
-        C220FixpReadPipeline, C220FixpReadProgress, C220FixpSourceFormat,
+        C220FixpReadPacket, C220FixpReadPipeline, C220FixpReadProgress, C220FixpSourceFormat,
     };
 
     #[test]
@@ -278,7 +278,9 @@ mod tests {
             C220FixpReadProgress::Delayed { ready_tick: 12 }
         );
         for tick in 12..19 {
-            let C220FixpReadProgress::Advanced(uop) = pipeline.generate(tick).unwrap() else {
+            let C220FixpReadProgress::Advanced(C220FixpReadPacket::L0c(uop)) =
+                pipeline.generate(tick).unwrap()
+            else {
                 panic!("expected generated read")
             };
             assert_eq!(uop.operation, packets[(tick - 12) as usize]);

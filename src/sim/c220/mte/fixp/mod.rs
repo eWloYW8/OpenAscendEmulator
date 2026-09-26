@@ -74,7 +74,8 @@ pub use read_pipeline::{
 };
 
 pub use read_uop::{
-    C220FixpReadGenerator, C220FixpReadGeneratorError, C220FixpReadStream, C220FixpReadUop,
+    C220FixpReadGenerator, C220FixpReadGeneratorError, C220FixpReadPacket, C220FixpReadStream,
+    C220FixpReadUop,
 };
 
 pub use execute::{C220FixpCommand, C220FixpExecutionError, C220FixpSliceResult};
