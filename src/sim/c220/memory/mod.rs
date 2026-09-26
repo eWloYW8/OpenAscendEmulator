@@ -64,6 +64,7 @@ pub struct C220LocalMemory {
     l0c: C220L0c,
     l1: C220LocalBuffer,
     bt: PvMemory,
+    smask: PvMemory,
     weight_index: C220LocalBuffer,
 }
 
@@ -75,6 +76,7 @@ impl C220LocalMemory {
             l0c: C220L0c::new(config.l0c_bytes, config.l0c_unit_flag_read_latency)?,
             l1: C220LocalBuffer::new(config.l1_bytes),
             bt: PvMemory::new(0, usize::MAX),
+            smask: PvMemory::new(0, usize::MAX),
             weight_index: C220LocalBuffer::new(u64::MAX),
         })
     }
@@ -123,6 +125,14 @@ impl C220LocalMemory {
 
     pub fn bt_mut(&mut self) -> &mut PvMemory {
         &mut self.bt
+    }
+
+    pub const fn smask(&self) -> &PvMemory {
+        &self.smask
+    }
+
+    pub fn smask_mut(&mut self) -> &mut PvMemory {
+        &mut self.smask
     }
 
     /// Linear sparse-weight metadata storage, without a physical-capacity constraint.
