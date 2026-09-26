@@ -12,6 +12,7 @@ impl C220MteL1ReadPort {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220MteL1ReadDestination {
+    External,
     L0a,
     L0b,
     L0c,

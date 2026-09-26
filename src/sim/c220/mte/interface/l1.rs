@@ -301,7 +301,11 @@ impl<T: Copy> C220MteL1Interface<T> {
                         operation.output_address,
                         operation.output_bytes,
                         operation.last_in_instruction,
-                        operation.output_bandwidth,
+                        if operation.destination == C220MteL1OutputDestination::External {
+                            NonZeroU32::MAX
+                        } else {
+                            operation.output_bandwidth
+                        },
                     ),
                     request,
                 )?;
@@ -343,6 +347,10 @@ impl<T: Copy> C220MteL1Interface<T> {
         self.output.acknowledgment_ready_tick()
     }
 
+    pub fn external_head(&self, tick: u64) -> Option<C220MteL1ReadRequest<T>> {
+        self.output.external_head(tick)
+    }
+
     pub fn retirement_ready_tick(&self) -> Option<u64> {
         self.output.retirement_ready_tick()
     }
@@ -352,6 +360,7 @@ impl<T: Copy> C220MteL1Interface<T> {
             self.inputs[index].front().map(|entry| C220MteL1ReadHead {
                 ready_tick: entry.ready_tick,
                 destination: match entry.request.operation.destination {
+                    C220MteL1OutputDestination::External => C220MteL1ReadDestination::External,
                     C220MteL1OutputDestination::SparseIndex => C220MteL1ReadDestination::Sp,
                     C220MteL1OutputDestination::Bt => C220MteL1ReadDestination::Bt,
                     C220MteL1OutputDestination::Fb => C220MteL1ReadDestination::Fb,

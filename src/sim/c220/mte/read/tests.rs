@@ -370,6 +370,7 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
                             request_ready: tick >= 20 && l1.request_ready(C220L1Port::MteRead),
                             response,
                             output_credits: C220MteL1OutputCredits {
+                                external: false,
                                 l0a: [l0a.can_push(C220L0WritePort::Port0), false, false],
                                 l0b: [l0b.can_push(C220L0WritePort::Port0), false, false],
                             },
@@ -414,6 +415,9 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
                                         }
                                         C220MteL1OutputDestination::SparseIndex => {
                                             panic!("index responses must not emit output")
+                                        }
+                                        C220MteL1OutputDestination::External => {
+                                            panic!("workload does not write external memory")
                                         }
                                         C220MteL1OutputDestination::L0a(port) => {
                                             assert!(l0a.push(tick, port, sent.fragment).unwrap())

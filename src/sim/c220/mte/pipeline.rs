@@ -1888,6 +1888,7 @@ impl C220MtePipeline {
                         request_ready: self.memory.request_ready(C220L1Port::MteRead),
                         response,
                         output_credits: C220MteL1OutputCredits {
+                            external: false,
                             l0a: [self.l0[0].can_push(C220L0WritePort::Port0), false, false],
                             l0b: [self.l0[1].can_push(C220L0WritePort::Port0), false, false],
                         },
@@ -1921,6 +1922,7 @@ impl C220MtePipeline {
                                     C220MteL1OutputDestination::L0a(port) => Some((0, port)),
                                     C220MteL1OutputDestination::L0b(port) => Some((1, port)),
                                     C220MteL1OutputDestination::Bt
+                                    | C220MteL1OutputDestination::External
                                     | C220MteL1OutputDestination::Fb
                                     | C220MteL1OutputDestination::Smask
                                     | C220MteL1OutputDestination::SparseIndex => None,

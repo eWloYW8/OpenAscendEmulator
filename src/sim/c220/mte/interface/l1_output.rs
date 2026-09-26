@@ -6,6 +6,8 @@ use super::{C220L0WritePort, C220MteOutputFragment, C220MteOutputPlan};
 pub enum C220MteL1OutputDestination {
     /// Read-only timing sink; index responses do not generate output fragments.
     SparseIndex,
+    /// Whole-transaction acknowledgment to the external-output engine.
+    External,
     Bt,
     Fb,
     Smask,
@@ -18,13 +20,14 @@ impl C220MteL1OutputDestination {
         match self {
             Self::Bt | Self::Smask => Some(5),
             Self::Fb => Some(0),
-            Self::SparseIndex | Self::L0a(_) | Self::L0b(_) => None,
+            Self::SparseIndex | Self::External | Self::L0a(_) | Self::L0b(_) => None,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct C220MteL1OutputCredits {
+    pub external: bool,
     pub l0a: [bool; 3],
     pub l0b: [bool; 3],
 }
@@ -33,6 +36,7 @@ impl C220MteL1OutputCredits {
     fn permits(self, destination: C220MteL1OutputDestination) -> bool {
         match destination {
             C220MteL1OutputDestination::SparseIndex => false,
+            C220MteL1OutputDestination::External => self.external,
             C220MteL1OutputDestination::Bt
             | C220MteL1OutputDestination::Fb
             | C220MteL1OutputDestination::Smask => true,
@@ -133,7 +137,7 @@ impl<T: Copy> C220MteL1Output<T> {
         C220MteL1OutputQueues {
             acknowledged: self.acknowledged.len(),
             output_fragments: self.acknowledged.front().map_or(0, |head| {
-                if head.expanded {
+                if head.expanded && head.destination != C220MteL1OutputDestination::External {
                     head.fragments.len()
                 } else {
                     0
@@ -234,6 +238,14 @@ impl<T: Copy> C220MteL1Output<T> {
 
     pub fn acknowledgment_ready_tick(&self) -> Option<u64> {
         self.acknowledged.front().map(|entry| entry.ready_tick)
+    }
+
+    /// Only the shared acknowledgment head may be offered to the external
+    /// receiver. A blocked external response also holds up local outputs.
+    pub fn external_head(&self, tick: u64) -> Option<T> {
+        self.ready_head(tick)
+            .filter(|head| head.destination == C220MteL1OutputDestination::External)
+            .map(|head| head.payload)
     }
 
     pub fn retirement_ready_tick(&self) -> Option<u64> {

@@ -21,6 +21,30 @@ pub struct C220L1OutputRead {
 }
 
 impl C220L1OutputRead {
+    pub fn l1_operation(
+        self,
+        instruction_id: u64,
+    ) -> crate::sim::c220::mte::interface::C220MteL1ReadOperation<Self> {
+        use crate::sim::c220::memory::l1::C220L1Access;
+        use crate::sim::c220::mte::interface::{
+            C220MteL1OutputDestination, C220MteL1ReadOperation,
+        };
+        C220MteL1ReadOperation {
+            instruction_id,
+            access: C220L1Access {
+                address: self.source_address,
+                bytes: self.bytes,
+            },
+            destination: C220MteL1OutputDestination::External,
+            output_address: self.destination_address,
+            output_bytes: self.destination_bytes,
+            output_bandwidth: NonZeroU32::MAX,
+            completes_logical_uop: self.last_in_transaction,
+            last_in_instruction: self.last_in_instruction,
+            payload: self,
+        }
+    }
+
     pub fn output_fragment(
         self,
         instruction_id: u64,
@@ -165,6 +189,109 @@ impl Iterator for C220L1OutputReadPlan {
 mod tests {
     use super::*;
     use crate::isa::c220::mte::l1_to_out::C220MovL1ToOutInstruction;
+
+    #[test]
+    fn l1_responses_forward_whole_transactions_with_shared_head_backpressure() {
+        use crate::sim::c220::memory::l1::{C220L1Geometry, C220L1Port, C220L1Transport};
+        use crate::sim::c220::mte::fixp::C220FixpExternalOutput;
+        use crate::sim::c220::mte::interface::{
+            C220MteL1Interface, C220MteL1OutputCredits, C220MteL1ReadPort,
+        };
+
+        let instruction =
+            C220MovL1ToOutInstruction::decode((3 << 29) | (2 << 27) | (4 << 23) | (2 << 3))
+                .unwrap();
+        let transfer = C220MovL1ToOutTransfer {
+            instruction,
+            source_address: 0,
+            destination_address: 4096,
+            xm: (1 << 4) | (16 << 16),
+        };
+        let mut reads = C220L1OutputReadPlan::new(
+            transfer,
+            C220DmaUopMode::Wide512,
+            NonZeroU32::new(32).unwrap(),
+        )
+        .peekable();
+        let mut interface = C220MteL1Interface::default();
+        let mut memory = C220L1Transport::new(C220L1Geometry::new(32, 1, 1, 0).unwrap());
+        let mut output = C220FixpExternalOutput::default();
+        let mut responses = 0;
+        let mut forwarded = Vec::new();
+        let mut blocked = false;
+        for tick in 0..200 {
+            if interface.can_push(C220MteL1ReadPort::Port1)
+                && let Some(read) = reads.next()
+            {
+                interface
+                    .push(tick, C220MteL1ReadPort::Port1, read.l1_operation(7))
+                    .unwrap()
+                    .unwrap();
+            }
+            memory.advance(tick).unwrap();
+            let sent = interface
+                .send_request(tick, memory.request_ready(C220L1Port::MteRead))
+                .unwrap();
+            if let Some(request) = sent.sent {
+                assert!(
+                    memory
+                        .send_request(tick, C220L1Port::MteRead, request.l1_request())
+                        .unwrap()
+                );
+            }
+            if let Some(response) = memory.receive_response(tick, C220L1Port::MteRead).unwrap() {
+                let request = interface
+                    .receive_response(tick, Some(response.request.id))
+                    .unwrap()
+                    .unwrap();
+                responses += 1;
+                if !request.operation.completes_logical_uop {
+                    assert_eq!(interface.queue_state().output.acknowledged, 0);
+                } else {
+                    assert!(interface.external_head(tick).is_none());
+                    assert_eq!(interface.acknowledgment_ready_tick(), Some(tick + 1));
+                }
+            }
+            let accepted = if let Some(head) = interface.external_head(tick) {
+                blocked |= tick < 100;
+                output
+                    .receive_l1_source(
+                        tick,
+                        tick,
+                        head.operation
+                            .payload
+                            .output_fragment(head.operation.instruction_id, head.id),
+                        tick >= 100,
+                    )
+                    .unwrap()
+            } else {
+                false
+            };
+            let sent = interface
+                .send_output(
+                    tick,
+                    C220MteL1OutputCredits {
+                        external: accepted,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            if let Some(transfer) = sent.sent {
+                forwarded.push(transfer.fragment);
+            }
+            assert_eq!(interface.queue_state().output.output_fragments, 0);
+            assert!(interface.retire(tick).unwrap().is_none());
+        }
+        assert!(blocked);
+        assert_eq!(responses, 16);
+        assert!(memory.is_idle());
+        assert!(interface.is_idle());
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].bytes, 512);
+        assert!(forwarded[0].last_in_instruction);
+        assert_eq!(output.bursts().len(), 1);
+        assert_eq!(output.bursts()[0].ready_tick, 101);
+    }
 
     #[test]
     fn transaction_splits_read_bandwidth_and_gather_rows() {
