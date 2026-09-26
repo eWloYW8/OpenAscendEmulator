@@ -166,13 +166,22 @@ impl C220Core {
                 return self.step_fixp_at(tick, pc, word);
             }
             C220DispatchKind::Vector => {
-                return Ok(match self.vector.step_at(tick, word, &mut self.state)? {
-                    VectorStep::Issued(instruction) => C220CoreStep::Executed {
-                        tick,
-                        instruction: C220CoreInstruction::Vector(instruction),
+                let request = crate::sim::c220::vector::C220VectorRequest::capture(
+                    self.state.scalar(),
+                    word,
+                )?;
+                return Ok(
+                    match self.vector.dispatch_at(tick, &request, &mut self.state)? {
+                        VectorStep::Issued(instruction) => {
+                            self.state.commit_c220_sequential_issue();
+                            C220CoreStep::Executed {
+                                tick,
+                                instruction: C220CoreInstruction::Vector(instruction),
+                            }
+                        }
+                        VectorStep::Stalled(stall) => C220CoreStep::Stalled(stall),
                     },
-                    VectorStep::Stalled(stall) => C220CoreStep::Stalled(stall),
-                });
+                );
             }
             C220DispatchKind::Mte1 => return self.step_mte1_at(tick, pc, word),
             C220DispatchKind::CubeSpr(instruction) => {

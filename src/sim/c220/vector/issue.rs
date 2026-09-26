@@ -61,13 +61,16 @@ struct ResolvedC220UnaryVector {
     iteration_masks: Vec<[u64; 4]>,
 }
 
-impl C220State {
+pub(super) struct C220VectorIssueContext<'a> {
+    pub pc: u64,
+    pub machine: &'a crate::sim::common::scalar::ScalarMachine,
+    pub ub: &'a crate::memory::ub::UbMemory,
+}
+
+impl C220VectorIssueContext<'_> {
     fn vector_issue_pc(&self, word: u32) -> Result<u64, C220ExecutionError> {
-        let pc = self.scalar.pc();
-        if self.scalar.is_halted() {
-            return Err(C220ExecutionError::ProgramEnded { pc });
-        }
-        if self.scalar.machine().architecture() != Architecture::Dav2201 {
+        let pc = self.pc;
+        if self.machine.architecture() != Architecture::Dav2201 {
             return Err(C220ExecutionError::UnsupportedWord { pc, word });
         }
         Ok(pc)
@@ -78,10 +81,10 @@ impl C220State {
         word: u32,
     ) -> Result<C220MergeIssue, C220ExecutionError> {
         let pc = self.vector_issue_pc(word)?;
-        let machine = self.scalar.machine();
+        let machine = self.machine;
         C220MergeInstruction::decode(word)
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
-        Ok(plan_c220_merge_issue(pc, word, machine.xregs(), &self.ub)?)
+        Ok(plan_c220_merge_issue(pc, word, machine.xregs(), self.ub)?)
     }
 
     pub(crate) fn preview_c220_sort_word(
@@ -89,7 +92,7 @@ impl C220State {
         word: u32,
     ) -> Result<C220SortIssue, C220ExecutionError> {
         let pc = self.vector_issue_pc(word)?;
-        let machine = self.scalar.machine();
+        let machine = self.machine;
         let instruction = C220SortInstruction::decode(word)
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
         let registers = machine.xregs();
@@ -102,7 +105,7 @@ impl C220State {
                 source_0: registers[usize::from(instruction.value_register)],
                 source_1: registers[usize::from(instruction.index_register)],
             },
-            &self.ub,
+            self.ub,
         )?)
     }
 
@@ -111,7 +114,7 @@ impl C220State {
         word: u32,
     ) -> Result<C220FusedIssue, C220ExecutionError> {
         let pc = self.vector_issue_pc(word)?;
-        let machine = self.scalar.machine();
+        let machine = self.machine;
         let instruction = C220FusedInstruction::decode(word)
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
         let xregs = machine.xregs();
@@ -149,7 +152,7 @@ impl C220State {
                 descriptor_address: 32 * (deq_scale & 0x3fff),
                 deq_scale: deq_scale as u16,
             },
-            &self.ub,
+            self.ub,
         )?)
     }
 
@@ -158,7 +161,7 @@ impl C220State {
         word: u32,
     ) -> Result<C220ConversionIssue, C220ExecutionError> {
         let pc = self.vector_issue_pc(word)?;
-        let machine = self.scalar.machine();
+        let machine = self.machine;
         let instruction = C220ConversionInstruction::decode(word)
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
         let xregs = machine.xregs();
@@ -194,7 +197,7 @@ impl C220State {
                 integer_saturating: mask_control & (1 << 59) == 0,
                 deq_scale,
             },
-            &self.ub,
+            self.ub,
         )?)
     }
 
@@ -202,12 +205,8 @@ impl C220State {
         &self,
         word: u32,
     ) -> Result<C220SpecialUnaryIssue, C220ExecutionError> {
-        let instruction = C220SpecialUnaryInstruction::decode(word).ok_or(
-            C220ExecutionError::UnsupportedWord {
-                pc: self.scalar.pc(),
-                word,
-            },
-        )?;
+        let instruction = C220SpecialUnaryInstruction::decode(word)
+            .ok_or(C220ExecutionError::UnsupportedWord { pc: self.pc, word })?;
         let resolved = self.resolve_c220_unary_vector(
             word,
             instruction.destination_register,
@@ -223,7 +222,7 @@ impl C220State {
             resolved.addresses,
             &resolved.iteration_masks,
             C220Fp16Mode::from_control_spr(resolved.mask_control),
-            &self.ub,
+            self.ub,
         )?)
     }
 
@@ -231,11 +230,8 @@ impl C220State {
         &self,
         word: u32,
     ) -> Result<C220AxpyIssue, C220ExecutionError> {
-        let instruction =
-            C220AxpyInstruction::decode(word).ok_or(C220ExecutionError::UnsupportedWord {
-                pc: self.scalar.pc(),
-                word,
-            })?;
+        let instruction = C220AxpyInstruction::decode(word)
+            .ok_or(C220ExecutionError::UnsupportedWord { pc: self.pc, word })?;
         let resolved = self.resolve_c220_unary_vector(
             word,
             instruction.destination_register,
@@ -248,14 +244,13 @@ impl C220State {
             C220AxpyIssueInputs {
                 pc: resolved.pc,
                 word,
-                scalar_bits: self.scalar.machine().xregs()[usize::from(instruction.scalar_register)]
-                    as u32,
+                scalar_bits: self.machine.xregs()[usize::from(instruction.scalar_register)] as u32,
                 control: resolved.control,
                 addresses: resolved.addresses,
                 iteration_masks: &resolved.iteration_masks,
                 fp16_mode: C220Fp16Mode::from_control_spr(resolved.mask_control),
             },
-            &self.ub,
+            self.ub,
         )?)
     }
 
@@ -266,7 +261,7 @@ impl C220State {
         let pc = self.vector_issue_pc(word)?;
         let instruction = C220GatherInstruction::decode(word)
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
-        let machine = self.scalar.machine();
+        let machine = self.machine;
         let registers = machine.xregs();
         let control_value = registers[usize::from(instruction.control_register)];
         let iteration_masks = match instruction.kind {
@@ -292,7 +287,7 @@ impl C220State {
             registers[usize::from(instruction.destination_register)],
             registers[usize::from(instruction.index_register)],
             iteration_masks,
-            &self.ub,
+            self.ub,
         )?)
     }
 
@@ -303,7 +298,7 @@ impl C220State {
         let pc = self.vector_issue_pc(word)?;
         let instruction = C220TernaryInstruction::decode(word)
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
-        let machine = self.scalar.machine();
+        let machine = self.machine;
         let registers = machine.xregs();
         let control =
             C220VectorControl::decode_binary(registers[usize::from(instruction.control_register)]);
@@ -332,7 +327,7 @@ impl C220State {
             },
             &iteration_masks,
             C220Fp16Mode::from_control_spr(mask_control),
-            &self.ub,
+            self.ub,
         )?)
     }
 
@@ -340,11 +335,8 @@ impl C220State {
         &self,
         word: u32,
     ) -> Result<C220ReductionIssue, C220ExecutionError> {
-        let instruction =
-            C220ReductionInstruction::decode(word).ok_or(C220ExecutionError::UnsupportedWord {
-                pc: self.scalar.pc(),
-                word,
-            })?;
+        let instruction = C220ReductionInstruction::decode(word)
+            .ok_or(C220ExecutionError::UnsupportedWord { pc: self.pc, word })?;
         let resolved = self.resolve_c220_unary_vector(
             word,
             instruction.destination_register,
@@ -360,7 +352,7 @@ impl C220State {
             resolved.addresses,
             &resolved.iteration_masks,
             C220Fp16Mode::from_control_spr(resolved.mask_control),
-            &self.ub,
+            self.ub,
         )?)
     }
 
@@ -371,13 +363,13 @@ impl C220State {
         let pc = self.vector_issue_pc(word)?;
         let instruction = C220TransposeInstruction::decode(word)
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
-        let xregs = self.scalar.machine().xregs();
+        let xregs = self.machine.xregs();
         Ok(plan_c220_transpose_issue(
             pc,
             word,
             xregs[usize::from(instruction.source_register)],
             xregs[usize::from(instruction.destination_register)],
-            &self.ub,
+            self.ub,
         )?)
     }
 
@@ -388,14 +380,14 @@ impl C220State {
         let pc = self.vector_issue_pc(word)?;
         let instruction = C220BroadcastInstruction::decode(word)
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
-        let xregs = self.scalar.machine().xregs();
+        let xregs = self.machine.xregs();
         Ok(plan_c220_broadcast_issue(
             pc,
             word,
             xregs[usize::from(instruction.control_register)],
             xregs[usize::from(instruction.source_register)],
             xregs[usize::from(instruction.destination_register)],
-            &self.ub,
+            self.ub,
         )?)
     }
 
@@ -409,7 +401,7 @@ impl C220State {
         let element_bytes = instruction
             .supported_element_bytes()
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
-        let machine = self.scalar.machine();
+        let machine = self.machine;
         let xregs = machine.xregs();
         let control = xregs[usize::from(instruction.control_register)];
         let control = C220MovevControl::decode(control);
@@ -439,7 +431,7 @@ impl C220State {
             destination_address,
             scalar_word,
             &iteration_masks,
-            &self.ub,
+            self.ub,
         )?)
     }
 
@@ -449,8 +441,7 @@ impl C220State {
     ) -> Result<C220VectorArithmeticIssue, C220ExecutionError> {
         let resolved = self.resolve_c220_vector_arithmetic(word)?;
         let control_spr = self
-            .scalar
-            .machine()
+            .machine
             .spr_value(3)
             .ok_or(C220VectorError::MissingMaskState)?;
         let issue = plan_c220_vector_arithmetic_issue(
@@ -460,7 +451,7 @@ impl C220State {
             resolved.addresses,
             &resolved.iteration_masks,
             C220VectorArithmeticModes::from_control_spr(control_spr),
-            &self.ub,
+            self.ub,
         )?;
         Ok(issue)
     }
@@ -469,12 +460,8 @@ impl C220State {
         &self,
         word: u32,
     ) -> Result<C220VectorScalarIssue, C220ExecutionError> {
-        let instruction = C220VectorScalarInstruction::decode(word).ok_or(
-            C220ExecutionError::UnsupportedWord {
-                pc: self.scalar.pc(),
-                word,
-            },
-        )?;
+        let instruction = C220VectorScalarInstruction::decode(word)
+            .ok_or(C220ExecutionError::UnsupportedWord { pc: self.pc, word })?;
         let resolved = self.resolve_c220_unary_vector(
             word,
             instruction.destination_register,
@@ -487,15 +474,14 @@ impl C220State {
             resolved.pc,
             word,
             C220VectorScalarOperand {
-                bits: self.scalar.machine().xregs()[usize::from(instruction.scalar_register)]
-                    as u32,
+                bits: self.machine.xregs()[usize::from(instruction.scalar_register)] as u32,
                 fp16_mode: C220Fp16Mode::from_control_spr(resolved.mask_control),
                 integer_saturating: resolved.mask_control & (1 << 53) != 0,
             },
             resolved.control,
             resolved.addresses,
             &resolved.iteration_masks,
-            &self.ub,
+            self.ub,
         )?;
         Ok(issue)
     }
@@ -504,11 +490,8 @@ impl C220State {
         &self,
         word: u32,
     ) -> Result<C220ShiftIssue, C220ExecutionError> {
-        let instruction =
-            C220ShiftInstruction::decode(word).ok_or(C220ExecutionError::UnsupportedWord {
-                pc: self.scalar.pc(),
-                word,
-            })?;
+        let instruction = C220ShiftInstruction::decode(word)
+            .ok_or(C220ExecutionError::UnsupportedWord { pc: self.pc, word })?;
         let resolved = self.resolve_c220_unary_vector(
             word,
             instruction.destination_register,
@@ -520,11 +503,11 @@ impl C220State {
         Ok(plan_c220_shift_issue(
             resolved.pc,
             word,
-            self.scalar.machine().xregs()[usize::from(instruction.shift_register)] as u32,
+            self.machine.xregs()[usize::from(instruction.shift_register)] as u32,
             resolved.control,
             resolved.addresses,
             &resolved.iteration_masks,
-            &self.ub,
+            self.ub,
         )?)
     }
 
@@ -532,11 +515,8 @@ impl C220State {
         &self,
         word: u32,
     ) -> Result<C220CopyIssue, C220ExecutionError> {
-        let instruction =
-            C220CopyInstruction::decode(word).ok_or(C220ExecutionError::UnsupportedWord {
-                pc: self.scalar.pc(),
-                word,
-            })?;
+        let instruction = C220CopyInstruction::decode(word)
+            .ok_or(C220ExecutionError::UnsupportedWord { pc: self.pc, word })?;
         let resolved = self.resolve_c220_unary_vector(
             word,
             instruction.destination_register,
@@ -551,7 +531,7 @@ impl C220State {
             resolved.control,
             resolved.addresses,
             &resolved.iteration_masks,
-            &self.ub,
+            self.ub,
         )?)
     }
 
@@ -565,7 +545,7 @@ impl C220State {
         supports_count_mask: bool,
     ) -> Result<ResolvedC220UnaryVector, C220ExecutionError> {
         let pc = self.vector_issue_pc(word)?;
-        let machine = self.scalar.machine();
+        let machine = self.machine;
         let xregs = machine.xregs();
         let mask_control = machine
             .spr_value(3)
@@ -601,14 +581,6 @@ impl C220State {
         })
     }
 
-    pub(crate) fn commit_c220_vector_stores(
-        &mut self,
-        stores: &[C220VectorStore],
-    ) -> Result<(), C220ExecutionError> {
-        super::access::commit_vector_stores(&mut self.ub, stores)?;
-        Ok(())
-    }
-
     fn resolve_c220_vector_arithmetic(
         &self,
         word: u32,
@@ -623,7 +595,7 @@ impl C220State {
                     || hint.has_bitwise_b16_value_path()
             })
             .ok_or(C220ExecutionError::UnsupportedWord { pc, word })?;
-        let machine = self.scalar.machine();
+        let machine = self.machine;
         let xregs = machine.xregs();
         let control = xregs[usize::from(hint.control_register)];
         let control = if matches!(
@@ -669,5 +641,15 @@ impl C220State {
             },
             iteration_masks,
         })
+    }
+}
+
+impl C220State {
+    pub(crate) fn commit_c220_vector_stores(
+        &mut self,
+        stores: &[C220VectorStore],
+    ) -> Result<(), C220ExecutionError> {
+        super::access::commit_vector_stores(&mut self.ub, stores)?;
+        Ok(())
     }
 }

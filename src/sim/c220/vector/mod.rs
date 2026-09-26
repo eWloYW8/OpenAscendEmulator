@@ -9,6 +9,7 @@ pub mod ops;
 pub mod pipeline;
 pub mod read;
 mod repeat;
+mod request;
 pub(super) mod runtime;
 mod spr;
 pub mod timing;
@@ -17,6 +18,7 @@ pub mod va;
 pub mod vmsu;
 
 pub use instruction::C220VectorInstruction;
+pub use request::C220VectorRequest;
 pub use runtime::{C220VectorFence, C220VectorRuntimeError};
 
 use crate::isa::c220::vector::C220VectorControl;

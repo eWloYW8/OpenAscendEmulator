@@ -6,6 +6,7 @@ pub(super) fn execute_write(
     pc: u64,
     word: u32,
     instruction: C220VectorSprWrite,
+    source_value: u64,
 ) -> Result<ScalarSprStep, ScalarMachineError> {
     let mask = match instruction.destination_spr {
         12 | 17 | 48..=51 | 56 | 63 => u64::MAX,
@@ -14,7 +15,6 @@ pub(super) fn execute_write(
         57 => 0xffff_ffff,
         _ => return Err(ScalarMachineError::UnsupportedWord { pc, word }),
     };
-    let source_value = machine.xregs()[usize::from(instruction.source_register)];
     let prior_destination_value = machine.spr_value(instruction.destination_spr);
     let value = source_value & mask;
     machine.set_spr_value(instruction.destination_spr, value)?;
