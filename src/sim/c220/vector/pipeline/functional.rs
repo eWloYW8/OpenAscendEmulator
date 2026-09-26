@@ -10,6 +10,7 @@ use crate::sim::c220::vector::ops::{
     conversion::C220ConversionIssue,
     copy::C220CopyIssue,
     fused::C220FusedIssue,
+    nchw::C220NchwIssue,
     scalar::C220VectorScalarIssue,
     select::{C220SelectIssue, C220SelectMode},
     shift::C220ShiftIssue,
@@ -39,6 +40,7 @@ pub(super) enum FunctionalInstruction {
     Transpose(Box<C220TransposeIssue>),
     Broadcast(Box<C220BroadcastIssue>),
     Sort(Box<C220SortIssue>),
+    Nchw(Box<C220NchwIssue>),
 }
 
 impl FunctionalInstruction {
@@ -68,6 +70,7 @@ impl FunctionalInstruction {
             C220VectorReadIssue::Transpose(issue) => Some(Self::Transpose(Box::new(issue.clone()))),
             C220VectorReadIssue::Broadcast(issue) => Some(Self::Broadcast(Box::new(issue.clone()))),
             C220VectorReadIssue::Sort(issue) => Some(Self::Sort(Box::new(issue.clone()))),
+            C220VectorReadIssue::Nchw(issue) => Some(Self::Nchw(Box::new(issue.clone()))),
             _ => None,
         }
     }
@@ -90,6 +93,7 @@ impl FunctionalInstruction {
             Self::Transpose(issue) => C220VectorReadIssue::Transpose(issue),
             Self::Broadcast(issue) => C220VectorReadIssue::Broadcast(issue),
             Self::Sort(issue) => C220VectorReadIssue::Sort(issue),
+            Self::Nchw(issue) => C220VectorReadIssue::Nchw(issue),
         }
     }
 
@@ -144,6 +148,7 @@ impl FunctionalInstruction {
             Self::MoveMask(_) | Self::Transpose(_) => return (1, 0),
             Self::Broadcast(issue) => return (usize::from(issue.control.repeat_count), 0),
             Self::Sort(issue) => return (usize::from(issue.repeat_count), 0),
+            Self::Nchw(issue) => return (issue.rows.len(), 0),
             Self::PackedCompare(issue) => {
                 return (issue.uop_count(), issue.instruction.width.lane_count());
             }
@@ -177,6 +182,7 @@ impl C220VectorPipeline {
                     | FunctionalInstruction::Transpose(_)
                     | FunctionalInstruction::Broadcast(_)
                     | FunctionalInstruction::Sort(_)
+                    | FunctionalInstruction::Nchw(_)
             ) {
                 (None, C220VectorUopKind::Ordinary)
             } else {
@@ -188,9 +194,14 @@ impl C220VectorPipeline {
                     },
                 )
             };
+            let read_index = if matches!(instruction, FunctionalInstruction::Nchw(_)) {
+                2 * repeat
+            } else {
+                repeat
+            };
             let mut read = PendingVectorRead::new_functional(
                 instruction.read_issue(),
-                repeat,
+                read_index,
                 lane_group,
                 kind,
             )?;

@@ -380,13 +380,6 @@ impl PendingVectorRead {
         self.sampled
     }
 
-    pub(super) fn shares_read_with_next(&self) -> bool {
-        matches!(
-            &self.operation,
-            C220VectorReadOperation::Transpose | C220VectorReadOperation::Nchw { .. }
-        )
-    }
-
     pub(super) fn is_load_va(&self) -> bool {
         matches!(self.operation, C220VectorReadOperation::LoadVa { .. })
     }

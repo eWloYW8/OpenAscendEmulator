@@ -720,22 +720,7 @@ impl C220VectorPipeline {
             let (sample, stores) = read.sample(ub, self.compare_mask)?;
             let reduction_update = sample.reduction_update;
             let va_update = sample.va_update;
-            let shares_read = read.shares_read_with_next();
-            let first_store_count = self.pending[index].stores.len();
-            if shares_read && (index + 1 >= self.pending.len() || stores.len() < first_store_count)
-            {
-                return Err(C220VectorAdvanceError::WriteTargetMismatch);
-            }
-            let (first_stores, second_stores) = if shares_read {
-                stores.split_at(first_store_count)
-            } else {
-                (stores.as_slice(), &[][..])
-            };
-            if !write_targets_match(first_stores, &self.pending[index].stores)
-                || (shares_read
-                    && (!self.pending[index + 1].shared_read_from_previous
-                        || !write_targets_match(second_stores, &self.pending[index + 1].stores)))
-            {
+            if !write_targets_match(&stores, &self.pending[index].stores) {
                 return Err(C220VectorAdvanceError::WriteTargetMismatch);
             }
             self.pending[index]
@@ -743,7 +728,7 @@ impl C220VectorPipeline {
                 .as_mut()
                 .expect("read remains pending")
                 .mark_sampled();
-            self.pending[index].stores = first_stores.to_vec();
+            self.pending[index].stores = stores;
             if let Some(update) = self.pending[index].reduction_update.as_mut() {
                 update.update = reduction_update;
             }
@@ -752,9 +737,6 @@ impl C220VectorPipeline {
                 .checked_add(u64::from(self.pending[index].uop.stages.execute_ticks))
                 .ok_or(C220VectorAdvanceError::TimeOverflow)?;
             self.pending[index].execute_ready_tick = Some(execute_ready_tick);
-            if shares_read {
-                self.pending[index + 1].stores = second_stores.to_vec();
-            }
             self.last_read_samples.push(sample);
         }
         Ok(())

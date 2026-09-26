@@ -218,9 +218,12 @@ impl C220VectorPipeline {
                 && match compute {
                     Some(C220VectorReadIssue::Select(select)) => select.iteration_masks.is_empty(),
                     Some(C220VectorReadIssue::Broadcast(issue)) => issue.control.repeat_count == 0,
-                    Some(C220VectorReadIssue::MoveMask(_) | C220VectorReadIssue::Transpose(_)) => {
-                        false
-                    }
+                    Some(
+                        C220VectorReadIssue::MoveMask(_)
+                        | C220VectorReadIssue::Transpose(_)
+                        | C220VectorReadIssue::Sort(_)
+                        | C220VectorReadIssue::Nchw(_),
+                    ) => false,
                     _ => uop.lane_group.is_none(),
                 };
             let mut read = if let Some(issue) = compute

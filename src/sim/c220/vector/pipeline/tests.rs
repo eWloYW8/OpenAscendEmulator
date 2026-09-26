@@ -12,6 +12,99 @@ use crate::sim::common::scalar::ScalarMachine;
 use crate::sim::common::scalar::ScalarStepper;
 
 #[test]
+fn nchw_repeats_commit_whole_tiles_and_keep_physical_reads() {
+    use crate::sim::c220::vector::C220VectorInstruction;
+    use crate::sim::c220::vector::ops::nchw::plan_c220_nchw_issue;
+    use crate::sim::c220::vector::va::{C220VaRegisters, C220VaUpdate};
+
+    for word in [
+        0x8200_0680,
+        0x8200_0681,
+        0x8200_0682,
+        0x8200_0683,
+        0x8240_0680,
+        0x8280_0680,
+    ] {
+        let initial = (0..512)
+            .map(|index| (index * 37 + index / 32) as u8)
+            .collect::<Vec<_>>();
+        let mut ub = UbMemory::new(512, 512);
+        ub.write_states(
+            0,
+            &initial
+                .iter()
+                .copied()
+                .map(MemoryByteState::Known)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut va = C220VaRegisters::default();
+        for register in 0..2 {
+            va.apply(C220VaUpdate {
+                destination_va: register,
+                entries: std::array::from_fn(|index| u16::from(register) * 8 + index as u16),
+            });
+        }
+        let instruction =
+            C220VectorInstruction::Nchw(plan_c220_nchw_issue(0, word, 2 << 56, &va, &ub).unwrap());
+        let mut expected = initial;
+        let width = match word & !3 {
+            0x8240_0680 => 2,
+            0x8280_0680 => 4,
+            _ => 1,
+        };
+        for _ in 0..2 {
+            let input = expected.clone();
+            for row in 0..(32 / width).min(16) {
+                for column in 0..16 {
+                    let source =
+                        column * 32 + row * width + usize::from(width == 1 && word & 2 != 0) * 16;
+                    let destination = if width == 4 {
+                        (row * 2 + column / 8) * 32 + (column % 8) * 4
+                    } else {
+                        row * 32 + column * width + usize::from(width == 1 && word & 1 != 0) * 16
+                    };
+                    expected[destination..destination + width]
+                        .copy_from_slice(&input[source..source + width]);
+                }
+            }
+        }
+        let machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+        let mut core = C220State::new(ScalarStepper::new(machine, 0), ub);
+        let mut pipeline = C220VectorPipeline::new(C220VectorTimingRules {
+            dispatch_ticks: 0,
+            uop_issue_interval: NonZeroU64::new(1).unwrap(),
+            ub_response_ticks: 2,
+        });
+        let uops = instruction.uops().unwrap();
+        assert_eq!(uops.len(), 4);
+        pipeline
+            .issue_at(0, &uops, instruction.stores(), instruction.read_issue())
+            .unwrap();
+        let releases = pipeline.advance_to(512, &mut core).unwrap();
+        assert_eq!(releases.len(), 4);
+        assert_eq!(pipeline.last_read_samples().len(), 2);
+        assert!(
+            pipeline
+                .last_read_samples()
+                .iter()
+                .all(|sample| !sample.read0_grants.is_empty()
+                    && sample.read0_grants.iter().all(Option::is_some))
+        );
+        assert_eq!(pipeline.last_functional_samples().len(), 2);
+        assert!(
+            pipeline
+                .last_functional_samples()
+                .iter()
+                .all(|sample| sample.tick == releases.last().unwrap().release_tick + 1)
+        );
+        assert_eq!(core.ub().read_known(0, 512).unwrap(), expected);
+        assert_eq!(pipeline.pending_uops(), 0);
+        assert_eq!(pipeline.pending_ub_responses(), 0);
+    }
+}
+
+#[test]
 fn sort_functional_completion_observes_live_inputs_and_repeat_feedback() {
     use crate::sim::c220::numeric::fp16::to_f64;
     use crate::sim::c220::vector::C220VectorInstruction;
@@ -101,6 +194,13 @@ fn sort_functional_completion_observes_live_inputs_and_repeat_feedback() {
             let releases = pipeline.advance_to(512, &mut core).unwrap();
             let samples = pipeline.last_functional_samples();
             assert_eq!(samples.len(), 2);
+            assert_eq!(pipeline.last_read_samples().len(), 2);
+            assert!(pipeline.last_read_samples().iter().all(|sample| {
+                !sample.read0_grants.is_empty()
+                    && sample.read0_grants.iter().all(Option::is_some)
+                    && !sample.read1_grants.is_empty()
+                    && sample.read1_grants.iter().all(Option::is_some)
+            }));
             assert!(
                 samples
                     .iter()
