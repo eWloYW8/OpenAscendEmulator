@@ -23,6 +23,8 @@ use thiserror::Error;
 pub enum C220VmsuError {
     #[error("C220 VMSU is already active")]
     Busy,
+    #[error("C220 VMSU timing for an empty merge schedule is not implemented")]
+    UnsupportedEmptySchedule,
     #[error("C220 VMSU timeline moved backwards from {previous} to {requested}")]
     TimeReversed { previous: u64, requested: u64 },
     #[error("C220 VMSU timeline computation overflowed")]
@@ -83,6 +85,12 @@ impl C220VmsuPipeline {
         self.active.as_ref().map(|active| active.generation)
     }
 
+    pub(crate) fn fence_is_retired(&self, generation: u64) -> bool {
+        self.active
+            .as_ref()
+            .is_none_or(|active| active.generation != generation)
+    }
+
     pub(crate) fn fence_retirement_tick(&self, generation: u64) -> Option<u64> {
         self.active
             .as_ref()
@@ -119,13 +127,13 @@ impl C220VmsuPipeline {
         tick: u64,
         issue: C220MergeIssue,
         ub: &UbMemory,
-    ) -> Result<Option<u64>, C220VmsuError> {
+    ) -> Result<u64, C220VmsuError> {
         if self.active.is_some() {
             return Err(C220VmsuError::Busy);
         }
         self.check_time(tick)?;
         if issue.repeat_count() == 0 {
-            return Ok(None);
+            return Err(C220VmsuError::UnsupportedEmptySchedule);
         }
         let admission_tick = tick
             .checked_add(self.rules.dispatch_ticks)
@@ -157,7 +165,7 @@ impl C220VmsuPipeline {
             projected_visibility,
         });
         self.observed_tick = Some(tick);
-        Ok(Some(projected_visibility))
+        Ok(projected_visibility)
     }
 
     pub(crate) fn next_event_tick(&self) -> Option<u64> {

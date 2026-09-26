@@ -141,7 +141,7 @@ mod tests {
             C220CompareMask::from_bits([0; 2]),
         );
         assert!(matches!(
-            engine.dispatch_at(20, &request, &mut state).unwrap(),
+            engine.dispatch_at(20, 0, &request, &mut state).unwrap(),
             VectorStep::Issued(C220VectorInstruction::Arithmetic(_))
         ));
         assert_eq!(state.scalar().pc(), 0x1004);
@@ -153,6 +153,10 @@ mod tests {
             engine.advance_event(tick, &mut state).unwrap();
         }
         assert_eq!(state.ub().read_known(64, 4).unwrap(), 7_f32.to_le_bytes());
+        assert_eq!(engine.retirements.len(), 1);
+        assert_eq!(engine.retirements[0].instruction_id, 0);
+        assert_eq!(engine.retirements[0].pc, 0x1000);
+        assert_eq!(engine.retirements[0].dispatch_tick, 20);
         assert!(state.ub().read_known(128, 4).is_err());
         assert_eq!(state.scalar().machine().spr_value(100), Some(1));
         assert_eq!(
@@ -174,7 +178,7 @@ mod tests {
             .set_spr_value(12, 99)
             .unwrap();
         let VectorStep::Issued(C220VectorInstruction::WriteSpr(step)) =
-            engine.dispatch_at(100, &request, &mut state).unwrap()
+            engine.dispatch_at(100, 1, &request, &mut state).unwrap()
         else {
             panic!("captured SPR write");
         };
@@ -182,5 +186,37 @@ mod tests {
         assert_eq!(step.value, 0xabcdef);
         assert_eq!(state.scalar().machine().spr_value(12), Some(0xabcdef));
         assert_eq!(state.scalar().pc(), 0x1004);
+        engine.begin_advance();
+        assert!(matches!(
+            engine.dispatch_at(101, 7, &request, &mut state).unwrap(),
+            VectorStep::Issued(C220VectorInstruction::WriteSpr(_))
+        ));
+        let fence = engine.instruction_fence();
+        assert_eq!(fence.instruction_id, Some(7));
+        engine.advance_event(102, &mut state).unwrap();
+        assert_eq!(engine.retirements.len(), 1);
+        assert_eq!(engine.retirements[0].instruction_id, 1);
+        assert_eq!(engine.retirements[0].retirement_tick, 102);
+        assert_eq!(engine.fence_retirement_tick(fence), Some(103));
+        engine.advance_event(103, &mut state).unwrap();
+        assert_eq!(engine.retirements[1].instruction_id, 7);
+        assert_eq!(engine.retirements[1].retirement_tick, 103);
+        assert_eq!(engine.fence_retirement_tick(fence), None);
+
+        state
+            .scalar_mut()
+            .machine_mut()
+            .set_spr_value(17, 57)
+            .unwrap();
+        let empty = C220VectorRequest::capture(state.scalar(), 0x85c0_0003).unwrap();
+        assert!(matches!(
+            engine.dispatch_at(104, 8, &empty, &mut state),
+            Err(super::super::runtime::C220VectorRuntimeError::Merge(
+                super::super::vmsu::C220VmsuError::UnsupportedEmptySchedule
+            ))
+        ));
+        assert_eq!(state.scalar().machine().spr_value(17), Some(57));
+        assert_eq!(state.scalar().pc(), 0x1004);
+        assert_eq!(engine.instruction_fence().instruction_id, None);
     }
 }

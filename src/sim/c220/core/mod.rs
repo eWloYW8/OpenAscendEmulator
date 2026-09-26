@@ -337,6 +337,14 @@ impl C220Core {
         &self.vector.releases
     }
 
+    pub fn last_vector_retirements(&self) -> &[crate::sim::c220::vector::C220VectorRetirement] {
+        &self.vector.retirements
+    }
+
+    pub fn outstanding_vector_instructions(&self) -> usize {
+        self.vector.outstanding_instructions()
+    }
+
     pub fn last_cube_outcomes(&self) -> &[C220CubeExecutionOutcome] {
         &self.cube.outcomes
     }

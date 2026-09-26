@@ -375,6 +375,16 @@ impl C220VectorPipeline {
             .max()
     }
 
+    pub(crate) fn fence_is_retired(&self, group: u64) -> bool {
+        let retired = |due: u64| self.observed_tick.is_some_and(|tick| tick >= due);
+        !self.pending.iter().any(|entry| {
+            entry.instruction_group <= group && !entry.retirement_tick.is_some_and(retired)
+        }) && self
+            .register_retirements
+            .range(..=group)
+            .all(|(_, &due)| retired(due))
+    }
+
     pub fn pending_drain_tick(&self) -> Option<u64> {
         self.predicted_ticks()
             .into_iter()

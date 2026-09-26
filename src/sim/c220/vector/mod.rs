@@ -10,6 +10,7 @@ pub mod pipeline;
 pub mod read;
 mod repeat;
 mod request;
+mod retirement;
 pub(super) mod runtime;
 mod spr;
 pub mod timing;
@@ -19,7 +20,8 @@ pub mod vmsu;
 
 pub use instruction::C220VectorInstruction;
 pub use request::C220VectorRequest;
-pub use runtime::{C220VectorFence, C220VectorRuntimeError};
+pub use retirement::{C220VectorFence, C220VectorRetirement};
+pub use runtime::C220VectorRuntimeError;
 
 use crate::isa::c220::vector::C220VectorControl;
 pub use access::{

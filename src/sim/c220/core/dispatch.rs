@@ -171,7 +171,12 @@ impl C220Core {
                     word,
                 )?;
                 return Ok(
-                    match self.vector.dispatch_at(tick, &request, &mut self.state)? {
+                    match self.vector.dispatch_at(
+                        tick,
+                        self.next_instruction_id,
+                        &request,
+                        &mut self.state,
+                    )? {
                         VectorStep::Issued(instruction) => {
                             self.state.commit_c220_sequential_issue();
                             C220CoreStep::Executed {

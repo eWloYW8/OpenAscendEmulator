@@ -8,7 +8,9 @@ use crate::sim::c220::vector::va::C220VaRegisters;
 use crate::sim::c220::vector::vmsu::C220VmsuPipeline;
 
 use super::pipeline::{C220VectorAdvanceError, C220VectorPipelineError};
+use super::retirement::PendingVectorInstruction;
 use super::vmsu::C220VmsuError;
+use super::{C220VectorFence, C220VectorRetirement};
 use super::{C220VectorInstruction, C220VectorUopError};
 
 pub(in crate::sim::c220) struct VectorEngine {
@@ -17,12 +19,11 @@ pub(in crate::sim::c220) struct VectorEngine {
     pub(in crate::sim::c220) va: C220VaRegisters,
     pub(in crate::sim::c220) releases: Vec<C220VectorUopRelease>,
     scalar_flags: BTreeMap<u32, VecDeque<C220VectorFence>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220VectorFence {
-    pub instruction_group: Option<u64>,
-    pub vmsu_generation: Option<u64>,
+    pub(super) pending_instructions: VecDeque<PendingVectorInstruction>,
+    pub(super) last_dispatched_id: Option<u64>,
+    pub(super) last_retired_tick: Option<u64>,
+    pub(super) observed_tick: Option<u64>,
+    pub(in crate::sim::c220) retirements: Vec<C220VectorRetirement>,
 }
 
 impl VectorEngine {
@@ -70,28 +71,6 @@ impl VectorEngine {
         }
     }
 
-    pub(in crate::sim::c220) fn instruction_fence(&self) -> C220VectorFence {
-        C220VectorFence {
-            instruction_group: self.pipeline.instruction_fence(),
-            vmsu_generation: self.vmsu.instruction_fence(),
-        }
-    }
-
-    pub(in crate::sim::c220) fn fence_retirement_tick(
-        &self,
-        fence: C220VectorFence,
-    ) -> Option<u64> {
-        fence
-            .instruction_group
-            .and_then(|group| self.pipeline.fence_retirement_tick(group))
-            .into_iter()
-            .chain(
-                fence
-                    .vmsu_generation
-                    .and_then(|generation| self.vmsu.fence_retirement_tick(generation)),
-            )
-            .max()
-    }
     pub(in crate::sim::c220) fn ub_cycles_at(
         &self,
         tick: u64,
@@ -120,11 +99,17 @@ impl VectorEngine {
             va: C220VaRegisters::default(),
             releases: Vec::new(),
             scalar_flags: BTreeMap::new(),
+            pending_instructions: VecDeque::new(),
+            last_dispatched_id: None,
+            last_retired_tick: None,
+            observed_tick: None,
+            retirements: Vec::new(),
         }
     }
 
     pub(in crate::sim::c220) fn begin_advance(&mut self) {
         self.releases.clear();
+        self.retirements.clear();
         self.pipeline.begin_advance();
     }
 
@@ -133,6 +118,7 @@ impl VectorEngine {
             .next_event_tick()
             .into_iter()
             .chain(self.vmsu.next_event_tick())
+            .chain(self.next_retirement_tick())
             .min()
     }
 
@@ -148,6 +134,8 @@ impl VectorEngine {
             self.va.apply(update);
         }
         self.vmsu.advance_to(tick, state)?;
+        self.retire_ready(tick);
+        self.observed_tick = Some(tick);
         Ok(())
     }
 
@@ -180,12 +168,15 @@ impl VectorEngine {
             .pending_drain_tick()
             .into_iter()
             .chain(self.vmsu.pending_drain_tick())
+            .chain(self.fence_retirement_tick(self.instruction_fence()))
             .max()
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220VectorRuntimeError {
+    #[error("Vector instruction ID {requested} does not follow {previous}")]
+    InstructionOrder { previous: u64, requested: u64 },
     #[error(transparent)]
     Execute(#[from] crate::sim::c220::state::C220ExecutionError),
     #[error(transparent)]

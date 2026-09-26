@@ -46,9 +46,18 @@ impl VectorEngine {
     pub(in crate::sim::c220) fn dispatch_at(
         &mut self,
         tick: u64,
+        instruction_id: u64,
         request: &super::C220VectorRequest,
         state: &mut C220State,
     ) -> Result<VectorStep, C220VectorRuntimeError> {
+        if let Some(previous) = self.last_dispatched_id
+            && instruction_id <= previous
+        {
+            return Err(C220VectorRuntimeError::InstructionOrder {
+                previous,
+                requested: instruction_id,
+            });
+        }
         let pc = request.pc;
         let word = request.word;
         let inputs = request.context(state.scalar().machine(), state.ub());
@@ -367,11 +376,7 @@ impl VectorEngine {
                     }));
                 }
                 let step = inputs.preview_c220_merge_word(word)?;
-                if step.repeat_count() == 0 {
-                    state.scalar_mut().machine_mut().set_spr_value(17, 0)?;
-                } else {
-                    self.vmsu.issue_at(tick, step.clone(), state.ub())?;
-                }
+                self.vmsu.issue_at(tick, step.clone(), state.ub())?;
 
                 C220VectorInstruction::Merge(step)
             }
@@ -462,6 +467,7 @@ impl VectorEngine {
 
             _ => return Err(C220ExecutionError::UnsupportedWord { pc, word }.into()),
         };
+        self.record_dispatch(tick, instruction_id, pc, word);
         Ok(VectorStep::Issued(instruction))
     }
 }
