@@ -142,6 +142,25 @@ impl C220Core {
         }
         if let Some(barrier) = PipelineBarrierStep::decode(Architecture::Dav2201, pc, word) {
             match barrier.scope {
+                PipelineBarrierScope::Vector => {
+                    use crate::sim::c220::vector::barrier::VectorBarrierAdmission;
+                    return Ok(
+                        match self.vector.issue_barrier_at(
+                            tick,
+                            self.next_instruction_id,
+                            barrier,
+                        )? {
+                            VectorBarrierAdmission::Issued(outcome) => {
+                                self.state.commit_c220_sequential_issue();
+                                C220CoreStep::Executed {
+                                    tick,
+                                    instruction: C220CoreInstruction::VectorBarrier(outcome),
+                                }
+                            }
+                            VectorBarrierAdmission::Stalled(stall) => C220CoreStep::Stalled(stall),
+                        },
+                    );
+                }
                 PipelineBarrierScope::Fix => return self.step_fixp_barrier_at(tick, barrier),
                 PipelineBarrierScope::Cube => return self.step_cube_barrier_at(tick, barrier),
                 PipelineBarrierScope::Mte1 => return self.step_mte1_barrier_at(tick, barrier),

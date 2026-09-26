@@ -1612,9 +1612,37 @@ fn loadva_commits_at_execute_and_high_half_observes_the_ldvad_hazard() {
         }
     ));
     assert!(matches!(
-        core.step_word_at(2, 0x8040_000c).unwrap(),
+        core.step_word_at(2, 0x40e0_0400).unwrap(),
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::VectorBarrier(
+                crate::sim::c220::vector::C220VectorBarrierOutcome {
+                    completed_tick: None,
+                    ..
+                }
+            ),
+            ..
+        }
+    ));
+    assert!(matches!(
+        core.step_word_at(3, 0x40e0_0400).unwrap(),
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::VectorBarrier(_),
+            ..
+        }
+    ));
+    assert_eq!(core.pending_vector_barriers().len(), 2);
+    assert_eq!(core.queued_vector_instructions().len(), 0);
+    assert!(matches!(
+        core.step_word_at(4, 0x8040_000c).unwrap(),
         C220CoreStep::Executed {
             instruction: C220CoreInstruction::VectorQueued(_),
+            ..
+        }
+    ));
+    assert!(matches!(
+        core.step_word_at(5, 0x4140_0000).unwrap(),
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Scalar { .. },
             ..
         }
     ));
@@ -1626,8 +1654,30 @@ fn loadva_commits_at_execute_and_high_half_observes_the_ldvad_hazard() {
                 crate::sim::c220::vector::C220VectorFrontendEvent::Stalled(_)
             ))
     );
-    assert_eq!(core.state().scalar().pc(), 0x400c);
+    assert_eq!(core.state().scalar().pc(), 0x4018);
     core.advance_to(32).unwrap();
+    assert_eq!(core.pending_vector_barriers().len(), 0);
+    assert!(
+        core.last_vector_frontend_events()
+            .iter()
+            .any(|event| matches!(
+                event,
+                crate::sim::c220::vector::C220VectorFrontendEvent::Stalled(C220Stall {
+                    cause: C220StallCause::VectorBarrier,
+                    ..
+                })
+            ))
+    );
+    assert_eq!(
+        core.last_vector_frontend_events()
+            .iter()
+            .filter(|event| matches!(
+                event,
+                crate::sim::c220::vector::C220VectorFrontendEvent::Barrier(_)
+            ))
+            .count(),
+        2
+    );
     assert_eq!(core.va_registers().entry(0, 0), Some(0));
     assert_eq!(core.va_registers().entry(0, 7), Some(7));
     assert_eq!(core.va_registers().entry(1, 0), Some(8));
@@ -1636,6 +1686,18 @@ fn loadva_commits_at_execute_and_high_half_observes_the_ldvad_hazard() {
         core.state().scalar().machine().spr_value(100),
         Some(0x1234_5678)
     );
+    assert!(matches!(
+        core.step_word_at(33, 0x40e0_0400).unwrap(),
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::VectorBarrier(
+                crate::sim::c220::vector::C220VectorBarrierOutcome {
+                    completed_tick: Some(33),
+                    ..
+                }
+            ),
+            ..
+        }
+    ));
 }
 
 #[test]

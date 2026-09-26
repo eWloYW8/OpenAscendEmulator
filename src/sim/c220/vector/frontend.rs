@@ -41,6 +41,7 @@ pub struct C220VectorReception {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220VectorFrontendEvent {
+    Barrier(super::C220VectorBarrierOutcome),
     Received(C220VectorReception),
     Dispatched {
         instruction_id: u64,
@@ -70,6 +71,8 @@ pub(super) struct VectorFrontend {
     reception_ticks: u64,
     issued: VecDeque<Issued>,
     received: VecDeque<Received>,
+    pub last_accepted: Option<u64>,
+    pub barriers: VecDeque<super::C220VectorBarrier>,
     pub next_tick: Option<u64>,
     pub events: Vec<C220VectorFrontendEvent>,
 }
@@ -81,6 +84,8 @@ impl VectorFrontend {
             reception_ticks,
             issued: VecDeque::new(),
             received: VecDeque::new(),
+            last_accepted: None,
+            barriers: VecDeque::new(),
             next_tick: None,
             events: Vec::new(),
         }
@@ -110,6 +115,10 @@ impl VectorFrontend {
     pub(super) fn received_count(&self) -> usize {
         self.received.len()
     }
+
+    pub(super) fn is_full(&self) -> bool {
+        self.issued.len() >= self.config.issue_queue_depth.get() as usize
+    }
 }
 
 impl VectorEngine {
@@ -138,7 +147,7 @@ impl VectorEngine {
         let ready_tick = tick
             .checked_add(1)
             .ok_or(C220VectorPipelineError::TimeOverflow)?;
-        if self.frontend.issued.len() >= self.frontend.config.issue_queue_depth.get() as usize {
+        if self.frontend.is_full() {
             return Ok(VectorAdmission::Stalled(C220Stall {
                 tick,
                 pc: request.pc,
@@ -154,6 +163,7 @@ impl VectorEngine {
             ready_tick,
         };
         self.frontend.issued.push_back(Issued { ticket, request });
+        self.frontend.last_accepted = Some(instruction_id);
         self.frontend.next_tick = Some(
             self.frontend
                 .next_tick
@@ -183,6 +193,12 @@ impl VectorEngine {
                 || self.pending_instructions.len() >= 32
             {
                 Some(C220StallCause::VectorOutstandingLimit)
+            } else if self.frontend.barriers.iter().any(|barrier| {
+                barrier
+                    .predecessor
+                    .is_some_and(|id| id < ticket.instruction_id)
+            }) {
+                Some(C220StallCause::VectorBarrier)
             } else {
                 None
             };
@@ -320,6 +336,20 @@ mod tests {
             })
         ));
         let fence = engine.instruction_fence();
+        let barrier = crate::isa::flow::PipelineBarrierStep::decode(
+            Architecture::Dav2201,
+            0x1000,
+            0x40e0_0400,
+        )
+        .unwrap();
+        assert!(matches!(
+            engine.issue_barrier_at(3, 3, barrier).unwrap(),
+            super::super::barrier::VectorBarrierAdmission::Stalled(C220Stall {
+                cause: C220StallCause::VectorIssueQueueFull,
+                ..
+            })
+        ));
+        assert_eq!(engine.pending_barriers().len(), 0);
         assert_eq!(fence.instruction_id, Some(2));
         for tick in 4..=5 {
             engine.advance_event(tick, &mut state).unwrap();

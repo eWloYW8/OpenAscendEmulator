@@ -117,6 +117,7 @@ pub enum C220CoreInstruction {
         step: crate::sim::common::scalar::ScalarSprStep,
     },
     VectorQueued(crate::sim::c220::vector::C220VectorQueuedInstruction),
+    VectorBarrier(crate::sim::c220::vector::C220VectorBarrierOutcome),
     VectorToScalarFlag(FlagStep),
     Mte3 {
         step: C220OutputStep,

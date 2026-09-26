@@ -1,4 +1,5 @@
 mod access;
+pub(super) mod barrier;
 pub(super) mod dispatch;
 mod error;
 pub(super) mod frontend;
@@ -19,6 +20,7 @@ mod uop;
 pub mod va;
 pub mod vmsu;
 
+pub use barrier::{C220VectorBarrier, C220VectorBarrierOutcome};
 pub use frontend::{
     C220VectorFrontendConfig, C220VectorFrontendEvent, C220VectorQueuedInstruction,
     C220VectorReception,

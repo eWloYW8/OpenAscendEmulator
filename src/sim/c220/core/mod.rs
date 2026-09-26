@@ -367,6 +367,12 @@ impl C220Core {
         self.vector.frontend_events()
     }
 
+    pub fn pending_vector_barriers(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &crate::sim::c220::vector::C220VectorBarrier> {
+        self.vector.pending_barriers()
+    }
+
     pub fn last_cube_outcomes(&self) -> &[C220CubeExecutionOutcome] {
         &self.cube.outcomes
     }

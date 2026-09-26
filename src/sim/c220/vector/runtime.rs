@@ -146,6 +146,7 @@ impl VectorEngine {
         }
         self.vmsu.advance_to(tick, state)?;
         self.retire_ready(tick);
+        self.release_barriers_at(tick);
         self.observed_tick = Some(tick);
         self.advance_frontend(tick, state)?;
         Ok(())

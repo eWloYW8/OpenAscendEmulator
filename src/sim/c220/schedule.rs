@@ -31,6 +31,7 @@ pub enum C220StallCause {
     VectorIssueQueueFull,
     VectorReceptionQueueFull,
     VectorOutstandingLimit,
+    VectorBarrier,
     CubeDependency,
     CubeIssueQueueFull,
     CubeOutstandingLimit,
