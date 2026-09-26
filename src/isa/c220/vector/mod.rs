@@ -11,6 +11,7 @@ pub mod scalar;
 pub mod select;
 pub mod sort;
 pub mod special;
+pub mod spr;
 pub mod ternary;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

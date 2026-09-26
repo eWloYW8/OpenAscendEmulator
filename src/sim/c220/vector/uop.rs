@@ -497,19 +497,8 @@ impl C220VectorInstruction {
             }
             return Ok(ensure_vector_uop(step.pc, uops));
         }
-        if let Self::MoveAddress { pc, .. } = self {
-            return Ok(vec![C220VectorUop {
-                pc: *pc,
-                repeat_index: 0,
-                lane_group: None,
-                kind: C220VectorUopKind::MoveVa,
-                stages: C220VectorUopStages {
-                    read_ticks: 6,
-                    execute_ticks: 1,
-                },
-                writeback_ticks: 1,
-                writes_ub: false,
-            }]);
+        if matches!(self, Self::MoveAddress { .. } | Self::WriteSpr(_)) {
+            return Ok(Vec::new());
         }
         if let Self::LoadAddress(step) = self {
             return Ok(vec![C220VectorUop {

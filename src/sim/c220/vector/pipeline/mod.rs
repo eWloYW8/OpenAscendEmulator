@@ -17,8 +17,8 @@ use crate::sim::c220::vector::read::{
     C220VectorReadError, C220VectorReadSample, PendingVectorRead,
 };
 use crate::sim::c220::vector::timing::{
-    C220VectorTimelineError, C220VectorUop, C220VectorUopKind, C220VectorUopRelease,
-    C220VectorWriteCompletion, C220VectorWritePlanError,
+    C220VectorTimelineError, C220VectorUop, C220VectorUopRelease, C220VectorWriteCompletion,
+    C220VectorWritePlanError,
 };
 use crate::sim::c220::vector::va::C220VaUpdate;
 use crate::sim::c220::vector::{C220VectorError, C220VectorStore};
@@ -120,6 +120,7 @@ pub struct C220VectorPipeline {
     compare_mask: C220CompareMask,
     next_reduction_group: u64,
     next_instruction_group: u64,
+    register_retirements: BTreeMap<u64, u64>,
     reduction_states: BTreeMap<u64, C220ReductionState>,
 }
 
@@ -143,6 +144,7 @@ impl C220VectorPipeline {
             compare_mask: C220CompareMask::default(),
             next_reduction_group: 0,
             next_instruction_group: 0,
+            register_retirements: BTreeMap::new(),
             reduction_states: BTreeMap::new(),
         }
     }
@@ -350,7 +352,12 @@ impl C220VectorPipeline {
     }
 
     pub(crate) fn instruction_fence(&self) -> Option<u64> {
-        self.pending.back().map(|entry| entry.instruction_group)
+        self.pending
+            .back()
+            .map(|entry| entry.instruction_group)
+            .into_iter()
+            .chain(self.register_retirements.keys().next_back().copied())
+            .max()
     }
 
     pub(crate) fn fence_retirement_tick(&self, group: u64) -> Option<u64> {
@@ -359,6 +366,11 @@ impl C220VectorPipeline {
             .zip(self.predicted_ticks())
             .filter(|(entry, _)| entry.instruction_group <= group)
             .map(|(_, timing)| timing.retirement)
+            .chain(
+                self.register_retirements
+                    .range(..=group)
+                    .map(|(_, &tick)| tick),
+            )
             .filter(|&tick| self.observed_tick.is_none_or(|observed| observed < tick))
             .max()
     }
@@ -372,6 +384,7 @@ impl C220VectorPipeline {
                     .map_or(timing.retirement, |tick| tick.max(timing.retirement))
                     .max(timing.write_completion.unwrap_or(0))
             })
+            .chain(self.register_retirements.values().copied())
             .max()
     }
 
@@ -380,17 +393,30 @@ impl C220VectorPipeline {
         self.predicted_ticks()
             .into_iter()
             .map(|timing| timing.retirement)
+            .chain(self.register_retirements.values().copied())
             .filter(|&retirement| self.observed_tick.is_none_or(|tick| retirement > tick))
             .max()
     }
 
-    pub fn pending_move_va_blocker_tick(&self) -> Option<u64> {
+    pub fn pending_register_write_blocker_tick(&self) -> Option<u64> {
         let last = self.pending.back()?;
-        if matches!(last.uop.kind, C220VectorUopKind::MoveVa) {
+        if self
+            .register_retirements
+            .keys()
+            .next_back()
+            .is_some_and(|&group| group > last.instruction_group)
+        {
             None
         } else {
-            self.pending_drain_tick()
+            self.pending_retirement_tick()
         }
+    }
+
+    /// Instruction-group IDs and retirement ticks for writes that bypass execution uops.
+    pub fn pending_register_retirements(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.register_retirements
+            .iter()
+            .map(|(&group, &tick)| (group, tick))
     }
 
     pub(crate) fn pending_queue_hazard_tick(&self, incoming: C220VectorQueueClass) -> Option<u64> {
@@ -435,7 +461,11 @@ impl C220VectorPipeline {
     }
 
     pub(crate) fn next_event_tick(&self) -> Option<u64> {
-        (!self.pending.is_empty()).then_some(self.next_service_tick)
+        (!self.pending.is_empty())
+            .then_some(self.next_service_tick)
+            .into_iter()
+            .chain(self.register_retirements.values().copied().min())
+            .min()
     }
 
     pub(crate) fn advance_event(
@@ -506,6 +536,8 @@ impl C220VectorPipeline {
             .checked_add(1)
             .ok_or(C220VectorAdvanceError::TimeOverflow)?;
         self.observed_tick = Some(tick);
+        self.register_retirements
+            .retain(|_, retirement| *retirement > tick);
         Ok(releases)
     }
 

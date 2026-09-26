@@ -368,7 +368,6 @@ impl C220VectorUopStages {
 pub enum C220VectorUopKind {
     Ordinary,
     LaneSlice { first_lane: u16, lane_count: u16 },
-    MoveVa,
     GatherIndex { group: u8 },
     GatherData { group: u8 },
 }

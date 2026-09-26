@@ -15,6 +15,41 @@ use crate::sim::c220::vector::timing::{
 };
 use crate::sim::c220::vector::{C220_VECTOR_BLOCK_BYTES, C220VectorStore};
 impl C220VectorPipeline {
+    pub(crate) fn issue_register_write_at(
+        &mut self,
+        tick: u64,
+    ) -> Result<(), C220VectorPipelineError> {
+        if let Some(previous) = self.observed_tick
+            && tick < previous
+        {
+            return Err(C220VectorTimelineError::TimeReversed {
+                previous,
+                requested: tick,
+            }
+            .into());
+        }
+        let retirement = tick
+            .checked_add(self.rules.dispatch_ticks)
+            .and_then(|tick| tick.checked_add(super::VECTOR_RETIREMENT_BOUNDARY_TICKS))
+            .ok_or(C220VectorPipelineError::TimeOverflow)?;
+        let retirement = match self.register_retirements.values().next_back() {
+            Some(&previous) => retirement.max(
+                previous
+                    .checked_add(1)
+                    .ok_or(C220VectorPipelineError::TimeOverflow)?,
+            ),
+            None => retirement,
+        };
+        let group = self.next_instruction_group;
+        let next_group = group
+            .checked_add(1)
+            .ok_or(C220VectorPipelineError::TimeOverflow)?;
+        self.register_retirements.insert(group, retirement);
+        self.next_instruction_group = next_group;
+        self.observed_tick = Some(tick);
+        Ok(())
+    }
+
     pub fn issue_at(
         &mut self,
         tick: u64,

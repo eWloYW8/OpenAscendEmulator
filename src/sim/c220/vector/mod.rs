@@ -10,6 +10,7 @@ pub mod pipeline;
 pub mod read;
 mod repeat;
 pub(super) mod runtime;
+mod spr;
 pub mod timing;
 mod uop;
 pub mod va;

@@ -28,6 +28,7 @@ use crate::sim::c220::vector::{C220MovevStep, C220VectorArithmeticIssue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220VectorInstruction {
+    WriteSpr(crate::sim::common::scalar::ScalarSprStep),
     MoveAddress {
         pc: u64,
         word: u32,
@@ -105,6 +106,7 @@ impl C220VectorInstruction {
             C220VectorInstruction::Gather(issue) => Some(C220VectorReadIssue::Gather(issue)),
             C220VectorInstruction::Nchw(issue) => Some(C220VectorReadIssue::Nchw(issue)),
             Self::MoveAddress { .. }
+            | Self::WriteSpr(_)
             | Self::Control { .. }
             | Self::NoEffect { .. }
             | Self::Movemask(_)
@@ -127,6 +129,7 @@ impl C220VectorInstruction {
     pub(crate) fn stores(&self) -> &[C220VectorStore] {
         match self {
             Self::MoveAddress { .. }
+            | Self::WriteSpr(_)
             | Self::Control { .. }
             | Self::NoEffect { .. }
             | Self::LoadAddress(_)

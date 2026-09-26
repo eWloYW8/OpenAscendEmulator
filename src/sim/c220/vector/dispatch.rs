@@ -15,6 +15,7 @@ use crate::isa::c220::vector::scalar::C220VectorScalarInstruction;
 use crate::isa::c220::vector::select::C220SelectInstruction;
 use crate::isa::c220::vector::sort::C220SortInstruction;
 use crate::isa::c220::vector::special::C220SpecialUnaryInstruction;
+use crate::isa::c220::vector::spr::C220VectorSprWrite;
 use crate::isa::c220::vector::ternary::C220TernaryInstruction;
 use crate::isa::c220::vector::{
     C220BroadcastInstruction, C220CopyInstruction, C220MoveVaInstruction, C220MovemaskHint,
@@ -80,18 +81,33 @@ impl VectorEngine {
             }
         }
 
+        if (C220MoveVaInstruction::decode(word).is_some()
+            || C220VectorSprWrite::decode(word).is_some())
+            && let Some(resume_tick) = self
+                .pipeline
+                .pending_register_write_blocker_tick()
+                .into_iter()
+                .chain(self.vmsu.pending_drain_tick())
+                .max()
+            && tick < resume_tick
+        {
+            return Ok(VectorStep::Stalled(C220Stall {
+                tick,
+                pc,
+                resume_tick,
+                cause: C220StallCause::VectorDependency,
+            }));
+        }
         let instruction = match word {
+            _ if C220VectorSprWrite::decode(word).is_some() => {
+                let decoded = C220VectorSprWrite::decode(word).expect("matched decode");
+                self.pipeline.issue_register_write_at(tick)?;
+                let step =
+                    super::spr::execute_write(state.scalar_mut().machine_mut(), pc, word, decoded)?;
+                state.commit_c220_sequential_issue();
+                C220VectorInstruction::WriteSpr(step)
+            }
             _ if C220MoveVaInstruction::decode(word).is_some() => {
-                if let Some(resume_tick) = self.pipeline.pending_move_va_blocker_tick()
-                    && tick < resume_tick
-                {
-                    return Ok(VectorStep::Stalled(C220Stall {
-                        tick,
-                        pc,
-                        resume_tick,
-                        cause: C220StallCause::VectorDependency,
-                    }));
-                }
                 let decoded = C220MoveVaInstruction::decode(word).expect("matched decode");
                 let instruction = C220VectorInstruction::MoveAddress {
                     pc,
@@ -442,6 +458,7 @@ impl VectorEngine {
 
 pub(in crate::sim::c220) fn is_vector_word(word: u32) -> bool {
     C220MoveVaInstruction::decode(word).is_some()
+        || C220VectorSprWrite::decode(word).is_some()
         || C220LoadVaInstruction::decode(word).is_some()
         || C220MovemaskHint::from_word(word).is_some()
         || C220VectorControlInstruction::decode(word).is_some()

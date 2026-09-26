@@ -1487,12 +1487,10 @@ fn moveva_updates_only_its_selected_pair_and_retires_as_vector_work() {
     else {
         panic!("MOVEVA should issue");
     };
-    assert_eq!(
-        first.as_vector().unwrap().uops().unwrap()[0]
-            .stages
-            .execute_ticks,
-        1
-    );
+    assert!(first.as_vector().unwrap().uops().unwrap().is_empty());
+    let first_fence = core.vector.instruction_fence();
+    assert_eq!(core.vector.fence_retirement_tick(first_fence), Some(2));
+    assert_eq!(core.vector_pipeline().pending_uops(), 0);
     assert_eq!(core.va_registers().entry(0, 0), Some(9));
     assert_eq!(core.va_registers().entry(0, 1), Some(11));
     assert_eq!(core.va_registers().entry(0, 2), None);
@@ -1505,9 +1503,54 @@ fn moveva_updates_only_its_selected_pair_and_retires_as_vector_work() {
     ));
     assert_eq!(core.va_registers().entry(0, 2), Some(9));
     assert_eq!(core.va_registers().entry(0, 3), Some(11));
+    assert_eq!(core.vector.pending_drain_tick(), Some(3));
+    core.advance_to(2).unwrap();
+    assert_eq!(core.vector.fence_retirement_tick(first_fence), None);
+    assert_eq!(core.vector.pending_drain_tick(), Some(3));
     core.advance_to(30).unwrap();
-    assert_eq!(core.last_vector_releases().len(), 2);
+    assert!(core.last_vector_releases().is_empty());
     assert!(core.vector_pipeline().last_read_samples().is_empty());
+    assert_eq!(core.vector.pending_drain_tick(), None);
+
+    core.state
+        .scalar_mut()
+        .machine_mut()
+        .set_xreg(6, u64::MAX)
+        .unwrap();
+    let cases = [
+        (12, u64::MAX),
+        (17, u64::MAX),
+        (19, 0xffff),
+        (48, u64::MAX),
+        (49, u64::MAX),
+        (50, u64::MAX),
+        (51, u64::MAX),
+        (55, 0xffff_ffff_ffff),
+        (56, u64::MAX),
+        (57, 0xffff_ffff),
+        (60, 0xffff_ffff_ffff),
+        (63, u64::MAX),
+        (69, 0xffff),
+    ];
+    for (index, (spr, expected)) in cases.into_iter().enumerate() {
+        let tick = 32 + index as u64 * 3;
+        let word = (2 << 24) | (spr << 17) | (6 << 12) | (18 << 7);
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Vector(C220VectorInstruction::WriteSpr(step)),
+            ..
+        } = core.step_word_at(tick, word).unwrap()
+        else {
+            panic!("vector SPR {spr} should issue");
+        };
+        assert_eq!(step.source_value, u64::MAX);
+        assert_eq!(step.value, expected);
+        assert_eq!(
+            core.state().scalar().machine().spr_value(spr as u16),
+            Some(expected)
+        );
+        assert_eq!(core.vector.pending_drain_tick(), Some(tick + 2));
+        assert_eq!(core.vector_pipeline().pending_uops(), 0);
+    }
 }
 
 #[test]

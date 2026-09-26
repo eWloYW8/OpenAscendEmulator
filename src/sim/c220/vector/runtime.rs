@@ -156,6 +156,13 @@ impl VectorEngine {
         tick: u64,
         instruction: &C220VectorInstruction,
     ) -> Result<(), C220VectorRuntimeError> {
+        if matches!(
+            instruction,
+            C220VectorInstruction::MoveAddress { .. } | C220VectorInstruction::WriteSpr(_)
+        ) {
+            self.pipeline.issue_register_write_at(tick)?;
+            return Ok(());
+        }
         let uops = instruction.uops()?;
         let stores = instruction.stores();
         self.pipeline.issue_classified_at(
