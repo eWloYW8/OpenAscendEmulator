@@ -6,6 +6,7 @@ pub enum C220StallCause {
     ScalarDependency,
     LsuDependency,
     Mte1IssueRate,
+    Mte1IssueQueueFull,
     Mte1CommandQueueFull,
     Mte1OutstandingLimit,
     Mte1Dependency,

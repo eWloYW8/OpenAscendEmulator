@@ -47,6 +47,8 @@ mod hflag;
 mod mte1;
 mod mte1_frontend;
 pub use mte1_frontend::C220Mte1QueuedCommand;
+mod mte1_issue;
+pub use mte1_issue::{C220Mte1FrontendConfig, C220Mte1IssuedInstruction, C220Mte1Operation};
 mod mte2;
 mod mte3;
 
@@ -69,6 +71,7 @@ pub struct C220CoreConfig {
     pub device: C220Device,
     pub cube: C220CubeConfig,
     pub cube_frontend: crate::sim::c220::cube::frontend::C220CubeFrontendConfig,
+    pub mte1_frontend: C220Mte1FrontendConfig,
     pub timing: C220CoreTimingRules,
 }
 
@@ -78,6 +81,7 @@ impl C220CoreConfig {
             device: C220Device::default(),
             cube: C220CubeConfig::default(),
             cube_frontend: Default::default(),
+            mte1_frontend: Default::default(),
             timing,
         }
     }
@@ -161,6 +165,7 @@ impl C220Core {
             device,
             cube: cube_config,
             cube_frontend,
+            mte1_frontend,
             timing,
         } = config;
         if state.scalar().machine().architecture() != Architecture::Dav2201 {
@@ -178,8 +183,11 @@ impl C220Core {
             mte2: C220Mte2Pipeline::new(timing.mte2),
             scalar_timing: C220ScalarTimingLane::default(),
             lsu: None,
-            mte1: Mte1Engine::default(),
-            mte1_frontend: mte1_frontend::Mte1Frontend::default(),
+            mte1: Mte1Engine::with_outstanding_limit(mte1_frontend.outstanding_limit),
+            mte1_frontend: mte1_frontend::Mte1Frontend {
+                config: mte1_frontend,
+                ..Default::default()
+            },
             mte_pipeline: None,
             fixp: None,
             external_fixp: None,

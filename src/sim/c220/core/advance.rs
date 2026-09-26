@@ -111,6 +111,10 @@ impl C220Core {
                     self.transfer_fixp_issue_at(event_tick)?;
                     continue;
                 }
+                if pipeline.mte1_issue_pending() {
+                    self.transfer_mte1_issue_at(event_tick)?;
+                    continue;
+                }
                 if pipeline.mte1_sync_pending() {
                     pipeline.resolve_mte1_sync(&mut self.hardware_flags)?;
                     continue;

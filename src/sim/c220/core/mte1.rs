@@ -10,9 +10,9 @@ use crate::sim::c220::mte::mte1::C220Mte1Command;
 use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadTransfer;
 use crate::sim::c220::mte::mte1::load2d::C220Load2dTransferError;
 
-use crate::sim::c220::schedule::{C220Stall, C220StallCause};
+use crate::sim::c220::schedule::C220Stall;
 
-use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
+use super::{C220Core, C220CoreError, C220CoreStep};
 
 impl C220Core {
     /// Inspect LOAD3Dv2 inputs without issuing or advancing the core clock.
@@ -42,18 +42,16 @@ impl C220Core {
         word: u32,
     ) -> Result<C220CoreStep, C220CoreError> {
         let flow_flag = FlagInstruction::decode(Architecture::Dav2201, word);
-        if flow_flag.is_none() {
-            if self.mte_pipeline.is_none() {
-                return Err(C220CoreError::MteUnconfigured);
-            }
-            if let Some(cause) = self.mte1_accept_blocker() {
-                return Ok(C220CoreStep::Stalled(C220Stall {
-                    tick,
-                    pc,
-                    resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
-                    cause,
-                }));
-            }
+        if self.mte_pipeline.is_none() {
+            return Err(C220CoreError::MteUnconfigured);
+        }
+        if let Some(cause) = self.mte1_accept_blocker() {
+            return Ok(C220CoreStep::Stalled(C220Stall {
+                tick,
+                pc,
+                resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+                cause,
+            }));
         }
         let registers = self.state.scalar().machine().xregs();
         let command = if let Some(instruction) =
@@ -75,15 +73,6 @@ impl C220Core {
         } else if let Some(instruction) =
             crate::isa::c220::control::C220SetCrossCoreInstruction::decode(word)
         {
-            if let Some(resume_tick) = self.pending_mte1_tick() {
-                return Ok(C220CoreStep::Stalled(C220Stall {
-                    tick,
-                    pc,
-                    resume_tick: resume_tick
-                        .max(tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?),
-                    cause: C220StallCause::Mte1Dependency,
-                }));
-            }
             Some(C220Mte1Command::CrossCore {
                 instruction,
                 payload: crate::sim::c220::sync::C220DeviceSync::from_value(
@@ -123,19 +112,13 @@ impl C220Core {
                 C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(decoded.capture(registers)))
             })
         };
-        let instruction = if let Some(command) = command {
-            return self.enqueue_mte1_at(tick, pc, word, command);
+        if let Some(command) = command {
+            self.enqueue_mte1_issue_at(tick, pc, word, super::C220Mte1Operation::Command(command))
         } else {
             let flag = flow_flag
                 .expect("matched C220 MTE1 flag")
                 .resolve(pc, self.state.scalar().machine().xregs());
-            self.mte1.set_event(
-                flag.flag_id,
-                self.mte1_frontend.commands.back().map(|c| c.instruction_id),
-            );
-            self.state.commit_c220_sequential_issue();
-            C220CoreInstruction::Mte1Flag(flag)
-        };
-        Ok(C220CoreStep::Executed { tick, instruction })
+            self.enqueue_mte1_issue_at(tick, pc, word, super::C220Mte1Operation::SetEvent(flag))
+        }
     }
 }

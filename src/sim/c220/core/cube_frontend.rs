@@ -118,13 +118,7 @@ impl C220Core {
             };
             if cause.is_none()
                 && let C220CubeCommand::WaitMte1(step) = queued.command
-                && !self.mte1.wait_event(
-                    step.flag_id,
-                    self.mte1_frontend
-                        .commands
-                        .front()
-                        .map(|command| command.instruction_id),
-                )
+                && !self.mte1.wait_event(step.flag_id)
             {
                 cause = Some(C220StallCause::PipelineEventDependency);
             }

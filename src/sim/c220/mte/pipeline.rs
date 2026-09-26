@@ -90,6 +90,8 @@ pub struct C220MtePipelineConfig {
 enum Callback {
     FixpIssueProbe,
     FixpIssueTransfer,
+    Mte1IssueProbe,
+    Mte1IssueTransfer,
     FixpCommandProbe,
     FixpCommandDispatch,
     Mte1CommandProbe,
@@ -369,9 +371,24 @@ pub struct C220MtePipeline {
     fixp_issue_valid: EventId,
     fixp_issue_ready: Option<u64>,
     fixp_issue_pending: bool,
+    mte1_issue_valid: EventId,
+    mte1_issue_ready: Option<u64>,
+    mte1_issue_pending: bool,
 }
 
 impl C220MtePipeline {
+    pub(crate) fn set_mte1_issue_head(&mut self, ready: Option<u64>) {
+        self.mte1_issue_ready = ready;
+    }
+
+    pub(crate) fn mte1_issue_pending(&self) -> bool {
+        self.mte1_issue_pending
+    }
+
+    pub(crate) fn finish_mte1_issue(&mut self) {
+        self.mte1_issue_pending = false;
+    }
+
     pub(crate) fn set_mte1_command_head(&mut self, ready: Option<u64>) {
         self.mte1_command_ready = ready;
     }
@@ -417,6 +434,11 @@ impl C220MtePipeline {
         let issue_transfer = events.add_process(Callback::FixpIssueTransfer, false);
         events.subscribe(clock, issue_probe);
         events.subscribe(fixp_issue_valid, issue_transfer);
+        let mte1_issue_valid = events.add_event();
+        let issue_probe = events.add_process(Callback::Mte1IssueProbe, false);
+        let issue_transfer = events.add_process(Callback::Mte1IssueTransfer, false);
+        events.subscribe(clock, issue_probe);
+        events.subscribe(mte1_issue_valid, issue_transfer);
         let mte3_events = C220Mte3Events::register(&mut events, clock, Callback::Mte3);
         let fixp_command_valid = events.add_event();
         let probe = events.add_process(Callback::FixpCommandProbe, false);
@@ -533,6 +555,9 @@ impl C220MtePipeline {
             fixp_issue_valid,
             fixp_issue_ready: None,
             fixp_issue_pending: false,
+            mte1_issue_valid,
+            mte1_issue_ready: None,
+            mte1_issue_pending: false,
         }
     }
 
@@ -572,6 +597,7 @@ impl C220MtePipeline {
         self.fixp_command_ready.is_none()
             && self.mte1_command_ready.is_none()
             && self.fixp_issue_ready.is_none()
+            && self.mte1_issue_ready.is_none()
             && self.active_cycle.is_none()
             && self.fixp_write.is_idle()
             && self.biu_cube_source.is_idle()
@@ -1181,7 +1207,7 @@ impl C220MtePipeline {
             if self.fixp_dispatch_pending || self.fixp_issue_pending {
                 return Err(C220MtePipelineError::FixpDispatchPending);
             }
-            if self.mte1_dispatch_pending {
+            if self.mte1_dispatch_pending || self.mte1_issue_pending {
                 return Err(C220MtePipelineError::Mte1DispatchPending);
             }
             if self.mte1_sync_pending() {
@@ -1256,6 +1282,15 @@ impl C220MtePipeline {
                 }
                 Callback::FixpIssueTransfer => {
                     self.fixp_issue_pending = true;
+                    return Ok(());
+                }
+                Callback::Mte1IssueProbe => {
+                    if self.mte1_issue_ready.is_some_and(|ready| ready <= tick) {
+                        self.events.notify_at(self.mte1_issue_valid, tick);
+                    }
+                }
+                Callback::Mte1IssueTransfer => {
+                    self.mte1_issue_pending = true;
                     return Ok(());
                 }
                 Callback::FixpCommandProbe => {

@@ -73,7 +73,8 @@ pub enum C220CoreInstruction {
         spr_timing: Option<crate::sim::c220::scalar::spr::C220ScalarSprTimingTicket>,
     },
     Barrier(ScalarProgramStep),
-    Mte1Queued(super::C220Mte1QueuedCommand),
+    Mte1Queued(super::C220Mte1IssuedInstruction),
+    Mte1Scheduled(super::C220Mte1QueuedCommand),
     Mte1 {
         instruction_id: u64,
         pc: u64,

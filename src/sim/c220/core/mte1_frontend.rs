@@ -1,5 +1,5 @@
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
-use crate::sim::c220::mte::mte1::{C220_MTE1_OUTSTANDING_LIMIT, C220Mte1Command};
+use crate::sim::c220::mte::mte1::C220Mte1Command;
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 use std::collections::VecDeque;
 
@@ -15,6 +15,8 @@ pub struct C220Mte1QueuedCommand {
 
 #[derive(Default)]
 pub(super) struct Mte1Frontend {
+    pub config: super::C220Mte1FrontendConfig,
+    pub issued: VecDeque<super::C220Mte1IssuedInstruction>,
     pub commands: VecDeque<C220Mte1QueuedCommand>,
     pub outcomes: Vec<C220CoreStep>,
 }
@@ -34,6 +36,9 @@ impl C220Core {
 
     pub(super) fn pending_mte1_tick(&self) -> Option<u64> {
         self.mte1.next_event_tick().or_else(|| {
+            if !self.mte1_frontend.issued.is_empty() {
+                return Some(self.mte1.tick().saturating_add(1));
+            }
             self.mte1_frontend
                 .commands
                 .front()
@@ -42,49 +47,18 @@ impl C220Core {
     }
 
     pub(super) fn mte1_accept_blocker(&self) -> Option<C220StallCause> {
-        if self.mte1_frontend.commands.len() == 3 {
-            Some(C220StallCause::Mte1CommandQueueFull)
-        } else if self.outstanding_mte1_commands() >= C220_MTE1_OUTSTANDING_LIMIT {
-            Some(C220StallCause::Mte1OutstandingLimit)
+        if self.mte1_frontend.issued.len()
+            >= self.mte1_frontend.config.issue_queue_depth.get() as usize
+        {
+            Some(C220StallCause::Mte1IssueQueueFull)
         } else {
             None
         }
     }
 
-    pub(super) fn enqueue_mte1_at(
-        &mut self,
-        tick: u64,
-        pc: u64,
-        word: u32,
-        command: C220Mte1Command,
-    ) -> Result<C220CoreStep, C220CoreError> {
-        let ready_tick = tick.checked_add(3).ok_or(C220CoreError::TimeOverflow)?;
-        let queued = C220Mte1QueuedCommand {
-            instruction_id: self.next_instruction_id,
-            pc,
-            word,
-            accepted_tick: tick,
-            ready_tick,
-            command,
-        };
-        if let C220Mte1Command::WriteSpr(step) = command {
-            self.state
-                .scalar_mut()
-                .machine_mut()
-                .set_spr_value(step.destination_spr, step.value)
-                .map_err(C220CoreError::MteSpr)?;
-        }
-        self.mte1_frontend.commands.push_back(queued);
-        self.update_mte1_command_head();
-        self.state.commit_c220_sequential_issue();
-        Ok(C220CoreStep::Executed {
-            tick,
-            instruction: C220CoreInstruction::Mte1Queued(queued),
-        })
-    }
-
-    fn update_mte1_command_head(&mut self) {
+    pub(super) fn update_mte1_command_head(&mut self) {
         if let Some(pipeline) = &mut self.mte_pipeline {
+            pipeline.set_mte1_issue_head(self.mte1_frontend.issued.front().map(|c| c.ready_tick));
             pipeline
                 .set_mte1_command_head(self.mte1_frontend.commands.front().map(|c| c.ready_tick));
         }
