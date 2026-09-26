@@ -296,14 +296,14 @@ mod tests {
             C220CoreStep::Stalled(_)
         ));
         assert_eq!(core.state.scalar().pc(), pc + 16);
-        assert!(core.pending_compute_drain().is_some());
+        assert!(!core.activity().is_idle());
         core.advance_to(500).unwrap();
         assert!(core.fixp_engine().unwrap().is_idle());
         assert_eq!(
             core.local_memory.l1().read_known(4096, 256).unwrap(),
             0x4000_u16.to_le_bytes().repeat(128)
         );
-        assert!(core.pending_compute_drain().is_none());
+        assert!(core.activity().is_idle());
         let flag = crate::isa::c220::hflag::C220HardwareFlagInstruction::decode(
             (2 << 29) | (15 << 21) | (3 << 15) | (10 << 10) | (2 << 7),
         )
@@ -358,7 +358,7 @@ mod tests {
                 }
             ));
             assert_eq!(core.queued_fixp_commands(), 2);
-            assert!(core.pending_compute_drain().is_some());
+            assert!(!core.activity().is_idle());
             core.advance_to(tick + 199).unwrap();
             assert!(core.fixp_engine().unwrap().is_idle());
             assert_eq!(core.factor_outcomes().len(), 2);
@@ -395,10 +395,10 @@ mod tests {
             core.fixp_engine().unwrap().control_commands().get(&flag_id),
             Some(&906)
         );
-        assert!(core.pending_compute_drain().is_some());
+        assert!(!core.activity().is_idle());
         core.advance_to(906).unwrap();
         assert!(core.fixp_engine().unwrap().is_idle());
-        assert!(core.pending_compute_drain().is_none());
+        assert!(core.activity().is_idle());
         let empty_factor = (6 << 29) | (1 << 17) | (2 << 12) | (3 << 7);
         let predecessor = core.next_instruction_id;
         assert!(matches!(
@@ -518,10 +518,10 @@ mod tests {
         assert_eq!(reception.tick, 927);
         assert_eq!((reception.payload.mode, reception.payload.flag_id), (2, 14));
         assert!(core.fixp_engine().unwrap().cross_core_commands().is_empty());
-        assert!(core.pending_compute_drain().is_some());
+        assert!(!core.activity().is_idle());
         core.advance_to(928).unwrap();
         assert!(core.fixp_engine().unwrap().is_idle());
-        assert!(core.pending_compute_drain().is_none());
+        assert!(core.activity().is_idle());
         assert_eq!(core.hardware_flags.pending_mte_flags().count(), 2);
     }
 
@@ -665,7 +665,7 @@ mod tests {
             }
         ));
         assert_eq!(core.state.scalar().pc(), pc + 8);
-        assert!(core.pending_compute_drain().is_some());
+        assert!(!core.activity().is_idle());
         assert!(core.fixp_engine().unwrap().hardware_flag_trigger_ready());
         core.state
             .scalar_mut()
@@ -766,7 +766,7 @@ mod tests {
         assert_eq!(sent_bytes, 128);
         assert!(trigger_blocked && trigger_released);
         assert!(core.fixp_runtime().unwrap().is_idle());
-        assert!(core.pending_compute_drain().is_none());
+        assert!(core.activity().is_idle());
         assert_eq!(core.memory.read_known_at(4096, 128).unwrap(), [1; 128]);
         assert_eq!(core.memory.read_known_at(4224, 128).unwrap(), [0; 128]);
         core.advance_to(1000).unwrap();
@@ -1148,7 +1148,7 @@ mod tests {
                 .unwrap(),
             16.0_f32.to_le_bytes()
         );
-        assert!(core.pending_compute_drain().is_none());
+        assert!(core.activity().is_idle());
     }
 
     #[test]
@@ -1215,7 +1215,7 @@ mod tests {
                 .unwrap(),
             32.0_f32.to_le_bytes()
         );
-        assert!(core.pending_compute_drain().is_none());
+        assert!(core.activity().is_idle());
 
         core.state
             .scalar_mut()
@@ -1229,7 +1229,7 @@ mod tests {
         assert_eq!(core.outstanding_cube_commands(), 0);
         core.step_word_at(506, set).unwrap();
         core.advance_to(600).unwrap();
-        assert!(core.pending_compute_drain().is_none());
+        assert!(core.activity().is_idle());
     }
 
     #[test]
@@ -1289,7 +1289,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(core.pending_compute_drain().is_none());
+        assert!(core.activity().is_idle());
         let set = (2 << 29) | (5 << 21) | (3 << 10) | (2 << 7) | 1;
         let wait = (set & !(15 << 21)) | (6 << 21);
         core.step_word_at(402, set).unwrap();
@@ -1409,7 +1409,7 @@ mod tests {
             assert_eq!(core.queued_cube_commands().count(), 0);
             assert_eq!(core.outstanding_cube_commands(), 0);
             assert!(core.active_cube_control().is_none());
-            assert!(core.pending_compute_drain().is_none());
+            assert!(core.activity().is_idle());
         }
     }
 
@@ -1456,14 +1456,14 @@ mod tests {
                 [0; 512]
             );
             assert_eq!(core.queued_mte1_commands().count(), usize::from(disabled));
-            assert!(core.pending_compute_drain().is_some());
+            assert!(!core.activity().is_idle());
             assert!(matches!(
                 core.step_word_at(341, signal).unwrap(),
                 C220CoreStep::Executed { .. }
             ));
             core.advance_to(500).unwrap();
             assert_eq!(core.hardware_flags.count(3, C220MatrixMemory::L0a, 0), 0);
-            assert!(core.pending_compute_drain().is_none());
+            assert!(core.activity().is_idle());
             let expected = if disabled {
                 vec![0; 512]
             } else {
@@ -1702,7 +1702,7 @@ mod tests {
             .set_xreg(11, 16 | (1 << 16))
             .unwrap();
         core.step_word_at(201, fill).unwrap();
-        assert!(core.pending_mte1_tick().is_some());
+        assert!(core.activity().mte1);
         core.step_word_at(202, word).unwrap();
         core.advance_to(203).unwrap();
         assert!(
@@ -1710,7 +1710,7 @@ mod tests {
             instruction: C220CoreInstruction::CubeSpr { step, .. }, ..
         } if step.value == 7)
         );
-        assert!(core.pending_mte1_tick().is_some());
+        assert!(core.activity().mte1);
         for (tick, source, memory) in [(205, 3, 1), (207, 10, 3)] {
             let set =
                 (2 << 29) | (15 << 21) | (1 << 19) | (memory << 15) | (source << 10) | (2 << 7);
@@ -3002,13 +3002,7 @@ mod tests {
                 .issue_l1_fill(core.mte_pipeline.as_mut().unwrap(), 100, 0, fill)
                 .unwrap();
             assert!(core.pending_mte1_commands().next().is_none());
-            assert_eq!(
-                core.pending_compute_drain(),
-                Some((
-                    81,
-                    crate::sim::c220::schedule::C220StallCause::MtePhysicalDependency
-                ))
-            );
+            assert!(core.activity().memory);
         }
         for tick in 81..=160 {
             incremental.advance_to(tick).unwrap();

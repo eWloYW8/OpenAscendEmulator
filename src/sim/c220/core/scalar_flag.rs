@@ -155,6 +155,18 @@ mod tests {
                 ));
                 assert_eq!(core.state().scalar().pc(), pc);
                 assert_eq!(core.queued_vector_instructions().len(), 1);
+                let read_spr = |spr: u32| {
+                    (2 << 24) | ((spr & 0x60) << 17) | (5 << 17) | ((spr & 31) << 12) | (17 << 7)
+                };
+                assert_eq!(
+                    core.spr_dispatch_dependency(read_spr(17)),
+                    Some(C220StallCause::VectorDependency)
+                );
+                assert_eq!(core.spr_dispatch_dependency(read_spr(54)), None);
+                assert_eq!(
+                    core.spr_dispatch_dependency((2 << 24) | (2 << 17) | (4 << 12) | (18 << 7)),
+                    Some(C220StallCause::VectorDependency)
+                );
             }
         }
     }

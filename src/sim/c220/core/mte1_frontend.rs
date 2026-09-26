@@ -36,18 +36,6 @@ impl C220Core {
         self.mte1_frontend.commands.len() + self.mte1.pending_commands().count()
     }
 
-    pub(super) fn pending_mte1_tick(&self) -> Option<u64> {
-        self.mte1.next_event_tick().or_else(|| {
-            if !self.mte1_frontend.issued.is_empty() {
-                return Some(self.mte1.tick().saturating_add(1));
-            }
-            self.mte1_frontend
-                .commands
-                .front()
-                .map(|_| self.mte1.tick().saturating_add(1))
-        })
-    }
-
     pub(super) fn mte1_accept_blocker(&self) -> Option<C220StallCause> {
         if self.mte1_frontend.issued.len()
             >= self.mte1_frontend.config.issue_queue_depth.get() as usize

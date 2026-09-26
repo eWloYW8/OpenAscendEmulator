@@ -9,7 +9,7 @@ use crate::sim::c220::mte::mte1::{C220Mte1CommandState, C220Mte1Outcome};
 use crate::sim::c220::mte::mte2::C220Mte2Pipeline;
 use crate::sim::c220::mte::{C220MtePipeline, C220MtePipelineConfig};
 use crate::sim::c220::scalar::timing::C220ScalarTimingLane;
-use crate::sim::c220::schedule::{C220IssueClock, C220Stall, C220StallCause};
+use crate::sim::c220::schedule::{C220IssueClock, C220Stall};
 use crate::sim::c220::state::C220State;
 use crate::sim::c220::sync::C220HardwareFlagState;
 use crate::sim::c220::vector::ops::compare::C220CompareMask;
@@ -498,60 +498,6 @@ impl C220Core {
                 .ok_or(C220CoreError::TimeOverflow)?;
         }
         Ok(step)
-    }
-
-    fn pending_compute_drain(&self) -> Option<(u64, C220StallCause)> {
-        [
-            self.lsu
-                .as_ref()
-                .and_then(|lsu| lsu.next_tick)
-                .map(|tick| (tick, C220StallCause::LsuDependency)),
-            self.external_fixp
-                .as_ref()
-                .and_then(|fixp| {
-                    self.mte_pipeline
-                        .as_ref()
-                        .and_then(|pipeline| pipeline.next_external_fixp_event_tick(&fixp.engine))
-                })
-                .map(|tick| (tick, C220StallCause::FixpDependency)),
-            self.fixp
-                .as_ref()
-                .and_then(|fixp| {
-                    self.mte_pipeline
-                        .as_ref()
-                        .and_then(|pipeline| pipeline.next_fixp_event_tick(&fixp.engine))
-                })
-                .map(|tick| (tick, C220StallCause::FixpDependency)),
-            self.scalar_timing
-                .pending_drain_tick()
-                .map(|tick| (tick, C220StallCause::ScalarDependency)),
-            self.mte3
-                .timing
-                .latest_retirement_tick()
-                .map(|tick| (tick, C220StallCause::Mte3Dependency)),
-            self.vector
-                .pending_drain_tick()
-                .map(|tick| (tick, C220StallCause::VectorDependency)),
-            self.cube
-                .pipeline
-                .pending_drain_tick()
-                .map(|tick| (tick, C220StallCause::CubeDependency)),
-            self.cube_frontend
-                .next_tick
-                .map(|tick| (tick, C220StallCause::CubeDependency)),
-            self.pending_mte1_tick()
-                .map(|tick| (tick, C220StallCause::Mte1Dependency)),
-            self.mte2
-                .next_event_tick()
-                .map(|tick| (tick, C220StallCause::Mte2Dependency)),
-            self.mte_pipeline
-                .as_ref()
-                .and_then(C220MtePipeline::next_event_tick)
-                .map(|tick| (tick, C220StallCause::MtePhysicalDependency)),
-        ]
-        .into_iter()
-        .flatten()
-        .max_by_key(|(tick, _)| *tick)
     }
 }
 

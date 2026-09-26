@@ -4201,7 +4201,7 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     for spr in [17, 19, 57, 63, 74, 87] {
         assert_eq!(
             core.spr_dispatch_dependency(read_spr(spr)),
-            Some((retirement, C220StallCause::VectorDependency))
+            Some(C220StallCause::VectorDependency)
         );
     }
     for spr in [16, 18, 54, 58, 62, 73, 75, 86, 88] {
@@ -4211,7 +4211,7 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     for spr in [2, 48, 49, 50, 51] {
         assert_eq!(
             core.spr_dispatch_dependency(write_spr(spr)),
-            Some((retirement, C220StallCause::VectorDependency))
+            Some(C220StallCause::VectorDependency)
         );
         assert_eq!(
             core.spr_dispatch_dependency((18 << 24) | (spr << 17) | 1),
@@ -4249,7 +4249,7 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
             cause: C220StallCause::VectorDependency,
             resume_tick,
             ..
-        }) if resume_tick == retirement
+        }) if resume_tick == 4
     ));
     assert_eq!(core.state().scalar().pc(), waiting_pc);
     let mut standalone_state = core.state().clone();

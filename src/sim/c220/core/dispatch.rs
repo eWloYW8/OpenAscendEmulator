@@ -9,7 +9,7 @@ use crate::sim::c220::vector::frontend::VectorAdmission;
 use crate::sim::common::scalar::{ScalarInstructionStep, ScalarProgramStep};
 
 impl C220Core {
-    pub(super) fn spr_dispatch_dependency(&self, word: u32) -> Option<(u64, C220StallCause)> {
+    pub(super) fn spr_dispatch_dependency(&self, word: u32) -> Option<C220StallCause> {
         use crate::isa::scalar::ScalarInstruction;
         let instruction = ScalarInstruction::from_word(Architecture::Dav2201, word)?;
         if matches!(
@@ -19,7 +19,7 @@ impl C220Core {
                 ..
             }
         ) {
-            return self.pending_compute_drain();
+            return self.barrier_all_blocker();
         }
         let ScalarInstruction::ScalarKey2MoveFromSpr {
             encoded_source_spr, ..
@@ -28,13 +28,18 @@ impl C220Core {
             return None;
         };
         match encoded_source_spr {
-            17 | 19 | 57 | 63 | 74 | 87 => self
-                .vector
-                .pending_drain_tick()
-                .map(|tick| (tick, C220StallCause::VectorDependency)),
-            54 => self
-                .pending_mte1_tick()
-                .map(|tick| (tick, C220StallCause::Mte1Dependency)),
+            17 | 19 | 57 | 63 | 74 | 87 => (self.activity().vector
+                || self
+                    .pipeline_events
+                    .pending()
+                    .any(|event| event.step.instruction.source_pipe_code == 1))
+            .then_some(C220StallCause::VectorDependency),
+            54 => (self.activity().mte1
+                || self
+                    .pipeline_events
+                    .pending()
+                    .any(|event| event.step.instruction.source_pipe_code == 3))
+            .then_some(C220StallCause::Mte1Dependency),
             _ => None,
         }
     }
@@ -90,11 +95,11 @@ impl C220Core {
             }));
         }
         let pc = self.state.scalar().pc();
-        if let Some((ready, cause)) = self.spr_dispatch_dependency(word) {
+        if let Some(cause) = self.spr_dispatch_dependency(word) {
             return Ok(C220CoreStep::Stalled(C220Stall {
                 tick,
                 pc,
-                resume_tick: ready.max(tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?),
+                resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
                 cause,
             }));
         }
