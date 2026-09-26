@@ -7,6 +7,7 @@ pub mod fixp;
 pub mod interface;
 pub mod load2d;
 pub mod load3d;
+pub mod mov_pad;
 pub mod mte1;
 pub mod mte2;
 pub mod mte3;

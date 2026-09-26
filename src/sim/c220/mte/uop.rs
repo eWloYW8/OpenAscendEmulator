@@ -438,6 +438,90 @@ fn split_requests(
     })
 }
 
+pub fn mov_pad_uops(
+    transfer: crate::isa::c220::mte::mov_pad::C220MovPadTransfer,
+    mode: C220DmaUopMode,
+) -> Result<C220DmaUops, C220DmaUopError> {
+    let length = transfer.burst_bytes();
+    let no_padding = transfer.left_padding() + transfer.right_padding() == 0;
+    let batch = transfer.source_gap() == 0
+        && transfer.destination_gap() == 0
+        && if transfer.is_input() {
+            length <= 31 && no_padding
+        } else {
+            length.is_multiple_of(32)
+        };
+    let collapse = transfer.is_input()
+        && no_padding
+        && matches!(length, 32 | 64)
+        && transfer.source_gap() == 0
+        && transfer.destination_gap() != 0;
+    let gather = !transfer.is_input()
+        && transfer.source_base.is_multiple_of(32)
+        && transfer.destination_base.is_multiple_of(64)
+        && transfer.source_gap() != 0
+        && transfer.destination_gap() == 0
+        && transfer.burst_count() > 1
+        && length == 64;
+    let split_enabled = if !transfer.is_input() {
+        true
+    } else if batch || collapse || !no_padding {
+        false
+    } else if transfer.source_base.is_multiple_of(32) {
+        transfer.destination_base.is_multiple_of(32)
+            && length.is_multiple_of(32)
+            && transfer.source_gap().is_multiple_of(32)
+    } else {
+        let element_bytes = u32::from(transfer.instruction.element_bytes);
+        transfer
+            .source_base
+            .is_multiple_of(u64::from(element_bytes))
+            && (transfer.source_gap() != 0 || transfer.destination_gap() != 0)
+            && length == 1
+            && transfer.source_gap().is_multiple_of(element_bytes)
+    };
+    let flatten = batch || collapse || gather;
+    let mut requests = split_requests(
+        DmaRequestGeometry {
+            source_base: transfer.source_base,
+            destination_base: transfer.destination_base,
+            burst_count: if transfer.is_disabled() {
+                0
+            } else if flatten {
+                1
+            } else {
+                transfer.burst_count()
+            },
+            burst_bytes: u64::from(if flatten {
+                length.wrapping_mul(u32::from(transfer.burst_count()))
+            } else {
+                length
+            }),
+            source_stride: u64::from(transfer.source_stride()),
+            destination_stride: transfer.destination_stride(),
+            split_on_destination: !transfer.is_input(),
+            split_enabled,
+        },
+        if batch {
+            C220DmaUopRoute::ContiguousBatch
+        } else if collapse {
+            C220DmaUopRoute::DestinationGapCollapse
+        } else if gather {
+            C220DmaUopRoute::SourceGapGather
+        } else {
+            C220DmaUopRoute::Ordinary
+        },
+        mode,
+    )?;
+    requests.sid = transfer.sid();
+    requests.destination = C220DmaDestinationLayout {
+        base: transfer.destination_base,
+        burst_bytes: transfer.padded_bytes(),
+        burst_stride: transfer.destination_stride(),
+    };
+    Ok(requests)
+}
+
 /// Lazy physical requests. Burst source offsets use a 32-bit accumulator;
 /// destination offsets and both base addresses remain 64-bit.
 #[derive(Debug, Clone, PartialEq, Eq)]
