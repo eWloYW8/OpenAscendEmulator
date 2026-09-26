@@ -1,6 +1,8 @@
 use crate::sim::c220::mte::interface::biu_read::C220BiuReadError;
 use std::collections::{BTreeMap, VecDeque};
 mod biu;
+mod events;
+pub use events::{C220Nd2NzCallback, C220Nd2NzEvent, C220Nd2NzEvents};
 
 use super::{
     C220Nd2NzReadPlan, C220Nd2NzReadRequest, C220Nd2NzReadRoute, C220Nd2NzResponse,
@@ -50,7 +52,7 @@ pub struct C220Nd2NzIssuedRead {
     pub request: C220Nd2NzReadRequest,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Source {
     sid: u8,
     instruction_id: u64,
@@ -61,7 +63,7 @@ struct Source {
     next_id: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Command {
     instruction_id: u64,
     ready_tick: u64,
@@ -72,7 +74,7 @@ struct Command {
 
 /// Dedicated ND2NZ scheduling and response ownership. The owner schedules the
 /// independent callbacks and transports issued reads; L1 writes use Port1.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220Nd2NzEngine {
     staging: C220Nd2NzStaging,
     source: Option<Source>,

@@ -19,6 +19,8 @@ use crate::sim::c220::mte::{C220MtePipeline, C220MtePipelineError, C220TransferE
 #[derive(Debug, thiserror::Error)]
 pub enum C220Mte2RuntimeError {
     #[error(transparent)]
+    Nd2Nz(#[from] crate::sim::c220::mte::nd2nz::C220Nd2NzError),
+    #[error(transparent)]
     MovPad(#[from] crate::sim::c220::mte::mov_pad::C220MovPadError),
     #[error(transparent)]
     Load2d(#[from] crate::sim::c220::mte::load2d::C220Load2dTransferError),
@@ -60,6 +62,40 @@ pub struct C220Mte2Pipeline {
 }
 
 impl C220Mte2Pipeline {
+    pub(crate) fn issue_nd2nz(
+        &mut self,
+        pipeline: &mut C220MtePipeline,
+        instruction_id: u64,
+        pc: u64,
+        transfer: crate::isa::c220::mte::nd2nz::C220Nd2NzTransfer,
+        mode: crate::sim::c220::mte::uop::C220DmaUopMode,
+    ) -> Result<C220Mte2Issue, C220Mte2RuntimeError> {
+        if !transfer.is_disabled() {
+            self.check_physical_generator_switch()?;
+        }
+        self.now
+            .checked_add(1)
+            .ok_or(C220Mte2RuntimeError::TimeOverflow)?;
+        let timing = pipeline.issue_nd2nz(instruction_id, transfer, mode)?;
+        let command = C220Mte2Command::Nd2Nz { transfer, mode };
+        self.pending.push_back(C220Mte2CommandState {
+            instruction_id,
+            pc,
+            issue_tick: timing.tick,
+            command,
+            completion: if timing.completion_ready {
+                C220Mte2Completion::Observed { tick: timing.tick }
+            } else {
+                C220Mte2Completion::AwaitingDestination
+            },
+        });
+        Ok(C220Mte2Issue {
+            instruction_id,
+            pc,
+            command,
+            timing: C220Mte2IssueTiming::Dma(timing),
+        })
+    }
     pub fn new(rules: C220Mte2TimingRules) -> Self {
         Self {
             dma: C220Mte2DmaTiming::new(rules),
@@ -525,6 +561,13 @@ impl C220Mte2Pipeline {
             }
         {
             let result = match command.command {
+                C220Mte2Command::Nd2Nz { transfer, .. } => {
+                    C220Mte2Result::Nd2Nz(crate::sim::c220::mte::nd2nz::execute_c220_nd2nz(
+                        transfer,
+                        source,
+                        local.l1_mut(),
+                    )?)
+                }
                 C220Mte2Command::MovPad(captured) => C220Mte2Result::MovPad(
                     crate::sim::c220::mte::mov_pad::prepare_c220_mov_pad(
                         captured.transfer,
@@ -597,7 +640,8 @@ impl C220Mte2Pipeline {
 }
 
 pub(crate) fn is_mte2_transfer(word: u32) -> bool {
-    crate::isa::c220::mte::C220MovOutToUbDescriptor::is_word(word)
+    crate::isa::c220::mte::nd2nz::C220Nd2NzInstruction::decode(word).is_some()
+        || crate::isa::c220::mte::C220MovOutToUbDescriptor::is_word(word)
         || crate::isa::c220::mte::mov_pad::C220MovPadInstruction::decode(word).is_some_and(
             |instruction| {
                 matches!(

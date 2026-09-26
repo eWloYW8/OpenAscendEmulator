@@ -135,7 +135,12 @@ impl C220MtePipeline {
                     .progress(tag)
                     .expect("tracked request")
                     .request;
-                if request.input.generated.last_in_instruction {
+                if request.input.generated.last_in_instruction
+                    && !matches!(
+                        request.input.destination,
+                        super::C220BiuWriteDestination::Nd2Nz { .. }
+                    )
+                {
                     self.dma_tails.push(request.input.generated.instruction_id);
                 }
             }

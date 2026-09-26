@@ -71,14 +71,14 @@ impl C220Nd2NzResponse {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RowFragment {
     ready_tick: u64,
     bytes: u32,
     padding_bytes: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SmallBatch {
     ready_tick: u64,
     elements: VecDeque<C220Nd2NzReadElement>,
@@ -86,7 +86,7 @@ struct SmallBatch {
 
 /// Response queues and per-row write credits. Each method represents one
 /// scheduler callback; source instruction ownership is enforced by the engine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220Nd2NzStaging {
     config: C220Nd2NzStagingConfig,
     alignment: Vec<u32>,
@@ -134,6 +134,17 @@ impl C220Nd2NzStaging {
 
     pub fn pending_small_batches(&self) -> usize {
         self.small.len()
+    }
+
+    pub(crate) fn small_ready_tick(&self) -> Option<u64> {
+        self.small.front().map(|head| head.ready_tick)
+    }
+
+    pub(crate) fn lane_ready_tick(&self, lane: usize) -> Option<u64> {
+        [lane, lane + 4]
+            .into_iter()
+            .filter_map(|row| self.rows.get(row)?.front().map(|head| head.ready_tick))
+            .min()
     }
 
     pub fn pending_row_fragments(&self, row: u32) -> Option<usize> {

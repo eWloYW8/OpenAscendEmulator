@@ -47,7 +47,12 @@ impl C220Core {
 
     pub fn take_mte2_biu_request(&mut self) -> Option<C220BiuReadRequest> {
         let request = self.mte_pipeline.as_mut()?.take_biu_read_request()?;
-        if request.input.generated.last_in_instruction {
+        if request.input.generated.last_in_instruction
+            && !matches!(
+                request.input.destination,
+                crate::sim::c220::mte::interface::biu_read::write::C220BiuWriteDestination::Nd2Nz { .. }
+            )
+        {
             self.mte2
                 .observe_dma_tail(request.input.generated.instruction_id);
         }
@@ -132,6 +137,20 @@ impl C220Core {
                 payload: crate::sim::c220::sync::C220DeviceSync::from_value(
                     machine.xregs()[usize::from(instruction.source_register)],
                 ),
+            }
+        } else if let Some(decoded) =
+            crate::isa::c220::mte::nd2nz::C220Nd2NzInstruction::decode(word)
+        {
+            let mode_word = if self.state.isa_instance_index == 0 {
+                0
+            } else {
+                machine
+                    .spr_value(93)
+                    .ok_or(C220ExecutionError::MissingSpr { pc, index: 93 })?
+            };
+            C220Mte2Command::Nd2Nz {
+                transfer: decoded.capture(machine.xregs()),
+                mode: crate::sim::c220::mte::uop::C220DmaUopMode::from_mode_word(mode_word),
             }
         } else if let Some(decoded) =
             crate::isa::c220::mte::smask::C220MovSmaskInstruction::decode(word)
@@ -262,6 +281,24 @@ impl C220Core {
     ) -> Result<bool, C220CoreError> {
         use crate::sim::c220::mte::mte2::C220Mte2Command;
         Ok(match command {
+            C220Mte2Command::Nd2Nz { transfer, .. } => {
+                let pipeline = self
+                    .mte_pipeline
+                    .as_ref()
+                    .ok_or(C220CoreError::MteUnconfigured)?;
+                if transfer.is_disabled() {
+                    true
+                } else {
+                    self.mte2.check_physical_generator_switch()?;
+                    pipeline.validate_external_load2d_connection()?;
+                    if pipeline.nd2nz_engine().is_none() {
+                        return Err(
+                            crate::sim::c220::mte::C220MtePipelineError::Nd2NzUnconfigured.into(),
+                        );
+                    }
+                    pipeline.can_issue_nd2nz()
+                }
+            }
             C220Mte2Command::MovPad(command) => {
                 if command.transfer.is_disabled() {
                     true
@@ -348,6 +385,15 @@ impl C220Core {
     ) -> Result<crate::sim::c220::mte::mte2::C220Mte2Issue, C220CoreError> {
         use crate::sim::c220::mte::mte2::C220Mte2Command;
         Ok(match command {
+            C220Mte2Command::Nd2Nz { transfer, mode } => self.mte2.issue_nd2nz(
+                self.mte_pipeline
+                    .as_mut()
+                    .ok_or(C220CoreError::MteUnconfigured)?,
+                id,
+                pc,
+                transfer,
+                mode,
+            )?,
             C220Mte2Command::MovPad(command) => self.mte2.issue_mov_pad(
                 self.mte_pipeline
                     .as_mut()

@@ -6,6 +6,10 @@ use crate::sim::c220::mte::set2d::{C220Set2dIssue, C220Set2dResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte2Command {
+    Nd2Nz {
+        transfer: crate::isa::c220::mte::nd2nz::C220Nd2NzTransfer,
+        mode: crate::sim::c220::mte::uop::C220DmaUopMode,
+    },
     MovPad(crate::sim::c220::mte::mov_pad::C220MovPadCommand),
     Load2d {
         transfer: crate::isa::c220::mte::load2d::C220Load2dTransfer,
@@ -70,6 +74,7 @@ pub struct C220Mte2CommandState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220Mte2Result {
+    Nd2Nz(crate::sim::c220::mte::nd2nz::C220Nd2NzResult),
     MovPad(UbTransferResult),
     Load2d(crate::sim::c220::mte::load2d::C220Load2dTransferResult),
     WriteSpr(crate::sim::common::scalar::ScalarSprStep),

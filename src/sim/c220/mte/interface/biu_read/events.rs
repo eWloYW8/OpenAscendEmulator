@@ -28,6 +28,9 @@ pub struct C220BiuReadEvents {
 }
 
 impl C220BiuReadEvents {
+    pub(crate) fn arm_input<T: Copy>(&self, events: &mut EventDispatcher<T>) {
+        events.set_process_enabled(self.input_probe, true);
+    }
     pub fn register<T: Copy>(
         events: &mut EventDispatcher<T>,
         clock: EventId,

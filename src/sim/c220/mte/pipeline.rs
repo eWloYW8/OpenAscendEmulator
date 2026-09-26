@@ -45,6 +45,9 @@ use super::mte3::frontend::{
     C220Mte3Callback, C220Mte3Events, C220Mte3Frontend, C220Mte3FrontendError,
     C220Mte3FrontendEvent, C220Mte3Record,
 };
+use super::nd2nz::{
+    C220Nd2NzCallback, C220Nd2NzEngine, C220Nd2NzEngineError, C220Nd2NzEvent, C220Nd2NzEvents,
+};
 use super::uop::{C220DmaUopError, C220DmaUops, mte2_l1_uops, mte2_uops};
 use crate::isa::c220::mte::out_to_l1::C220L1DmaDescriptor;
 use crate::isa::c220::mte::set2d::{C220Set2dDestination, C220Set2dFill};
@@ -88,6 +91,7 @@ pub struct C220MtePipelineConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Callback {
+    Nd2Nz(C220Nd2NzCallback),
     FixpIssueProbe,
     FixpIssueTransfer,
     Mte1IssueProbe,
@@ -125,6 +129,7 @@ enum Callback {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220MtePipelineEvent {
+    Nd2Nz(C220Nd2NzEvent),
     FixpExternal(C220FixpRuntimeEvent),
     FixpExternalStored {
         slice: C220FixpSliceResult,
@@ -167,6 +172,10 @@ pub enum C220MtePipelineEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220MtePipelineError {
+    #[error(transparent)]
+    Nd2Nz(#[from] C220Nd2NzEngineError),
+    #[error("ND2NZ requires explicit staging and column-alignment configuration")]
+    Nd2NzUnconfigured,
     #[error("MTE2 MOV_PAD requires an external-to-UB transfer")]
     WrongMovPadDirection,
     #[error(transparent)]
@@ -291,6 +300,7 @@ pub enum C220MtePipelineError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mte2Generator {
+    Nd2Nz,
     ExternalLoad2d,
     Default,
     Load3d,
@@ -302,6 +312,7 @@ mod cache;
 mod external_fixp;
 mod load2d;
 mod memory;
+mod nd2nz;
 mod read;
 mod smask;
 mod sync;
@@ -321,6 +332,9 @@ mod write;
 /// destination acknowledgment, not a prediction made at command admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220MtePipeline {
+    nd2nz: Option<C220Nd2NzEngine>,
+    nd2nz_events: C220Nd2NzEvents,
+    nd2nz_column_alignment: Option<NonZeroU32>,
     fixp_events: Vec<C220FixpStageEvents>,
     external_fixp_events: Vec<C220FixpStageEvents<C220FixpRuntimeStage>>,
     fixp_write: C220FixpL1WriteInterface,
@@ -554,6 +568,7 @@ impl C220MtePipeline {
         let set2d_events = C220Set2dEvents::register(&mut events, clock, Callback::Set2d);
         let dma_events = C220DmaEvents::register(&mut events, clock, Callback::Dma);
         let load2d_events = C220DmaEvents::register(&mut events, clock, Callback::ExternalLoad2d);
+        let nd2nz_events = C220Nd2NzEvents::register(&mut events, clock, Callback::Nd2Nz);
         let set2d_l1_events = C220Set2dEvents::register(&mut events, clock, Callback::Set2dL1);
         let biu_events = C220BiuReadEvents::register(&mut events, clock, Callback::BiuRead);
         let biu_return_events =
@@ -573,6 +588,9 @@ impl C220MtePipeline {
         });
         Self {
             fixp_events: Vec::new(),
+            nd2nz: None,
+            nd2nz_events,
+            nd2nz_column_alignment: None,
             external_fixp_events: Vec::new(),
             fixp_write: C220FixpL1WriteInterface::default(),
             fixp_write_events,
@@ -712,6 +730,7 @@ impl C220MtePipeline {
             && self.set2d.is_idle()
             && self.set2d_l1.is_idle()
             && self.external_load2d.is_idle()
+            && self.nd2nz.as_ref().is_none_or(C220Nd2NzEngine::is_idle)
             && self.load2d_destinations.is_empty()
             && self.dma.is_idle()
             && self.mte3.is_idle()
@@ -860,6 +879,8 @@ impl C220MtePipeline {
         self.biu_read = None;
         self.biu_returns = None;
         self.biu_bus_reads = None;
+        self.nd2nz = None;
+        self.nd2nz_column_alignment = None;
         Ok(())
     }
 
@@ -885,6 +906,10 @@ impl C220MtePipeline {
         self.biu_bus_reads = None;
         self.biu_returns = Some(returns);
         self.biu_subcore = subcore;
+        if subcore != C220BiuSubcore::Cube {
+            self.nd2nz = None;
+            self.nd2nz_column_alignment = None;
+        }
         self.dma_connected = true;
         Ok(())
     }
@@ -1090,6 +1115,7 @@ impl C220MtePipeline {
     pub(crate) fn mte2_generator_idle(&self) -> bool {
         self.selected_mte2_generator
             .is_none_or(|generator| match generator {
+                Mte2Generator::Nd2Nz => self.nd2nz.as_ref().is_none_or(C220Nd2NzEngine::is_idle),
                 Mte2Generator::ExternalLoad2d => self.external_load2d.is_idle(),
                 Mte2Generator::Default => self.generator(C220MteReadKind::Default).is_idle(),
                 Mte2Generator::Dma => self.dma.is_idle(),
@@ -1602,6 +1628,7 @@ impl C220MtePipeline {
                     }
                 }
                 Callback::ExternalLoad2d(phase) => self.advance_external_load2d(phase)?,
+                Callback::Nd2Nz(phase) => self.advance_nd2nz(phase)?,
                 Callback::Dma(phase) => {
                     let output_ready = self
                         .biu_read
@@ -1671,6 +1698,9 @@ impl C220MtePipeline {
                     }
                 }
                 Callback::BiuReturn(phase) => {
+                    if self.advance_nd2nz_return(phase)? {
+                        continue;
+                    }
                     let cube_ready = self.cube_read_output_ready();
                     if let Some(returns) = &mut self.biu_returns {
                         let outcome = self.biu_return_events.handle(

@@ -11,6 +11,7 @@ pub enum C220BiuReturnCallback {
     Read,
     Egress(C220BiuSubcore),
     Send(C220BiuSubcore),
+    Nd2NzPush,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub enum C220BiuReturnEvent {
     Read(Vec<C220BiuRobBeat>),
     Egress(Option<C220BiuReadOutput>),
     Send(C220BiuWriteSend),
+    Nd2Nz(super::C220BiuNd2NzProgress),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +32,7 @@ pub struct C220BiuReturnEvents {
     read: EventId,
     egress: [EventId; 3],
     send: [EventId; 3],
+    nd2nz: EventId,
 }
 
 impl C220BiuReturnEvents {
@@ -64,12 +67,16 @@ impl C220BiuReturnEvents {
             events.subscribe(event, process);
             event
         });
+        let nd2nz = events.add_event();
+        let process = events.add_process(tag(C220BiuReturnCallback::Nd2NzPush), false);
+        events.subscribe(nd2nz, process);
         Self {
             ingress,
             selection,
             read,
             egress,
             send,
+            nd2nz,
         }
     }
 
@@ -82,7 +89,16 @@ impl C220BiuReturnEvents {
     ) -> Result<C220BiuReturnEvent, C220BiuReturnError> {
         let tick = events.tick();
         match callback {
+            C220BiuReturnCallback::Nd2NzPush => Err(C220BiuReturnError::DedicatedEgressRequired),
             C220BiuReturnCallback::Probe => {
+                if returns
+                    .nd2nz_rows
+                    .iter()
+                    .flatten()
+                    .any(|head| head.ready_tick <= tick)
+                {
+                    events.notify_at(self.nd2nz, tick);
+                }
                 for (port, queue) in returns.ingress.iter().enumerate() {
                     if queue.front().is_some_and(|head| head.ready_tick <= tick) {
                         events.notify_at(self.ingress[port], tick);

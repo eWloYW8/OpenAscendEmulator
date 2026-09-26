@@ -80,6 +80,123 @@ fn configured_dma_core() -> C220Core {
 }
 
 #[test]
+fn nd2nz_runs_through_core_events_and_retires_after_l1_ack() {
+    use crate::isa::c220::mte::nd2nz::C220Nd2NzInstruction;
+    use crate::sim::c220::mte::{
+        C220MtePipelineEvent,
+        interface::biu_read::write::C220BiuWriteBandwidths,
+        interface::{C220MteL1WriteEventOutcome, C220MteL1WritePort},
+        mte2::C220Mte2Result,
+        nd2nz::{C220Nd2NzStagingConfig, execute_c220_nd2nz},
+    };
+    use std::collections::VecDeque;
+    for columns in [35_u64, 64] {
+        let mut core = configured_dma_core();
+        let width = NonZeroU32::new(32).unwrap();
+        core.connect_mte2_biu(
+            C220BiuReadConfig {
+                outstanding: NonZeroU32::new(4).unwrap(),
+                weights: [1; 3],
+                group_vector_returns: false,
+                write_bandwidths: C220BiuWriteBandwidths {
+                    l1: width,
+                    l0a: width,
+                    l0b: width,
+                    ub: width,
+                },
+            },
+            C220BiuSubcore::Cube,
+        )
+        .unwrap();
+        core.configure_nd2nz(
+            C220Nd2NzStagingConfig {
+                rows: NonZeroU32::new(8).unwrap(),
+                alignment_depth: 256,
+                small_data_capacity: NonZeroU32::new(256).unwrap(),
+                receive_bandwidth: width,
+            },
+            width,
+        )
+        .unwrap();
+        let word = (3 << 29) | (1 << 27) | (12 << 22) | (1 << 17) | (2 << 12) | (3 << 7) | (4 << 2);
+        let machine = core.state.scalar_mut().machine_mut();
+        for (reg, value) in [
+            (1, 512),
+            (2, 0x2000),
+            (3, (1 << 4) | (3 << 16) | (columns << 32)),
+            (4, 64 | (3 << 16) | (1 << 32)),
+        ] {
+            machine.set_xreg(reg, value).unwrap();
+        }
+        let transfer = C220Nd2NzInstruction::decode(word)
+            .unwrap()
+            .capture(machine.xregs());
+        let mut expected = crate::sim::c220::memory::C220LocalBuffer::new(4096);
+        let result = execute_c220_nd2nz(transfer, &core.memory, &mut expected).unwrap();
+        core.step_word_at(0, word).unwrap();
+        for reg in 1..=4 {
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_xreg(reg, 0)
+                .unwrap();
+        }
+        let mut responses = VecDeque::new();
+        let mut ack_tick = None;
+        let mut retired = None;
+        for tick in 1..300 {
+            core.advance_to(tick).unwrap();
+            for event in core.mte_pipeline().unwrap().last_events() {
+                if let C220MtePipelineEvent::L1Write(C220MteL1WriteEventOutcome::Acknowledged(
+                    Some(ack),
+                )) = event
+                    && ack.retired_instruction().is_some()
+                {
+                    assert_eq!(ack.request.port, C220MteL1WritePort::Port1);
+                    ack_tick = Some(tick);
+                }
+            }
+            if let Some(request) = core.take_mte2_biu_request() {
+                responses.extend(
+                    (0..request.input.generated.request.bytes.div_ceil(128)).map(
+                        |transaction_id| C220BiuReadBeat {
+                            tag: request.tag,
+                            transaction_id,
+                        },
+                    ),
+                );
+            }
+            if let Some(outcome) = core.mte2.last_outcomes().first() {
+                retired = Some(outcome.clone());
+                break;
+            }
+            if core
+                .receive_mte2_biu_at(tick, [responses.front().copied(), None])
+                .unwrap()[0]
+            {
+                responses.pop_front();
+            }
+        }
+        let retired = retired.expect("ND2NZ core retirement");
+        assert_eq!(retired.retire_tick, ack_tick.unwrap() + 1);
+        assert_eq!(retired.result, C220Mte2Result::Nd2Nz(result));
+        for segment in transfer.segments() {
+            assert_eq!(
+                core.local_memory
+                    .l1()
+                    .read_states_linear(segment.destination_address, segment.output_bytes as usize)
+                    .unwrap(),
+                expected
+                    .read_states_linear(segment.destination_address, segment.output_bytes as usize)
+                    .unwrap()
+            );
+        }
+        assert!(core.mte_pipeline().unwrap().is_idle());
+        assert!(!core.mte2_is_busy());
+    }
+}
+
+#[test]
 fn mov_pad_input_counts_padding_traffic_and_retires_after_ub_ack() {
     use crate::memory::sparse::MemoryByteState;
     use crate::sim::c220::mte::interface::biu_read::write::C220BiuWriteBandwidths;
