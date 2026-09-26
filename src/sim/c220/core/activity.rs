@@ -1,4 +1,5 @@
 use super::C220Core;
+use crate::sim::c220::schedule::C220StallCause;
 
 /// Outstanding execution work, excluding completed results and ready event tokens.
 /// This is an occupancy snapshot, not an END instruction latency prediction.
@@ -23,6 +24,39 @@ impl C220CoreActivity {
 }
 
 impl C220Core {
+    /// First outstanding execution domain blocking BAR.ALL. Independent memory
+    /// transport and already-published event tokens do not block this barrier.
+    pub fn barrier_all_blocker(&self) -> Option<C220StallCause> {
+        let activity = self.activity();
+        let fixp_pending = self.fixp_engine().is_some_and(|engine| {
+            !engine.commands().is_empty()
+                || !engine.factor_commands().is_empty()
+                || !engine.control_commands().is_empty()
+                || !engine.cross_core_commands().is_empty()
+        }) || !self.fixp_frontend.is_idle();
+        [
+            (activity.scalar, C220StallCause::ScalarDependency),
+            (
+                self.lsu
+                    .as_ref()
+                    .is_some_and(|lsu| lsu.instructions_pending()),
+                C220StallCause::LsuDependency,
+            ),
+            (activity.vector, C220StallCause::VectorDependency),
+            (activity.cube, C220StallCause::CubeDependency),
+            (activity.mte1, C220StallCause::Mte1Dependency),
+            (activity.mte2, C220StallCause::Mte2Dependency),
+            (activity.mte3, C220StallCause::Mte3Dependency),
+            (fixp_pending, C220StallCause::FixpDependency),
+            (
+                activity.deferred_events,
+                C220StallCause::PipelineEventDependency,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(pending, cause)| pending.then_some(cause))
+    }
+
     pub fn activity(&self) -> C220CoreActivity {
         C220CoreActivity {
             scalar: self.scalar_timing.pending_drain_tick().is_some(),

@@ -3989,7 +3989,7 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
             resume_tick,
             cause: C220StallCause::Mte3Dependency,
             ..
-        }) if resume_tick == ticket.retire_tick
+        }) if resume_tick == issue_tick + 2
     ));
     core.state
         .scalar_mut()
@@ -4112,7 +4112,7 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
     assert_eq!(core.pending_mte3_commands().count(), 2);
     assert!(matches!(
         core.step_word_at(next.retire_tick, 0x40e0_1800).unwrap(),
-        C220CoreStep::Stalled(C220Stall { resume_tick, .. }) if resume_tick == disabled.retire_tick
+        C220CoreStep::Stalled(C220Stall { resume_tick, .. }) if resume_tick == next.retire_tick + 1
     ));
     core.advance_to(disabled.retire_tick).unwrap();
     let outcomes = core.last_mte3_outcomes();

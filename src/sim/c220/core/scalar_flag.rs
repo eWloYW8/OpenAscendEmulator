@@ -130,11 +130,32 @@ mod tests {
             assert_eq!(published[0].published_tick, 5);
             assert_eq!(published[0].step.flag_id, 7);
             assert!(matches!(
-                core.step_word_at(6, set + (1 << 21)).unwrap(),
+                core.step_word_at(6, 0x40e0_1800).unwrap(),
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::Barrier(_),
+                    ..
+                }
+            ));
+            assert!(matches!(
+                core.step_word_at(7, set + (1 << 21)).unwrap(),
                 C220CoreStep::Executed { .. }
             ));
-            core.advance_to(7).unwrap();
+            core.advance_to(8).unwrap();
             assert!(core.pipeline_events.ready(0, destination as u8).is_empty());
+            if destination == 1 {
+                core.step_word_at(8, set + (1 << 21)).unwrap();
+                let pc = core.state().scalar().pc();
+                assert!(matches!(
+                    core.step_word_at(9, 0x40e0_1800).unwrap(),
+                    C220CoreStep::Stalled(C220Stall {
+                        cause: C220StallCause::VectorDependency,
+                        resume_tick: 10,
+                        ..
+                    })
+                ));
+                assert_eq!(core.state().scalar().pc(), pc);
+                assert_eq!(core.queued_vector_instructions().len(), 1);
+            }
         }
     }
 }

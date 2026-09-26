@@ -116,6 +116,21 @@ pub(super) struct CoreLsu {
 }
 
 impl CoreLsu {
+    pub(super) fn instructions_pending(&self) -> bool {
+        !self.ingress.is_empty()
+            || !self.preloads.is_empty()
+            || !self.pending.is_empty()
+            || !self.stores.is_empty()
+            || !self.maintenance.is_empty()
+            || !self.atomics.is_empty()
+            || self.commits.pending_count() != 0
+            || self.commits.retirement_occupancy() != 0
+            || self
+                .cache
+                .as_ref()
+                .is_some_and(|cache| !cache.pending.is_empty())
+    }
+
     pub(super) fn trigger_set_flag_flush(&mut self) {
         if self.config.flush_on_scalar_set_flag {
             self.scheduler.stores.trigger_idle_flush();
@@ -123,15 +138,8 @@ impl CoreLsu {
     }
 
     pub(super) fn is_idle(&self) -> bool {
-        self.ingress.is_empty()
-            && self.preloads.is_empty()
-            && self.pending.is_empty()
-            && self.stores.is_empty()
-            && self.maintenance.is_empty()
-            && self.atomics.is_empty()
+        !self.instructions_pending()
             && !self.scheduler.maintenance_active()
-            && self.commits.pending_count() == 0
-            && self.commits.retirement_occupancy() == 0
             && self.cache.as_ref().is_none_or(CoreCache::is_idle)
             && self.scheduler.reads.requests().next().is_none()
             && self.scheduler.writes.requests().next().is_none()

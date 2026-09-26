@@ -268,13 +268,11 @@ impl C220Core {
                 })
             ) =>
             {
-                if let Some((resume_tick, cause)) = self.pending_compute_drain()
-                    && tick < resume_tick
-                {
+                if let Some(cause) = self.barrier_all_blocker() {
                     return Ok(C220CoreStep::Stalled(C220Stall {
                         tick,
                         pc,
-                        resume_tick,
+                        resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
                         cause,
                     }));
                 }
