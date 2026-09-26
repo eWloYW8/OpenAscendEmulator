@@ -9,6 +9,32 @@ use crate::sim::c220::memory::C220LocalBuffer;
 use std::num::NonZeroU32;
 
 #[test]
+fn read_route_uses_column_alignment_and_byte_capacity() {
+    use C220Nd2NzReadRoute::{ContiguousRows, PerRow};
+    for (format, columns, stride, depth, expected) in [
+        (0, 32, 32, 256, PerRow),
+        (0, 64, 64, 256, ContiguousRows),
+        (1, 32, 32, 64, ContiguousRows),
+        (1, 32, 32, 63, PerRow),
+        (2, 16, 16, 256, PerRow),
+        (2, 32, 32, 128, ContiguousRows),
+        (3, 16, 16, 256, PerRow),
+        (3, 32, 32, 128, ContiguousRows),
+        (3, 32, 64, 256, PerRow),
+    ] {
+        let transfer = crate::isa::c220::mte::nd2nz::C220Nd2NzTransfer {
+            instruction: C220Nd2NzInstruction::decode((3 << 29) | (1 << 27) | (12 << 22) | format)
+                .unwrap(),
+            source_base: 0,
+            destination_base: 0,
+            xm: (1 << 4) | (1 << 16) | (columns << 32),
+            xt: stride,
+        };
+        assert_eq!(C220Nd2NzReadRoute::select(transfer, depth), expected);
+    }
+}
+
+#[test]
 fn biu_returns_preserve_nd2nz_latency_tag_lifetime_and_both_routes() {
     use crate::isa::c220::mte::nd2nz::C220Nd2NzTransfer;
     use crate::sim::c220::mte::{

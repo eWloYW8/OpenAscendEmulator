@@ -9,6 +9,21 @@ pub enum C220Nd2NzReadRoute {
     ContiguousRows,
 }
 
+impl C220Nd2NzReadRoute {
+    pub fn select(transfer: C220Nd2NzTransfer, alignment_depth: u32) -> Self {
+        let row_bytes = transfer.row_bytes();
+        if row_bytes > 63
+            && row_bytes <= alignment_depth
+            && transfer.columns() == transfer.source_row_stride()
+            && transfer.columns().is_multiple_of(32)
+        {
+            Self::ContiguousRows
+        } else {
+            Self::PerRow
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220Nd2NzReadElement {
     pub row_slot: u32,
@@ -26,8 +41,7 @@ pub struct C220Nd2NzReadRequest {
     pub last_in_instruction: bool,
 }
 
-/// Request geometry only; the engine selects the route using its configured
-/// small-data threshold and row alignment. Both routes use in-order returns.
+/// Request geometry only; both routes use in-order returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220Nd2NzReadPlan {
     transfer: C220Nd2NzTransfer,

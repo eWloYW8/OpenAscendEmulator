@@ -174,7 +174,7 @@ pub enum C220MtePipelineEvent {
 pub enum C220MtePipelineError {
     #[error(transparent)]
     Nd2Nz(#[from] C220Nd2NzEngineError),
-    #[error("ND2NZ requires explicit staging and column-alignment configuration")]
+    #[error("ND2NZ requires staging configuration")]
     Nd2NzUnconfigured,
     #[error("MTE2 MOV_PAD requires an external-to-UB transfer")]
     WrongMovPadDirection,
@@ -334,7 +334,6 @@ mod write;
 pub struct C220MtePipeline {
     nd2nz: Option<C220Nd2NzEngine>,
     nd2nz_events: C220Nd2NzEvents,
-    nd2nz_column_alignment: Option<NonZeroU32>,
     fixp_events: Vec<C220FixpStageEvents>,
     external_fixp_events: Vec<C220FixpStageEvents<C220FixpRuntimeStage>>,
     fixp_write: C220FixpL1WriteInterface,
@@ -590,7 +589,6 @@ impl C220MtePipeline {
             fixp_events: Vec::new(),
             nd2nz: None,
             nd2nz_events,
-            nd2nz_column_alignment: None,
             external_fixp_events: Vec::new(),
             fixp_write: C220FixpL1WriteInterface::default(),
             fixp_write_events,
@@ -880,7 +878,6 @@ impl C220MtePipeline {
         self.biu_returns = None;
         self.biu_bus_reads = None;
         self.nd2nz = None;
-        self.nd2nz_column_alignment = None;
         Ok(())
     }
 
@@ -908,7 +905,6 @@ impl C220MtePipeline {
         self.biu_subcore = subcore;
         if subcore != C220BiuSubcore::Cube {
             self.nd2nz = None;
-            self.nd2nz_column_alignment = None;
         }
         self.dma_connected = true;
         Ok(())

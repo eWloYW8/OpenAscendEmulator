@@ -9,14 +9,12 @@ impl C220MtePipeline {
     pub fn configure_nd2nz(
         &mut self,
         config: C220Nd2NzStagingConfig,
-        column_alignment: NonZeroU32,
     ) -> Result<(), C220MtePipelineError> {
         if !self.is_idle() || self.active_cycle.is_some() {
             return Err(C220MtePipelineError::CommandBusy);
         }
         self.validate_external_load2d_connection()?;
         self.nd2nz = Some(C220Nd2NzEngine::new(config)?);
-        self.nd2nz_column_alignment = Some(column_alignment);
         Ok(())
     }
 
@@ -47,23 +45,14 @@ impl C220MtePipeline {
             });
         }
         self.validate_external_load2d_connection()?;
-        let alignment = self
-            .nd2nz_column_alignment
+        self.nd2nz
+            .as_ref()
             .ok_or(C220MtePipelineError::Nd2NzUnconfigured)?;
         if !self.can_issue_nd2nz() {
             return Err(C220MtePipelineError::CommandBusy);
         }
         let engine = self.nd2nz.as_mut().expect("configured ND2NZ");
-        let row_bytes = transfer.row_bytes();
-        let route = if row_bytes > 63
-            && row_bytes <= engine.staging().config().alignment_depth
-            && transfer.columns() == transfer.source_row_stride()
-            && u32::from(transfer.columns()).is_multiple_of(alignment.get())
-        {
-            C220Nd2NzReadRoute::ContiguousRows
-        } else {
-            C220Nd2NzReadRoute::PerRow
-        };
+        let route = C220Nd2NzReadRoute::select(transfer, engine.staging().config().alignment_depth);
         assert!(engine.submit(tick, id, transfer, route, mode)?);
         self.nd2nz_events.arm(&mut self.events);
         self.selected_mte2_generator = Some(Mte2Generator::Nd2Nz);

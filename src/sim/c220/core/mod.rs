@@ -289,7 +289,6 @@ impl C220Core {
     pub fn configure_nd2nz(
         &mut self,
         config: crate::sim::c220::mte::nd2nz::C220Nd2NzStagingConfig,
-        column_alignment: std::num::NonZeroU32,
     ) -> Result<(), C220CoreError> {
         if self.mte2.is_busy() || !self.mte2_frontend.is_idle() {
             return Err(C220CoreError::MtePipelineBusy);
@@ -297,7 +296,7 @@ impl C220Core {
         self.mte_pipeline
             .as_mut()
             .ok_or(C220CoreError::MteUnconfigured)?
-            .configure_nd2nz(config, column_alignment)?;
+            .configure_nd2nz(config)?;
         Ok(())
     }
 
