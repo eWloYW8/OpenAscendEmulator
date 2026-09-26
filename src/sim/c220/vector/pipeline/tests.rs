@@ -21,9 +21,18 @@ fn gather_completion_uses_live_indices_and_sequential_data_feedback() {
         (0x8000_004a, 4, 64),
         (0x8000_0043, 32, 8),
     ] {
+        let base = if width == 32 { 32 } else { 0 };
         let mut bytes = vec![0_u8; 4096];
         for (index, byte) in bytes[..512].iter_mut().enumerate() {
             *byte = (index * 19) as u8;
+        }
+        if width == 32 {
+            for repeat in 0..2 {
+                for lane in 0..count {
+                    let offset = 1024 + (repeat * count + lane) * 4;
+                    bytes[offset..offset + 4].copy_from_slice(&(lane as u32 * 32).to_le_bytes());
+                }
+            }
         }
         let mut ub = UbMemory::new(4096, 4096);
         ub.write_states(
@@ -39,7 +48,7 @@ fn gather_completion_uses_live_indices_and_sequential_data_feedback() {
             plan_c220_gather_issue(
                 0,
                 word,
-                (2 << 56) | (8 << 32),
+                (2 << 56) | (8 << 32) | base as u64,
                 128,
                 1024,
                 vec![[u64::MAX; 4]; 2],
@@ -65,7 +74,7 @@ fn gather_completion_uses_live_indices_and_sequential_data_feedback() {
                 let index = if lane == 0 {
                     0
                 } else {
-                    128 + repeat * 256 + (lane - 1) * width
+                    128 + repeat * 256 + (lane - 1) * width - base
                 };
                 let offset = 1024 + (repeat * count + lane) * 4;
                 bytes[offset..offset + 4].copy_from_slice(&(index as u32).to_le_bytes());
@@ -85,8 +94,9 @@ fn gather_completion_uses_live_indices_and_sequential_data_feedback() {
         for repeat in 0..2 {
             for lane in 0..count {
                 let offset = 1024 + (repeat * count + lane) * 4;
-                let source =
-                    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                let source = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+                    as usize
+                    + base;
                 let data = bytes[source..source + width].to_vec();
                 let destination = 128 + repeat * 256 + lane * width;
                 bytes[destination..destination + width].copy_from_slice(&data);
@@ -98,6 +108,27 @@ fn gather_completion_uses_live_indices_and_sequential_data_feedback() {
         assert!(samples.iter().all(|sample| sample.transfers.len() == count
             && sample.tick == releases.last().unwrap().release_tick + 1));
         assert!(!pipeline.last_read_samples().is_empty());
+        if width == 32 {
+            let reads = pipeline
+                .last_read_samples()
+                .iter()
+                .filter(|sample| sample.lane_group == Some(0))
+                .collect::<Vec<_>>();
+            assert_eq!(reads.len(), 2);
+            for sample in reads {
+                assert_eq!(sample.read0_grants.len(), 8);
+                assert!(sample.read0_grants.iter().all(Option::is_some));
+                assert!(sample.read1_grants.is_empty());
+                assert_eq!(
+                    sample
+                        .accesses
+                        .iter()
+                        .map(|access| access.address)
+                        .collect::<Vec<_>>(),
+                    (0..8).map(|lane| lane * 32).collect::<Vec<_>>()
+                );
+            }
+        }
         assert_eq!(core.ub().read_known(0, 4096).unwrap(), bytes);
         assert_eq!(pipeline.pending_uops(), 0);
         assert_eq!(pipeline.pending_ub_responses(), 0);

@@ -575,7 +575,7 @@ impl PendingVectorRead {
                         C220VectorReadOperation::GatherIndex,
                     ),
                     C220VectorUopKind::GatherData { group } if lane_group == Some(group) => (
-                        issue.data_read_accesses(repeat_index, group)?,
+                        issue.timing_data_read_accesses(repeat_index, group)?,
                         C220VectorReadOperation::GatherData {
                             issue: Box::new(issue.clone()),
                             group,

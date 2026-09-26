@@ -177,6 +177,35 @@ impl C220GatherIssue {
         }
     }
 
+    pub(crate) fn timing_data_read_accesses(
+        &self,
+        repeat_index: usize,
+        group: u8,
+    ) -> Result<Vec<C220VectorReadAccess>, C220VectorError> {
+        if !matches!(self.instruction.kind, C220GatherKind::Blocks) {
+            return self.data_read_accesses(repeat_index, group);
+        }
+        if group != 0 {
+            return Err(C220VectorError::InvalidLaneGroup(group));
+        }
+        let indices = self
+            .indices
+            .get(repeat_index)
+            .ok_or(C220VectorError::InvalidRepeatIndex(repeat_index))?;
+        Ok(indices
+            .iter()
+            .enumerate()
+            .map(|(block, &index)| C220VectorReadAccess {
+                source_index: 0,
+                block_index: block as u8,
+                buffer_offset: (block * C220_VECTOR_BLOCK_BYTES) as u16,
+                bytes: C220_VECTOR_BLOCK_BYTES as u16,
+                address: u64::from(index),
+                active_lane_mask: u16::MAX,
+            })
+            .collect())
+    }
+
     pub(crate) fn stores_for_data_uop(
         &self,
         repeat_index: usize,
