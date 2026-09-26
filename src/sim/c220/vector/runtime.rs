@@ -29,6 +29,12 @@ pub(in crate::sim::c220) struct VectorEngine {
 }
 
 impl VectorEngine {
+    pub(in crate::sim::c220) fn is_idle(&self) -> bool {
+        self.frontend.is_idle()
+            && self.pending_instructions.is_empty()
+            && self.pending_execution_drain_tick().is_none()
+    }
+
     pub(in crate::sim::c220) fn ub_activity_at(
         &self,
         tick: u64,

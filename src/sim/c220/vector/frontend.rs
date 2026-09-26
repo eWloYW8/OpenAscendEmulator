@@ -91,6 +91,10 @@ pub(super) struct VectorFrontend {
 }
 
 impl VectorFrontend {
+    pub(super) fn is_idle(&self) -> bool {
+        self.issued.is_empty() && self.received.is_empty() && self.barriers.is_empty()
+    }
+
     pub(super) fn new(config: C220VectorFrontendConfig, reception_ticks: u64) -> Self {
         Self {
             config,

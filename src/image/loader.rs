@@ -283,6 +283,72 @@ mod tests {
     }
 
     #[test]
+    fn c220_end_drains_vector_work_and_resumes_at_budget_boundary() {
+        use crate::memory::{mapped::MappedMemory, sparse::SparseMemory, ub::UbMemory};
+        use crate::sim::c220::{
+            core::{C220Core, C220CoreTimingRules, C220RunStop},
+            mte::{mte2::C220Mte2TimingRules, mte3::C220Mte3TimingRules},
+            state::C220State,
+            vector::pipeline::C220VectorTimingRules,
+        };
+        use std::num::NonZeroU64;
+
+        for blocked in [false, true] {
+            // WAIT MTE3->Vector has no matching SET in the blocked program.
+            let word = if blocked { 0x40c2_14cc } else { 0x8000_6380 };
+            let (mut code, kernel) = loaded_program(Architecture::Dav2201, &[word, 0x4160_0000]);
+            let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+            machine.set_xreg(6, 0x120).unwrap();
+            machine.set_xreg(7, 0x160).unwrap();
+            let one = NonZeroU64::new(1).unwrap();
+            let mut core = C220Core::new(
+                C220State::new(
+                    ScalarStepper::new(machine, kernel.entry_address()),
+                    UbMemory::new(512, 256),
+                ),
+                MappedMemory::bind(SparseMemory::new(vec![], 512, 512), &[]).unwrap(),
+                C220CoreTimingRules {
+                    mte2: C220Mte2TimingRules {
+                        issue_interval: one,
+                        startup_ticks: 0,
+                        bytes_per_tick: one,
+                        retire_ticks: 0,
+                    },
+                    mte3: C220Mte3TimingRules {
+                        issue_interval: one,
+                        startup_ticks: 0,
+                        bytes_per_tick: one,
+                        retire_ticks: 0,
+                    },
+                    vector: C220VectorTimingRules {
+                        dispatch_ticks: 8,
+                        uop_issue_interval: one,
+                        ub_response_ticks: 1,
+                    },
+                },
+            )
+            .unwrap();
+            let first = core.run_loaded_until(0, 4, 16, &kernel, &mut code).unwrap();
+            assert_eq!(first.stop, C220RunStop::TickBudget);
+            assert!(core.state().scalar().is_halted());
+            assert!(core.activity().vector);
+            let last = core
+                .run_loaded_until(first.next_tick, 32, 16, &kernel, &mut code)
+                .unwrap();
+            assert!(last.events.is_empty());
+            if blocked {
+                assert_eq!(last.stop, C220RunStop::TickBudget);
+                assert!(core.activity().vector);
+            } else {
+                assert_eq!(last.stop, C220RunStop::Halted);
+                assert!(core.activity().is_idle());
+                assert_eq!(core.va_registers().entry(0, 0), Some(9));
+                assert_eq!(core.va_registers().entry(0, 1), Some(11));
+            }
+        }
+    }
+
+    #[test]
     fn loaded_scalar_program_steps_until_end() {
         for architecture in [Architecture::Dav2201, Architecture::Dav3510] {
             let words = [0x0706_0001_u32, 0x4160_0000];

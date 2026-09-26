@@ -63,6 +63,10 @@ pub(super) struct Mte2Frontend {
 }
 
 impl Mte2Frontend {
+    pub(super) fn is_idle(&self) -> bool {
+        self.issued.is_empty() && self.commands.is_empty() && self.barriers.is_empty()
+    }
+
     pub(super) fn new(config: C220Mte2FrontendConfig) -> Self {
         Self {
             config,

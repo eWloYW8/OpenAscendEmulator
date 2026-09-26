@@ -48,6 +48,10 @@ pub(super) struct Mte3IssueQueue {
 }
 
 impl Mte3IssueQueue {
+    pub(super) fn is_idle(&self) -> bool {
+        self.issued.is_empty() && self.barriers.is_empty()
+    }
+
     pub(super) fn new(config: C220Mte3IssueQueueConfig) -> Self {
         Self {
             config,

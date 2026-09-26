@@ -18,7 +18,9 @@ use crate::sim::c220::vector::timing::C220VectorUopRelease;
 use crate::sim::c220::vector::va::C220VaRegisters;
 use crate::sim::c220::vector::vmsu::C220VmsuPipeline;
 
+mod activity;
 mod advance;
+pub use activity::C220CoreActivity;
 mod cache;
 mod lsu;
 pub use crate::sim::c220::sync::C220DeviceSync;
@@ -440,9 +442,10 @@ impl C220Core {
         let mut tick = start_tick;
         let mut events = Vec::new();
         loop {
-            let stop = if self.state.scalar().is_halted()
-                && self.lsu.as_ref().is_none_or(|lsu| lsu.next_tick.is_none())
-            {
+            if self.state.scalar().is_halted() {
+                self.advance_to(tick)?;
+            }
+            let stop = if self.state.scalar().is_halted() && self.activity().is_idle() {
                 Some(C220RunStop::Halted)
             } else if tick >= tick_limit {
                 Some(C220RunStop::TickBudget)
@@ -452,7 +455,9 @@ impl C220Core {
                 None
             };
             if let Some(stop) = stop {
-                self.advance_to(tick)?;
+                if !self.state.scalar().is_halted() {
+                    self.advance_to(tick)?;
+                }
                 return Ok(C220CoreRun {
                     start_tick,
                     next_tick: tick,
@@ -462,7 +467,6 @@ impl C220Core {
                 });
             }
             if self.state.scalar().is_halted() {
-                self.advance_to(tick)?;
                 tick = tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?;
                 continue;
             }

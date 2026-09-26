@@ -113,6 +113,25 @@ pub(super) struct CoreLsu {
     cache: Option<CoreCache>,
 }
 
+impl CoreLsu {
+    pub(super) fn is_idle(&self) -> bool {
+        self.ingress.is_empty()
+            && self.preloads.is_empty()
+            && self.pending.is_empty()
+            && self.stores.is_empty()
+            && self.maintenance.is_empty()
+            && self.atomics.is_empty()
+            && !self.scheduler.maintenance_active()
+            && self.commits.pending_count() == 0
+            && self.commits.retirement_occupancy() == 0
+            && self.cache.as_ref().is_none_or(CoreCache::is_idle)
+            && self.scheduler.reads.requests().next().is_none()
+            && self.scheduler.writes.requests().next().is_none()
+            && self.send_pending.is_none()
+            && self.ub_writes.is_empty()
+    }
+}
+
 impl C220Core {
     /// Attach the scalar LSU to the core's configured shared BIU and memory service.
     pub fn configure_lsu(&mut self, config: C220CoreLsuConfig) -> Result<(), C220CoreError> {
@@ -407,22 +426,7 @@ impl C220Core {
             loads.send_at(tick, pipeline, scheduler)?;
         }
         lsu.send_writes_at(tick, pipeline)?;
-        let scheduler = &lsu.scheduler;
-        lsu.next_tick = if lsu.ingress.is_empty()
-            && lsu.preloads.is_empty()
-            && lsu.pending.is_empty()
-            && lsu.stores.is_empty()
-            && lsu.maintenance.is_empty()
-            && lsu.atomics.is_empty()
-            && !scheduler.maintenance_active()
-            && lsu.commits.pending_count() == 0
-            && lsu.commits.retirement_occupancy() == 0
-            && lsu.cache.as_ref().is_none_or(CoreCache::is_idle)
-            && scheduler.reads.requests().next().is_none()
-            && scheduler.writes.requests().next().is_none()
-            && lsu.send_pending.is_none()
-            && lsu.ub_writes.is_empty()
-        {
+        lsu.next_tick = if lsu.is_idle() {
             None
         } else {
             Some(tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?)

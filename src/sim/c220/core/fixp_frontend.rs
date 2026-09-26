@@ -65,6 +65,10 @@ pub(super) struct FixpFrontend {
 }
 
 impl FixpFrontend {
+    pub(super) fn is_idle(&self) -> bool {
+        self.issued.is_empty() && self.commands.is_empty() && self.barriers.is_empty()
+    }
+
     pub(super) fn contains_instruction(&self, id: u64) -> bool {
         self.issued
             .iter()
