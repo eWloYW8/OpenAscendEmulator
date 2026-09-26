@@ -1,6 +1,6 @@
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
 use crate::isa::flow::PipelineBarrierStep;
-use crate::sim::c220::cube::frontend::C220CubeBarrier;
+use crate::sim::c220::cube::frontend::{C220CubeBarrier, C220CubeCommand};
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 
 impl C220Core {
@@ -40,6 +40,11 @@ impl C220Core {
             step,
             predecessor: self.cube_frontend.last_accepted,
             issued_tick: tick,
+            requires_idle: self
+                .cube_frontend
+                .commands
+                .back()
+                .is_some_and(|command| matches!(command.command, C220CubeCommand::WaitMte1(_))),
         };
         let pending = barrier
             .predecessor
@@ -62,6 +67,7 @@ impl C220Core {
             if barrier
                 .predecessor
                 .is_some_and(|id| self.cube_instruction_pending(id))
+                || (barrier.requires_idle && self.outstanding_cube_commands() != 0)
             {
                 break;
             }

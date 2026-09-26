@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 use crate::isa::c220::control::C220SetCrossCoreInstruction;
 use crate::isa::c220::cube::{C220CubeInstruction, C220CubeRegisterValues};
 use crate::isa::c220::hflag::C220HardwareFlagStep;
-use crate::isa::flow::PipelineBarrierStep;
+use crate::isa::flow::{FlagStep, PipelineBarrierStep};
 use crate::sim::c220::sync::C220DeviceSync;
 use crate::sim::common::scalar::ScalarSprStep;
 
@@ -36,6 +36,7 @@ pub enum C220CubeCommand {
     },
     WriteSpr(ScalarSprStep),
     HardwareFlag(C220HardwareFlagStep),
+    WaitMte1(FlagStep),
     CrossCore {
         instruction: C220SetCrossCoreInstruction,
         payload: C220DeviceSync,
@@ -61,4 +62,6 @@ pub struct C220CubeBarrier {
     pub step: PipelineBarrierStep,
     pub predecessor: Option<u64>,
     pub issued_tick: u64,
+    /// A queue-handled event fence also waits for earlier running instructions.
+    pub requires_idle: bool,
 }

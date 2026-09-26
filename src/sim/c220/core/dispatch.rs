@@ -148,6 +148,19 @@ impl C220Core {
             }
         }
         let decoded_word = C220DecodedWord::decode(word);
+        if let Some(flag) = decoded_word.flow_flag.filter(|flag| {
+            flag.source_pipe_code == 3
+                && flag.trigger_pipe_code == 2
+                && flag.operation == FlagOperation::Wait
+        }) {
+            let step = flag.resolve(pc, self.state.scalar().machine().xregs());
+            return self.enqueue_cube_at(
+                tick,
+                pc,
+                word,
+                crate::sim::c220::cube::frontend::C220CubeCommand::WaitMte1(step),
+            );
+        }
         match decoded_word.kind {
             C220DispatchKind::Factor(_) | C220DispatchKind::Fixp => {
                 return self.step_fixp_at(tick, pc, word);

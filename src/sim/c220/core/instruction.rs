@@ -89,6 +89,7 @@ pub enum C220CoreInstruction {
     Mte2(C220Mte2Issue),
     Mte2Flag(FlagStep),
     Cube(C220CubeIssue),
+    CubeFlag(FlagStep),
     CubeQueued(crate::sim::c220::cube::frontend::C220CubeQueuedCommand),
     CubeBarrier {
         barrier: crate::sim::c220::cube::frontend::C220CubeBarrier,

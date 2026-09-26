@@ -96,7 +96,7 @@ impl C220Core {
                 .front()
                 .expect("armed Cube receive");
             let pending = self.cube.pipeline.pending_retirement_count();
-            let cause = if tick < self.cube.pipeline.next_accept_tick() {
+            let mut cause = if tick < self.cube.pipeline.next_accept_tick() {
                 Some(C220StallCause::CubeDependency)
             } else if pending >= self.cube_frontend.config.outstanding_limit.get() as usize {
                 Some(C220StallCause::CubeOutstandingLimit)
@@ -116,6 +116,18 @@ impl C220Core {
             } else {
                 None
             };
+            if cause.is_none()
+                && let C220CubeCommand::WaitMte1(step) = queued.command
+                && !self.mte1.wait_event(
+                    step.flag_id,
+                    self.mte1_frontend
+                        .commands
+                        .front()
+                        .map(|command| command.instruction_id),
+                )
+            {
+                cause = Some(C220StallCause::PipelineEventDependency);
+            }
             if let Some(cause) = cause {
                 self.cube_frontend
                     .outcomes
@@ -132,6 +144,7 @@ impl C220Core {
         }
         let queued = self.cube_frontend.active.expect("received Cube command");
         let instruction = match queued.command {
+            C220CubeCommand::WaitMte1(step) => C220CoreInstruction::CubeFlag(step),
             C220CubeCommand::Mmad {
                 instruction,
                 registers,

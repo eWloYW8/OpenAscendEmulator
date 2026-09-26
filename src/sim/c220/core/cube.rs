@@ -799,6 +799,87 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_mte1_waits_release_queued_cube_work_after_transfer_retirement() {
+        let mut core = matrix_core();
+        core.advance_to(300).unwrap();
+        let event_id = 0x1234_5678;
+        let machine = core.state.scalar_mut().machine_mut();
+        for (register, value) in [(0, 4096), (6, 0), (7, 0), (12, event_id)] {
+            machine.set_xreg(register, value).unwrap();
+        }
+        let load = (3 << 29) | (6 << 17) | (7 << 12) | (8 << 7) | 8;
+        let set = (2 << 29) | (5 << 21) | (1 << 17) | (3 << 10) | (2 << 7) | (12 << 2);
+        let wait = (set & !(15 << 21)) | (6 << 21);
+        let cube = (7 << 29) | (3 << 22) | (1 << 12) | (2 << 7) | (3 << 2);
+        for (tick, word) in [
+            (301, load),
+            (302, set),
+            (303, set),
+            (304, wait),
+            (305, wait),
+            (306, 0x4140_0000),
+            (307, cube),
+        ] {
+            assert!(matches!(
+                core.step_word_at(tick, word).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+        }
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(12, 0)
+            .unwrap();
+        assert_eq!(core.queued_cube_commands().count(), 3);
+        assert_eq!(core.outstanding_cube_commands(), 0);
+        assert!(core.active_cube_control().is_none());
+        core.advance_to(500).unwrap();
+        let transfer_retirement = core.last_mte1_outcomes().last().unwrap().retire_tick;
+        let waits: Vec<_> = core
+            .cube_frontend_outcomes()
+            .iter()
+            .filter_map(|event| match event {
+                C220CoreStep::Executed {
+                    tick,
+                    instruction: C220CoreInstruction::CubeFlag(step),
+                } => Some((*tick, *step)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(waits.len(), 2);
+        assert_eq!(waits[0].0, transfer_retirement);
+        assert_eq!(waits[1].0, transfer_retirement + 1);
+        assert!(
+            waits
+                .iter()
+                .all(|(_, step)| step.flag_id == event_id as u32)
+        );
+        assert_eq!(
+            core.local_memory
+                .l0c()
+                .buffer()
+                .read_known(4096, 4)
+                .unwrap(),
+            32.0_f32.to_le_bytes()
+        );
+        assert!(core.pending_compute_drain().is_none());
+
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(12, event_id)
+            .unwrap();
+        core.step_word_at(501, wait).unwrap();
+        core.step_word_at(502, cube).unwrap();
+        core.advance_to(505).unwrap();
+        assert_eq!(core.queued_cube_commands().count(), 2);
+        assert_eq!(core.outstanding_cube_commands(), 0);
+        core.step_word_at(506, set).unwrap();
+        core.advance_to(600).unwrap();
+        assert!(core.pending_compute_drain().is_none());
+    }
+
+    #[test]
     fn cube_barriers_hold_later_reception_without_blocking_scalar_admission() {
         let mut core = matrix_core();
         core.advance_to(300).unwrap();
@@ -856,6 +937,25 @@ mod tests {
             }
         ));
         assert!(core.pending_compute_drain().is_none());
+        let set = (2 << 29) | (5 << 21) | (3 << 10) | (2 << 7) | 1;
+        let wait = (set & !(15 << 21)) | (6 << 21);
+        core.step_word_at(402, set).unwrap();
+        core.step_word_at(403, word).unwrap();
+        core.step_word_at(404, wait).unwrap();
+        core.step_word_at(405, 0x40e0_0800).unwrap();
+        assert!(core.pending_cube_barriers().next().unwrap().requires_idle);
+        core.step_word_at(406, word).unwrap();
+        let retirement = core.cube.pipeline.pending_drain_tick().unwrap();
+        core.advance_to(retirement - 1).unwrap();
+        assert_eq!(core.pending_cube_barriers().len(), 1);
+        assert_eq!(core.queued_cube_commands().count(), 1);
+        assert!(matches!(
+            core.queued_cube_commands().next().unwrap().command,
+            C220CubeCommand::Mmad { .. }
+        ));
+        core.advance_to(retirement).unwrap();
+        assert_eq!(core.pending_cube_barriers().len(), 0);
+        assert_eq!(core.queued_cube_commands().count(), 0);
     }
 
     #[test]
@@ -1631,7 +1731,10 @@ mod tests {
         ));
         assert!(matches!(
             core.step_word_at(307, wait).unwrap(),
-            C220CoreStep::Stalled(_)
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::CubeQueued(_),
+                ..
+            }
         ));
         core.advance_to(700).unwrap();
         assert_eq!(core.outstanding_mte1_commands(), 0);
@@ -1651,10 +1754,14 @@ mod tests {
             core.local_memory.l0a().read_known(16384, 512).unwrap(),
             0x2222_u16.to_le_bytes().repeat(256)
         );
-        assert!(matches!(
-            core.step_word_at(701, wait).unwrap(),
-            C220CoreStep::Executed { .. }
-        ));
+        assert!(core.cube_frontend_outcomes().iter().any(|event| matches!(
+            event,
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::CubeFlag(_),
+                ..
+            }
+        )));
+        assert_eq!(core.queued_cube_commands().count(), 0);
     }
 
     #[test]

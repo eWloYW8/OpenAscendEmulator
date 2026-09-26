@@ -7,7 +7,7 @@ use crate::isa::c220::mte::load2d::C220Load2dInstruction;
 use crate::isa::c220::mte::load2d_sparse::C220Load2dSparseInstruction;
 use crate::isa::c220::mte::load2d_transpose::C220Load2dTransposeInstruction;
 use crate::isa::c220::mte::set2d::{C220Set2dDestination, C220Set2dInstruction};
-use crate::isa::flow::FlagInstruction;
+use crate::isa::flow::{FlagInstruction, FlagOperation};
 use crate::sim::c220::mte::mte2::is_mte2_transfer;
 use crate::sim::c220::vector::dispatch::is_vector_word;
 
@@ -50,7 +50,9 @@ impl C220DecodedWord {
             || C220Set2dInstruction::decode(word)
                 .is_some_and(|instruction| instruction.destination != C220Set2dDestination::L1)
             || flow_flag.is_some_and(|instruction| {
-                instruction.source_pipe_code == 3 && instruction.trigger_pipe_code == 2
+                instruction.source_pipe_code == 3
+                    && instruction.trigger_pipe_code == 2
+                    && instruction.operation == FlagOperation::Set
             })
         {
             C220DispatchKind::Mte1

@@ -11,6 +11,7 @@ pub enum C220StallCause {
     Mte1Dependency,
     MtePhysicalDependency,
     HardwareFlagDependency,
+    PipelineEventDependency,
     DeviceFlagDependency,
     Mte2IssueRate,
     Mte2Dependency,

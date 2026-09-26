@@ -5,7 +5,7 @@ use crate::isa::c220::mte::load2d_sparse::C220Load2dSparseInstruction;
 use crate::isa::c220::mte::load2d_transpose::C220Load2dTransposeInstruction;
 use crate::isa::c220::mte::set2d::C220Set2dInstruction;
 use crate::isa::c220::mte::spr::C220Mte1SprWrite;
-use crate::isa::flow::{FlagInstruction, FlagOperation};
+use crate::isa::flow::FlagInstruction;
 use crate::sim::c220::mte::mte1::C220Mte1Command;
 use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadTransfer;
 use crate::sim::c220::mte::mte1::load2d::C220Load2dTransferError;
@@ -129,28 +129,10 @@ impl C220Core {
             let flag = flow_flag
                 .expect("matched C220 MTE1 flag")
                 .resolve(pc, self.state.scalar().machine().xregs());
-            match flag.instruction.operation {
-                FlagOperation::Set => self.mte1.set_event(
-                    flag.flag_id,
-                    self.mte1_frontend.commands.back().map(|c| c.instruction_id),
-                ),
-                FlagOperation::Wait => {
-                    if !self.mte1.wait_event(
-                        flag.flag_id,
-                        self.mte1_frontend
-                            .commands
-                            .front()
-                            .map(|c| c.instruction_id),
-                    ) {
-                        return Ok(C220CoreStep::Stalled(C220Stall {
-                            tick,
-                            pc,
-                            resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
-                            cause: C220StallCause::Mte1Dependency,
-                        }));
-                    }
-                }
-            }
+            self.mte1.set_event(
+                flag.flag_id,
+                self.mte1_frontend.commands.back().map(|c| c.instruction_id),
+            );
             self.state.commit_c220_sequential_issue();
             C220CoreInstruction::Mte1Flag(flag)
         };
