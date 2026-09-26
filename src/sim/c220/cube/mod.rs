@@ -10,6 +10,7 @@ mod layout;
 mod mmad;
 mod numeric;
 pub mod sparse;
+pub(super) mod spr;
 #[cfg(test)]
 mod tests;
 pub mod timing;

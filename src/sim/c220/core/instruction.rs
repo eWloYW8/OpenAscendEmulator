@@ -89,6 +89,10 @@ pub enum C220CoreInstruction {
     Mte2(C220Mte2Issue),
     Mte2Flag(FlagStep),
     Cube(C220CubeIssue),
+    CubeSpr {
+        instruction_id: u64,
+        step: crate::sim::common::scalar::ScalarSprStep,
+    },
     Vector(C220VectorInstruction),
     VectorToScalarFlag(FlagStep),
     Mte3 {

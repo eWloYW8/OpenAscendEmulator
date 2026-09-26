@@ -1,5 +1,7 @@
 pub const C220_CUBE_ARRAY_EDGE: u16 = 16;
 
+pub mod spr;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220CubeOperation {
     Mmad,

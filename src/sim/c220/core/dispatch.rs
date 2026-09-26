@@ -160,14 +160,15 @@ impl C220Core {
                 });
             }
             C220DispatchKind::Mte1 => return self.step_mte1_at(tick, pc, word),
+            C220DispatchKind::CubeSpr(instruction) => {
+                return self.step_cube_spr_at(tick, pc, word, instruction);
+            }
             C220DispatchKind::Mte2 => return self.step_mte2_at(tick, pc, word),
             C220DispatchKind::HardwareFlag(instruction) => {
-                return if instruction.source_pipe
-                    == crate::isa::c220::hflag::C220HardwareFlagSourcePipe::Fix
-                {
-                    self.step_fixp_at(tick, pc, word)
-                } else {
-                    self.step_mte1_at(tick, pc, word)
+                return match instruction.execution_pipe_code() {
+                    2 => self.step_cube_hardware_wait_at(tick, pc, instruction),
+                    10 => self.step_fixp_at(tick, pc, word),
+                    _ => self.step_mte1_at(tick, pc, word),
                 };
             }
             _ => {}

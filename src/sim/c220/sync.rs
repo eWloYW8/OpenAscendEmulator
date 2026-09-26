@@ -354,6 +354,14 @@ impl C220HardwareFlagState {
         self.cube_waits.len()
     }
 
+    pub fn has_pending_cube_wait(&self, step: C220HardwareFlagStep) -> bool {
+        self.cube_waits.iter().any(|pending| {
+            pending.step.instruction.source_pipe == step.instruction.source_pipe
+                && C220HardwareFlagKey::from_step(pending.step)
+                    == C220HardwareFlagKey::from_step(step)
+        })
+    }
+
     pub fn wait_ready_tick(
         &self,
         step: C220HardwareFlagStep,

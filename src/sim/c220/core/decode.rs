@@ -19,6 +19,7 @@ pub(super) enum C220DispatchKind {
     Mte2,
     HardwareFlag(C220HardwareFlagInstruction),
     Cube(C220CubeInstruction),
+    CubeSpr(crate::isa::c220::cube::spr::C220CubeSprWrite),
     Vector,
     Mte3,
     Scalar,
@@ -64,6 +65,10 @@ impl C220DecodedWord {
             C220DispatchKind::Mte2
         } else if let Some(instruction) = C220HardwareFlagInstruction::decode(word) {
             C220DispatchKind::HardwareFlag(instruction)
+        } else if let Some(instruction) =
+            crate::isa::c220::cube::spr::C220CubeSprWrite::decode(word)
+        {
+            C220DispatchKind::CubeSpr(instruction)
         } else if let Some(instruction) = C220CubeInstruction::decode(word) {
             C220DispatchKind::Cube(instruction)
         } else if is_vector_word(word) {

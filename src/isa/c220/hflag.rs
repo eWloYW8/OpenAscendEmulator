@@ -46,6 +46,16 @@ pub struct C220HardwareFlagStep {
 }
 
 impl C220HardwareFlagInstruction {
+    pub const fn execution_pipe_code(self) -> u8 {
+        match self.operation {
+            C220HardwareFlagOperation::Wait => self.destination_pipe_code,
+            C220HardwareFlagOperation::Set => match self.source_pipe {
+                C220HardwareFlagSourcePipe::Mte1 => 3,
+                C220HardwareFlagSourcePipe::Fix => 10,
+            },
+        }
+    }
+
     pub const fn decode(word: u32) -> Option<Self> {
         if !matches!(super::control::special_flow_form(word), Some(0 | 2 | 6 | 7)) {
             return None;
