@@ -409,6 +409,9 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
                                         C220MteL1OutputDestination::Fb => {
                                             panic!("MTE1 workload does not load factors")
                                         }
+                                        C220MteL1OutputDestination::Smask => {
+                                            panic!("workload does not load sparse masks")
+                                        }
                                         C220MteL1OutputDestination::SparseIndex => {
                                             panic!("index responses must not emit output")
                                         }

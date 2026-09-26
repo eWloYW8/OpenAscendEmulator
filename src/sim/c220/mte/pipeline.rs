@@ -1805,6 +1805,7 @@ impl C220MtePipeline {
                                     C220MteL1OutputDestination::L0b(port) => Some((1, port)),
                                     C220MteL1OutputDestination::Bt
                                     | C220MteL1OutputDestination::Fb
+                                    | C220MteL1OutputDestination::Smask
                                     | C220MteL1OutputDestination::SparseIndex => None,
                                 };
                                 if let Some((index, port)) = target {

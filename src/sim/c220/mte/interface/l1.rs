@@ -355,6 +355,7 @@ impl<T: Copy> C220MteL1Interface<T> {
                     C220MteL1OutputDestination::SparseIndex => C220MteL1ReadDestination::Sp,
                     C220MteL1OutputDestination::Bt => C220MteL1ReadDestination::Bt,
                     C220MteL1OutputDestination::Fb => C220MteL1ReadDestination::Fb,
+                    C220MteL1OutputDestination::Smask => C220MteL1ReadDestination::Smask,
                     C220MteL1OutputDestination::L0a(_) => C220MteL1ReadDestination::L0a,
                     C220MteL1OutputDestination::L0b(_) => C220MteL1ReadDestination::L0b,
                 },

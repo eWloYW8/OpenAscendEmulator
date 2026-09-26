@@ -8,8 +8,19 @@ pub enum C220MteL1OutputDestination {
     SparseIndex,
     Bt,
     Fb,
+    Smask,
     L0a(C220L0WritePort),
     L0b(C220L0WritePort),
+}
+
+impl C220MteL1OutputDestination {
+    fn local_retirement_delay(self) -> Option<u64> {
+        match self {
+            Self::Bt | Self::Smask => Some(5),
+            Self::Fb => Some(0),
+            Self::SparseIndex | Self::L0a(_) | Self::L0b(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -22,7 +33,9 @@ impl C220MteL1OutputCredits {
     fn permits(self, destination: C220MteL1OutputDestination) -> bool {
         match destination {
             C220MteL1OutputDestination::SparseIndex => false,
-            C220MteL1OutputDestination::Bt | C220MteL1OutputDestination::Fb => true,
+            C220MteL1OutputDestination::Bt
+            | C220MteL1OutputDestination::Fb
+            | C220MteL1OutputDestination::Smask => true,
             C220MteL1OutputDestination::L0a(port) => self.l0a[port as usize],
             C220MteL1OutputDestination::L0b(port) => self.l0b[port as usize],
         }
@@ -48,7 +61,7 @@ pub struct C220MteL1OutputCycle<T> {
     pub tick: u64,
     pub sent: Option<C220MteL1OutputTransfer<T>>,
     pub blocked: Option<C220MteL1OutputDestination>,
-    /// Local BT/FB completion. L0 destinations retire through their write interface.
+    /// Local completion. L0 destinations retire through their write interface.
     pub retired: Option<C220MteL1OutputTransfer<T>>,
     pub queues: C220MteL1OutputQueues,
 }
@@ -186,14 +199,14 @@ impl<T: Copy> C220MteL1Output<T> {
     ) -> Result<(), C220MteL1OutputError> {
         self.check_callback(tick, self.send_tick, "send")?;
         if let Some(head) = self.ready_head(tick)
-            && head.destination == C220MteL1OutputDestination::Bt
+            && let Some(delay) = head.destination.local_retirement_delay()
             && credits.permits(head.destination)
             && head
                 .fragments
                 .front()
                 .is_some_and(|fragment| fragment.last_in_uop)
         {
-            tick.checked_add(5)
+            tick.checked_add(delay)
                 .ok_or(C220MteL1OutputError::TimeOverflow)?;
         }
         Ok(())
@@ -265,17 +278,9 @@ impl<T: Copy> C220MteL1Output<T> {
                     };
                     sent = Some(transfer);
                     if fragment.last_in_uop {
-                        if matches!(
-                            head.destination,
-                            C220MteL1OutputDestination::Bt | C220MteL1OutputDestination::Fb
-                        ) {
+                        if let Some(delay) = head.destination.local_retirement_delay() {
                             self.retiring.push_back(Retirement {
-                                ready_tick: tick
-                                    + if head.destination == C220MteL1OutputDestination::Bt {
-                                        5
-                                    } else {
-                                        0
-                                    },
+                                ready_tick: tick + delay,
                                 transfer,
                             });
                         }

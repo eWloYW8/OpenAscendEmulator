@@ -5,39 +5,48 @@ use crate::sim::c220::mte::mte1::load2d::C220Load2dRequestPlan;
 use std::num::NonZeroU32;
 
 #[test]
-fn factor_output_retires_after_last_fragment_without_bt_delay() {
-    let mut output = C220MteL1Output::default();
-    output
-        .receive(
-            10,
-            C220MteL1OutputDestination::Fb,
-            C220MteOutputPlan::new(7, 3, 2048, 128, true, NonZeroU32::new(64).unwrap()),
-            3_u64,
-        )
-        .unwrap();
-    assert!(
+fn local_output_retires_after_last_fragment_with_destination_delay() {
+    for (destination, delay) in [
+        (C220MteL1OutputDestination::Fb, 0),
+        (C220MteL1OutputDestination::Bt, 5),
+        (C220MteL1OutputDestination::Smask, 5),
+    ] {
+        let mut output = C220MteL1Output::default();
         output
-            .send(10, C220MteL1OutputCredits::default())
+            .receive(
+                10,
+                destination,
+                C220MteOutputPlan::new(7, 3, 2048, 128, true, NonZeroU32::new(64).unwrap()),
+                3_u64,
+            )
+            .unwrap();
+        assert!(
+            output
+                .send(10, C220MteL1OutputCredits::default())
+                .unwrap()
+                .sent
+                .is_none()
+        );
+        let first = output
+            .send(11, C220MteL1OutputCredits::default())
             .unwrap()
             .sent
-            .is_none()
-    );
-    let first = output
-        .send(11, C220MteL1OutputCredits::default())
-        .unwrap()
-        .sent
-        .unwrap();
-    assert!(!first.fragment.last_in_instruction);
-    assert_eq!(output.retirement_ready_tick(), None);
-    let last = output
-        .send(12, C220MteL1OutputCredits::default())
-        .unwrap()
-        .sent
-        .unwrap();
-    assert!(last.fragment.last_in_instruction);
-    assert_eq!(output.retirement_ready_tick(), Some(12));
-    assert_eq!(output.retire(12).unwrap(), Some(last));
-    assert!(output.is_idle());
+            .unwrap();
+        assert!(!first.fragment.last_in_instruction);
+        assert_eq!(output.retirement_ready_tick(), None);
+        let last = output
+            .send(12, C220MteL1OutputCredits::default())
+            .unwrap()
+            .sent
+            .unwrap();
+        assert!(last.fragment.last_in_instruction);
+        assert_eq!(output.retirement_ready_tick(), Some(12 + delay));
+        for tick in 12..12 + delay {
+            assert!(output.retire(tick).unwrap().is_none());
+        }
+        assert_eq!(output.retire(12 + delay).unwrap(), Some(last));
+        assert!(output.is_idle());
+    }
 }
 
 #[test]
