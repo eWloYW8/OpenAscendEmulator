@@ -20,6 +20,23 @@ pub struct C220L1OutputRead {
     pub last_in_instruction: bool,
 }
 
+impl C220L1OutputRead {
+    pub fn output_fragment(
+        self,
+        instruction_id: u64,
+        request_id: u64,
+    ) -> crate::sim::c220::mte::interface::C220MteOutputFragment {
+        crate::sim::c220::mte::interface::C220MteOutputFragment {
+            instruction_id,
+            request_id,
+            destination_address: self.destination_address,
+            bytes: self.destination_bytes,
+            last_in_uop: self.last_in_transaction,
+            last_in_instruction: self.last_in_instruction,
+        }
+    }
+}
+
 /// Lazy L1 reads grouped by their external write transaction.
 #[derive(Debug, Clone)]
 pub struct C220L1OutputReadPlan {
@@ -191,6 +208,56 @@ mod tests {
         assert_eq!(reads[1].destination_bytes, 128);
         assert_eq!(reads.iter().map(|r| r.bytes).sum::<u32>(), 512);
         assert_eq!(reads.iter().filter(|r| r.last_in_instruction).count(), 1);
+        {
+            use crate::sim::c220::mte::fixp::{
+                C220FixpDispatchPipeline, C220FixpExternalOutput, C220FixpStoreBuffer,
+            };
+            let mut output = C220FixpExternalOutput::default();
+            let mut dispatch = C220FixpDispatchPipeline::default();
+            let mut stores = C220FixpStoreBuffer::default();
+            let transaction = C220MovL1ToOutTransfer {
+                xm: (1 << 4) | (32 << 16),
+                destination_address: 0x1000,
+                ..transfer
+            };
+            let plan = C220L1OutputReadPlan::new(transaction, C220DmaUopMode::Unbounded, width);
+            for (index, read) in plan.enumerate() {
+                let tick = index as u64;
+                let fragment = read.output_fragment(9, tick);
+                assert!(
+                    !output
+                        .receive_l1_source(tick, tick, fragment, false)
+                        .unwrap()
+                );
+                assert!(
+                    !output
+                        .receive_l1_source(tick, tick + 1, fragment, true)
+                        .unwrap()
+                );
+                assert!(
+                    output
+                        .receive_l1_source(tick, tick, fragment, true)
+                        .unwrap()
+                );
+                assert_eq!(output.bursts().len(), usize::from(read.last_in_transaction));
+            }
+            assert!(
+                dispatch
+                    .packetize_l1_source(31, &mut output, &mut stores, C220DmaUopMode::Unbounded)
+                    .unwrap()
+                    .is_none()
+            );
+            let packet = dispatch
+                .packetize_l1_source(32, &mut output, &mut stores, C220DmaUopMode::Unbounded)
+                .unwrap()
+                .unwrap();
+            assert_eq!(packet.write.fragment.bytes, 1024);
+            assert_eq!(packet.write.fragment.instruction_id, 9);
+            assert!(packet.write.fragment.last_in_instruction);
+            assert_eq!(stores.len(), 1);
+            assert!(output.bursts().is_empty());
+            assert_eq!(dispatch.packets().len(), 1);
+        }
         transfer.xm |= 1 << 48;
         assert_eq!(
             C220L1OutputReadPlan::new(transfer, C220DmaUopMode::Wide512, width).route(),

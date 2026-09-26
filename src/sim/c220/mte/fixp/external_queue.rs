@@ -343,6 +343,75 @@ pub struct C220FixpExternalOutput {
 }
 
 impl C220FixpExternalOutput {
+    /// Accepts an L1 read completion. Only the final read of a transaction
+    /// contributes its full output size; earlier reads still obey backpressure.
+    pub fn receive_l1_source(
+        &mut self,
+        tick: u64,
+        ready_tick: u64,
+        fragment: C220MteOutputFragment,
+        destination_ready: bool,
+    ) -> Result<bool, C220FixpExternalOutputError> {
+        self.observe(tick)?;
+        if !destination_ready || !self.can_receive() || ready_tick > tick {
+            return Ok(false);
+        }
+        let ready_tick = tick
+            .checked_add(1)
+            .ok_or(C220FixpExternalOutputError::TimeOverflow)?;
+        if fragment.last_in_uop {
+            self.append(C220FixpExternalBurst {
+                instruction_id: fragment.instruction_id,
+                request_id: fragment.request_id,
+                address: fragment.destination_address,
+                bytes: fragment.bytes,
+                closed: true,
+                last_in_instruction: fragment.last_in_instruction,
+                gather: true,
+                row_bytes: 0,
+                row_offset: 0,
+                second_channel_offset: None,
+                policy: C220FixpExternalOutputPolicy::new(0, 0),
+                ready_tick,
+            });
+        }
+        Ok(true)
+    }
+
+    /// L1-source transactions are already split by the read plan. Publish
+    /// the complete head without applying FIX numerical-output packet sizing.
+    pub fn take_l1_source_write(
+        &mut self,
+        tick: u64,
+        destination_ready: bool,
+        stores: &mut C220FixpStoreBuffer,
+    ) -> Result<Option<C220FixpStoreWrite>, C220FixpExternalOutputError> {
+        self.observe(tick)?;
+        if self.packet_tick == Some(tick) {
+            return Err(C220FixpExternalOutputError::RepeatedPacket(tick));
+        }
+        self.packet_tick = Some(tick);
+        let Some(head) = self.bursts.front_mut() else {
+            return Ok(None);
+        };
+        if !destination_ready || head.ready_tick > tick {
+            return Ok(None);
+        }
+        let fragment = C220MteOutputFragment {
+            instruction_id: head.instruction_id,
+            request_id: head.request_id,
+            destination_address: head.address,
+            bytes: head.bytes,
+            last_in_uop: true,
+            last_in_instruction: head.closed && head.last_in_instruction,
+        };
+        head.bytes = 0;
+        if head.closed {
+            self.bursts.pop_front();
+        }
+        Ok(Some(stores.publish(fragment)))
+    }
+
     pub fn take_l1_write(
         &mut self,
         tick: u64,
