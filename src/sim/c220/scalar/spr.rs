@@ -17,9 +17,6 @@ pub(crate) const fn scalar_write_mask(register: u16) -> Option<u64> {
 
 pub(crate) fn write_destination(word: u32) -> Option<u16> {
     if let Some(instruction) = C220ScalarSprImmediate::decode(word) {
-        if instruction.destination_spr == 3 {
-            return None;
-        }
         scalar_write_mask(instruction.destination_spr)?;
         return Some(instruction.destination_spr);
     }
@@ -58,7 +55,11 @@ pub(crate) fn execute_write(
     let mask = scalar_write_mask(encoded_destination_spr)
         .ok_or(ScalarMachineError::UnsupportedWord { pc, word })?;
     let prior_destination_value = machine.spr_value(encoded_destination_spr);
-    let value = source_value & mask;
+    let value = if encoded_destination_spr == 3 && source_register.is_none() {
+        0
+    } else {
+        source_value & mask
+    };
     machine.set_spr_value(encoded_destination_spr, value)?;
     Ok(ScalarSprStep {
         pc,
@@ -76,4 +77,27 @@ pub struct C220ScalarSprTimingTicket {
     pub destination_spr: u16,
     pub issue_tick: u64,
     pub retire_tick: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn immediate_control_clears_while_register_control_preserves_source() {
+        let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+        machine.set_xreg(1, u64::MAX).unwrap();
+        for immediate in [0, 1, 0xabcd, 0xffff] {
+            let register_write = (2 << 24) | (3 << 17) | (1 << 12) | (18 << 7);
+            let step = execute_write(&mut machine, 0, register_write).unwrap();
+            assert_eq!(step.value, u64::MAX);
+            let word = (18 << 24) | (3 << 17) | immediate;
+            let step = execute_write(&mut machine, 4, word).unwrap();
+            assert_eq!(step.prior_destination_value, Some(u64::MAX));
+            assert_eq!(step.source_register, None);
+            assert_eq!(step.source_value, u64::from(immediate));
+            assert_eq!(step.value, 0);
+            assert_eq!(machine.spr_value(3), Some(0));
+        }
+    }
 }
