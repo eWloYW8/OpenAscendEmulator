@@ -1,7 +1,7 @@
 use super::decode::{C220DecodedWord, C220DispatchKind};
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
 use crate::architecture::Architecture;
-use crate::isa::flow::{FlagOperation, PipelineBarrierScope, PipelineBarrierStep};
+use crate::isa::flow::{PipelineBarrierScope, PipelineBarrierStep};
 use crate::sim::c220::scalar::timing::C220ScalarTimingRule;
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 use crate::sim::c220::state::C220ExecutionError;
@@ -171,6 +171,27 @@ impl C220Core {
         }
         let decoded_word = C220DecodedWord::decode(word);
         match decoded_word.kind {
+            C220DispatchKind::VectorFlag => {
+                let step = decoded_word
+                    .flow_flag
+                    .expect("decoded Vector flag")
+                    .resolve(pc, self.state.scalar().machine().xregs());
+                return Ok(
+                    match self
+                        .vector
+                        .enqueue_flag_at(tick, self.next_instruction_id, word, step)?
+                    {
+                        VectorAdmission::Queued(ticket) => {
+                            self.state.commit_c220_sequential_issue();
+                            C220CoreStep::Executed {
+                                tick,
+                                instruction: C220CoreInstruction::VectorQueued(ticket),
+                            }
+                        }
+                        VectorAdmission::Stalled(stall) => C220CoreStep::Stalled(stall),
+                    },
+                );
+            }
             C220DispatchKind::CubeFlag => {
                 let flag = decoded_word.flow_flag.expect("decoded Cube flag");
                 let step = flag.resolve(pc, self.state.scalar().machine().xregs());
@@ -234,24 +255,17 @@ impl C220Core {
                     .flow_flag
                     .expect("matched vector-to-scalar flag")
                     .resolve(pc, self.state.scalar().machine().xregs());
-                match flag.instruction.operation {
-                    FlagOperation::Set => {
-                        self.vector.signal_scalar(flag.flag_id);
-                    }
-                    FlagOperation::Wait => {
-                        let ready_tick = self.vector.scalar_event_ready_tick(flag.flag_id, tick);
-                        if ready_tick.is_none_or(|ready| tick < ready) {
-                            return Ok(C220CoreStep::Stalled(C220Stall {
-                                tick,
-                                pc,
-                                resume_tick: ready_tick.unwrap_or(
-                                    tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
-                                ),
-                                cause: C220StallCause::VectorDependency,
-                            }));
-                        }
-                        self.vector.consume_scalar_event(flag.flag_id);
-                    }
+                if self
+                    .pipeline_events
+                    .consume(self.next_instruction_id, flag, tick)
+                    .is_none()
+                {
+                    return Ok(C220CoreStep::Stalled(C220Stall {
+                        tick,
+                        pc,
+                        resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+                        cause: C220StallCause::PipelineEventDependency,
+                    }));
                 }
                 self.state.commit_c220_sequential_issue();
                 C220CoreInstruction::VectorToScalarFlag(flag)

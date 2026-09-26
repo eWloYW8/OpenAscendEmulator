@@ -9,6 +9,14 @@ use std::collections::{BTreeMap, VecDeque};
 
 pub const C220_MTE3_OUTSTANDING_LIMIT: usize = 31;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220Mte3Step {
+    pub pc: u64,
+    pub word: u32,
+    pub next_pc: u64,
+    pub transfer: super::C220Mte3TransferPlan,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum C220Mte3RuntimeError {
     #[error("MTE3 retirement has no functional command for instruction {0}")]
@@ -21,6 +29,7 @@ pub enum C220Mte3RuntimeError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220Mte3Outcome {
+    pub instruction_id: u64,
     pub tick: u64,
     pub pc: u64,
     pub word: u32,
@@ -50,6 +59,7 @@ pub(in crate::sim::c220) struct Mte3Engine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220Mte3CommandState {
+    pub instruction_id: u64,
     pub pc: u64,
     pub word: u32,
     pub ticket: C220Mte3Ticket,
@@ -58,6 +68,7 @@ pub struct C220Mte3CommandState {
 impl Mte3Engine {
     pub(in crate::sim::c220) fn issue(
         &mut self,
+        instruction_id: u64,
         pc: u64,
         word: u32,
         ticket: C220Mte3Ticket,
@@ -66,8 +77,12 @@ impl Mte3Engine {
             return Err(C220Mte3TimingError::QueueFull);
         }
         self.timing.issue(ticket)?;
-        self.pending
-            .push_back(C220Mte3CommandState { pc, word, ticket });
+        self.pending.push_back(C220Mte3CommandState {
+            instruction_id,
+            pc,
+            word,
+            ticket,
+        });
         Ok(())
     }
 
@@ -175,6 +190,7 @@ impl Mte3Engine {
                 plan.destination_address,
             )?;
             self.outcomes.push(C220Mte3Outcome {
+                instruction_id: pending.instruction_id,
                 tick,
                 pc: pending.pc,
                 word: pending.word,
@@ -215,13 +231,13 @@ mod tests {
         };
         for tick in 0..C220_MTE3_OUTSTANDING_LIMIT as u64 {
             let ticket = engine.timing.preview_issue(tick, plan).unwrap();
-            engine.issue(tick * 4, word, ticket).unwrap();
+            engine.issue(tick, tick * 4, word, ticket).unwrap();
         }
         assert!(engine.is_full());
         let rejected = engine.timing.preview_issue(31, plan).unwrap();
         let previous_retirement = engine.timing.latest_retirement_tick();
         assert!(matches!(
-            engine.issue(124, word, rejected),
+            engine.issue(31, 124, word, rejected),
             Err(C220Mte3TimingError::QueueFull)
         ));
         assert_eq!(engine.timing.latest_retirement_tick(), previous_retirement);
@@ -243,7 +259,7 @@ mod tests {
         assert_eq!(engine.outcomes.len(), 1);
         assert_eq!(engine.outcomes[0].result.unknown_bytes, 128);
         let ticket = engine.timing.preview_issue(head.retire_tick, plan).unwrap();
-        engine.issue(124, word, ticket).unwrap();
+        engine.issue(31, 124, word, ticket).unwrap();
         assert!(engine.is_full());
     }
 }

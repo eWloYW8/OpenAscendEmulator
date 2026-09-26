@@ -11,6 +11,7 @@ pub struct C220VectorBarrier {
     pub step: PipelineBarrierStep,
     pub predecessor: Option<u64>,
     pub issued_tick: u64,
+    pub requires_idle: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +65,7 @@ impl VectorEngine {
             step,
             predecessor: self.frontend.last_accepted,
             issued_tick: tick,
+            requires_idle: self.frontend.last_queued_is_flag(),
         };
         let pending = barrier
             .predecessor
@@ -82,6 +84,7 @@ impl VectorEngine {
             if barrier
                 .predecessor
                 .is_some_and(|id| self.instruction_pending(id))
+                || (barrier.requires_idle && self.outstanding_instructions() != 0)
             {
                 break;
             }

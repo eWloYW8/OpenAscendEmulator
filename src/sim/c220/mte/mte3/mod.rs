@@ -1,12 +1,9 @@
 pub mod frontend;
-mod state;
-pub(crate) use state::C220Mte3State;
-pub use state::{C220OutputAction, C220OutputDependency, C220OutputEvent, C220OutputStep};
 
 pub(in crate::sim::c220) mod runtime;
 pub use runtime::{
     C220_MTE3_OUTSTANDING_LIMIT, C220Mte3CommandState, C220Mte3DmaOutcome, C220Mte3Outcome,
-    C220Mte3RuntimeError,
+    C220Mte3RuntimeError, C220Mte3Step,
 };
 mod timing;
 pub use timing::{C220Mte3Ticket, C220Mte3TimingError, C220Mte3TimingRules, C220TimedMte3Lane};

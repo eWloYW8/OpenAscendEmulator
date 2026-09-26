@@ -167,7 +167,7 @@ impl C220Core {
         }
         let flag = FlagInstruction::decode(Architecture::Dav2201, word);
         let inline_wait = flag.is_some_and(|flag| {
-            flag.operation == FlagOperation::Wait && matches!(flag.trigger_pipe_code, 0 | 1)
+            flag.operation == FlagOperation::Wait && flag.trigger_pipe_code == 0
         });
         if self.mte_pipeline.is_some() && !inline_wait {
             if let Some(cause) = self.mte2_accept_blocker() {

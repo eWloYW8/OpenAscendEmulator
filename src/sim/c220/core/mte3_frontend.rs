@@ -3,8 +3,8 @@ use std::{collections::VecDeque, num::NonZeroU32};
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep, C220Mte3Barrier};
 use crate::isa::flow::{FlagOperation, FlagStep};
 use crate::sim::c220::device::C220CoreKind;
+use crate::sim::c220::mte::mte3::C220Mte3Step;
 use crate::sim::c220::mte::mte3::frontend::C220Mte3Command;
-use crate::sim::c220::mte::mte3::{C220OutputAction, C220OutputDependency, C220OutputStep};
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,27 +140,6 @@ impl C220Core {
             .set_mte3_issue_head(self.mte3_issue_queue.issued.front().map(|c| c.ready_tick));
     }
 
-    fn consume_mte3_flag(&mut self, id: u64, step: FlagStep, tick: u64) -> bool {
-        if step.instruction.source_pipe_code != 1 {
-            return self.pipeline_events.consume(id, step, tick).is_some();
-        }
-        let ready = self
-            .state
-            .output
-            .dependency(step)
-            .is_some_and(|dependency| match dependency {
-                C220OutputDependency::Vector(fence) => self
-                    .vector
-                    .fence_retirement_tick(fence)
-                    .is_none_or(|ready| ready <= tick),
-                C220OutputDependency::NotBefore(ready) => ready <= tick,
-            });
-        if ready {
-            self.state.output.consume(step);
-        }
-        ready
-    }
-
     pub(super) fn transfer_mte3_issue_at(&mut self, tick: u64) -> Result<(), C220CoreError> {
         let queued = *self
             .mte3_issue_queue
@@ -194,7 +173,10 @@ impl C220Core {
         if cause.is_none()
             && let C220Mte3Operation::Flag(step) = queued.operation
             && step.instruction.operation == FlagOperation::Wait
-            && !self.consume_mte3_flag(queued.instruction_id, step, tick)
+            && self
+                .pipeline_events
+                .consume(queued.instruction_id, step, tick)
+                .is_none()
         {
             cause = Some(C220StallCause::PipelineEventDependency);
         }
@@ -223,11 +205,11 @@ impl C220Core {
                         C220Mte3Command::Dma(plan) => {
                             let record = pipeline.issue_mte3_dma(queued.instruction_id, plan)?;
                             C220CoreInstruction::Mte3Dma {
-                                step: C220OutputStep {
+                                step: C220Mte3Step {
                                     pc: queued.pc,
                                     word: queued.word,
                                     next_pc: queued.pc.wrapping_add(4),
-                                    action: C220OutputAction::CopyToHbm { transfer: plan },
+                                    transfer: plan,
                                 },
                                 record,
                             }

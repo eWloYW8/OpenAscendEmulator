@@ -1,7 +1,5 @@
 use crate::isa::flow::{FlagInstruction, FlagOperation};
-use crate::sim::c220::mte::mte3::{
-    C220OutputAction, C220OutputDependency, C220OutputStep, decode_mte3_transfer,
-};
+use crate::sim::c220::mte::mte3::{C220Mte3Step, decode_mte3_transfer};
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
@@ -221,32 +219,7 @@ impl C220Core {
         if self.mte3.physical {
             if let Some(instruction) = flag {
                 let step = instruction.resolve(pc, self.state.scalar().machine().xregs());
-                let owner = match instruction.operation {
-                    FlagOperation::Set => instruction.source_pipe_code,
-                    FlagOperation::Wait => instruction.trigger_pipe_code,
-                };
-                if owner == 5 {
-                    return self.enqueue_mte3_at(
-                        tick,
-                        pc,
-                        word,
-                        super::C220Mte3Operation::Flag(step),
-                    );
-                }
-                if instruction.source_pipe_code == 5 {
-                    if self
-                        .pipeline_events
-                        .consume(self.next_instruction_id, step, tick)
-                        .is_none()
-                    {
-                        return self.mte3_stall(tick, pc, C220StallCause::Mte3Dependency);
-                    }
-                    self.state.commit_c220_sequential_issue();
-                    return Ok(C220CoreStep::Executed {
-                        tick,
-                        instruction: C220CoreInstruction::Mte3Flag(step),
-                    });
-                }
+                return self.enqueue_mte3_at(tick, pc, word, super::C220Mte3Operation::Flag(step));
             } else {
                 let plan = decode_mte3_transfer(
                     self.state.scalar.machine(),
@@ -264,63 +237,35 @@ impl C220Core {
                 );
             }
         }
-        if flag.is_some_and(|instruction| {
-            matches!(instruction.source_pipe_code, 2 | 3 | 4 | 5 | 10)
-                && matches!(instruction.trigger_pipe_code, 2 | 3 | 4 | 5 | 10)
-        }) {
-            return Err(C220CoreError::Mte3FrontendRequired);
-        }
-        let (action, ticket) = if let Some(instruction) = flag {
-            let flag = instruction.resolve(pc, self.state.scalar().machine().xregs());
-            let cause = if instruction.source_pipe_code == 5 {
-                C220StallCause::Mte3Dependency
-            } else {
-                C220StallCause::VectorDependency
-            };
-            let dependency = match instruction.operation {
+        if let Some(instruction) = flag {
+            let step = instruction.resolve(pc, self.state.scalar().machine().xregs());
+            match instruction.operation {
                 FlagOperation::Set => {
-                    let dependency = if instruction.source_pipe_code == 5 {
-                        C220OutputDependency::NotBefore(
-                            self.mte3
-                                .timing
-                                .latest_retirement_tick()
-                                .unwrap_or(tick)
-                                .max(tick),
-                        )
-                    } else {
-                        C220OutputDependency::Vector(self.vector.instruction_fence())
-                    };
-                    self.state.output.signal(flag, dependency);
-                    dependency
+                    let predecessor = self
+                        .mte3
+                        .pending_commands()
+                        .last()
+                        .map(|command| command.instruction_id);
+                    self.pipeline_events
+                        .set(self.next_instruction_id, step, predecessor, tick);
                 }
                 FlagOperation::Wait => {
-                    let ready =
-                        self.state
-                            .output
-                            .dependency(flag)
-                            .map(|dependency| match dependency {
-                                C220OutputDependency::NotBefore(ready) => ready,
-                                C220OutputDependency::Vector(fence) => {
-                                    self.vector.fence_retirement_tick(fence).unwrap_or(tick)
-                                }
-                            });
-                    if ready.is_none_or(|ready| tick < ready) {
-                        return Ok(C220CoreStep::Stalled(C220Stall {
-                            tick,
-                            pc,
-                            resume_tick: ready
-                                .unwrap_or(tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?),
-                            cause,
-                        }));
+                    if self
+                        .pipeline_events
+                        .consume(self.next_instruction_id, step, tick)
+                        .is_none()
+                    {
+                        return self.mte3_stall(tick, pc, C220StallCause::PipelineEventDependency);
                     }
-                    self.state
-                        .output
-                        .consume(flag)
-                        .expect("ready event remains queued")
                 }
-            };
-            (C220OutputAction::Event { flag, dependency }, None)
-        } else {
+            }
+            self.state.commit_c220_sequential_issue();
+            return Ok(C220CoreStep::Executed {
+                tick,
+                instruction: C220CoreInstruction::Mte3Flag(step),
+            });
+        }
+        let (plan, ticket) = {
             let plan = decode_mte3_transfer(
                 self.state.scalar.machine(),
                 pc,
@@ -352,16 +297,16 @@ impl C220Core {
                 }));
             }
             let ticket = self.mte3.timing.preview_issue(tick, plan)?;
-            let action = C220OutputAction::CopyToHbm { transfer: plan };
-            self.mte3.issue(pc, word, ticket)?;
-            (action, Some(ticket))
+            self.mte3
+                .issue(self.next_instruction_id, pc, word, ticket)?;
+            (plan, ticket)
         };
         self.state.commit_c220_sequential_issue();
-        let step = C220OutputStep {
+        let step = C220Mte3Step {
             pc,
             word,
             next_pc: self.state.scalar().pc(),
-            action,
+            transfer: plan,
         };
         Ok(C220CoreStep::Executed {
             tick,

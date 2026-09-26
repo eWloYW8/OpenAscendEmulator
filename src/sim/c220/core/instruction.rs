@@ -3,8 +3,8 @@ use crate::isa::flow::FlagStep;
 use crate::sim::c220::cube::C220CubeIssue;
 use crate::sim::c220::mte::mte1::{C220Mte1Command, C220Mte1Issue};
 use crate::sim::c220::mte::mte2::C220Mte2Issue;
+use crate::sim::c220::mte::mte3::C220Mte3Step;
 use crate::sim::c220::mte::mte3::C220Mte3Ticket;
-use crate::sim::c220::mte::mte3::C220OutputStep;
 use crate::sim::c220::scalar::timing::C220ScalarTimingTicket;
 use crate::sim::common::scalar::ScalarProgramStep;
 
@@ -120,11 +120,11 @@ pub enum C220CoreInstruction {
     VectorBarrier(crate::sim::c220::vector::C220VectorBarrierOutcome),
     VectorToScalarFlag(FlagStep),
     Mte3 {
-        step: C220OutputStep,
-        ticket: Option<C220Mte3Ticket>,
+        step: C220Mte3Step,
+        ticket: C220Mte3Ticket,
     },
     Mte3Dma {
-        step: C220OutputStep,
+        step: C220Mte3Step,
         record: crate::sim::c220::mte::mte3::frontend::C220Mte3Record,
     },
 }

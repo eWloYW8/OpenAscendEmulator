@@ -178,20 +178,18 @@ impl C220Core {
             )?;
             self.release_cube_barriers_at(event_tick);
             self.dispatch_cube_head_at(event_tick)?;
-            let previous_vector_retirements = self.vector.retirements.len();
-            self.vector.advance_event(event_tick, &mut self.state)?;
-            for retirement in &self.vector.retirements[previous_vector_retirements..] {
-                self.pipeline_events.retire(
-                    1,
-                    retirement.instruction_id,
-                    retirement.retirement_tick,
-                );
-            }
+            self.vector
+                .advance_event(event_tick, &mut self.state, &mut self.pipeline_events)?;
             if let Some(pipeline) = &mut self.mte_pipeline {
                 pipeline.advance_ub_service(self.vector.ub_activity_at(event_tick))?;
             }
+            let previous_mte3_outcomes = self.mte3.outcomes.len();
             self.mte3
                 .commit_ready_at(event_tick, self.state.ub(), &mut self.memory)?;
+            for outcome in &self.mte3.outcomes[previous_mte3_outcomes..] {
+                self.pipeline_events
+                    .retire(5, outcome.instruction_id, outcome.tick);
+            }
             if self.mte3.physical
                 && let Some(pipeline) = &mut self.mte_pipeline
                 && let Some(id) = self.mte3.commit_native_at(

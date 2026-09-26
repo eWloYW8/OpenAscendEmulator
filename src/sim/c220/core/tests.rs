@@ -1281,7 +1281,10 @@ fn native_mte3_write_path(mode: u8) {
     assert!(matches!(
         core.step_word_at(command_tick + 1, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
             .unwrap(),
-        C220CoreStep::Stalled(_)
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::VectorQueued(_),
+            ..
+        }
     ));
     let data = (command_tick + 2..60)
         .find_map(|tick| core.take_biu_write_data_at(tick).unwrap())
@@ -1332,11 +1335,9 @@ fn native_mte3_write_path(mode: u8) {
     );
     assert_eq!(core.last_mte3_dma_outcomes().len(), 1);
     assert_eq!(core.last_mte3_dma_outcomes()[0].tick, retirement_tick);
-    assert!(matches!(
-        core.step_word_at(retirement_tick + 1, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
-            .unwrap(),
-        C220CoreStep::Executed { .. }
-    ));
+    core.advance_to(retirement_tick + 1).unwrap();
+    assert_eq!(core.queued_vector_instructions().len(), 0);
+    assert_eq!(core.pipeline_events.last_consumptions().len(), 1);
     assert!(core.mte_pipeline().unwrap().is_idle());
     assert_eq!(
         core.mte_pipeline()
@@ -1410,25 +1411,29 @@ fn reduction_state_waits_for_both_repeats() {
     assert!(matches!(
         core.step_word_at(1, 0x40a0_0400).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorToScalarFlag(_),
+            instruction: C220CoreInstruction::VectorQueued(_),
             ..
         }
     ));
     let C220CoreStep::Stalled(stall) = core.step_word_at(2, 0x40c0_0400).unwrap() else {
         panic!("scalar wait should observe pending vector work");
     };
-    assert!(matches!(
-        core.step_word_at(stall.resume_tick, 0x40c0_0400).unwrap(),
-        C220CoreStep::Executed {
-            instruction: C220CoreInstruction::VectorToScalarFlag(_),
-            ..
-        }
-    ));
+    let consumed_tick = (stall.resume_tick..128)
+        .find(|&tick| {
+            matches!(
+                core.step_word_at(tick, 0x40c0_0400).unwrap(),
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::VectorToScalarFlag(_),
+                    ..
+                }
+            )
+        })
+        .expect("scalar wait completes after Vector retirement");
     assert_eq!(
         core.state().scalar().machine().spr_value(87),
         Some(192.0_f32.to_bits().into())
     );
-    let max_tick = stall.resume_tick + 1;
+    let max_tick = consumed_tick + 1;
     assert!(matches!(
         core.step_word_at(max_tick, 0x83c6_2410).unwrap(),
         C220CoreStep::Executed {
@@ -2122,7 +2127,7 @@ fn broadcast_issues_one_full_tile_uop_per_repeat() {
             core.step_word_at(206, (set | 7) + (1 << 21)).unwrap(),
             C220CoreStep::Stalled(C220Stall {
                 resume_tick: 207,
-                cause: C220StallCause::VectorDependency,
+                cause: C220StallCause::PipelineEventDependency,
                 ..
             })
         ));
@@ -3772,10 +3777,7 @@ fn disabled_dma_retires_without_memory_access_or_bandwidth_delay() {
                 C220CoreInstruction::Mte2(issue) => {
                     assert_eq!(issue.timing, C220Mte2IssueTiming::Disabled)
                 }
-                C220CoreInstruction::Mte3 {
-                    ticket: Some(ticket),
-                    ..
-                } => {
+                C220CoreInstruction::Mte3 { ticket, .. } => {
                     assert_eq!(ticket.requests().unwrap().next(), None);
                     assert_eq!(ticket.uop_count, 0);
                     assert_eq!(ticket.modeled_service_ticks, 0);
@@ -3819,27 +3821,43 @@ fn disabled_dma_retires_without_memory_access_or_bandwidth_delay() {
                 ));
                 tick += 1;
             }
-            let events = core.state().pending_output_events().collect::<Vec<_>>();
+            core.advance_to(tick).unwrap();
+            let events = core
+                .pipeline_events
+                .ready(source_pipe as u8, destination_pipe as u8);
             assert_eq!(events.len(), 2);
-            assert!(
-                events
-                    .iter()
-                    .all(|event| event.flag_id == 7 && event.source_pipe == source_pipe as u8)
-            );
+            assert!(events.iter().all(|event| event.step.flag_id == 7));
             for remaining in [1, 0] {
                 assert!(matches!(
                     core.step_word_at(tick, wait).unwrap(),
                     C220CoreStep::Executed { .. }
                 ));
                 tick += 1;
-                assert_eq!(core.state().pending_output_events().count(), remaining);
+                core.advance_to(tick).unwrap();
+                assert_eq!(
+                    core.pipeline_events
+                        .ready(source_pipe as u8, destination_pipe as u8)
+                        .len(),
+                    remaining
+                );
             }
             let pc = core.state().scalar().pc();
-            assert!(matches!(
-                core.step_word_at(tick, wait).unwrap(),
-                C220CoreStep::Stalled(_)
-            ));
-            assert_eq!(core.state().scalar().pc(), pc);
+            let outcome = core.step_word_at(tick, wait).unwrap();
+            if destination_pipe == 1 {
+                assert!(matches!(
+                    outcome,
+                    C220CoreStep::Executed {
+                        instruction: C220CoreInstruction::VectorQueued(_),
+                        ..
+                    }
+                ));
+                core.advance_to(tick + 1).unwrap();
+                assert_eq!(core.queued_vector_instructions().len(), 1);
+                assert_eq!(core.state().scalar().pc(), pc + 4);
+            } else {
+                assert!(matches!(outcome, C220CoreStep::Stalled(_)));
+                assert_eq!(core.state().scalar().pc(), pc);
+            }
             tick += 1;
         }
     }
@@ -3931,7 +3949,7 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
     else {
         panic!("WAIT must observe the Vector instruction still in reception");
     };
-    assert_eq!(stall.cause, C220StallCause::VectorDependency);
+    assert_eq!(stall.cause, C220StallCause::PipelineEventDependency);
     let mut vector_retired = None;
     for now in set_tick + 2..256 {
         if matches!(
@@ -3953,11 +3971,7 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
         .step_word_at(issue_tick, CAPTURED_C220_MOV_UB_TO_OUT_WORD)
         .unwrap();
     let C220CoreStep::Executed {
-        instruction:
-            C220CoreInstruction::Mte3 {
-                ticket: Some(ticket),
-                ..
-            },
+        instruction: C220CoreInstruction::Mte3 { ticket, .. },
         ..
     } = issued
     else {
@@ -3991,11 +4005,10 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
     assert!(matches!(
         core.step_word_at(issue_tick + 2, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
             .unwrap(),
-        C220CoreStep::Stalled(C220Stall {
-            resume_tick,
-            cause: C220StallCause::Mte3Dependency,
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::VectorQueued(_),
             ..
-        }) if resume_tick == ticket.retire_tick
+        }
     ));
     assert!(core.memory().read_known_at(0x2000, 128).is_err());
     assert_eq!(
@@ -4019,22 +4032,15 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
             )
             .unwrap();
     }
-    assert!(matches!(
-        core.step_word_at(ticket.data_ready_tick, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
-            .unwrap(),
-        C220CoreStep::Stalled(C220Stall {
-            resume_tick,
-            cause: C220StallCause::Mte3Dependency,
-            ..
-        }) if resume_tick == ticket.retire_tick
-    ));
+    assert_eq!(core.queued_vector_instructions().len(), 1);
+    assert!(core.pipeline_events.ready(5, 1).is_empty());
     assert!(core.memory().read_known_at(0x2000, 128).is_err());
     assert!(matches!(
         core.step_word_at(ticket.retire_tick, 0x40e0_1800).unwrap(),
-        C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Barrier(_),
+        C220CoreStep::Stalled(C220Stall {
+            cause: C220StallCause::VectorDependency,
             ..
-        }
+        })
     ));
     assert_eq!(core.pending_output_retirement_tick(), None);
     let outcomes = core.last_mte3_outcomes();
@@ -4045,8 +4051,15 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
     assert_eq!(outcomes[0].result.known_bytes, 128);
     assert_eq!(outcomes[0].result.unknown_bytes, 0);
     assert_eq!(core.memory().read_known_at(0x2000, 128).unwrap(), updated);
-    core.step_word_at(ticket.retire_tick + 1, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
-        .unwrap();
+    assert!(matches!(
+        core.step_word_at(ticket.retire_tick + 1, 0x40e0_1800)
+            .unwrap(),
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Barrier(_),
+            ..
+        }
+    ));
+    assert_eq!(core.queued_vector_instructions().len(), 0);
     assert_eq!(core.memory().read_known_at(0x2000, 128).unwrap(), updated);
     core.state
         .scalar_mut()
@@ -4054,9 +4067,7 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
         .set_xreg(10, 0x2000)
         .unwrap();
     let C220CoreStep::Executed {
-        instruction: C220CoreInstruction::Mte3 {
-            ticket: Some(next), ..
-        },
+        instruction: C220CoreInstruction::Mte3 { ticket: next, .. },
         ..
     } = core
         .step_word_at(ticket.retire_tick + 2, CAPTURED_C220_MOV_UB_TO_OUT_WORD)
@@ -4065,11 +4076,7 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
         panic!("a transfer does not require a fresh event");
     };
     let C220CoreStep::Executed {
-        instruction:
-            C220CoreInstruction::Mte3 {
-                ticket: Some(queued),
-                ..
-            },
+        instruction: C220CoreInstruction::Mte3 { ticket: queued, .. },
         ..
     } = core
         .step_word_at(next.issue_tick + 1, CAPTURED_C220_MOV_UB_TO_OUT_WORD)
@@ -4085,11 +4092,9 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
         .set_xreg(3, 0)
         .unwrap();
     let C220CoreStep::Executed {
-        instruction:
-            C220CoreInstruction::Mte3 {
-                ticket: Some(disabled),
-                ..
-            },
+        instruction: C220CoreInstruction::Mte3 {
+            ticket: disabled, ..
+        },
         ..
     } = core
         .step_word_at(next.issue_tick + 2, CAPTURED_C220_MOV_UB_TO_OUT_WORD)

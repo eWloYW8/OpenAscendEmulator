@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, VecDeque};
+use crate::sim::c220::sync::C220PipelineEvents;
+use std::collections::VecDeque;
 
 use crate::sim::c220::state::C220State;
 use crate::sim::c220::vector::ops::compare::C220CompareMask;
@@ -20,7 +21,6 @@ pub(in crate::sim::c220) struct VectorEngine {
     pub(in crate::sim::c220) vmsu: C220VmsuPipeline,
     pub(in crate::sim::c220) va: C220VaRegisters,
     pub(in crate::sim::c220) releases: Vec<C220VectorUopRelease>,
-    scalar_flags: BTreeMap<u32, VecDeque<C220VectorFence>>,
     pub(super) pending_instructions: VecDeque<PendingVectorInstruction>,
     pub(super) last_dispatched_id: Option<u64>,
     pub(super) last_retired_tick: Option<u64>,
@@ -45,32 +45,6 @@ impl VectorEngine {
             activity.triggered = true;
         }
         activity
-    }
-
-    pub(in crate::sim::c220) fn signal_scalar(&mut self, flag_id: u32) {
-        let fence = self.instruction_fence();
-        self.scalar_flags
-            .entry(flag_id)
-            .or_default()
-            .push_back(fence);
-    }
-
-    pub(in crate::sim::c220) fn scalar_event_ready_tick(
-        &self,
-        flag_id: u32,
-        tick: u64,
-    ) -> Option<u64> {
-        let fence = *self.scalar_flags.get(&flag_id)?.front()?;
-        Some(self.fence_retirement_tick(fence).unwrap_or(tick))
-    }
-
-    pub(in crate::sim::c220) fn consume_scalar_event(&mut self, flag_id: u32) {
-        if let Some(events) = self.scalar_flags.get_mut(&flag_id) {
-            events.pop_front();
-            if events.is_empty() {
-                self.scalar_flags.remove(&flag_id);
-            }
-        }
     }
 
     pub(in crate::sim::c220) fn ub_cycles_at(
@@ -107,7 +81,6 @@ impl VectorEngine {
             vmsu: C220VmsuPipeline::new(rules),
             va: C220VaRegisters::default(),
             releases: Vec::new(),
-            scalar_flags: BTreeMap::new(),
             pending_instructions: VecDeque::new(),
             last_dispatched_id: None,
             last_retired_tick: None,
@@ -137,6 +110,7 @@ impl VectorEngine {
         &mut self,
         tick: u64,
         state: &mut C220State,
+        events: &mut C220PipelineEvents,
     ) -> Result<(), C220VectorRuntimeError> {
         let va_updates = self.pipeline.last_va_updates().len();
         self.releases
@@ -145,10 +119,14 @@ impl VectorEngine {
             self.va.apply(update);
         }
         self.vmsu.advance_to(tick, state)?;
+        let previous_retirements = self.retirements.len();
         self.retire_ready(tick);
+        for retirement in &self.retirements[previous_retirements..] {
+            events.retire(1, retirement.instruction_id, retirement.retirement_tick);
+        }
         self.release_barriers_at(tick);
         self.observed_tick = Some(tick);
-        self.advance_frontend(tick, state)?;
+        self.advance_frontend(tick, state, events)?;
         Ok(())
     }
 

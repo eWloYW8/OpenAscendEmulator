@@ -22,6 +22,7 @@ pub(super) enum C220DispatchKind {
     CubeFlag,
     CubeSpr(crate::isa::c220::cube::spr::C220CubeSprWrite),
     Vector,
+    VectorFlag,
     Mte3,
     Scalar,
 }
@@ -37,8 +38,11 @@ impl C220DecodedWord {
         let flow_flag = FlagInstruction::decode(Architecture::Dav2201, word);
         let shared_flag_pipe = flow_flag
             .filter(|flag| {
-                matches!(flag.source_pipe_code, 2 | 3 | 4 | 5 | 10)
-                    && matches!(flag.trigger_pipe_code, 2 | 3 | 4 | 5 | 10)
+                (matches!(flag.source_pipe_code, 1 | 2 | 3 | 4 | 5 | 10)
+                    && matches!(flag.trigger_pipe_code, 1 | 2 | 3 | 4 | 5 | 10))
+                    || (flag.source_pipe_code == 1
+                        && flag.trigger_pipe_code == 0
+                        && flag.operation == FlagOperation::Set)
             })
             .map(|flag| match flag.operation {
                 FlagOperation::Set => flag.source_pipe_code,
@@ -46,6 +50,7 @@ impl C220DecodedWord {
             });
         let kind = if let Some(pipe) = shared_flag_pipe {
             match pipe {
+                1 => C220DispatchKind::VectorFlag,
                 2 => C220DispatchKind::CubeFlag,
                 3 => C220DispatchKind::Mte1,
                 4 => C220DispatchKind::Mte2,
@@ -74,8 +79,7 @@ impl C220DecodedWord {
             || C220Set2dInstruction::decode(word)
                 .is_some_and(|instruction| instruction.destination == C220Set2dDestination::L1)
             || flow_flag.is_some_and(|instruction| {
-                instruction.source_pipe_code == 4
-                    && matches!(instruction.trigger_pipe_code, 0 | 1 | 3)
+                instruction.source_pipe_code == 4 && instruction.trigger_pipe_code == 0
             })
         {
             C220DispatchKind::Mte2
@@ -89,14 +93,7 @@ impl C220DecodedWord {
             C220DispatchKind::Cube(instruction)
         } else if is_vector_word(word) {
             C220DispatchKind::Vector
-        } else if C220DmaMovDescriptor::is_word(word)
-            || flow_flag.is_some_and(|instruction| {
-                matches!(
-                    (instruction.source_pipe_code, instruction.trigger_pipe_code),
-                    (1, 5) | (1, 4) | (5, 1)
-                )
-            })
-        {
+        } else if C220DmaMovDescriptor::is_word(word) {
             C220DispatchKind::Mte3
         } else {
             C220DispatchKind::Scalar

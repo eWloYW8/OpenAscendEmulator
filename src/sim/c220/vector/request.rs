@@ -151,7 +151,9 @@ mod tests {
             .write_states(0, &4_f32.to_le_bytes().map(MemoryByteState::Known))
             .unwrap();
         for tick in 20..100 {
-            engine.advance_event(tick, &mut state).unwrap();
+            engine
+                .advance_event(tick, &mut state, &mut Default::default())
+                .unwrap();
         }
         assert_eq!(state.ub().read_known(64, 4).unwrap(), 7_f32.to_le_bytes());
         assert_eq!(engine.retirements.len(), 1);
@@ -194,12 +196,16 @@ mod tests {
         ));
         let fence = engine.instruction_fence();
         assert_eq!(fence.instruction_id, Some(7));
-        engine.advance_event(102, &mut state).unwrap();
+        engine
+            .advance_event(102, &mut state, &mut Default::default())
+            .unwrap();
         assert_eq!(engine.retirements.len(), 1);
         assert_eq!(engine.retirements[0].instruction_id, 1);
         assert_eq!(engine.retirements[0].retirement_tick, 102);
         assert_eq!(engine.fence_retirement_tick(fence), Some(103));
-        engine.advance_event(103, &mut state).unwrap();
+        engine
+            .advance_event(103, &mut state, &mut Default::default())
+            .unwrap();
         assert_eq!(engine.retirements[1].instruction_id, 7);
         assert_eq!(engine.retirements[1].retirement_tick, 103);
         assert_eq!(engine.fence_retirement_tick(fence), None);

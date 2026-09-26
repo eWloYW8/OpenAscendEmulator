@@ -1,6 +1,5 @@
 mod error;
 use crate::memory::ub::UbMemory;
-use crate::sim::c220::mte::mte3::C220Mte3State;
 use crate::sim::common::scalar::ScalarStepper;
 pub use error::C220ExecutionError;
 
@@ -9,7 +8,6 @@ pub struct C220State {
     pub(crate) scalar: ScalarStepper,
     pub(crate) ub: UbMemory,
     pub(crate) isa_instance_index: u32,
-    pub(crate) output: C220Mte3State,
 }
 
 impl C220State {
@@ -18,7 +16,6 @@ impl C220State {
             scalar,
             ub,
             isa_instance_index: 0,
-            output: C220Mte3State::default(),
         }
     }
 
@@ -40,11 +37,5 @@ impl C220State {
 
     pub(crate) fn ub_mut(&mut self) -> &mut UbMemory {
         &mut self.ub
-    }
-
-    pub fn pending_output_events(
-        &self,
-    ) -> impl Iterator<Item = crate::sim::c220::mte::mte3::C220OutputEvent> + '_ {
-        self.output.pending_events()
     }
 }

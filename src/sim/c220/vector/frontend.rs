@@ -1,3 +1,5 @@
+use crate::isa::flow::{FlagOperation, FlagStep};
+use crate::sim::c220::sync::C220PipelineEvents;
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
 
@@ -41,6 +43,11 @@ pub struct C220VectorReception {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220VectorFrontendEvent {
+    Flag {
+        instruction: C220VectorQueuedInstruction,
+        step: FlagStep,
+        tick: u64,
+    },
     Barrier(super::C220VectorBarrierOutcome),
     Received(C220VectorReception),
     Dispatched {
@@ -58,7 +65,12 @@ pub(in crate::sim::c220) enum VectorAdmission {
 
 struct Issued {
     ticket: C220VectorQueuedInstruction,
-    request: C220VectorRequest,
+    operation: VectorOperation,
+}
+
+enum VectorOperation {
+    Instruction(Box<C220VectorRequest>),
+    Flag(FlagStep),
 }
 
 struct Received {
@@ -72,6 +84,7 @@ pub(super) struct VectorFrontend {
     issued: VecDeque<Issued>,
     received: VecDeque<Received>,
     pub last_accepted: Option<u64>,
+    last_received: Option<u64>,
     pub barriers: VecDeque<super::C220VectorBarrier>,
     pub next_tick: Option<u64>,
     pub events: Vec<C220VectorFrontendEvent>,
@@ -85,6 +98,7 @@ impl VectorFrontend {
             issued: VecDeque::new(),
             received: VecDeque::new(),
             last_accepted: None,
+            last_received: None,
             barriers: VecDeque::new(),
             next_tick: None,
             events: Vec::new(),
@@ -119,6 +133,12 @@ impl VectorFrontend {
     pub(super) fn is_full(&self) -> bool {
         self.issued.len() >= self.config.issue_queue_depth.get() as usize
     }
+
+    pub(super) fn last_queued_is_flag(&self) -> bool {
+        self.issued
+            .back()
+            .is_some_and(|entry| matches!(entry.operation, VectorOperation::Flag(_)))
+    }
 }
 
 impl VectorEngine {
@@ -144,25 +164,58 @@ impl VectorEngine {
         instruction_id: u64,
         request: C220VectorRequest,
     ) -> Result<VectorAdmission, C220VectorRuntimeError> {
+        self.enqueue_operation(
+            tick,
+            instruction_id,
+            request.pc,
+            request.word,
+            VectorOperation::Instruction(Box::new(request)),
+        )
+    }
+
+    pub(in crate::sim::c220) fn enqueue_flag_at(
+        &mut self,
+        tick: u64,
+        instruction_id: u64,
+        word: u32,
+        step: FlagStep,
+    ) -> Result<VectorAdmission, C220VectorRuntimeError> {
+        self.enqueue_operation(
+            tick,
+            instruction_id,
+            step.pc,
+            word,
+            VectorOperation::Flag(step),
+        )
+    }
+
+    fn enqueue_operation(
+        &mut self,
+        tick: u64,
+        instruction_id: u64,
+        pc: u64,
+        word: u32,
+        operation: VectorOperation,
+    ) -> Result<VectorAdmission, C220VectorRuntimeError> {
         let ready_tick = tick
             .checked_add(1)
             .ok_or(C220VectorPipelineError::TimeOverflow)?;
         if self.frontend.is_full() {
             return Ok(VectorAdmission::Stalled(C220Stall {
                 tick,
-                pc: request.pc,
+                pc,
                 resume_tick: ready_tick,
                 cause: C220StallCause::VectorIssueQueueFull,
             }));
         }
         let ticket = C220VectorQueuedInstruction {
             instruction_id,
-            pc: request.pc,
-            word: request.word,
+            pc,
+            word,
             accepted_tick: tick,
             ready_tick,
         };
-        self.frontend.issued.push_back(Issued { ticket, request });
+        self.frontend.issued.push_back(Issued { ticket, operation });
         self.frontend.last_accepted = Some(instruction_id);
         self.frontend.next_tick = Some(
             self.frontend
@@ -176,6 +229,7 @@ impl VectorEngine {
         &mut self,
         tick: u64,
         state: &mut C220State,
+        events: &mut C220PipelineEvents,
     ) -> Result<(), C220VectorRuntimeError> {
         if self.frontend.next_tick.is_none_or(|next| next > tick) {
             return Ok(());
@@ -186,7 +240,7 @@ impl VectorEngine {
         if let Some(ticket) = self.frontend.issued.front().map(|entry| entry.ticket)
             && ticket.ready_tick <= tick
         {
-            let cause = if self.frontend.received.len() as u64 > self.frontend.reception_ticks {
+            let mut cause = if self.frontend.received.len() as u64 > self.frontend.reception_ticks {
                 Some(C220StallCause::VectorReceptionQueueFull)
             } else if self.outstanding_instructions()
                 >= self.frontend.config.outstanding_limit.get() as usize
@@ -202,6 +256,18 @@ impl VectorEngine {
             } else {
                 None
             };
+            if cause.is_none()
+                && let VectorOperation::Flag(step) = self
+                    .frontend
+                    .issued
+                    .front()
+                    .expect("ready Vector issue")
+                    .operation
+                && step.instruction.operation == FlagOperation::Wait
+                && events.consume(ticket.instruction_id, step, tick).is_none()
+            {
+                cause = Some(C220StallCause::PipelineEventDependency);
+            }
             if let Some(cause) = cause {
                 self.frontend
                     .events
@@ -212,26 +278,56 @@ impl VectorEngine {
                         cause,
                     }));
             } else {
-                let ready_tick = tick
-                    .checked_add(self.frontend.reception_ticks)
-                    .ok_or(C220VectorPipelineError::TimeOverflow)?;
+                let ready_tick = match self
+                    .frontend
+                    .issued
+                    .front()
+                    .expect("ready Vector issue")
+                    .operation
+                {
+                    VectorOperation::Instruction(_) => tick
+                        .checked_add(self.frontend.reception_ticks)
+                        .ok_or(C220VectorPipelineError::TimeOverflow)?,
+                    VectorOperation::Flag(_) => tick,
+                };
                 let issued = self
                     .frontend
                     .issued
                     .pop_front()
                     .expect("ready Vector issue");
-                let reception = C220VectorReception {
-                    instruction: issued.ticket,
-                    received_tick: tick,
-                    ready_tick,
-                };
-                self.frontend.received.push_back(Received {
-                    reception,
-                    request: issued.request,
-                });
-                self.frontend
-                    .events
-                    .push(C220VectorFrontendEvent::Received(reception));
+                match issued.operation {
+                    VectorOperation::Flag(step) => {
+                        if step.instruction.operation == FlagOperation::Set {
+                            let predecessor = (self.outstanding_instructions() != 0).then(|| {
+                                self.frontend
+                                    .last_received
+                                    .expect("running Vector predecessor")
+                            });
+                            events.set(ticket.instruction_id, step, predecessor, tick);
+                        }
+                        self.frontend.events.push(C220VectorFrontendEvent::Flag {
+                            instruction: ticket,
+                            step,
+                            tick,
+                        });
+                        self.release_barriers_at(tick);
+                    }
+                    VectorOperation::Instruction(request) => {
+                        let reception = C220VectorReception {
+                            instruction: issued.ticket,
+                            received_tick: tick,
+                            ready_tick,
+                        };
+                        self.frontend.last_received = Some(ticket.instruction_id);
+                        self.frontend.received.push_back(Received {
+                            reception,
+                            request: *request,
+                        });
+                        self.frontend
+                            .events
+                            .push(C220VectorFrontendEvent::Received(reception));
+                    }
+                }
             }
         }
         if let Some(received) = self
@@ -281,98 +377,4 @@ impl VectorEngine {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::architecture::Architecture;
-    use crate::memory::ub::UbMemory;
-    use crate::sim::c220::vector::ops::compare::C220CompareMask;
-    use crate::sim::c220::vector::pipeline::C220VectorTimingRules;
-    use crate::sim::common::scalar::{ScalarMachine, ScalarStepper};
-    use std::num::NonZeroU64;
-
-    #[test]
-    fn outstanding_credit_is_held_from_reception_through_retirement() {
-        let mut state = C220State::new(
-            ScalarStepper::new(
-                ScalarMachine::from_pem_initial_state(Architecture::Dav2201),
-                0x1000,
-            ),
-            UbMemory::new(256, 256),
-        );
-        let mut engine = VectorEngine::new(
-            C220VectorTimingRules {
-                dispatch_ticks: 3,
-                uop_issue_interval: NonZeroU64::new(1).unwrap(),
-                ub_response_ticks: 1,
-            },
-            C220CompareMask::from_bits([0; 2]),
-            C220VectorFrontendConfig {
-                issue_queue_depth: NonZeroU32::new(2).unwrap(),
-                outstanding_limit: NonZeroU32::new(1).unwrap(),
-            },
-        );
-        let capture =
-            |state: &C220State| C220VectorRequest::capture(state.scalar(), 0x8000_6380).unwrap();
-        assert!(matches!(
-            engine.enqueue_at(0, 0, capture(&state)).unwrap(),
-            VectorAdmission::Queued(_)
-        ));
-        engine.advance_event(1, &mut state).unwrap();
-        assert_eq!(engine.outstanding_instructions(), 1);
-        assert_eq!(engine.received_instructions().next().unwrap().ready_tick, 4);
-        for id in 1..=2 {
-            assert!(matches!(
-                engine.enqueue_at(id, id, capture(&state)).unwrap(),
-                VectorAdmission::Queued(_)
-            ));
-            assert_eq!(engine.frontend.next_tick, Some(id + 1));
-            engine.advance_event(id + 1, &mut state).unwrap();
-        }
-        assert!(matches!(
-            engine.enqueue_at(3, 3, capture(&state)).unwrap(),
-            VectorAdmission::Stalled(C220Stall {
-                cause: C220StallCause::VectorIssueQueueFull,
-                ..
-            })
-        ));
-        let fence = engine.instruction_fence();
-        let barrier = crate::isa::flow::PipelineBarrierStep::decode(
-            Architecture::Dav2201,
-            0x1000,
-            0x40e0_0400,
-        )
-        .unwrap();
-        assert!(matches!(
-            engine.issue_barrier_at(3, 3, barrier).unwrap(),
-            super::super::barrier::VectorBarrierAdmission::Stalled(C220Stall {
-                cause: C220StallCause::VectorIssueQueueFull,
-                ..
-            })
-        ));
-        assert_eq!(engine.pending_barriers().len(), 0);
-        assert_eq!(fence.instruction_id, Some(2));
-        for tick in 4..=5 {
-            engine.advance_event(tick, &mut state).unwrap();
-            assert_eq!(engine.queued_instructions().len(), 2);
-            assert_eq!(engine.outstanding_instructions(), 1);
-        }
-        engine.advance_event(6, &mut state).unwrap();
-        assert_eq!(engine.retirements[0].instruction_id, 0);
-        assert_eq!(engine.queued_instructions().len(), 1);
-        assert_eq!(engine.outstanding_instructions(), 1);
-        for tick in 7..=16 {
-            assert!(engine.fence_retirement_tick(fence).is_some());
-            engine.advance_event(tick, &mut state).unwrap();
-        }
-        assert_eq!(engine.fence_retirement_tick(fence), None);
-        assert_eq!(engine.outstanding_instructions(), 0);
-        assert_eq!(
-            engine
-                .retirements
-                .iter()
-                .map(|entry| entry.retirement_tick)
-                .collect::<Vec<_>>(),
-            [6, 11, 16]
-        );
-    }
-}
+mod tests;
