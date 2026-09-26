@@ -192,12 +192,16 @@ mod tests {
 
     #[test]
     fn l1_responses_forward_whole_transactions_with_shared_head_backpressure() {
+        use super::super::{C220L1OutputCommand, C220L1OutputEngine, C220L1OutputEngineConfig};
         use crate::sim::c220::memory::l1::{C220L1Geometry, C220L1Port, C220L1Transport};
         use crate::sim::c220::mte::fixp::{
-            C220FixpExternalOutput, C220FixpReadPipeline, C220FixpReadProgress, C220FixpReadStream,
+            C220FixpAdmission, C220FixpReadProgress, C220FixpStoreBuffer,
         };
         use crate::sim::c220::mte::interface::{
-            C220MteL0cReadInterface, C220MteL1Interface, C220MteL1OutputCredits, C220MteL1ReadPort,
+            C220MteL1Interface, C220MteL1OutputCredits,
+            biu_write::command::{C220BiuWriteCommands, C220BiuWriteConfig},
+            biu_write::cube::C220BiuCubeWriteSource,
+            biu_write::data::C220BiuWriteDataPort,
         };
 
         let instruction =
@@ -209,49 +213,49 @@ mod tests {
             destination_address: 4096,
             xm: (1 << 4) | (16 << 16),
         };
-        let reads = C220L1OutputReadPlan::new(
+        let config = C220L1OutputEngineConfig {
+            read_bandwidth: NonZeroU32::new(32).unwrap(),
+            instruction_fifo_depth: 1,
+            write_outstanding_limit: 1,
+        };
+        let command = C220L1OutputCommand {
             transfer,
-            C220DmaUopMode::Wide512,
-            NonZeroU32::new(32).unwrap(),
+            control: 0,
+            mode: C220DmaUopMode::Wide512,
+        };
+        let mut engine = C220L1OutputEngine::new(config);
+        assert_eq!(
+            engine.admit(0, 7, command).unwrap(),
+            C220FixpAdmission::Active
         );
-        let mut pipeline = C220FixpReadPipeline::default();
-        pipeline
-            .submit(
-                0,
-                C220FixpReadStream::L1Output {
-                    instruction_id: 7,
-                    reads,
-                },
-            )
-            .unwrap();
-        let mut l0c = C220MteL0cReadInterface::new(32, 0).unwrap();
+        assert_eq!(
+            engine.admit(0, 8, command).unwrap(),
+            C220FixpAdmission::ReadGenerationBusy
+        );
+        let mut independent = C220L1OutputEngine::new(config);
+        assert_eq!(
+            independent.admit(0, 8, command).unwrap(),
+            C220FixpAdmission::Active
+        );
+        let mut stores = C220FixpStoreBuffer::default();
+        let mut biu = C220BiuWriteCommands::new(C220BiuWriteConfig {
+            outstanding: NonZeroU32::new(1).unwrap(),
+            weights: [1; 3],
+            source_bandwidth: config.read_bandwidth,
+        });
         let mut interface = C220MteL1Interface::default();
         let mut memory = C220L1Transport::new(C220L1Geometry::new(32, 1, 1, 0).unwrap());
-        let mut output = C220FixpExternalOutput::default();
         let mut responses = 0;
         let mut forwarded = Vec::new();
         let mut blocked = false;
         for tick in 0..200 {
-            let generated = pipeline.generate(tick).unwrap();
+            let generated = engine.generate_read(tick).unwrap();
             if tick < 2 {
                 assert_eq!(generated, C220FixpReadProgress::Delayed { ready_tick: 2 });
             }
-            let progress = pipeline
-                .send_routed(
-                    tick,
-                    &mut l0c,
-                    |operation| {
-                        Ok(interface
-                            .push(tick, C220MteL1ReadPort::Port1, operation)?
-                            .is_some())
-                    },
-                    |_| tick >= 10,
-                    true,
-                )
+            engine
+                .send_read(tick, &stores, &mut interface, |read| read)
                 .unwrap();
-            if (5..10).contains(&tick) {
-                assert_eq!(progress, C220FixpReadProgress::DestinationBackpressure);
-            }
             memory.advance(tick).unwrap();
             let sent = interface
                 .send_request(tick, memory.request_ready(C220L1Port::MteRead))
@@ -278,16 +282,7 @@ mod tests {
             }
             let accepted = if let Some(head) = interface.external_head(tick) {
                 blocked |= tick < 100;
-                output
-                    .receive_l1_source(
-                        tick,
-                        tick,
-                        head.operation
-                            .payload
-                            .output_fragment(head.operation.instruction_id, head.id),
-                        tick >= 100,
-                    )
-                    .unwrap()
+                tick >= 100 && engine.receive_source(tick, &stores, head).unwrap()
             } else {
                 false
             };
@@ -305,18 +300,55 @@ mod tests {
             }
             assert_eq!(interface.queue_state().output.output_fragments, 0);
             assert!(interface.retire(tick).unwrap().is_none());
+            engine.packetize(tick, &mut stores).unwrap();
+            engine.generate_write(tick).unwrap();
+            engine.send_write(tick, &mut biu).unwrap();
+            biu.advance(tick).unwrap();
         }
         assert!(blocked);
         assert_eq!(responses, 16);
         assert!(memory.is_idle());
         assert!(interface.is_idle());
-        assert!(pipeline.is_idle());
-        assert!(l0c.input().is_empty());
+        assert!(engine.read_pipeline().is_idle());
+        assert!(engine.write_pipeline().is_idle());
+        assert!(engine.output().bursts().is_empty());
+        assert!(!engine.is_idle());
+        assert!(engine.instruction_fifo().is_empty());
+        assert_eq!(engine.commands()[&7].source_completed_tick, Some(100));
+        assert_eq!(engine.commands()[&7].write_dispatched_tick, Some(103));
+        assert!(engine.retire(7).is_err());
         assert_eq!(forwarded.len(), 1);
         assert_eq!(forwarded[0].bytes, 512);
         assert!(forwarded[0].last_in_instruction);
-        assert_eq!(output.bursts().len(), 1);
-        assert_eq!(output.bursts()[0].ready_tick, 101);
+        let request = biu.take_request(200).unwrap().unwrap().command;
+        let tag = request.tag;
+        let mut source = C220BiuCubeWriteSource::default();
+        source
+            .register(request.source_request(), request.input.store_token.unwrap())
+            .unwrap();
+        biu.mark_dbid(tag);
+        source.receive_dbid(200, tag).unwrap();
+        source
+            .ingress(201, |tag| {
+                biu.begin_source(tag);
+                true
+            })
+            .unwrap();
+        let mut port = C220BiuWriteDataPort::default();
+        for tick in 202..=205 {
+            let ready = source.egress(tick, &mut stores).unwrap();
+            assert_eq!(ready.is_some(), tick == 205);
+        }
+        assert!(stores.is_empty());
+        let ready = source.take_data_ready(206).unwrap().unwrap();
+        port.send(206, [Some(ready), None, None]).unwrap();
+        port.take_request(207).unwrap().unwrap();
+        let response = port.receive_response(208, tag).unwrap();
+        source.release_response(208, tag).unwrap();
+        biu.release_tag(tag).unwrap();
+        assert_eq!(engine.complete_response(response).unwrap(), Some(7));
+        assert_eq!(engine.retire(7).unwrap().response_tick, Some(208));
+        assert!(engine.is_idle());
     }
 
     #[test]

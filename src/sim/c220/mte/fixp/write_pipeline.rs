@@ -148,7 +148,7 @@ impl<T: Copy> C220FixpWritePipeline<T> {
         Ok(C220FixpWriteProgress::Advanced(fragment))
     }
 
-    pub(super) fn send_with(
+    pub(in crate::sim::c220::mte) fn send_with(
         &mut self,
         tick: u64,
         send: impl FnOnce(T) -> Result<bool, C220FixpWritePipelineError>,

@@ -159,6 +159,41 @@ impl C220FixpReadPipeline {
         mut destination_ready: impl FnMut(u64) -> bool,
         mut sync: impl C220FixpSync,
     ) -> Result<C220FixpReadProgress, C220FixpReadPipelineError> {
+        self.send_with(tick, |packet| {
+            if !destination_ready(packet.instruction_id()) {
+                return Ok(C220FixpReadProgress::DestinationBackpressure);
+            }
+            match packet {
+                C220FixpReadPacket::L0c(uop) => {
+                    if !input.can_enqueue() {
+                        return Ok(C220FixpReadProgress::QueueFull);
+                    }
+                    if sync.blocked(C220FixpSyncRequest {
+                        tick,
+                        instruction_id: uop.operation.instruction_id,
+                        point: C220FixpSyncPoint::ReadWait,
+                    })? {
+                        return Ok(C220FixpReadProgress::HardwareSync);
+                    }
+                    if !input.enqueue(tick, uop.operation)? {
+                        return Ok(C220FixpReadProgress::QueueFull);
+                    }
+                }
+                C220FixpReadPacket::L1(operation) => {
+                    if !send_l1(operation)? {
+                        return Ok(C220FixpReadProgress::QueueFull);
+                    }
+                }
+            }
+            Ok(C220FixpReadProgress::Advanced(packet))
+        })
+    }
+
+    pub(in crate::sim::c220::mte) fn send_with(
+        &mut self,
+        tick: u64,
+        send: impl FnOnce(C220FixpReadPacket) -> Result<C220FixpReadProgress, C220FixpReadPipelineError>,
+    ) -> Result<C220FixpReadProgress, C220FixpReadPipelineError> {
         self.begin(tick, 1, "send")?;
         let Some(entry) = self.dispatch.front().copied() else {
             return Ok(C220FixpReadProgress::Idle);
@@ -168,33 +203,11 @@ impl C220FixpReadPipeline {
                 ready_tick: entry.ready_tick,
             });
         }
-        if !destination_ready(entry.uop.instruction_id()) {
-            return Ok(C220FixpReadProgress::DestinationBackpressure);
+        let progress = send(entry.uop)?;
+        if matches!(progress, C220FixpReadProgress::Advanced(_)) {
+            self.dispatch.pop_front();
         }
-        match entry.uop {
-            C220FixpReadPacket::L0c(uop) => {
-                if !input.can_enqueue() {
-                    return Ok(C220FixpReadProgress::QueueFull);
-                }
-                if sync.blocked(C220FixpSyncRequest {
-                    tick,
-                    instruction_id: uop.operation.instruction_id,
-                    point: C220FixpSyncPoint::ReadWait,
-                })? {
-                    return Ok(C220FixpReadProgress::HardwareSync);
-                }
-                if !input.enqueue(tick, uop.operation)? {
-                    return Ok(C220FixpReadProgress::QueueFull);
-                }
-            }
-            C220FixpReadPacket::L1(operation) => {
-                if !send_l1(operation)? {
-                    return Ok(C220FixpReadProgress::QueueFull);
-                }
-            }
-        }
-        self.dispatch.pop_front();
-        Ok(C220FixpReadProgress::Advanced(entry.uop))
+        Ok(progress)
     }
 
     fn check_time(&mut self, tick: u64) -> Result<(), C220FixpReadPipelineError> {

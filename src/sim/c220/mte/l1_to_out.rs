@@ -6,7 +6,12 @@ use crate::sim::c220::memory::{C220LocalBuffer, C220LocalBufferError};
 
 use super::atomic::{C220AtomicConfig, commit_output};
 
+mod engine;
 mod read_plan;
+pub use engine::{
+    C220L1OutputCommand, C220L1OutputCommandState, C220L1OutputEngine, C220L1OutputEngineConfig,
+    C220L1OutputEngineError,
+};
 pub use read_plan::{C220L1OutputRead, C220L1OutputReadPlan, C220L1OutputRoute};
 
 #[derive(Debug, thiserror::Error)]
