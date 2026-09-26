@@ -17,6 +17,8 @@ use crate::sim::common::scalar::ScalarInstructionError;
 
 #[derive(Debug, Error)]
 pub enum C220CoreError {
+    #[error("L1 output requires an explicitly configured Cube output engine and BIU")]
+    L1OutputUnconfigured,
     #[error(transparent)]
     Load3dCapture(#[from] crate::sim::c220::mte::load3d::C220Load3dCaptureError),
     #[error(transparent)]

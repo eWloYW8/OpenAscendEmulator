@@ -42,6 +42,7 @@ mod factor;
 mod fixp;
 mod fixp_barrier;
 mod fixp_frontend;
+mod l1_output;
 mod scalar_flag;
 pub use external_fixp::C220CoreFixpConfig;
 pub use factor::{C220FactorOutcome, C220FactorReadConfig};
@@ -165,6 +166,7 @@ pub struct C220Core {
     mte_pipeline: Option<C220MtePipeline>,
     fixp: Option<fixp::CoreFixp>,
     external_fixp: Option<external_fixp::CoreExternalFixp>,
+    l1_output: Option<crate::sim::c220::mte::l1_to_out::C220L1OutputEngine>,
     fixp_frontend: fixp_frontend::FixpFrontend,
     hardware_flags: C220HardwareFlagState,
     pipeline_events: crate::sim::c220::sync::C220PipelineEvents,
@@ -229,6 +231,7 @@ impl C220Core {
             mte_pipeline: None,
             fixp: None,
             external_fixp: None,
+            l1_output: None,
             fixp_frontend: fixp_frontend::FixpFrontend::default(),
             hardware_flags: C220HardwareFlagState::default(),
             pipeline_events: Default::default(),
@@ -325,6 +328,7 @@ impl C220Core {
         self.mte_pipeline = Some(C220MtePipeline::new(self.mte1.tick(), config));
         self.fixp = None;
         self.external_fixp = None;
+        self.l1_output = None;
         Ok(())
     }
 

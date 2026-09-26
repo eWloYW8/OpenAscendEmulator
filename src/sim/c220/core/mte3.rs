@@ -118,7 +118,16 @@ impl C220Core {
             .mte_pipeline
             .as_mut()
             .ok_or(C220CoreError::MteUnconfigured)?;
-        pipeline.receive_biu_write_dbid(pipeline.ub_vector_subcore(), tag)?;
+        let subcore = if let Some(commands) = pipeline.biu_write_commands() {
+            commands
+                .awaiting_dbid(tag)
+                .map_err(crate::sim::c220::mte::C220MtePipelineError::from)?
+                .input
+                .subcore
+        } else {
+            pipeline.ub_vector_subcore()
+        };
+        pipeline.receive_biu_write_dbid(subcore, tag)?;
         Ok(())
     }
 
@@ -216,6 +225,11 @@ impl C220Core {
         word: u32,
         flag: Option<FlagInstruction>,
     ) -> Result<C220CoreStep, C220CoreError> {
+        if let Some(instruction) =
+            crate::isa::c220::mte::l1_to_out::C220MovL1ToOutInstruction::decode(word)
+        {
+            return self.enqueue_l1_output_at(tick, pc, instruction);
+        }
         if self.mte3.physical {
             if let Some(instruction) = flag {
                 let step = instruction.resolve(pc, self.state.scalar().machine().xregs());

@@ -463,8 +463,8 @@ impl C220MtePipeline {
                 C220Mte3Command::MovPad(command) => {
                     (command.biu_mode_word, command.transfer.source_stride())
                 }
-                C220Mte3Command::CrossCore { .. } => {
-                    unreachable!("cross-core commands do not generate write requests")
+                C220Mte3Command::CrossCore { .. } | C220Mte3Command::L1Output(_) => {
+                    unreachable!("command does not generate UB write requests")
                 }
             };
             let gather_stride = if generated.request.route == C220DmaUopRoute::SourceGapGather {

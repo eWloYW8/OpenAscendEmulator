@@ -526,6 +526,130 @@ mod tests {
     }
 
     #[test]
+    fn l1_output_core_captures_operands_and_commits_after_external_completion() {
+        use crate::memory::region::MemoryRegion;
+        use crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteConfig;
+        use crate::sim::c220::mte::l1_to_out::{C220L1OutputEngineConfig, C220L1OutputStage::*};
+        for (count, length, gap) in [(1_u64, 32_u64, 0_u64), (4, 2, 1), (0, 2, 0)] {
+            let mut core = matrix_core();
+            core.advance_to(300).unwrap();
+            let width = NonZeroU32::new(32).unwrap();
+            core.connect_cube_output_biu(C220BiuWriteConfig {
+                outstanding: NonZeroU32::new(1).unwrap(),
+                weights: [1; 3],
+                source_bandwidth: width,
+            })
+            .unwrap();
+            core.configure_l1_output(
+                C220L1OutputEngineConfig {
+                    read_bandwidth: width,
+                    instruction_fifo_depth: 2,
+                    write_outstanding_limit: 1,
+                },
+                &[GenerateRead, SendRead, Packetize, GenerateWrite, SendWrite],
+            )
+            .unwrap();
+            core.memory = MappedMemory::bind(
+                SparseMemory::new(
+                    vec![MemoryRegion::new(4096, vec![0; 4096]).unwrap()],
+                    4096,
+                    4096,
+                ),
+                &[4096],
+            )
+            .unwrap();
+            let source: Vec<u8> = (0..2048).map(|i| (i * 17 + i / 32) as u8).collect();
+            core.local_memory
+                .l1_mut()
+                .write_known_linear(0, &source)
+                .unwrap();
+            let expected: Vec<u8> = (0..count)
+                .flat_map(|row| {
+                    let start = (row * (length + gap) * 32) as usize;
+                    source[start..start + (length * 32) as usize]
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            let machine = core.state.scalar_mut().machine_mut();
+            for (register, value) in [
+                (1, 4096),
+                (2, 0),
+                (3, (count << 4) | (length << 16) | (gap << 32)),
+            ] {
+                machine.set_xreg(register, value).unwrap();
+            }
+            machine.set_spr_value(3, 0).unwrap();
+            let word =
+                (3 << 29) | (2 << 27) | (4 << 23) | (1 << 17) | (2 << 12) | (3 << 7) | (2 << 3);
+            let id = core.next_instruction_id();
+            assert!(matches!(
+                core.step_word_at(301, word).unwrap(),
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::Mte3Queued(_),
+                    ..
+                }
+            ));
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_xreg(3, 0)
+                .unwrap();
+            let mut delayed = None;
+            let mut response_tick = None;
+            let mut completed = false;
+            for tick in 302..700 {
+                core.advance_to(tick).unwrap();
+                if let Some(outcome) = core.last_mte3_dma_outcomes().first() {
+                    assert_eq!(outcome.record.instruction_id, id);
+                    assert_eq!(outcome.result.bytes, expected.len());
+                    if !expected.is_empty() {
+                        assert!(outcome.tick > response_tick.unwrap());
+                    }
+                    completed = true;
+                    break;
+                }
+                assert_eq!(
+                    core.memory
+                        .read_known_at(4096, expected.len().max(1))
+                        .unwrap(),
+                    vec![0; expected.len().max(1)]
+                );
+                if let Some(request) = core.take_biu_write_command_at(tick).unwrap() {
+                    assert_eq!(request.command.source_request().instruction_id, id);
+                    core.receive_mte3_biu_dbid_at(tick, request.command.tag)
+                        .unwrap();
+                }
+                if let Some(data) = core.take_biu_write_data_at(tick).unwrap() {
+                    assert!(delayed.is_none());
+                    delayed = Some((tick + 12, data.source.request.tag));
+                }
+                if let Some((ready, tag)) = delayed
+                    && tick >= ready
+                {
+                    let response = core.receive_mte3_biu_write_response_at(tick, tag).unwrap();
+                    if response.retired_instruction().is_some() {
+                        response_tick = Some(tick);
+                    }
+                    delayed = None;
+                }
+            }
+            assert!(completed);
+            if expected.is_empty() {
+                assert_eq!(core.memory.read_known_at(4096, 1).unwrap(), [0]);
+            } else {
+                assert_eq!(
+                    core.memory.read_known_at(4096, expected.len()).unwrap(),
+                    expected
+                );
+            }
+            assert!(core.l1_output_engine().unwrap().is_idle());
+            assert!(!core.mte3_is_busy());
+            assert!(core.mte_pipeline().unwrap().is_idle());
+        }
+    }
+
+    #[test]
     fn external_fixp_core_waits_for_transport_before_retirement() {
         use crate::memory::region::MemoryRegion;
         use crate::sim::c220::core::C220CoreFixpConfig;

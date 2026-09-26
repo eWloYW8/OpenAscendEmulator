@@ -206,6 +206,9 @@ impl C220Core {
                         .as_mut()
                         .expect("configured MTE3 pipeline");
                     let instruction = match command {
+                        C220Mte3Command::L1Output(command) => C220CoreInstruction::Mte3L1Output(
+                            pipeline.issue_mte3_l1_output(queued.instruction_id, command)?,
+                        ),
                         C220Mte3Command::MovPad(command) => C220CoreInstruction::Mte3MovPad(
                             pipeline.issue_mte3_mov_pad(queued.instruction_id, command)?,
                         ),

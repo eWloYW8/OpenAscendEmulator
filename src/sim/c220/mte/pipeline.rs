@@ -1654,10 +1654,14 @@ impl C220MtePipeline {
                         self.core_kind == crate::sim::c220::device::C220CoreKind::Cube
                             && self.fixp_head_is_convert,
                     );
-                    if let Some(outcome) =
-                        self.mte3_events
-                            .handle(phase, &mut self.events, &mut self.mte3)?
-                    {
+                    if let Some(outcome) = self.mte3_events.handle(
+                        phase,
+                        &mut self.events,
+                        &mut self.mte3,
+                        l1_output
+                            .as_deref_mut()
+                            .map(|engine| (engine, &mut self.l1_output_active)),
+                    )? {
                         self.trace.push(C220MtePipelineEvent::Mte3(outcome));
                     }
                 }

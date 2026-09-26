@@ -25,7 +25,7 @@ impl C220Core {
         factors: C220LocalBuffer,
         stages: &[C220FixpStage],
     ) -> Result<(), C220CoreError> {
-        if self.fixp.is_some() || self.external_fixp.is_some() {
+        if self.fixp.is_some() || self.external_fixp.is_some() || self.l1_output.is_some() {
             return Err(C220CoreError::MtePipelineBusy);
         }
         if config.l0c_capacity != self.local_memory.l0c().buffer().capacity() {

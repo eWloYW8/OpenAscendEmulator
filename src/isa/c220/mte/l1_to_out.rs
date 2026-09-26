@@ -53,6 +53,10 @@ pub struct C220MovL1ToOutSegment {
 }
 
 impl C220MovL1ToOutTransfer {
+    pub const fn is_disabled(self) -> bool {
+        (self.xm >> 4) & 0xfff == 0 || (self.xm >> 16) & 0xffff == 0
+    }
+
     pub const fn sid(self) -> u8 {
         (self.xm & 15) as u8
     }

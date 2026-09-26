@@ -108,18 +108,31 @@ impl C220Core {
                 } else if let Some(fixp) = &mut self.external_fixp {
                     self.hardware_flags.advance_to(event_tick)?;
                     let (l0c, l1) = self.local_memory.fixp_destinations_mut();
-                    pipeline.advance_external_fixp(
-                        event_tick,
-                        &mut fixp.engine,
-                        crate::sim::c220::mte::fixp::C220FixpRuntimeMemory {
-                            l0c,
-                            l1,
-                            slopes: &fixp.factors,
-                            external: &mut self.memory,
-                            atomics: self.mte_atomics,
-                        },
-                        fixp.bindings.resolver(&mut self.hardware_flags),
-                    )?;
+                    let memory = crate::sim::c220::mte::fixp::C220FixpRuntimeMemory {
+                        l0c,
+                        l1,
+                        slopes: &fixp.factors,
+                        external: &mut self.memory,
+                        atomics: self.mte_atomics,
+                    };
+                    if let Some(l1_output) = &mut self.l1_output {
+                        pipeline.advance_external_fixp_with_l1_output(
+                            event_tick,
+                            &mut fixp.engine,
+                            memory,
+                            fixp.bindings.resolver(&mut self.hardware_flags),
+                            l1_output,
+                        )?;
+                    } else {
+                        pipeline.advance_external_fixp(
+                            event_tick,
+                            &mut fixp.engine,
+                            memory,
+                            fixp.bindings.resolver(&mut self.hardware_flags),
+                        )?;
+                    }
+                } else if let Some(engine) = &mut self.l1_output {
+                    pipeline.advance_l1_output(event_tick, engine)?;
                 } else {
                     pipeline.advance(event_tick)?;
                 }
@@ -206,6 +219,9 @@ impl C220Core {
                     self.state.ub(),
                     &mut self.memory,
                     self.mte_atomics,
+                    self.l1_output
+                        .as_mut()
+                        .map(|engine| (self.local_memory.l1(), engine)),
                 )?
             {
                 self.pipeline_events.retire(5, id, event_tick);

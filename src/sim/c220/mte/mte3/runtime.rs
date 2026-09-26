@@ -26,6 +26,8 @@ pub enum C220Mte3RuntimeError {
     Transfer(#[from] C220TransferError),
     #[error(transparent)]
     MovPad(#[from] crate::sim::c220::mte::mov_pad::C220MovPadError),
+    #[error(transparent)]
+    L1Output(#[from] crate::sim::c220::mte::l1_to_out::C220L1OutputError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +114,10 @@ impl Mte3Engine {
         ub: &UbMemory,
         memory: &mut MappedMemory,
         atomics: crate::sim::c220::mte::atomic::C220AtomicConfig,
+        l1_output: Option<(
+            &crate::sim::c220::memory::C220LocalBuffer,
+            &mut crate::sim::c220::mte::l1_to_out::C220L1OutputEngine,
+        )>,
     ) -> Result<Option<u64>, C220Mte3RuntimeError> {
         let Some(record) = pipeline.mte3_retirement_candidate() else {
             return Ok(None);
@@ -121,6 +127,21 @@ impl Mte3Engine {
             .get(&record.instruction_id)
             .ok_or(C220Mte3RuntimeError::UnknownCommand(record.instruction_id))?;
         let result = match record.command {
+            super::frontend::C220Mte3Command::L1Output(command) => {
+                let (l1, engine) =
+                    l1_output.ok_or(C220Mte3RuntimeError::UnknownCommand(record.instruction_id))?;
+                let result = crate::sim::c220::mte::l1_to_out::execute_c220_mov_l1_to_out(
+                    l1,
+                    memory,
+                    command.transfer,
+                    command.control,
+                    atomics,
+                )?;
+                if !command.transfer.is_disabled() {
+                    pipeline.retire_l1_output(engine, record.instruction_id)?;
+                }
+                result
+            }
             super::frontend::C220Mte3Command::Dma(plan) => plan.execute(ub, memory, atomics)?,
             super::frontend::C220Mte3Command::MovPad(command) => {
                 crate::sim::c220::mte::mov_pad::prepare_c220_mov_pad(

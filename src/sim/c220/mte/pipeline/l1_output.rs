@@ -6,6 +6,22 @@ use crate::sim::c220::mte::l1_to_out::{
 };
 
 impl C220MtePipeline {
+    pub fn issue_mte3_l1_output(
+        &mut self,
+        id: u64,
+        command: C220L1OutputCommand,
+    ) -> Result<C220Mte3Record, C220MtePipelineError> {
+        if self.l1_output_events.is_empty() {
+            return Err(C220MtePipelineError::L1OutputContextMismatch);
+        }
+        Ok(self.mte3_events.issue_command(
+            &mut self.events,
+            &mut self.mte3,
+            id,
+            super::super::mte3::frontend::C220Mte3Command::L1Output(command),
+        )?)
+    }
+
     /// Register stages in the core owner's clock order. The shared L1 interface
     /// delivers source completions; the shared BIU delivers write responses.
     pub fn bind_l1_output_stages(
@@ -129,6 +145,14 @@ impl C220MtePipeline {
             )?),
         };
         self.trace.push(C220MtePipelineEvent::L1Output(event));
+        if let C220L1OutputEvent::SentWrite(super::super::fixp::C220FixpWriteProgress::Advanced(
+            super::super::fixp::C220FixpDispatchPacket::External(packet),
+        )) = event
+            && packet.write.fragment.last_in_instruction
+        {
+            self.mte3
+                .notify_l1_output_dispatched(packet.write.fragment.instruction_id);
+        }
         Ok(())
     }
 
@@ -166,6 +190,9 @@ impl C220MtePipeline {
     ) -> Result<(), C220MtePipelineError> {
         while let Some(response) = self.l1_output_responses.front().copied() {
             if let Some(instruction_id) = engine.complete_response(response)? {
+                if self.mte3.owns_l1_output(instruction_id) {
+                    self.mte3.notify_biu_retirement(instruction_id)?;
+                }
                 self.trace.push(C220MtePipelineEvent::L1Output(
                     C220L1OutputEvent::WriteCompleted {
                         tick: response.tick,

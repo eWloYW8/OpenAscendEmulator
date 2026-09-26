@@ -5,6 +5,7 @@ use crate::sim::c220::mte::C220MteGeneratorCallback;
 use crate::sim::c220::mte::dma::{
     C220DmaEventOutcome, C220DmaEvents, C220DmaFrontend, C220DmaFrontendError, C220DmaGenerated,
 };
+use crate::sim::c220::mte::l1_to_out::{C220L1OutputCommand, C220L1OutputEngine};
 use crate::sim::c220::mte::uop::{C220DmaUopError, C220DmaUops, mte3_uops};
 use crate::sim::common::event::{EventDispatcher, EventId, ProcessId};
 
@@ -30,6 +31,7 @@ pub enum C220Mte3FrontendEvent {
 pub enum C220Mte3Command {
     Dma(C220Mte3TransferPlan),
     MovPad(crate::sim::c220::mte::mov_pad::C220MovPadCommand),
+    L1Output(C220L1OutputCommand),
     CrossCore {
         instruction: crate::isa::c220::control::C220SetCrossCoreInstruction,
         payload: crate::sim::c220::sync::C220DeviceSync,
@@ -39,6 +41,7 @@ pub enum C220Mte3Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte3Generator {
     Dma,
+    L1Output,
     Load3d,
 }
 
@@ -70,6 +73,10 @@ pub enum C220Mte3FrontendError {
     WrongMovPadDirection,
     #[error("MTE3 BIU retirement notification is invalid for instruction {0}")]
     UnexpectedBiuRetirement(u64),
+    #[error("MTE3 L1 output requires its physical engine")]
+    L1OutputDisconnected,
+    #[error(transparent)]
+    L1Output(#[from] crate::sim::c220::mte::l1_to_out::C220L1OutputEngineError),
     #[error(transparent)]
     Dma(#[from] C220DmaFrontendError),
     #[error(transparent)]
@@ -80,7 +87,32 @@ pub enum C220Mte3FrontendError {
 struct Command {
     instruction_id: u64,
     ready_tick: u64,
-    requests: Option<C220DmaUops>,
+    source: CommandSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandSource {
+    Dma(C220DmaUops),
+    L1Output(C220L1OutputCommand),
+    Notification,
+}
+
+impl CommandSource {
+    fn is_disabled(&self) -> bool {
+        match self {
+            Self::Dma(requests) => requests.clone().next().is_none(),
+            Self::L1Output(command) => command.transfer.is_disabled(),
+            Self::Notification => false,
+        }
+    }
+
+    fn generator(&self) -> C220Mte3Generator {
+        match self {
+            Self::Dma(_) => C220Mte3Generator::Dma,
+            Self::L1Output(_) => C220Mte3Generator::L1Output,
+            Self::Notification => C220Mte3Generator::Load3d,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,13 +159,13 @@ impl C220Mte3Frontend {
         &self,
         instruction_id: u64,
     ) -> Result<(), C220Mte3FrontendError> {
-        if self.biu_retirement
-            && self.records.iter().any(|pending| {
-                pending.record.instruction_id == instruction_id
-                    && pending.tail_delivered
-                    && !pending.biu_retired
-            })
-        {
+        if self.records.iter().any(|pending| {
+            pending.record.instruction_id == instruction_id
+                && (self.biu_retirement
+                    || matches!(pending.record.command, C220Mte3Command::L1Output(_)))
+                && pending.tail_delivered
+                && !pending.biu_retired
+        }) {
             Ok(())
         } else {
             Err(C220Mte3FrontendError::UnexpectedBiuRetirement(
@@ -157,6 +189,22 @@ impl C220Mte3Frontend {
 
     pub fn can_issue(&self) -> bool {
         self.commands.len() < COMMAND_CAPACITY && self.records.len() < C220_MTE3_OUTSTANDING_LIMIT
+    }
+
+    pub(in crate::sim::c220::mte) fn notify_l1_output_dispatched(&mut self, id: u64) {
+        if let Some(pending) = self.records.iter_mut().find(|p| {
+            p.record.instruction_id == id
+                && matches!(p.record.command, C220Mte3Command::L1Output(_))
+        }) {
+            pending.tail_delivered = true;
+        }
+    }
+
+    pub(in crate::sim::c220::mte) fn owns_l1_output(&self, id: u64) -> bool {
+        self.records.iter().any(|p| {
+            p.record.instruction_id == id
+                && matches!(p.record.command, C220Mte3Command::L1Output(_))
+        })
     }
 
     pub fn is_idle(&self) -> bool {
@@ -252,7 +300,9 @@ impl C220Mte3Frontend {
             .filter(|p| {
                 p.record_ready_tick.is_some_and(|ready| tick >= ready)
                     && p.tail_delivered
-                    && if self.biu_retirement {
+                    && if self.biu_retirement
+                        || matches!(p.record.command, C220Mte3Command::L1Output(_))
+                    {
                         p.biu_retired
                     } else {
                         p.responses.is_empty()
@@ -341,20 +391,21 @@ impl C220Mte3Events {
             .tick()
             .checked_add(COMMAND_TICKS)
             .ok_or(C220Mte3FrontendError::TimeOverflow)?;
-        let requests = match command {
-            C220Mte3Command::Dma(transfer) => Some(mte3_uops(transfer)?),
+        let source = match command {
+            C220Mte3Command::Dma(transfer) => CommandSource::Dma(mte3_uops(transfer)?),
             C220Mte3Command::MovPad(command) => {
                 if command.transfer.is_input() {
                     return Err(C220Mte3FrontendError::WrongMovPadDirection);
                 }
-                Some(crate::sim::c220::mte::uop::mov_pad_uops(
+                CommandSource::Dma(crate::sim::c220::mte::uop::mov_pad_uops(
                     command.transfer,
                     crate::sim::c220::mte::uop::C220DmaUopMode::from_mode_word(
                         command.dma_mode_word,
                     ),
                 )?)
             }
-            C220Mte3Command::CrossCore { .. } => None,
+            C220Mte3Command::L1Output(command) => CommandSource::L1Output(command),
+            C220Mte3Command::CrossCore { .. } => CommandSource::Notification,
         };
         let record = C220Mte3Record {
             instruction_id,
@@ -372,7 +423,7 @@ impl C220Mte3Events {
         frontend.commands.push_back(Command {
             instruction_id,
             ready_tick,
-            requests,
+            source,
         });
         events.set_process_enabled(self.command_probe, true);
         Ok(record)
@@ -383,6 +434,7 @@ impl C220Mte3Events {
         phase: C220Mte3Callback,
         events: &mut EventDispatcher<T>,
         frontend: &mut C220Mte3Frontend,
+        mut l1_output: Option<(&mut C220L1OutputEngine, &mut BTreeSet<u64>)>,
     ) -> Result<Option<C220Mte3FrontendEvent>, C220Mte3FrontendError> {
         match phase {
             C220Mte3Callback::CommandReady => {
@@ -399,11 +451,9 @@ impl C220Mte3Events {
                 let Some(command) = frontend.commands.front() else {
                     return Ok(None);
                 };
-                let notification = command.requests.is_none();
-                let disabled = command
-                    .requests
-                    .as_ref()
-                    .is_some_and(|r| r.clone().next().is_none());
+                let notification = matches!(command.source, CommandSource::Notification);
+                let disabled = command.source.is_disabled();
+                let generator = command.source.generator();
                 if !disabled
                     && (frontend.external_fixp_pending
                         || (!notification && frontend.fixp_head_pending))
@@ -413,22 +463,47 @@ impl C220Mte3Events {
                         tick: events.tick(),
                     }));
                 }
-                if notification && !frontend.generator.is_idle()
-                    || !notification && !disabled && !frontend.generator.can_issue()
-                {
-                    return Ok(None);
+                if !disabled {
+                    let previous_done = match frontend.selected_generator {
+                        Some(C220Mte3Generator::L1Output) => l1_output
+                            .as_ref()
+                            .is_some_and(|(engine, _)| engine.write_pipeline().is_idle()),
+                        _ => frontend.generator.is_idle(),
+                    };
+                    if (notification || frontend.selected_generator != Some(generator))
+                        && !previous_done
+                        || generator == C220Mte3Generator::Dma && !frontend.generator.can_issue()
+                    {
+                        return Ok(None);
+                    }
                 }
                 let ready = events
                     .tick()
                     .checked_add(RECORD_TICKS)
                     .ok_or(C220Mte3FrontendError::TimeOverflow)?;
-                if !disabled && let Some(requests) = &command.requests {
-                    self.dma.issue(
-                        events,
-                        &mut frontend.generator,
-                        command.instruction_id,
-                        requests.clone(),
-                    )?;
+                if !disabled {
+                    match &command.source {
+                        CommandSource::Dma(requests) => {
+                            self.dma.issue(
+                                events,
+                                &mut frontend.generator,
+                                command.instruction_id,
+                                requests.clone(),
+                            )?;
+                        }
+                        CommandSource::L1Output(output) => {
+                            let (engine, active) = l1_output
+                                .as_mut()
+                                .ok_or(C220Mte3FrontendError::L1OutputDisconnected)?;
+                            let admission =
+                                engine.admit(events.tick(), command.instruction_id, *output)?;
+                            if admission != crate::sim::c220::mte::fixp::C220FixpAdmission::Active {
+                                return Ok(None);
+                            }
+                            active.insert(command.instruction_id);
+                        }
+                        CommandSource::Notification => {}
+                    }
                 }
                 let id = command.instruction_id;
                 let pending = frontend
@@ -441,11 +516,7 @@ impl C220Mte3Events {
                 pending.tail_delivered = disabled || notification;
                 pending.biu_retired = disabled || notification;
                 if !disabled {
-                    frontend.selected_generator = Some(if notification {
-                        C220Mte3Generator::Load3d
-                    } else {
-                        C220Mte3Generator::Dma
-                    });
+                    frontend.selected_generator = Some(generator);
                 }
                 frontend.commands.pop_front();
                 Ok(Some(C220Mte3FrontendEvent::Dispatched {
@@ -531,7 +602,7 @@ mod tests {
                 frontend.set_external_fixp_pending(tick < 6);
                 while let Some(invocation) = events.next_callback() {
                     callbacks
-                        .handle(invocation.callback, &mut events, &mut frontend)
+                        .handle(invocation.callback, &mut events, &mut frontend, None)
                         .unwrap();
                 }
                 if tick == 2 {
@@ -601,7 +672,7 @@ mod tests {
                 events.notify_at(clock, tick);
                 while let Some(invocation) = events.next_callback() {
                     callbacks
-                        .handle(invocation.callback, &mut events, &mut frontend)
+                        .handle(invocation.callback, &mut events, &mut frontend, None)
                         .unwrap();
                 }
                 assert!(frontend.output().is_none());

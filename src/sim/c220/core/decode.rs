@@ -92,6 +92,7 @@ impl C220DecodedWord {
         } else if is_vector_word(word) {
             C220DispatchKind::Vector
         } else if C220DmaMovDescriptor::is_word(word)
+            || crate::isa::c220::mte::l1_to_out::C220MovL1ToOutInstruction::decode(word).is_some()
             || crate::isa::c220::mte::mov_pad::C220MovPadInstruction::decode(word).is_some_and(
                 |instruction| {
                     matches!(
