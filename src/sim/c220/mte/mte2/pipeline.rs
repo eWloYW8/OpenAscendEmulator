@@ -113,6 +113,37 @@ impl C220Mte2Pipeline {
         Ok(pipeline.can_issue_l1_fill(fill))
     }
 
+    pub(crate) fn issue_spr(
+        &mut self,
+        pipeline: &C220MtePipeline,
+        instruction_id: u64,
+        pc: u64,
+        step: crate::sim::common::scalar::ScalarSprStep,
+    ) -> Result<C220Mte2Issue, C220Mte2RuntimeError> {
+        if !pipeline.mte2_generator_idle() {
+            return Err(C220Mte2RuntimeError::Busy);
+        }
+        self.now
+            .checked_add(1)
+            .ok_or(C220Mte2RuntimeError::TimeOverflow)?;
+        let command = C220Mte2Command::WriteSpr(step);
+        self.pending.push_back(C220Mte2CommandState {
+            instruction_id,
+            pc,
+            issue_tick: self.now,
+            command,
+            completion: C220Mte2Completion::Observed { tick: self.now },
+        });
+        Ok(C220Mte2Issue {
+            instruction_id,
+            pc,
+            command,
+            timing: C220Mte2IssueTiming::WriteSpr {
+                dispatch_tick: self.now,
+            },
+        })
+    }
+
     pub(crate) fn issue_cross_core(
         &mut self,
         pipeline: &mut C220MtePipeline,
@@ -361,6 +392,7 @@ impl C220Mte2Pipeline {
             }
         {
             let result = match command.command {
+                C220Mte2Command::WriteSpr(step) => C220Mte2Result::WriteSpr(step),
                 C220Mte2Command::CrossCore { payload, .. } => C220Mte2Result::CrossCore(payload),
                 C220Mte2Command::MovOutToL1(plan) => {
                     C220Mte2Result::MovOutToL1(execute_c220_mov_out_to_l1(

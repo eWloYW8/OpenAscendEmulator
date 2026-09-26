@@ -80,6 +80,10 @@ pub enum C220CoreInstruction {
     },
     Barrier(ScalarProgramStep),
     Mte1Queued(super::C220Mte1IssuedInstruction),
+    MteSprQueued {
+        mte1: super::C220Mte1IssuedInstruction,
+        mte2: super::C220Mte2IssuedInstruction,
+    },
     Mte1Scheduled(super::C220Mte1QueuedCommand),
     Mte1 {
         instruction_id: u64,

@@ -233,6 +233,11 @@ impl C220Core {
     ) -> Result<bool, C220CoreError> {
         use crate::sim::c220::mte::mte2::C220Mte2Command;
         Ok(match command {
+            C220Mte2Command::WriteSpr(_) => self
+                .mte_pipeline
+                .as_ref()
+                .ok_or(C220CoreError::MteUnconfigured)?
+                .mte2_generator_idle(),
             C220Mte2Command::Set2d(fill) => self.mte2.can_issue_l1_fill(
                 self.mte_pipeline
                     .as_ref()
@@ -280,6 +285,14 @@ impl C220Core {
     ) -> Result<crate::sim::c220::mte::mte2::C220Mte2Issue, C220CoreError> {
         use crate::sim::c220::mte::mte2::C220Mte2Command;
         Ok(match command {
+            C220Mte2Command::WriteSpr(step) => self.mte2.issue_spr(
+                self.mte_pipeline
+                    .as_ref()
+                    .ok_or(C220CoreError::MteUnconfigured)?,
+                id,
+                pc,
+                step,
+            )?,
             C220Mte2Command::MovOutToUb(transfer) => {
                 self.mte2
                     .issue_dma(self.mte_pipeline.as_mut(), id, pc, transfer)?

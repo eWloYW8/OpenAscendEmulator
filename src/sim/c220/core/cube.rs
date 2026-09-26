@@ -2156,17 +2156,25 @@ mod tests {
                 crate::isa::c220::mte::read_register_mask(word),
                 Some(1 << 14)
             );
-            let C220CoreStep::Executed {
-                instruction:
-                    C220CoreInstruction::Mte1Queued(super::super::C220Mte1IssuedInstruction {
-                        operation:
-                            super::super::C220Mte1Operation::Command(C220Mte1Command::WriteSpr(step)),
-                        ..
-                    }),
-                ..
-            } = core.step_word_at(setup_tick, word).unwrap()
+            let queued = match core.step_word_at(setup_tick, word).unwrap() {
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::Mte1Queued(queued),
+                    ..
+                } => queued,
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::MteSprQueued { mte1, mte2 },
+                    ..
+                } => {
+                    assert!(matches!(register, 13 | 15));
+                    assert_eq!(mte1.instruction_id, mte2.instruction_id);
+                    mte1
+                }
+                _ => panic!("MTE1 SPR write should issue"),
+            };
+            let super::super::C220Mte1Operation::Command(C220Mte1Command::WriteSpr(step)) =
+                queued.operation
             else {
-                panic!("MTE1 SPR write should issue");
+                panic!("expected SPR command");
             };
             assert_eq!(step.value, mask);
             assert_eq!(

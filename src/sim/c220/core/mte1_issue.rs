@@ -57,12 +57,23 @@ impl C220Core {
             ready_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
             operation,
         };
+        let mut mte2 = None;
         if let C220Mte1Operation::Command(C220Mte1Command::WriteSpr(step)) = operation {
             self.state
                 .scalar_mut()
                 .machine_mut()
                 .set_spr_value(step.destination_spr, step.value)
                 .map_err(C220CoreError::MteSpr)?;
+            if matches!(step.destination_spr, 13 | 15) {
+                mte2 = Some(self.append_mte2_issue_at(
+                    tick,
+                    pc,
+                    word,
+                    super::C220Mte2Operation::Command(
+                        crate::sim::c220::mte::mte2::C220Mte2Command::WriteSpr(step),
+                    ),
+                )?);
+            }
         }
         self.mte1_frontend.issued.push_back(queued);
         self.mte1_frontend.last_accepted = Some(queued.instruction_id);
@@ -70,7 +81,10 @@ impl C220Core {
         self.state.commit_c220_sequential_issue();
         Ok(C220CoreStep::Executed {
             tick,
-            instruction: C220CoreInstruction::Mte1Queued(queued),
+            instruction: match mte2 {
+                Some(mte2) => C220CoreInstruction::MteSprQueued { mte1: queued, mte2 },
+                None => C220CoreInstruction::Mte1Queued(queued),
+            },
         })
     }
 

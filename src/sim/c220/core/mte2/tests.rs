@@ -79,6 +79,68 @@ fn configured_dma_core() -> C220Core {
 }
 
 #[test]
+fn shared_spr_write_requires_both_queues_and_retires_on_both_pipes() {
+    use crate::sim::c220::core::{C220Mte1Operation, C220Mte2Operation};
+    use crate::sim::c220::mte::mte2::{C220Mte2Command, C220Mte2Result};
+    for spr in [13, 15] {
+        let mut core = configured_dma_core();
+        core.mte2_frontend.config.vector_issue_queue_depth = NonZeroU32::new(1).unwrap();
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(14, u64::MAX)
+            .unwrap();
+        // An unmatched WAIT holds the MTE2 issue queue without a running DMA.
+        let wait = (2 << 29) | (6 << 21) | (3 << 10) | (4 << 7) | 7;
+        core.step_word_at(0, wait).unwrap();
+        let pc = core.state.scalar().pc();
+        let prior = core.state.scalar().machine().spr_value(spr);
+        let word = (2 << 24) | (u32::from(spr) << 17) | (14 << 12) | (18 << 7);
+        let blocked = core.step_word_at(1, word).unwrap();
+        assert!(
+            matches!(
+                blocked,
+                C220CoreStep::Stalled(C220Stall {
+                    cause: C220StallCause::Mte2IssueQueueFull,
+                    ..
+                })
+            ),
+            "{blocked:?}"
+        );
+        assert_eq!(core.state.scalar().pc(), pc);
+        assert_eq!(core.state.scalar().machine().spr_value(spr), prior);
+        assert_eq!(core.queued_mte1_instructions().count(), 0);
+
+        let signal = FlagInstruction::decode(Architecture::Dav2201, wait - (1 << 21))
+            .unwrap()
+            .resolve(pc, core.state.scalar().machine().xregs());
+        core.pipeline_events.set(100, signal, None, 1);
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::MteSprQueued { mte1, mte2 },
+            ..
+        } = core.step_word_at(2, word).unwrap()
+        else {
+            panic!("shared SPR issue");
+        };
+        assert_eq!(mte1.instruction_id, mte2.instruction_id);
+        assert_eq!(core.state.scalar().pc(), pc + 4);
+        assert!(matches!(mte1.operation, C220Mte1Operation::Command(_)));
+        let C220Mte2Operation::Command(C220Mte2Command::WriteSpr(step)) = mte2.operation else {
+            panic!("MTE2 SPR command");
+        };
+        assert_eq!(step.value, u64::from(u32::MAX));
+        core.advance_to(6).unwrap();
+        assert!(core.mte2.last_outcomes().is_empty());
+        core.advance_to(7).unwrap();
+        let outcome = core.mte2.last_outcomes().last().unwrap();
+        assert_eq!(outcome.command.instruction_id, mte1.instruction_id);
+        assert_eq!(outcome.result, C220Mte2Result::WriteSpr(step));
+        assert_eq!(outcome.retire_tick, 7);
+        assert!(core.activity().is_idle());
+    }
+}
+
+#[test]
 fn mte2_issue_queue_preserves_operands_and_releases_mte1_at_retirement() {
     let mut core = configured_dma_core();
     core.mte2_frontend.config.vector_issue_queue_depth = NonZeroU32::new(2).unwrap();

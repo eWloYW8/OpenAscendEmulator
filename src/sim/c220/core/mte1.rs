@@ -45,7 +45,12 @@ impl C220Core {
         if self.mte_pipeline.is_none() {
             return Err(C220CoreError::MteUnconfigured);
         }
-        if let Some(cause) = self.mte1_accept_blocker() {
+        let dual_spr = C220Mte1SprWrite::decode(word)
+            .is_some_and(|instruction| matches!(instruction.destination_spr, 13 | 15));
+        if let Some(cause) = self
+            .mte1_accept_blocker()
+            .or_else(|| dual_spr.then(|| self.mte2_accept_blocker()).flatten())
+        {
             return Ok(C220CoreStep::Stalled(C220Stall {
                 tick,
                 pc,

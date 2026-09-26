@@ -115,6 +115,21 @@ impl C220Core {
         word: u32,
         operation: C220Mte2Operation,
     ) -> Result<C220CoreStep, C220CoreError> {
+        let queued = self.append_mte2_issue_at(tick, pc, word, operation)?;
+        self.state.commit_c220_sequential_issue();
+        Ok(C220CoreStep::Executed {
+            tick,
+            instruction: C220CoreInstruction::Mte2Queued(queued),
+        })
+    }
+
+    pub(super) fn append_mte2_issue_at(
+        &mut self,
+        tick: u64,
+        pc: u64,
+        word: u32,
+        operation: C220Mte2Operation,
+    ) -> Result<C220Mte2IssuedInstruction, C220CoreError> {
         let queued = C220Mte2IssuedInstruction {
             instruction_id: self.next_instruction_id,
             pc,
@@ -126,11 +141,7 @@ impl C220Core {
         self.mte2_frontend.issued.push_back(queued);
         self.mte2_frontend.last_accepted = Some(queued.instruction_id);
         self.update_mte2_heads();
-        self.state.commit_c220_sequential_issue();
-        Ok(C220CoreStep::Executed {
-            tick,
-            instruction: C220CoreInstruction::Mte2Queued(queued),
-        })
+        Ok(queued)
     }
 
     fn update_mte2_heads(&mut self) {

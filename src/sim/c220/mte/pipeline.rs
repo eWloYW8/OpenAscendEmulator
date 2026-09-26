@@ -1052,7 +1052,7 @@ impl C220MtePipeline {
         self.dma_hardware_sync_blocked = blocked;
     }
 
-    fn mte2_generator_idle(&self) -> bool {
+    pub(crate) fn mte2_generator_idle(&self) -> bool {
         self.selected_mte2_generator
             .is_none_or(|generator| match generator {
                 Mte2Generator::Dma => self.dma.is_idle(),

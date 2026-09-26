@@ -6,6 +6,7 @@ use crate::sim::c220::mte::set2d::{C220Set2dIssue, C220Set2dResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte2Command {
+    WriteSpr(crate::sim::common::scalar::ScalarSprStep),
     CrossCore {
         instruction: crate::isa::c220::control::C220SetCrossCoreInstruction,
         payload: crate::sim::c220::sync::C220DeviceSync,
@@ -17,8 +18,13 @@ pub enum C220Mte2Command {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte2IssueTiming {
+    WriteSpr {
+        dispatch_tick: u64,
+    },
     /// Zero-uop notification dispatched through the selected generator.
-    CrossCore { dispatch_tick: u64 },
+    CrossCore {
+        dispatch_tick: u64,
+    },
     /// Zero burst count or length; no generator, memory traffic or rate estimate.
     Disabled,
     /// Requests traverse the generator; completion must come from the consumer.
@@ -56,6 +62,7 @@ pub struct C220Mte2CommandState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220Mte2Result {
+    WriteSpr(crate::sim::common::scalar::ScalarSprStep),
     CrossCore(crate::sim::c220::sync::C220DeviceSync),
     MovOutToUb(UbTransferResult),
     MovOutToL1(C220L1DmaResult),
