@@ -23,6 +23,7 @@ fn factor_reads_share_l1_and_complete_on_fix_lane() {
                 l0a: width,
                 l0b: width,
                 bt: width,
+                smask: width,
             },
             set2d_bandwidths: C220Set2dBandwidths {
                 l0a: width,
@@ -131,6 +132,7 @@ fn mte3_output_and_biu_split_use_independent_captured_modes() {
                 l0a: width,
                 l0b: width,
                 bt: width,
+                smask: width,
             },
             set2d_bandwidths: C220Set2dBandwidths {
                 l0a: width,
@@ -195,6 +197,7 @@ fn fixp_write_runs_on_shared_clock_and_retires_after_contended_response() {
                 l0a: width,
                 l0b: width,
                 bt: width,
+                smask: width,
             },
             set2d_bandwidths: C220Set2dBandwidths {
                 l0a: width,
@@ -304,6 +307,7 @@ fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
                 l0a: width,
                 l0b: width,
                 bt: width,
+                smask: width,
             },
             set2d_bandwidths: C220Set2dBandwidths {
                 l0a: width,
@@ -516,6 +520,7 @@ fn biu_write_waits_for_dbid_and_all_source_packets_before_data_transport() {
                 l0a: width,
                 l0b: width,
                 bt: width,
+                smask: width,
             },
             set2d_bandwidths: C220Set2dBandwidths {
                 l0a: width,
@@ -596,6 +601,7 @@ fn ub_reads_share_vector_banks_and_wait_for_matching_response_tags() {
             l0a: width,
             l0b: width,
             bt: width,
+            smask: width,
         },
         set2d_bandwidths: C220Set2dBandwidths {
             l0a: width,
@@ -736,6 +742,7 @@ fn l1_fill_contends_with_load2d_and_completes_after_write_response() {
             l0a: width,
             l0b: width,
             bt: width,
+            smask: width,
         },
         set2d_bandwidths: C220Set2dBandwidths {
             l0a: width,

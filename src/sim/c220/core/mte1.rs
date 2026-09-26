@@ -112,6 +112,13 @@ impl C220Core {
             Some(C220Mte1Command::Read(
                 C220Mte1ReadTransfer::Load2dTranspose(decoded.capture(registers)),
             ))
+        } else if let Some(decoded) =
+            crate::isa::c220::mte::smask::C220MovSmaskInstruction::decode(word)
+                .filter(|instruction| instruction.source_mode == 2)
+        {
+            Some(C220Mte1Command::Read(C220Mte1ReadTransfer::Smask(
+                decoded.capture(registers),
+            )))
         } else {
             C220MovL1ToBtInstruction::decode(word).map(|decoded| {
                 C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(decoded.capture(registers)))

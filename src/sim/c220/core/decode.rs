@@ -70,6 +70,8 @@ impl C220DecodedWord {
             || crate::isa::c220::mte::load3d::C220Load3dV2Instruction::decode(word).is_some()
             || crate::isa::c220::mte::spr::C220Mte1SprWrite::decode(word).is_some()
             || C220MovL1ToBtInstruction::decode(word).is_some()
+            || crate::isa::c220::mte::smask::C220MovSmaskInstruction::decode(word)
+                .is_some_and(|instruction| instruction.source_mode == 2)
             || C220Set2dInstruction::decode(word)
                 .is_some_and(|instruction| instruction.destination != C220Set2dDestination::L1)
         {

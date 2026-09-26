@@ -1011,6 +1011,7 @@ fn native_mte3_write_path(mode: u8) {
             l0a: width,
             l0b: width,
             bt: width,
+            smask: width,
         },
         set2d_bandwidths: C220Set2dBandwidths {
             l0a: width,

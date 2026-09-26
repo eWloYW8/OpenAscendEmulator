@@ -9,6 +9,9 @@ use crate::isa::c220::mte::load2d::C220Load2dDestination;
 use crate::isa::c220::mte::set2d::C220Set2dDestination;
 use crate::sim::c220::memory::{C220LocalBufferError, C220LocalMemory};
 use crate::sim::c220::mte::set2d::{C220Set2dResult, execute_c220_set2d};
+use crate::sim::c220::mte::smask::{
+    C220SmaskTransferError, C220SmaskTransferResult, execute_c220_mov_l1_to_smask,
+};
 use crate::sim::c220::mte::{C220MtePipeline, C220MtePipelineError};
 use crate::sim::c220::sync::{
     C220HardwareFlagEvent, C220HardwareFlagState, C220HardwareFlagTimingError,
@@ -21,6 +24,8 @@ pub const C220_MTE1_OUTSTANDING_LIMIT: usize = 31;
 
 #[derive(Debug, thiserror::Error)]
 pub enum C220Mte1RuntimeError {
+    #[error(transparent)]
+    Smask(#[from] C220SmaskTransferError),
     #[error(transparent)]
     Load3dv2(#[from] crate::sim::c220::mte::load3d::C220Load3dExecutionError),
     #[error(transparent)]
@@ -41,6 +46,7 @@ pub enum C220Mte1RuntimeError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1TransferResult {
+    Smask(C220SmaskTransferResult),
     HardwareFlag(crate::isa::c220::hflag::C220HardwareFlagStep),
     WriteSpr(crate::sim::common::scalar::ScalarSprStep),
     Load3dv2(crate::sim::c220::mte::load3d::C220Load3dExecutionReport),
@@ -165,6 +171,7 @@ impl Mte1Engine {
                 }
             },
             C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(_)) => Some(C220MatrixMemory::BiasTable),
+            C220Mte1Command::Read(C220Mte1ReadTransfer::Smask(_)) => None,
             C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dSparse(_)) => {
                 Some(C220MatrixMemory::L0b)
             }
@@ -331,6 +338,9 @@ impl Mte1Engine {
                         prepare_c220_mov_l1_to_bt(memory, transfer)?.commit(memory)?,
                     )
                 }
+                C220Mte1Command::Read(C220Mte1ReadTransfer::Smask(transfer)) => {
+                    C220Mte1TransferResult::Smask(execute_c220_mov_l1_to_smask(memory, transfer)?)
+                }
                 C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dTranspose(transfer)) => {
                     let prepared = prepare_c220_load2d_transpose(memory, transfer)?;
                     let result = prepared.result;
@@ -408,6 +418,7 @@ mod tests {
                     l0a: width,
                     l0b: width,
                     bt: width,
+                    smask: width,
                 },
                 set2d_bandwidths: crate::sim::c220::mte::set2d::C220Set2dBandwidths {
                     l0a: width,

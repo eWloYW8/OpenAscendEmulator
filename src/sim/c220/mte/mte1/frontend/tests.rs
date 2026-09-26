@@ -21,6 +21,7 @@ fn nz(value: u32) -> NonZeroU32 {
 fn bandwidths(bt: u32) -> C220Mte1ReadBandwidths {
     C220Mte1ReadBandwidths {
         bt: nz(bt),
+        smask: nz(bt),
         l0a: nz(256),
         l0b: nz(128),
     }
@@ -441,7 +442,9 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
                     }
                 };
                 let (binding, frontend, index) = match kind {
-                    C220Mte1ReadKind::Load3dv2 => unreachable!("not registered in this test"),
+                    C220Mte1ReadKind::Load3dv2 | C220Mte1ReadKind::Smask => {
+                        unreachable!("not registered in this test")
+                    }
                     C220Mte1ReadKind::Load2d => (&load_events, &mut load, 0),
                     C220Mte1ReadKind::Bt => (&bt_events, &mut bt, 1),
                 };

@@ -941,6 +941,7 @@ mod tests {
                 l0a: NonZeroU32::new(256).unwrap(),
                 l0b: NonZeroU32::new(128).unwrap(),
                 bt: NonZeroU32::new(64).unwrap(),
+                smask: NonZeroU32::new(64).unwrap(),
             },
             set2d_bandwidths: crate::sim::c220::mte::set2d::C220Set2dBandwidths {
                 l0a: NonZeroU32::new(64).unwrap(),
@@ -2355,6 +2356,80 @@ mod tests {
                 assert!(core.mte_pipeline().unwrap().is_idle());
             }
         }
+    }
+
+    #[test]
+    fn smask_core_dispatch_reads_l1_and_commits_after_output_completion() {
+        use crate::sim::c220::mte::interface::C220MteL1EventOutcome;
+        use crate::sim::c220::mte::mte1::C220Mte1TransferResult;
+        use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadKind;
+
+        let mut core = matrix_core();
+        core.advance_to(300).unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(10, 511).unwrap();
+        machine.set_xreg(11, 4096).unwrap();
+        machine.set_xreg(12, 2 | (1 << 11)).unwrap();
+        let word = (3 << 29) | (17 << 22) | (10 << 17) | (11 << 12) | (12 << 2) | 2;
+        assert!(matches!(
+            core.step_word_at(301, word).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Mte1Queued(_),
+                ..
+            }
+        ));
+        for register in 10..=12 {
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_xreg(register, 0)
+                .unwrap();
+        }
+        let input: Vec<u8> = (0..260).map(|i| (i % 251) as u8).collect();
+        core.local_memory
+            .l1_mut()
+            .write_known(4096, &input)
+            .unwrap();
+        let mut output_tail = None;
+        let mut retired = None;
+        for tick in 302..380 {
+            core.advance_to(tick).unwrap();
+            for event in core.mte_pipeline().unwrap().last_events() {
+                if let C220MtePipelineEvent::Interface(C220MteL1EventOutcome::Output(output)) =
+                    event
+                    && let Some(sent) = output.sent
+                    && sent.fragment.last_in_instruction
+                {
+                    output_tail = Some(tick);
+                }
+            }
+            if let Some(outcome) = core.last_mte1_outcomes().first() {
+                retired = Some(*outcome);
+                break;
+            }
+            assert_eq!(core.local_memory.smask().read_byte(512), 0);
+        }
+        let retired = retired.expect("SMASK retirement");
+        assert_eq!(retired.retire_tick, output_tail.unwrap() + 6);
+        assert_eq!(
+            core.mte_pipeline().unwrap().selected_generator(),
+            Some(C220Mte1Generator::Read(C220Mte1ReadKind::Smask))
+        );
+        let C220Mte1TransferResult::Smask(result) = retired.result else {
+            panic!("SMASK result")
+        };
+        assert_eq!(result.bytes, 260);
+        assert_eq!(result.first_destination, Some(511));
+        let mut first = [0; 2];
+        core.local_memory
+            .smask()
+            .read_into(511, &mut first)
+            .unwrap();
+        assert_eq!(first, input[..2]);
+        core.local_memory.smask().read_into(1, &mut first).unwrap();
+        assert_eq!(first, input[258..]);
+        assert!(core.pending_mte1_commands().next().is_none());
+        assert!(core.mte_pipeline().unwrap().is_idle());
     }
 
     #[test]

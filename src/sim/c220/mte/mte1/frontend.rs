@@ -8,11 +8,13 @@ use crate::isa::c220::mte::bias::C220BtTransfer;
 use crate::isa::c220::mte::load2d::{C220Load2dDestination, C220Load2dError, C220Load2dTransfer};
 use crate::isa::c220::mte::load2d_sparse::C220Load2dSparseTransfer;
 use crate::isa::c220::mte::load2d_transpose::C220Load2dTransposeTransfer;
+use crate::isa::c220::mte::smask::C220SmaskTransfer;
 use crate::sim::c220::memory::l1::C220L1Access;
 use crate::sim::c220::mte::interface::{
     C220L0WritePort, C220MteL1Error, C220MteL1Interface, C220MteL1OutputDestination,
     C220MteL1ReadOperation, C220MteL1ReadPort, C220MteL1ReadRequest,
 };
+use crate::sim::c220::mte::smask::{C220SmaskReadUop, C220SmaskRequestPlan};
 
 const COMMAND_TICKS: u64 = 1;
 const GENERATED_TICKS: u64 = 3;
@@ -26,10 +28,12 @@ pub enum C220Mte1ReadKind {
     Load3dv2,
     Load2d,
     Bt,
+    Smask,
 }
 
 impl C220Mte1ReadKind {
-    pub(in crate::sim::c220::mte) const ALL: [Self; 3] = [Self::Load3dv2, Self::Load2d, Self::Bt];
+    pub(in crate::sim::c220::mte) const ALL: [Self; 4] =
+        [Self::Load3dv2, Self::Load2d, Self::Bt, Self::Smask];
 
     const fn generated_ticks(self) -> u64 {
         match self {
@@ -50,6 +54,7 @@ impl C220Mte1ReadKind {
             Self::Load3dv2 => 0,
             Self::Load2d => 1,
             Self::Bt => 2,
+            Self::Smask => 3,
         }
     }
 }
@@ -59,6 +64,7 @@ pub struct C220Mte1ReadBandwidths {
     pub l0a: NonZeroU32,
     pub l0b: NonZeroU32,
     pub bt: NonZeroU32,
+    pub smask: NonZeroU32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +74,7 @@ pub enum C220Mte1ReadTransfer {
     Load2dTranspose(C220Load2dTransposeTransfer),
     Load2dSparse(C220Load2dSparseTransfer),
     Bt(C220BtTransfer),
+    Smask(C220SmaskTransfer),
 }
 
 impl C220Mte1ReadTransfer {
@@ -78,6 +85,7 @@ impl C220Mte1ReadTransfer {
             Self::Load2dTranspose(transfer) => transfer.repeat_count() == 0,
             Self::Load2dSparse(transfer) => transfer.repeat_count() == 0,
             Self::Bt(transfer) => transfer.descriptor.is_empty(),
+            Self::Smask(transfer) => transfer.descriptor.is_empty(),
         }
     }
 
@@ -88,6 +96,7 @@ impl C220Mte1ReadTransfer {
                 C220Mte1ReadKind::Load2d
             }
             Self::Bt(_) => C220Mte1ReadKind::Bt,
+            Self::Smask(_) => C220Mte1ReadKind::Smask,
         }
     }
 }
@@ -98,6 +107,7 @@ pub enum C220Mte1ReadUop {
     Sparse(C220SparseReadUop),
     Load2d(C220Load2dReadUop),
     Bt(C220BtReadUop),
+    Smask(C220SmaskReadUop),
 }
 
 impl C220Mte1ReadUop {
@@ -106,6 +116,11 @@ impl C220Mte1ReadUop {
         instruction_id: u64,
         bandwidths: C220Mte1ReadBandwidths,
     ) -> C220MteL1ReadOperation<Self> {
+        if let Self::Smask(uop) = self {
+            return uop
+                .operation(instruction_id, bandwidths.smask)
+                .map_payload(Self::Smask);
+        }
         if let Self::Load3dv2(uop) = self {
             let bandwidth = match uop.logical.destination {
                 crate::isa::c220::mte::load3d::C220Load3dDestination::L0a => bandwidths.l0a,
@@ -125,7 +140,7 @@ impl C220Mte1ReadUop {
             completes_logical_uop,
             last_in_instruction,
         ) = match self {
-            Self::Load3dv2(_) => unreachable!("handled above"),
+            Self::Load3dv2(_) | Self::Smask(_) => unreachable!("handled above"),
             Self::Sparse(uop) => (
                 uop.source_address,
                 uop.input_bytes,
@@ -197,6 +212,7 @@ enum Plan {
     Sparse(C220SparseRequestPlan),
     Load2d(C220Load2dRequestPlan),
     Bt(C220BtRequestPlan),
+    Smask(C220SmaskRequestPlan),
 }
 
 impl Plan {
@@ -206,6 +222,7 @@ impl Plan {
             Self::Sparse(plan) => plan.len() as u64,
             Self::Load2d(plan) => plan.len() as u64,
             Self::Bt(plan) => plan.remaining_requests(),
+            Self::Smask(plan) => plan.len() as u64,
         }
     }
 
@@ -215,6 +232,7 @@ impl Plan {
             Self::Sparse(plan) => plan.next().map(C220Mte1ReadUop::Sparse),
             Self::Load2d(plan) => plan.next().map(C220Mte1ReadUop::Load2d),
             Self::Bt(plan) => plan.next().map(C220Mte1ReadUop::Bt),
+            Self::Smask(plan) => plan.next().map(C220Mte1ReadUop::Smask),
         }
     }
 }
@@ -272,6 +290,8 @@ pub struct C220Mte1ReadFrontendCycle {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220Mte1ReadFrontendError {
+    #[error("SMASK source mode {0} is not supported by the L1 generator")]
+    SmaskSource(u8),
     #[error(transparent)]
     Load3dv2(#[from] crate::sim::c220::mte::load3d::C220Load3dRequestError),
     #[error("MTE1 read generator cannot accept a command")]
@@ -293,7 +313,7 @@ pub enum C220Mte1ReadFrontendError {
     Interface(#[from] C220MteL1Error),
 }
 
-/// One generation engine. LOAD3Dv2, LOAD2D (including transpose), and BT use
+/// One generation engine. LOAD3Dv2, LOAD2D (including transpose), BT, and SMASK use
 /// separate instances with their own queue delays and capacities, but feed the
 /// same L1 interface and input port. The caller chooses
 /// producer callback order explicitly; this type does not invent cross-engine
@@ -374,6 +394,11 @@ impl C220Mte1ReadFrontend {
             return Err(C220Mte1ReadFrontendError::CommandBusy);
         }
         let plan = match transfer {
+            C220Mte1ReadTransfer::Smask(transfer) => Plan::Smask(
+                C220SmaskRequestPlan::new(transfer, self.access_width).map_err(|_| {
+                    C220Mte1ReadFrontendError::SmaskSource(transfer.instruction.source_mode)
+                })?,
+            ),
             C220Mte1ReadTransfer::Load3dv2(command) => {
                 Plan::Load3dv2(command.physical_reads(self.access_width)?.collect())
             }

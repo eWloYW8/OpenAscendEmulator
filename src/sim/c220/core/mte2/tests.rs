@@ -67,6 +67,7 @@ fn configured_dma_core() -> C220Core {
             l0a: width,
             l0b: width,
             bt: width,
+            smask: width,
         },
         set2d_bandwidths: C220Set2dBandwidths {
             l0a: width,
