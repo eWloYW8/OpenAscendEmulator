@@ -22,6 +22,13 @@ fn gather_blocks_prefetch_index_windows_across_the_full_repeat_range() {
             .unwrap();
         ub.write_states(0, &[MemoryByteState::Known(73); 32])
             .unwrap();
+        if repeats == 9 {
+            ub.write_states(
+                1024 + 4 * 32,
+                &1280_u32.to_le_bytes().map(MemoryByteState::Known),
+            )
+            .unwrap();
+        }
         let instruction = C220VectorInstruction::Gather(
             plan_c220_gather_issue(
                 0,
@@ -83,9 +90,13 @@ fn gather_blocks_prefetch_index_windows_across_the_full_repeat_range() {
                 assert!(release.conflict_check_tick >= grant + 10);
             }
         }
+        let mut expected = vec![73; repeats * 256];
+        if repeats == 9 {
+            expected[4 * 256..4 * 256 + 32].fill(0);
+        }
         assert_eq!(
             core.ub().read_known(32768, repeats * 256).unwrap(),
-            vec![73; repeats * 256]
+            expected
         );
         assert_eq!(pipeline.pending_uops(), 0);
         assert!(pipeline.index_prefetch_ready.is_empty());
@@ -102,17 +113,16 @@ fn gather_completion_uses_live_indices_and_sequential_data_feedback() {
         (0x8000_004a, 4, 64),
         (0x8000_0043, 32, 8),
     ] {
-        let base = if width == 32 { 32 } else { 0 };
+        let base = 32;
         let mut bytes = vec![0_u8; 4096];
         for (index, byte) in bytes[..512].iter_mut().enumerate() {
             *byte = (index * 19) as u8;
         }
-        if width == 32 {
-            for repeat in 0..2 {
-                for lane in 0..count {
-                    let offset = 1024 + (repeat * count + lane) * 4;
-                    bytes[offset..offset + 4].copy_from_slice(&(lane as u32 * 32).to_le_bytes());
-                }
+        for repeat in 0..2 {
+            for lane in 0..count {
+                let offset = 1024 + (repeat * count + lane) * 4;
+                let stride = if width == 32 { 32 } else { 4 };
+                bytes[offset..offset + 4].copy_from_slice(&(lane as u32 * stride).to_le_bytes());
             }
         }
         let mut ub = UbMemory::new(4096, 4096);
@@ -207,6 +217,26 @@ fn gather_completion_uses_live_indices_and_sequential_data_feedback() {
                         .map(|access| access.address)
                         .collect::<Vec<_>>(),
                     (0..8).map(|lane| lane * 32).collect::<Vec<_>>()
+                );
+            }
+        } else {
+            for sample in pipeline
+                .last_read_samples()
+                .iter()
+                .filter(|sample| sample.lane_group.is_some())
+            {
+                let first = usize::from(sample.lane_group.unwrap()) * 16;
+                assert_eq!(sample.read0_grants.len(), 8);
+                assert_eq!(sample.read1_grants.len(), 8);
+                assert_eq!(
+                    sample
+                        .accesses
+                        .iter()
+                        .map(|access| access.address)
+                        .collect::<Vec<_>>(),
+                    (first..first + 16)
+                        .map(|lane| lane as u64 * 4)
+                        .collect::<Vec<_>>()
                 );
             }
         }

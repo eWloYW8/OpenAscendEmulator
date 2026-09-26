@@ -645,6 +645,25 @@ impl PendingVectorRead {
             }
         ];
         let (port0, port1, destination_port) = match &operation {
+            C220VectorReadOperation::GatherData { issue, .. }
+                if matches!(
+                    issue.instruction.kind,
+                    crate::isa::c220::vector::gather::C220GatherKind::Blocks
+                ) =>
+            {
+                let data = accesses
+                    .iter()
+                    .copied()
+                    .filter(|access| access.source_index == 0)
+                    .collect::<Vec<_>>();
+                let prefetch = accesses
+                    .iter()
+                    .copied()
+                    .filter(|access| access.source_index == 1)
+                    .collect::<Vec<_>>();
+                let (port0, _) = ReadPort::routed_pair(&data, [0, 0, 0])?;
+                (port0, ReadPort::new(&prefetch)?, ReadPort::new(&[])?)
+            }
             C220VectorReadOperation::GatherData { .. } => {
                 let (port0, port1) = ReadPort::routed_pair(&accesses, [0, 1, 1])?;
                 (port0, port1, ReadPort::new(&[])?)

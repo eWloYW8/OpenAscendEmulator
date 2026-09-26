@@ -119,6 +119,15 @@ impl C220GatherIssue {
         repeat_index: usize,
         group: u8,
     ) -> Result<Vec<C220VectorReadAccess>, C220VectorError> {
+        self.data_accesses(repeat_index, group, true)
+    }
+
+    fn data_accesses(
+        &self,
+        repeat_index: usize,
+        group: u8,
+        add_base: bool,
+    ) -> Result<Vec<C220VectorReadAccess>, C220VectorError> {
         let indices = self
             .indices
             .get(repeat_index)
@@ -140,7 +149,11 @@ impl C220GatherIssue {
                     if mask[lane / 64] & (1_u64 << (lane % 64)) == 0 {
                         continue;
                     }
-                    let address = u64::from(self.control.base_offset.wrapping_add(indices[lane]));
+                    let address = u64::from(if add_base {
+                        self.control.base_offset.wrapping_add(indices[lane])
+                    } else {
+                        indices[lane]
+                    });
                     accesses.push(C220VectorReadAccess {
                         source_index: (local_lane / ELEMENTS_PER_READ_PORT) as u8,
                         block_index: ((local_lane % ELEMENTS_PER_READ_PORT)
@@ -182,7 +195,7 @@ impl C220GatherIssue {
         group: u8,
     ) -> Result<Vec<C220VectorReadAccess>, C220VectorError> {
         if !matches!(self.instruction.kind, C220GatherKind::Blocks) {
-            return self.data_read_accesses(repeat_index, group);
+            return self.data_accesses(repeat_index, group, false);
         }
         if group != 0 {
             return Err(C220VectorError::InvalidLaneGroup(group));
