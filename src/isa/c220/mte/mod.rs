@@ -55,9 +55,9 @@ impl C220MovInstruction {
         if (word >> 29) != 3 || ((word >> 27) & 3) != 2 {
             return None;
         }
-        let direction = match (((word >> 23) & 0xf), word & 0x7f) {
-            (2, 0x08) => C220MovDirection::HbmToUb,
-            (1, 0x10 | 0x11) => C220MovDirection::UbToHbm,
+        let direction = match ((word >> 23) & 0xf, (word >> 3) & 0xf) {
+            (2, 1) => C220MovDirection::HbmToUb,
+            (1, 2) => C220MovDirection::UbToHbm,
             _ => return None,
         };
         Some(Self {
@@ -330,6 +330,45 @@ impl C220DmaMovDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dma_encoding_aliases_preserve_registers_and_transfer_modes() {
+        let input_word = CAPTURED_C220_MOV_OUT_TO_UB_X_WORD;
+        let output_word = CAPTURED_C220_MOV_UB_TO_OUT_WORD;
+        let xm = (3_u64 << 48) | (1 << 32) | (2 << 16) | (2 << 4);
+        let input = C220MovOutToUbDescriptor::decode(input_word, xm).unwrap();
+        for extra in [0, 1 << 22] {
+            for low_bits in 0..8 {
+                let input_alias = input_word | extra | low_bits;
+                let output_alias = output_word | extra | low_bits;
+                for (base, alias) in [(input_word, input_alias), (output_word, output_alias)] {
+                    let decoded = C220MovInstruction::decode(base).unwrap();
+                    assert_eq!(
+                        C220MovInstruction::decode(alias),
+                        Some(C220MovInstruction {
+                            word: alias,
+                            ..decoded
+                        })
+                    );
+                    assert_eq!(read_register_mask(alias), read_register_mask(base));
+                }
+                assert_eq!(
+                    C220MovOutToUbDescriptor::decode(input_alias, xm)
+                        .unwrap()
+                        .segments(0x1000, 0x80),
+                    input.segments(0x1000, 0x80)
+                );
+                let output = C220DmaMovDescriptor::decode(output_alias, xm).unwrap();
+                let canonical =
+                    C220DmaMovDescriptor::decode(output_word | (low_bits & 1), xm).unwrap();
+                assert_eq!(output.byte_mode(), low_bits & 1 != 0);
+                assert_eq!(
+                    output.segments(0x80, 0x2000),
+                    canonical.segments(0x80, 0x2000)
+                );
+            }
+        }
+    }
 
     #[test]
     fn captured_descriptor_predicts_four_live_coordinates() {
