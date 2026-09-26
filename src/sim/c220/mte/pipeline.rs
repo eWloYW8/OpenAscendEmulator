@@ -107,6 +107,7 @@ enum Callback {
     Mte1CommandProbe,
     Mte1CommandDispatch,
     FixpExternal(usize, C220FixpCallback),
+    L1Output(usize, C220FixpCallback),
     Fixp(usize, C220FixpCallback),
     FixpWrite(C220FixpL1WriteCallback),
     Memory(C220L1Callback),
@@ -129,6 +130,7 @@ enum Callback {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220MtePipelineEvent {
+    L1Output(super::l1_to_out::C220L1OutputEvent),
     Nd2Nz(C220Nd2NzEvent),
     FixpExternal(C220FixpRuntimeEvent),
     FixpExternalStored {
@@ -210,6 +212,14 @@ pub enum C220MtePipelineError {
     FixpBindingBusy,
     #[error("FIX event binding and execution context must both be present")]
     FixpContextMismatch,
+    #[error(
+        "L1 output stages require an idle Cube pipeline, a BIU connection and five distinct stages"
+    )]
+    InvalidL1OutputBinding,
+    #[error("L1 output event binding and execution context must both be present")]
+    L1OutputContextMismatch,
+    #[error(transparent)]
+    L1Output(#[from] super::l1_to_out::C220L1OutputEngineError),
     #[error(transparent)]
     FixpEngine(#[from] super::fixp::C220FixpEngineError),
     #[error(transparent)]
@@ -310,6 +320,7 @@ enum Mte2Generator {
 
 mod cache;
 mod external_fixp;
+mod l1_output;
 mod load2d;
 mod memory;
 mod nd2nz;
@@ -321,6 +332,7 @@ mod sync;
 pub enum C220MteReadPayload {
     Read(C220MteReadUop),
     Factor(super::factor::C220FactorReadPacket),
+    L1Output(super::l1_to_out::C220L1OutputRead),
 }
 #[cfg(test)]
 mod tests;
@@ -336,6 +348,9 @@ pub struct C220MtePipeline {
     nd2nz_events: C220Nd2NzEvents,
     fixp_events: Vec<C220FixpStageEvents>,
     external_fixp_events: Vec<C220FixpStageEvents<C220FixpRuntimeStage>>,
+    l1_output_events: Vec<C220FixpStageEvents<super::l1_to_out::C220L1OutputStage>>,
+    l1_output_active: std::collections::BTreeSet<u64>,
+    l1_output_responses: std::collections::VecDeque<C220BiuWriteResponse>,
     fixp_write: C220FixpL1WriteInterface,
     fixp_write_events: C220FixpL1WriteEvents,
     fixp_completions: Vec<u64>,
@@ -590,6 +605,9 @@ impl C220MtePipeline {
             nd2nz: None,
             nd2nz_events,
             external_fixp_events: Vec::new(),
+            l1_output_events: Vec::new(),
+            l1_output_active: Default::default(),
+            l1_output_responses: Default::default(),
             fixp_write: C220FixpL1WriteInterface::default(),
             fixp_write_events,
             fixp_completions: Vec::new(),
@@ -713,7 +731,9 @@ impl C220MtePipeline {
         self.selected_generator
     }
     pub fn is_idle(&self) -> bool {
-        self.fixp_command_ready.is_none()
+        self.l1_output_active.is_empty()
+            && self.l1_output_responses.is_empty()
+            && self.fixp_command_ready.is_none()
             && self.mte1_command_ready.is_none()
             && self.fixp_issue_ready.is_none()
             && self.mte1_issue_ready.is_none()
@@ -1338,7 +1358,7 @@ impl C220MtePipeline {
     /// The owner supplies every active clock tick and consumes completions
     /// before advancing again. Idle intervals may be skipped.
     pub fn advance(&mut self, tick: u64) -> Result<(), C220MtePipelineError> {
-        self.advance_inner(tick, None, None)
+        self.advance_inner(tick, None, None, None)
     }
 
     pub fn advance_fixp(
@@ -1348,7 +1368,7 @@ impl C220MtePipeline {
         memory: C220FixpMemory<'_>,
         mut gates: impl C220FixpSync,
     ) -> Result<(), C220MtePipelineError> {
-        self.advance_inner(tick, Some((engine, memory, &mut gates)), None)
+        self.advance_inner(tick, Some((engine, memory, &mut gates)), None, None)
     }
 
     fn advance_inner(
@@ -1364,7 +1384,11 @@ impl C220MtePipeline {
             C220FixpRuntimeMemory<'_>,
             &mut dyn C220FixpSync,
         )>,
+        mut l1_output: Option<&mut super::l1_to_out::C220L1OutputEngine>,
     ) -> Result<(), C220MtePipelineError> {
+        if self.l1_output_events.is_empty() == l1_output.is_some() {
+            return Err(C220MtePipelineError::L1OutputContextMismatch);
+        }
         if self.fixp_events.is_empty() == fixp.is_some()
             || self.external_fixp_events.is_empty() == external_fixp.is_some()
         {
@@ -1447,6 +1471,9 @@ impl C220MtePipeline {
                 memory.advance(tick)?;
             }
             self.advance_biu_bus_returns(tick)?;
+            if let Some(engine) = l1_output.as_deref_mut() {
+                self.complete_l1_output_responses(engine)?;
+            }
             if let Some((engine, _, _)) = external_fixp.as_mut() {
                 for &id in &self.fixp_completions {
                     engine.complete_write_transport(tick, id)?;
@@ -1458,6 +1485,15 @@ impl C220MtePipeline {
         }
         while let Some(invocation) = self.events.next_callback() {
             match invocation.callback {
+                Callback::L1Output(index, phase) => {
+                    self.handle_l1_output(
+                        index,
+                        phase,
+                        l1_output
+                            .as_deref_mut()
+                            .expect("validated L1 output context"),
+                    )?;
+                }
                 Callback::FixpIssueProbe => {
                     if self.fixp_issue_ready.is_some_and(|ready| ready <= tick) {
                         self.events.notify_at(self.fixp_issue_valid, tick);
@@ -1878,6 +1914,11 @@ impl C220MtePipeline {
                     }
                 }
                 Callback::Interface(phase) => {
+                    let external = if phase == C220MteL1Callback::SendOutput {
+                        self.forward_l1_output_source(tick, l1_output.as_deref_mut())?
+                    } else {
+                        false
+                    };
                     let response = self
                         .memory
                         .responses(C220L1Port::MteRead)
@@ -1888,7 +1929,7 @@ impl C220MtePipeline {
                         request_ready: self.memory.request_ready(C220L1Port::MteRead),
                         response,
                         output_credits: C220MteL1OutputCredits {
-                            external: false,
+                            external,
                             l0a: [self.l0[0].can_push(C220L0WritePort::Port0), false, false],
                             l0b: [self.l0[1].can_push(C220L0WritePort::Port0), false, false],
                         },
@@ -1959,6 +2000,9 @@ impl C220MtePipeline {
                                         )?;
                                     }
                                     self.fixp_completions.push(output.fragment.instruction_id)
+                                }
+                                C220MteReadPayload::L1Output(_) => {
+                                    unreachable!("external L1 output has no local retirement")
                                 }
                             }
                         }

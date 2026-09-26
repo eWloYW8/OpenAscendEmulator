@@ -117,7 +117,12 @@ impl C220MtePipeline {
         if data.subcore == C220BiuSubcore::Cube {
             self.biu_cube_source
                 .release_response(self.events.tick(), tag)?;
-            if data.source.request.last_in_instruction {
+            if self
+                .l1_output_active
+                .contains(&data.source.request.instruction_id)
+            {
+                self.l1_output_responses.push_back(response);
+            } else if data.source.request.last_in_instruction {
                 self.fixp_completions
                     .push(data.source.request.instruction_id);
             }

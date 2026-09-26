@@ -6,6 +6,149 @@ use crate::sim::c220::mte::read::C220MteReadTransfer;
 use std::collections::BTreeMap;
 
 #[test]
+fn l1_output_uses_shared_events_and_keeps_external_retirement_separate() {
+    use crate::isa::c220::mte::l1_to_out::{C220MovL1ToOutInstruction, C220MovL1ToOutTransfer};
+    use crate::sim::c220::mte::fixp::C220FixpAdmission;
+    use crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteConfig;
+    use crate::sim::c220::mte::l1_to_out::{
+        C220L1OutputCommand, C220L1OutputEngine, C220L1OutputEngineConfig, C220L1OutputEvent,
+        C220L1OutputStage::*,
+    };
+    let width = NonZeroU32::new(32).unwrap();
+    let mut pipeline = C220MtePipeline::new(
+        0,
+        C220MtePipelineConfig {
+            core_kind: crate::sim::c220::device::C220CoreKind::Cube,
+            l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
+            read_width: width,
+            output_bandwidths: C220MteReadBandwidths {
+                l0a: width,
+                l0b: width,
+                bt: width,
+                smask: width,
+            },
+            set2d_bandwidths: C220Set2dBandwidths {
+                l0a: width,
+                l0b: width,
+                l1: width,
+            },
+        },
+    );
+    pipeline
+        .connect_fixp_biu(C220BiuWriteConfig {
+            outstanding: NonZeroU32::new(1).unwrap(),
+            weights: [1; 3],
+            source_bandwidth: width,
+        })
+        .unwrap();
+    pipeline
+        .bind_l1_output_stages(&[GenerateRead, SendRead, Packetize, GenerateWrite, SendWrite])
+        .unwrap();
+    let mut engine = C220L1OutputEngine::new(C220L1OutputEngineConfig {
+        read_bandwidth: width,
+        instruction_fifo_depth: 1,
+        write_outstanding_limit: 1,
+    });
+    let instruction =
+        C220MovL1ToOutInstruction::decode((3 << 29) | (2 << 27) | (4 << 23) | (2 << 3)).unwrap();
+    let command = C220L1OutputCommand {
+        transfer: C220MovL1ToOutTransfer {
+            instruction,
+            source_address: 0,
+            destination_address: 4096,
+            xm: (1 << 4) | (32 << 16),
+        },
+        control: 0,
+        mode: crate::sim::c220::mte::uop::C220DmaUopMode::Wide512,
+    };
+    assert_eq!(
+        pipeline.admit_l1_output(&mut engine, 91, command).unwrap(),
+        C220FixpAdmission::Active
+    );
+    assert!(matches!(
+        pipeline.advance(1),
+        Err(C220MtePipelineError::L1OutputContextMismatch)
+    ));
+    let mut read_responses = 0;
+    let mut writes = Vec::new();
+    let mut delayed = None;
+    let mut final_response = None;
+    let mut source_completion = None;
+    let mut write_completion = None;
+    for tick in 1..=300 {
+        pipeline.advance_l1_output(tick, &mut engine).unwrap();
+        for event in &pipeline.trace {
+            match event {
+                C220MtePipelineEvent::Interface(C220MteL1EventOutcome::Response(Some(_))) => {
+                    read_responses += 1
+                }
+                C220MtePipelineEvent::L1Output(C220L1OutputEvent::SourceCompleted {
+                    tick,
+                    instruction_id,
+                }) => {
+                    assert_eq!(*instruction_id, 91);
+                    assert!(source_completion.replace(*tick).is_none());
+                }
+                C220MtePipelineEvent::L1Output(C220L1OutputEvent::WriteCompleted {
+                    tick,
+                    instruction_id,
+                }) => {
+                    assert_eq!(*instruction_id, 91);
+                    assert!(write_completion.replace(*tick).is_none());
+                }
+                _ => {}
+            }
+        }
+        assert!(pipeline.fixp_completions().is_empty());
+        assert!(pipeline.mte1_completions().is_empty());
+        if let Some(transfer) = pipeline.take_biu_write_command().unwrap() {
+            let request = transfer.command;
+            writes.push(request.input.generated.request);
+            pipeline
+                .receive_biu_write_dbid(C220BiuSubcore::Cube, request.tag)
+                .unwrap();
+        }
+        if let Some(data) = pipeline.take_biu_write_data().unwrap() {
+            assert!(delayed.is_none());
+            delayed = Some((tick + 12, data));
+        }
+        if let Some((ready, data)) = delayed
+            && tick >= ready
+        {
+            let response = pipeline
+                .receive_biu_write_response(data.source.request.tag)
+                .unwrap();
+            if response.retired_instruction().is_some() {
+                final_response = Some(tick);
+            }
+            delayed = None;
+        }
+        if engine.commands()[&91].response_tick.is_some() {
+            break;
+        }
+        assert!(pipeline.retire_l1_output(&mut engine, 91).is_err());
+    }
+    assert_eq!(read_responses, 32);
+    assert_eq!(writes.len(), 2);
+    assert_eq!(
+        (writes[0].destination_address, writes[0].bytes),
+        (4096, 512)
+    );
+    assert_eq!(
+        (writes[1].destination_address, writes[1].bytes),
+        (4608, 512)
+    );
+    let state = pipeline.retire_l1_output(&mut engine, 91).unwrap();
+    assert_eq!(state.source_completed_tick, source_completion);
+    assert_eq!(state.response_tick, final_response);
+    assert_eq!(write_completion, final_response);
+    assert!(state.source_completed_tick.unwrap() < state.write_dispatched_tick.unwrap());
+    assert!(state.write_dispatched_tick.unwrap() < state.response_tick.unwrap());
+    assert!(pipeline.is_idle());
+    assert!(engine.is_idle());
+}
+
+#[test]
 fn factor_reads_share_l1_and_complete_on_fix_lane() {
     use crate::isa::c220::mte::factor::{C220FactorDescriptor, C220FactorLoad, C220FactorSource};
     use crate::sim::c220::memory::{C220L0c, C220LocalBuffer};

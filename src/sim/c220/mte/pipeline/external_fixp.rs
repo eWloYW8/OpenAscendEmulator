@@ -99,7 +99,7 @@ impl C220MtePipeline {
         memory: C220FixpRuntimeMemory<'_>,
         mut gates: impl C220FixpSync,
     ) -> Result<(), C220MtePipelineError> {
-        self.advance_inner(tick, None, Some((engine, memory, &mut gates)))
+        self.advance_inner(tick, None, Some((engine, memory, &mut gates)), None)
     }
 
     pub(super) fn handle_external_fixp(
