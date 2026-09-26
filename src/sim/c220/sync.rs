@@ -4,6 +4,8 @@ mod cross_core;
 pub use cross_core::{C220CrossCoreReception, C220DeviceSync};
 mod device_flags;
 pub use device_flags::{C220DeviceFlagDelivery, C220DeviceFlagState};
+mod cube;
+pub use cube::{C220CubeFlagCheckpoint, C220CubeFlagStages};
 
 use thiserror::Error;
 
@@ -71,7 +73,7 @@ struct C220PendingHardwareFlag {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct C220QueuedHardwareWait {
+struct C220QueuedCubeFlag {
     instruction_id: u64,
     step: C220HardwareFlagStep,
 }
@@ -89,7 +91,9 @@ pub struct C220HardwareFlagState {
     pending_sets: Vec<C220PendingHardwareFlag>,
     // The delivery process runs at most once per tick, across all notifications.
     notifications: BTreeSet<u64>,
-    cube_waits: VecDeque<C220QueuedHardwareWait>,
+    cube_waits: VecDeque<C220QueuedCubeFlag>,
+    cube_sets: [VecDeque<C220QueuedCubeFlag>; 3],
+    cube_checkpoints: [VecDeque<cube::Checkpoint>; 4],
     mte_flags: Vec<C220QueuedMteFlag>,
     saturated_sets: u64,
 }
@@ -173,11 +177,13 @@ impl C220HardwareFlagState {
                 previous: self.now,
             });
         }
-        while let Some(&notification) = self.notifications.first()
+        while let Some(notification) = self.next_notification_tick()
             && notification <= tick
         {
-            self.notifications.pop_first();
-            self.deliver_at(notification);
+            if self.notifications.remove(&notification) {
+                self.deliver_at(notification);
+            }
+            self.advance_cube_checkpoints(notification)?;
         }
         self.now = tick;
         Ok(())
@@ -263,7 +269,16 @@ impl C220HardwareFlagState {
     }
 
     pub fn next_notification_tick(&self) -> Option<u64> {
-        self.notifications.first().copied()
+        self.notifications
+            .first()
+            .copied()
+            .into_iter()
+            .chain(
+                self.cube_checkpoints
+                    .iter()
+                    .filter_map(|queue| queue.front().map(|head| head.tick)),
+            )
+            .min()
     }
 
     pub fn pending_deliveries(&self) -> impl Iterator<Item = C220HardwareFlagDelivery> + '_ {
@@ -306,7 +321,7 @@ impl C220HardwareFlagState {
         {
             return Err(C220HardwareFlagTimingError::InstructionOrder);
         }
-        self.cube_waits.push_back(C220QueuedHardwareWait {
+        self.cube_waits.push_back(C220QueuedCubeFlag {
             instruction_id,
             step,
         });
@@ -357,12 +372,15 @@ impl C220HardwareFlagState {
         self.cube_waits.len()
     }
 
-    pub fn has_pending_cube_wait(&self, step: C220HardwareFlagStep) -> bool {
-        self.cube_waits.iter().any(|pending| {
-            pending.step.instruction.source_pipe == step.instruction.source_pipe
-                && C220HardwareFlagKey::from_step(pending.step)
-                    == C220HardwareFlagKey::from_step(step)
-        })
+    pub fn has_pending_cube_flag(&self, step: C220HardwareFlagStep) -> bool {
+        self.cube_waits
+            .iter()
+            .chain(self.cube_sets.iter().flatten())
+            .any(|pending| {
+                pending.step.instruction.source_pipe == step.instruction.source_pipe
+                    && C220HardwareFlagKey::from_step(pending.step)
+                        == C220HardwareFlagKey::from_step(step)
+            })
     }
 
     pub fn wait_ready_tick(

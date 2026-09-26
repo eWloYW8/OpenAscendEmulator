@@ -823,6 +823,96 @@ mod tests {
     }
 
     #[test]
+    fn cube_deferred_signals_follow_uop_checkpoints() {
+        use crate::isa::c220::hflag::C220MatrixMemory;
+        let mut core = matrix_core();
+        core.advance_to(300).unwrap();
+        let flags = [
+            (1, C220MatrixMemory::L0a, 3, 5),
+            (2, C220MatrixMemory::L0b, 3, 5),
+            (5, C220MatrixMemory::BiasTable, 3, 4),
+            (3, C220MatrixMemory::L0c, 10, 16),
+        ];
+        let mut words = Vec::new();
+        for (index, &(code, _, destination, _)) in flags.iter().enumerate() {
+            let word = (2 << 29)
+                | (15 << 21)
+                | (code << 15)
+                | ((destination >> 3) << 14)
+                | (2 << 10)
+                | ((destination & 7) << 7);
+            words.push(word);
+            assert!(matches!(
+                core.step_word_at(301 + index as u64, word).unwrap(),
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::HardwareFlag {
+                        token_ready_tick: None,
+                        ..
+                    },
+                    ..
+                }
+            ));
+        }
+        let pc = core.state.scalar().pc();
+        assert!(matches!(
+            core.step_word_at(305, words[0] | (1 << 19)).unwrap(),
+            C220CoreStep::Stalled(_)
+        ));
+        assert_eq!(core.state.scalar().pc(), pc);
+        for (register, value) in [
+            (0, 4096),
+            (1, 0),
+            (2, 0),
+            (3, 32 | (32 << 12) | (16 << 24) | (1 << 62) | (1 << 63)),
+        ] {
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_xreg(register, value)
+                .unwrap();
+        }
+        core.local_memory
+            .l0a_mut()
+            .write_known(0, &0x3c00_u16.to_le_bytes().repeat(1024))
+            .unwrap();
+        core.local_memory
+            .l0b_mut()
+            .write_known(0, &0x3c00_u16.to_le_bytes().repeat(512))
+            .unwrap();
+        let word = (7 << 29) | (3 << 22) | (1 << 12) | (2 << 7) | (3 << 2);
+        let C220CoreStep::Executed {
+            instruction: C220CoreInstruction::Cube(issue),
+            ..
+        } = core.step_word_at(306, word).unwrap()
+        else {
+            panic!("Cube admission")
+        };
+        assert_eq!(issue.ticket.bias_checkpoint_uop, Some(1));
+        let mut releases = Vec::new();
+        for tick in 307..350 {
+            core.advance_to(tick).unwrap();
+            releases.extend_from_slice(core.cube.pipeline.last_uop_releases());
+            for &(_, memory, destination, delay) in &flags {
+                let checkpoint = if memory == C220MatrixMemory::BiasTable {
+                    1
+                } else {
+                    3
+                };
+                let visible = releases
+                    .get(checkpoint)
+                    .is_some_and(|release| tick >= release.issue_tick + delay);
+                assert_eq!(
+                    core.hardware_flags.count(destination as u8, memory, 0),
+                    u8::from(visible)
+                );
+            }
+        }
+        assert_eq!(releases.len(), 4);
+        assert_eq!(core.hardware_flags.pending_cube_set_count(), 0);
+        assert_eq!(core.hardware_flags.pending_cube_checkpoints().count(), 0);
+    }
+
+    #[test]
     fn cube_triggered_signals_reach_mte_and_fix_destinations() {
         use crate::isa::c220::hflag::C220MatrixMemory;
         use crate::sim::c220::memory::C220LocalBuffer;

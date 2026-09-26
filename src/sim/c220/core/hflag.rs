@@ -16,30 +16,38 @@ impl C220Core {
     ) -> Result<C220CoreStep, C220CoreError> {
         let step = instruction.resolve(pc, self.state.scalar().machine().xregs())?;
         let result = if instruction.operation == C220HardwareFlagOperation::Set {
-            if !instruction.trigger {
-                return Err(C220CoreError::UnsupportedHardwareFlagCheckpoint {
-                    source_pipe: instruction.source_pipe,
-                    memory: instruction.memory,
-                });
+            if self.hardware_flags.has_pending_cube_flag(step) {
+                return Ok(C220CoreStep::Stalled(C220Stall {
+                    tick,
+                    pc,
+                    resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+                    cause: C220StallCause::HardwareFlagDependency,
+                }));
             }
-            let ready = match self.hardware_flags.schedule_set(step, tick) {
-                Ok(ready) => ready,
-                Err(C220HardwareFlagTimingError::AlmostFull { .. }) => {
-                    return Ok(C220CoreStep::Stalled(C220Stall {
-                        tick,
-                        pc,
-                        resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
-                        cause: C220StallCause::HardwareFlagDependency,
-                    }));
+            let ready = if !instruction.trigger {
+                self.hardware_flags
+                    .enqueue_cube_set(self.next_instruction_id, step)?;
+                None
+            } else {
+                match self.hardware_flags.schedule_set(step, tick) {
+                    Ok(ready) => Some(ready),
+                    Err(C220HardwareFlagTimingError::AlmostFull { .. }) => {
+                        return Ok(C220CoreStep::Stalled(C220Stall {
+                            tick,
+                            pc,
+                            resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+                            cause: C220StallCause::HardwareFlagDependency,
+                        }));
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) => return Err(error.into()),
             };
             C220CoreStep::Executed {
                 tick,
                 instruction: C220CoreInstruction::HardwareFlag {
                     instruction_id: self.next_instruction_id,
                     step,
-                    token_ready_tick: Some(ready),
+                    token_ready_tick: ready,
                 },
             }
         } else {
@@ -59,7 +67,7 @@ impl C220Core {
     ) -> Result<C220CoreStep, C220CoreError> {
         self.hardware_flags.advance_to(tick)?;
         let retry = tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?;
-        let blocked = if self.hardware_flags.has_pending_cube_wait(step) {
+        let blocked = if self.hardware_flags.has_pending_cube_flag(step) {
             Some(retry)
         } else if step.instruction.trigger {
             match self.hardware_flags.wait_ready_tick(step)? {

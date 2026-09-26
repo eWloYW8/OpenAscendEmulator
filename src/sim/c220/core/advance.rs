@@ -22,6 +22,7 @@ impl C220Core {
                 .pipeline
                 .next_event_tick()
                 .into_iter()
+                .chain(self.hardware_flags.next_notification_tick())
                 .chain(self.mte1.next_event_tick())
                 .chain(self.lsu.as_ref().and_then(|lsu| lsu.next_tick))
                 .chain(self.mte2.next_event_tick())
@@ -40,6 +41,7 @@ impl C220Core {
                 }))
                 .min()
                 .map_or(tick, |next| next.min(tick));
+            self.hardware_flags.advance_to(event_tick)?;
             let previous_mte1_outcomes = self.mte1.outcomes.len();
             self.mte1.commit_ready_at(
                 event_tick,

@@ -11,7 +11,9 @@ use crate::sim::c220::cube::uop::{C220CubeUop, C220CubeUopRelease};
 use crate::sim::c220::memory::{
     C220L0c, C220L0cError, C220L0cMaster, C220L0cUnitFlagBlock, C220L0cWritePortBlock,
 };
-use crate::sim::c220::sync::{C220HardwareFlagState, C220HardwareFlagTimingError};
+use crate::sim::c220::sync::{
+    C220CubeFlagCheckpoint, C220CubeFlagStages, C220HardwareFlagState, C220HardwareFlagTimingError,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220CubeFsmVersion {
@@ -33,6 +35,7 @@ pub struct C220CubeConfig {
     pub fsm_version: C220CubeFsmVersion,
     pub v1_n2_mode: bool,
     pub v1_m_priority: bool,
+    pub flag_stages: C220CubeFlagStages,
 }
 
 impl Default for C220CubeConfig {
@@ -44,6 +47,7 @@ impl Default for C220CubeConfig {
             fsm_version: C220CubeFsmVersion::V1,
             v1_n2_mode: false,
             v1_m_priority: false,
+            flag_stages: C220CubeFlagStages::default(),
         }
     }
 }
@@ -66,6 +70,8 @@ pub struct C220CubeTicket {
     pub v1_n2_mode: bool,
     pub v1_frame_order: C220CubeV1FrameOrder,
     pub v1_dtype_bubbles_per_uop: u8,
+    pub bias_checkpoint_uop: Option<u64>,
+    pub unit_flag_sync: bool,
 }
 
 /// Mutually exclusive reasons for cycles added by runtime backpressure.
@@ -293,7 +299,14 @@ impl C220CubePipeline {
                 previous: self.now,
             });
         }
-        while let Some(event_tick) = self.next_event_tick().filter(|&next| next <= tick) {
+        while let Some(event_tick) = self
+            .next_event_tick()
+            .into_iter()
+            .chain(hardware_flags.next_notification_tick())
+            .min()
+            .filter(|&next| next <= tick)
+        {
+            hardware_flags.advance_to(event_tick)?;
             self.advance_event_at(event_tick, l0c, hardware_flags)?;
             self.now = event_tick;
         }
@@ -341,8 +354,9 @@ impl C220CubePipeline {
                     .expect("pending Cube tick has a uop");
                 l0c.scoreboard_mut().advance_to(ready_tick);
 
-                if let Some(resume_tick) =
-                    hardware_flags.gate_cube_instruction(ready_tick, flight.instruction_id)?
+                if uop.id == 0
+                    && let Some(resume_tick) =
+                        hardware_flags.gate_cube_instruction(ready_tick, flight.instruction_id)?
                 {
                     let delay = resume_tick
                         .checked_sub(ready_tick)
@@ -361,6 +375,10 @@ impl C220CubePipeline {
                 }
 
                 if uop.id == 0 {
+                    if flight.ticket.unit_flag_sync {
+                        hardware_flags
+                            .check_cube_unit_flag_set(flight.instruction_id, ready_tick)?;
+                    }
                     let observed = *flight.first_observation_tick.get_or_insert(ready_tick);
                     let control = self.live_issue_delay.unwrap_or(flight.ticket.issue_delay);
                     let guard = self
@@ -436,6 +454,14 @@ impl C220CubePipeline {
                 }
 
                 flight.pending_uops.pop_front();
+                if flight.ticket.bias_checkpoint_uop == Some(uop.id) {
+                    hardware_flags.enqueue_cube_checkpoint(
+                        C220CubeFlagCheckpoint::Bias,
+                        flight.instruction_id,
+                        ready_tick,
+                        self.config.flag_stages.bias,
+                    )?;
+                }
                 if let Some(request) = uop.l0c_read {
                     l0c.read_banks_mut().send_cube_read(
                         ready_tick,
@@ -456,6 +482,18 @@ impl C220CubePipeline {
                     None
                 };
                 if flight.pending_uops.is_empty() {
+                    hardware_flags.enqueue_cube_checkpoint(
+                        C220CubeFlagCheckpoint::ReadBuffers,
+                        flight.instruction_id,
+                        ready_tick,
+                        self.config.flag_stages.read_buffers,
+                    )?;
+                    hardware_flags.enqueue_cube_checkpoint(
+                        C220CubeFlagCheckpoint::WriteBuffer,
+                        flight.instruction_id,
+                        ready_tick,
+                        self.config.flag_stages.write_buffer,
+                    )?;
                     flight.ticket.last_uop_tick = Some(ready_tick);
                     self.previous_last_uop_tick = ready_tick;
                     self.next_accept_tick = self.next_accept_tick.max(
@@ -701,6 +739,8 @@ fn schedule(
             v1_n2_mode: config.v1_n2_mode,
             v1_frame_order,
             v1_dtype_bubbles_per_uop,
+            bias_checkpoint_uop: None,
+            unit_flag_sync: parameters.xt_bits_55_56 >= 2,
         });
     }
     let v1_shape_bubbles = if geometry.m_tiles == 1 && geometry.n_tiles == 1 {
@@ -785,6 +825,15 @@ fn schedule(
         v1_n2_mode: config.v1_n2_mode,
         v1_frame_order,
         v1_dtype_bubbles_per_uop,
+        bias_checkpoint_uop: parameters.xt_bit_62.then(|| {
+            let last = (uop_count - 1) as u32;
+            u64::from(if last == 0 {
+                0
+            } else {
+                last.wrapping_sub(u32::from(geometry.k_tiles))
+            })
+        }),
+        unit_flag_sync: parameters.xt_bits_55_56 >= 2,
     })
 }
 

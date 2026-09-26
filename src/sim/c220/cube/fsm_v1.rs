@@ -218,6 +218,8 @@ mod tests {
             v1_n2_mode: n2_mode,
             v1_frame_order: frame_order,
             v1_dtype_bubbles_per_uop: 0,
+            bias_checkpoint_uop: None,
+            unit_flag_sync: false,
         };
         let instruction = C220CubeInstruction {
             word: 0,
