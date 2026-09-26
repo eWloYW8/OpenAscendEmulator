@@ -32,6 +32,7 @@ impl C220Core {
                 .chain(self.lsu.as_ref().and_then(|lsu| lsu.next_tick))
                 .chain(self.mte2.next_event_tick())
                 .chain(self.vector.next_event_tick())
+                .chain(self.termination.next_tick())
                 .chain(self.mte3.pending_retirement_tick())
                 .chain(self.mte_pipeline.as_ref().and_then(|p| p.next_event_tick()))
                 .chain(self.fixp.as_ref().and_then(|fixp| {
@@ -46,6 +47,7 @@ impl C220Core {
                 }))
                 .min()
                 .map_or(tick, |next| next.min(tick));
+            self.scalar_timing.advance_to(event_tick);
             self.hardware_flags.advance_to(event_tick)?;
             let previous_mte1_outcomes = self.mte1.outcomes.len();
             self.mte1.commit_ready_at(
@@ -202,6 +204,7 @@ impl C220Core {
                 self.pipeline_events.retire(5, id, event_tick);
             }
             self.release_mte3_barriers_at(event_tick);
+            self.advance_termination(event_tick)?;
             if event_tick == tick {
                 break;
             }

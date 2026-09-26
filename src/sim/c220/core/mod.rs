@@ -19,6 +19,8 @@ use crate::sim::c220::vector::va::C220VaRegisters;
 use crate::sim::c220::vector::vmsu::C220VmsuPipeline;
 
 mod activity;
+mod termination;
+pub use termination::C220Termination;
 mod advance;
 pub use activity::C220CoreActivity;
 mod cache;
@@ -151,6 +153,7 @@ pub struct C220Core {
     mte2: C220Mte2Pipeline,
     mte2_frontend: mte2_frontend::Mte2Frontend,
     scalar_timing: C220ScalarTimingLane,
+    termination: C220Termination,
     lsu: Option<lsu::CoreLsu>,
     mte1: Mte1Engine,
     mte1_frontend: mte1_frontend::Mte1Frontend,
@@ -209,6 +212,7 @@ impl C220Core {
             mte2: C220Mte2Pipeline::new(timing.mte2),
             mte2_frontend: mte2_frontend::Mte2Frontend::new(mte2_frontend),
             scalar_timing: C220ScalarTimingLane::default(),
+            termination: C220Termination::default(),
             lsu: None,
             mte1: Mte1Engine::with_outstanding_limit(mte1_frontend.outstanding_limit),
             mte1_frontend: mte1_frontend::Mte1Frontend {
@@ -407,7 +411,6 @@ impl C220Core {
 
     pub fn advance_to(&mut self, tick: u64) -> Result<Option<C220Stall>, C220CoreError> {
         let gate = self.clock.observe(tick, self.state.scalar().pc())?;
-        self.scalar_timing.advance_to(tick);
         self.advance_engines_to(tick)?;
         self.hardware_flags.advance_to(tick)?;
         self.local_memory
@@ -445,7 +448,7 @@ impl C220Core {
             if self.state.scalar().is_halted() {
                 self.advance_to(tick)?;
             }
-            let stop = if self.state.scalar().is_halted() && self.activity().is_idle() {
+            let stop = if self.termination.is_complete() {
                 Some(C220RunStop::Halted)
             } else if tick >= tick_limit {
                 Some(C220RunStop::TickBudget)

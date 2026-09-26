@@ -286,7 +286,7 @@ mod tests {
     fn c220_end_drains_vector_work_and_resumes_at_budget_boundary() {
         use crate::memory::{mapped::MappedMemory, sparse::SparseMemory, ub::UbMemory};
         use crate::sim::c220::{
-            core::{C220Core, C220CoreTimingRules, C220RunStop},
+            core::{C220Core, C220CoreTimingRules, C220RunStop, C220Termination},
             mte::{mte2::C220Mte2TimingRules, mte3::C220Mte3TimingRules},
             state::C220State,
             vector::pipeline::C220VectorTimingRules,
@@ -332,18 +332,50 @@ mod tests {
             assert_eq!(first.stop, C220RunStop::TickBudget);
             assert!(core.state().scalar().is_halted());
             assert!(core.activity().vector);
+            let next_id = core.next_instruction_id();
+            assert!(core.step_word_at(4, 0x8000_6380).is_err());
+            assert_eq!(core.next_instruction_id(), next_id);
             let last = core
                 .run_loaded_until(first.next_tick, 32, 16, &kernel, &mut code)
                 .unwrap();
             assert!(last.events.is_empty());
+            assert_eq!(last.stop, C220RunStop::TickBudget);
+            assert_eq!(
+                core.termination(),
+                C220Termination::Draining {
+                    end_tick: 1,
+                    next_check_tick: 102
+                }
+            );
             if blocked {
-                assert_eq!(last.stop, C220RunStop::TickBudget);
                 assert!(core.activity().vector);
             } else {
-                assert_eq!(last.stop, C220RunStop::Halted);
                 assert!(core.activity().is_idle());
                 assert_eq!(core.va_registers().entry(0, 0), Some(9));
                 assert_eq!(core.va_registers().entry(0, 1), Some(11));
+            }
+            let completion = core
+                .run_loaded_until(last.next_tick, 103, 16, &kernel, &mut code)
+                .unwrap();
+            if blocked {
+                assert_eq!(completion.stop, C220RunStop::TickBudget);
+                assert_eq!(
+                    core.termination(),
+                    C220Termination::Draining {
+                        end_tick: 1,
+                        next_check_tick: 202
+                    }
+                );
+            } else {
+                assert_eq!(completion.stop, C220RunStop::Halted);
+                assert_eq!(completion.next_tick, 102);
+                assert_eq!(
+                    core.termination(),
+                    C220Termination::Complete {
+                        end_tick: 1,
+                        completion_tick: 102
+                    }
+                );
             }
         }
     }

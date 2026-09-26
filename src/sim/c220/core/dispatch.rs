@@ -64,6 +64,12 @@ impl C220Core {
         word: u32,
     ) -> Result<C220CoreStep, C220CoreError> {
         let gate = self.advance_to(tick)?;
+        if self.state.scalar().is_halted() {
+            return Err(C220ExecutionError::ProgramEnded {
+                pc: self.state.scalar().pc(),
+            }
+            .into());
+        }
         if let Some(stall) = gate {
             return Ok(C220CoreStep::Stalled(stall));
         }
@@ -313,6 +319,9 @@ impl C220Core {
                 let step = self
                     .state
                     .step_scalar_word_with_ub(word, &mut self.memory)?;
+                if step.halted_after {
+                    self.begin_termination(tick)?;
+                }
                 if let Some(ticket) = timing {
                     if let Some(destination) = ticket.destination_register {
                         self.supersede_load_destination(destination);
