@@ -12,6 +12,7 @@ pub mod mov_pad;
 pub mod mte1;
 pub mod mte2;
 pub mod mte3;
+pub mod nd2nz;
 pub mod out_to_l1;
 pub mod read;
 pub mod set2d;
