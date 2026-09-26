@@ -51,7 +51,7 @@ impl VectorEngine {
     ) -> Result<VectorStep, C220VectorRuntimeError> {
         let pc = request.pc;
         let word = request.word;
-        let inputs = request.context(state.ub());
+        let inputs = request.context(state.scalar().machine(), state.ub());
         if let Some(resume_tick) = self.pipeline.instruction_buffer_ready_tick()
             && tick < resume_tick
         {

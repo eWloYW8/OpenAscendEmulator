@@ -63,7 +63,7 @@ struct ResolvedC220UnaryVector {
 
 pub(super) struct C220VectorIssueContext<'a> {
     pub pc: u64,
-    pub machine: &'a crate::sim::common::scalar::ScalarMachine,
+    pub machine: super::request::C220VectorOperands<'a>,
     pub ub: &'a crate::memory::ub::UbMemory,
 }
 

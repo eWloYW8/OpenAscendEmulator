@@ -2,7 +2,7 @@ use crate::architecture::Architecture;
 use crate::sim::c220::state::C220ExecutionError;
 use crate::sim::common::scalar::{ScalarMachine, ScalarStepper};
 
-/// Register inputs captured independently of instruction dispatch and UB reads.
+/// CCU register snapshot; Vector-local SPR inputs are resolved at dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220VectorRequest {
     pub pc: u64,
@@ -34,12 +34,39 @@ impl C220VectorRequest {
 
     pub(super) fn context<'a>(
         &'a self,
+        live_registers: &'a ScalarMachine,
         ub: &'a crate::memory::ub::UbMemory,
     ) -> super::issue::C220VectorIssueContext<'a> {
         super::issue::C220VectorIssueContext {
             pc: self.pc,
-            machine: &self.registers,
+            machine: C220VectorOperands {
+                captured: &self.registers,
+                live: live_registers,
+            },
             ub,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct C220VectorOperands<'a> {
+    captured: &'a ScalarMachine,
+    live: &'a ScalarMachine,
+}
+
+impl C220VectorOperands<'_> {
+    pub(super) fn architecture(&self) -> Architecture {
+        self.captured.architecture()
+    }
+
+    pub(super) fn xregs(&self) -> &[u64; crate::sim::common::scalar::SCALAR_X_REGISTER_COUNT] {
+        self.captured.xregs()
+    }
+
+    pub(super) fn spr_value(&self, index: u16) -> Option<u64> {
+        match index {
+            2 | 7 | 12 | 48..=51 | 100 | 101 | 104 | 105 => self.live.spr_value(index),
+            _ => self.captured.spr_value(index),
         }
     }
 }
@@ -58,7 +85,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     #[test]
-    fn delayed_dispatch_preserves_register_inputs_but_reads_live_ub_without_advancing_pc() {
+    fn delayed_dispatch_uses_captured_gprs_and_control_but_live_vector_sprs_and_ub() {
         let word = C220_CAPTURED_VADD_WORD;
         let hint = C220VecArithmeticHint::from_word(word).unwrap();
         let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
@@ -71,7 +98,7 @@ mod tests {
             .set_xreg(hint.control_register, C220_CAPTURED_VADD_CONTROL)
             .unwrap();
         machine.set_spr_value(3, 0).unwrap();
-        machine.set_spr_value(100, 1).unwrap();
+        machine.set_spr_value(100, 0).unwrap();
         machine.set_spr_value(101, 0).unwrap();
         let mut state =
             C220State::new(ScalarStepper::new(machine, 0x1000), UbMemory::new(256, 256));
@@ -80,7 +107,17 @@ mod tests {
         let machine = state.scalar_mut().machine_mut();
         machine.set_xreg(hint.destination_register, 128).unwrap();
         machine.set_xreg(hint.control_register, 0).unwrap();
-        machine.set_spr_value(100, 0).unwrap();
+        machine.set_spr_value(100, 1).unwrap();
+        machine.set_spr_value(3, 1 << 56).unwrap();
+        for index in [2, 7, 12, 48, 49, 50, 51, 104, 105] {
+            machine.set_spr_value(index, u64::from(index) + 17).unwrap();
+        }
+        let inputs = request.context(state.scalar().machine(), state.ub());
+        assert_eq!(inputs.machine.spr_value(3), Some(0));
+        assert_eq!(inputs.machine.spr_value(100), Some(1));
+        for index in [2, 7, 12, 48, 49, 50, 51, 104, 105] {
+            assert_eq!(inputs.machine.spr_value(index), Some(u64::from(index) + 17));
+        }
         for (address, value) in [(0, 2_f32), (32, 3_f32)] {
             state
                 .ub
@@ -117,7 +154,7 @@ mod tests {
         }
         assert_eq!(state.ub().read_known(64, 4).unwrap(), 7_f32.to_le_bytes());
         assert!(state.ub().read_known(128, 4).is_err());
-        assert_eq!(state.scalar().machine().spr_value(100), Some(0));
+        assert_eq!(state.scalar().machine().spr_value(100), Some(1));
         assert_eq!(
             state.scalar().machine().xregs()[usize::from(hint.destination_register)],
             128
