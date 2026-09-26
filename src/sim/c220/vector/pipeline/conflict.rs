@@ -1,5 +1,7 @@
 use super::{C220VectorAdvanceError, C220VectorPipeline, PendingVectorUop};
 
+const GATHER_INDEX_READY_TICKS: u64 = 10;
+
 impl PendingVectorUop {
     fn nominal_latency(&self) -> u64 {
         u64::from(self.uop.stages.read_ticks)
@@ -18,6 +20,17 @@ impl PendingVectorUop {
 impl C220VectorPipeline {
     pub(super) fn conflict_ready_tick(&self, index: usize, earliest: u64) -> u64 {
         let entry = &self.pending[index];
+        let earliest = entry
+            .read
+            .as_ref()
+            .and_then(|read| read.index_prefetch().1)
+            .and_then(|repeat| {
+                self.index_prefetch_ready
+                    .get(&(entry.instruction_group, repeat))
+            })
+            .map_or(earliest, |ready| {
+                earliest.max(ready.saturating_add(GATHER_INDEX_READY_TICKS))
+            });
         let Some(previous) = self.pending.iter().take(index).rev().find(|previous| {
             previous.conflict_check_tick.is_some() && previous.release_tick.is_none()
         }) else {
@@ -68,6 +81,22 @@ impl C220VectorPipeline {
                 .is_none_or(|grant| grant > tick)
         {
             return Ok(());
+        }
+        if let Some(read) = &entry.read {
+            let (produces, requires) = read.index_prefetch();
+            if let Some(repeat) = produces {
+                self.index_prefetch_ready
+                    .entry((entry.instruction_group, repeat))
+                    .or_insert(tick);
+            }
+            if let Some(repeat) = requires
+                && self
+                    .index_prefetch_ready
+                    .get(&(entry.instruction_group, repeat))
+                    .is_none_or(|ready| tick < ready.saturating_add(GATHER_INDEX_READY_TICKS))
+            {
+                return Ok(());
+            }
         }
         let shared_ready = if entry.shared_read_from_previous {
             let Some(ready) = index.checked_sub(1).and_then(|previous| {

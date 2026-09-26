@@ -244,6 +244,8 @@ impl C220VectorPipeline {
             self.last_functional_samples.push(sample);
         }
         self.functional_instructions.remove(&group);
+        self.index_prefetch_ready
+            .retain(|(instruction, _), _| *instruction != group);
         Ok(())
     }
 }

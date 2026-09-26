@@ -483,6 +483,18 @@ impl PendingVectorRead {
                 .unwrap_or(admission_tick),
         )
     }
+
+    pub(super) fn index_prefetch(&self) -> (Option<usize>, Option<usize>) {
+        match &self.operation {
+            C220VectorReadOperation::GatherData { issue, .. } => (
+                issue.index_prefetch_repeat(self.repeat_index),
+                issue
+                    .waits_for_index_prefetch(self.repeat_index)
+                    .then_some(self.repeat_index),
+            ),
+            _ => (None, None),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

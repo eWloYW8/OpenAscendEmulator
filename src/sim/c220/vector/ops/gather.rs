@@ -15,7 +15,6 @@ const ELEMENTS_PER_READ_PORT: usize = 8;
 const BLOCKS_PER_REPEAT: usize = 8;
 const BLOCK_WORDS: usize = C220_VECTOR_BLOCK_BYTES / 4;
 const INDEX_WINDOW_BYTES: usize = 256;
-const MAX_BLOCK_REPEATS: usize = INDEX_WINDOW_BYTES / (BLOCKS_PER_REPEAT * 4);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220GatherControl {
@@ -192,7 +191,7 @@ impl C220GatherIssue {
             .indices
             .get(repeat_index)
             .ok_or(C220VectorError::InvalidRepeatIndex(repeat_index))?;
-        Ok(indices
+        let mut accesses = indices
             .iter()
             .enumerate()
             .map(|(block, &index)| C220VectorReadAccess {
@@ -203,7 +202,38 @@ impl C220GatherIssue {
                 address: u64::from(index),
                 active_lane_mask: u16::MAX,
             })
-            .collect())
+            .collect::<Vec<_>>();
+        if let Some(next) = self.index_prefetch_repeat(repeat_index) {
+            let address = self.index_address.checked_add((next * 32) as u64).ok_or(
+                C220VectorError::AddressOverflow {
+                    base: self.index_address,
+                    lane: next,
+                },
+            )?;
+            accesses.push(C220VectorReadAccess {
+                source_index: 1,
+                block_index: 0,
+                buffer_offset: 0,
+                bytes: ((self.repeat_count() - next).min(4) * 32) as u16,
+                address,
+                active_lane_mask: u16::MAX,
+            });
+        }
+        Ok(accesses)
+    }
+
+    pub(crate) fn index_prefetch_repeat(&self, repeat: usize) -> Option<usize> {
+        (matches!(self.instruction.kind, C220GatherKind::Blocks)
+            && repeat != 0
+            && repeat.is_multiple_of(4)
+            && repeat + 4 < self.repeat_count())
+        .then_some(repeat + 4)
+    }
+
+    pub(crate) fn waits_for_index_prefetch(&self, repeat: usize) -> bool {
+        matches!(self.instruction.kind, C220GatherKind::Blocks)
+            && repeat >= 8
+            && repeat.is_multiple_of(4)
     }
 
     pub(crate) fn stores_for_data_uop(
@@ -251,12 +281,6 @@ pub fn plan_c220_gather_issue(
         C220GatherKind::Blocks => usize::from(control.repeat_count),
     };
     check_repeat_limit(repeat_count)?;
-    if matches!(instruction.kind, C220GatherKind::Blocks) && repeat_count > MAX_BLOCK_REPEATS {
-        return Err(C220VectorError::RepeatLimitExceeded {
-            count: repeat_count as u64,
-            limit: MAX_BLOCK_REPEATS,
-        });
-    }
 
     let index_count = match instruction.kind {
         C220GatherKind::Elements(width) => width.lane_count(),

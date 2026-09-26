@@ -12,6 +12,87 @@ use crate::sim::common::scalar::ScalarMachine;
 use crate::sim::common::scalar::ScalarStepper;
 
 #[test]
+fn gather_blocks_prefetch_index_windows_across_the_full_repeat_range() {
+    use crate::sim::c220::vector::C220VectorInstruction;
+    use crate::sim::c220::vector::ops::gather::plan_c220_gather_issue;
+
+    for repeats in [0, 8, 9, 12, 13, 255] {
+        let mut ub = UbMemory::new(131072, 131072);
+        ub.write_states(0, &vec![MemoryByteState::Known(0); 131072])
+            .unwrap();
+        ub.write_states(0, &[MemoryByteState::Known(73); 32])
+            .unwrap();
+        let instruction = C220VectorInstruction::Gather(
+            plan_c220_gather_issue(
+                0,
+                0x8000_0043,
+                (repeats as u64) << 56 | (8 << 32),
+                32768,
+                1024,
+                Vec::new(),
+                &ub,
+            )
+            .unwrap(),
+        );
+        let machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+        let mut core = C220State::new(ScalarStepper::new(machine, 0), ub);
+        let mut pipeline = C220VectorPipeline::new(C220VectorTimingRules {
+            dispatch_ticks: 0,
+            uop_issue_interval: NonZeroU64::new(1).unwrap(),
+            ub_response_ticks: 2,
+        });
+        pipeline
+            .issue_at(
+                0,
+                &instruction.uops().unwrap(),
+                instruction.stores(),
+                instruction.read_issue(),
+            )
+            .unwrap();
+        let releases = pipeline.advance_to(20000, &mut core).unwrap();
+        assert_eq!(pipeline.last_gather_executions().len(), repeats);
+        let data_reads = pipeline
+            .last_read_samples()
+            .iter()
+            .filter(|sample| sample.lane_group == Some(0))
+            .collect::<Vec<_>>();
+        assert_eq!(data_reads.len(), repeats);
+        for sample in &data_reads {
+            let repeat = sample.repeat_index;
+            let prefetch = repeat != 0 && repeat.is_multiple_of(4) && repeat + 4 < repeats;
+            assert_eq!(!sample.read1_grants.is_empty(), prefetch);
+            if prefetch {
+                let access = sample
+                    .accesses
+                    .iter()
+                    .find(|access| access.source_index == 1)
+                    .unwrap();
+                assert_eq!(access.address, 1024 + ((repeat + 4) * 32) as u64);
+                assert_eq!(
+                    usize::from(access.bytes),
+                    (repeats - repeat - 4).min(4) * 32
+                );
+            }
+            if repeat >= 8 && repeat.is_multiple_of(4) {
+                let producer = data_reads[repeat - 4];
+                let grant = producer.read1_grants.iter().flatten().max().unwrap();
+                let release = releases
+                    .iter()
+                    .find(|release| release.repeat_index == repeat && release.lane_group == Some(0))
+                    .unwrap();
+                assert!(release.conflict_check_tick >= grant + 10);
+            }
+        }
+        assert_eq!(
+            core.ub().read_known(32768, repeats * 256).unwrap(),
+            vec![73; repeats * 256]
+        );
+        assert_eq!(pipeline.pending_uops(), 0);
+        assert!(pipeline.index_prefetch_ready.is_empty());
+    }
+}
+
+#[test]
 fn gather_completion_uses_live_indices_and_sequential_data_feedback() {
     use crate::sim::c220::vector::C220VectorInstruction;
     use crate::sim::c220::vector::ops::gather::plan_c220_gather_issue;
