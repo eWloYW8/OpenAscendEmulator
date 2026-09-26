@@ -109,7 +109,7 @@ impl C220Load2dInstruction {
         let descriptor = C220Load2dDescriptor::decode(
             xregs[usize::from(self.descriptor_register)],
             self.address_mode,
-        )?;
+        );
         Ok(C220Load2dTransfer {
             instruction: self,
             descriptor,
@@ -136,15 +136,9 @@ pub struct C220Load2dDescriptor {
 }
 
 impl C220Load2dDescriptor {
-    pub const fn decode(
-        raw: u64,
-        address_mode: C220Load2dAddressMode,
-    ) -> Result<Self, C220Load2dError> {
+    pub const fn decode(raw: u64, address_mode: C220Load2dAddressMode) -> Self {
         let repeat_count = ((raw >> 16) & 0xff) as u8;
-        if repeat_count != 0 && raw & (1 << 60) != 0 {
-            return Err(C220Load2dError::UnsupportedDescriptorBit60);
-        }
-        Ok(Self {
+        Self {
             raw,
             start_index: raw as u16,
             repeat_count,
@@ -152,7 +146,7 @@ impl C220Load2dDescriptor {
             sid: ((raw >> 40) & 0xf) as u8,
             destination_gap_blocks: ((raw >> 44) & 0xffff) as u16,
             address_mode,
-        })
+        }
     }
 
     pub const fn destination_stride_blocks(self) -> u32 {
@@ -236,8 +230,6 @@ pub enum C220Load2dError {
         source_buffer: C220Load2dSource,
         destination_buffer: C220Load2dDestination,
     },
-    #[error("LOAD_2D descriptor bit 60 is unsupported")]
-    UnsupportedDescriptorBit60,
 }
 
 #[cfg(test)]
@@ -259,9 +251,9 @@ mod tests {
                         .capture(&registers)
                         .unwrap();
                     let expected = baseline.segments().collect::<Vec<_>>();
-                    for upper in 0..8_u64 {
+                    for upper in 0..16_u64 {
                         for bit6 in [0, 64] {
-                            registers[3] = baseline.descriptor.raw | (upper << 61);
+                            registers[3] = baseline.descriptor.raw | (upper << 60);
                             let transfer = C220Load2dInstruction::decode(word | bit6)
                                 .unwrap()
                                 .capture(&registers)
@@ -274,8 +266,12 @@ mod tests {
                     registers[3] |= 1 << 60;
                     let instruction = C220Load2dInstruction::decode(word | 64).unwrap();
                     assert_eq!(
-                        instruction.capture(&registers),
-                        Err(C220Load2dError::UnsupportedDescriptorBit60)
+                        instruction
+                            .capture(&registers)
+                            .unwrap()
+                            .segments()
+                            .collect::<Vec<_>>(),
+                        expected
                     );
                     registers[3] &= !(0xff << 16);
                     assert_eq!(instruction.capture(&registers).unwrap().segments().len(), 0);

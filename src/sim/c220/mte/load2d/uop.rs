@@ -197,6 +197,15 @@ mod tests {
                     C220Load2dRequestPlan::new(transfer, NonZeroU32::new(width).unwrap()).unwrap();
                 let count = plan.len();
                 let requests = plan.by_ref().collect::<Vec<_>>();
+                let mut alternate_registers = registers;
+                alternate_registers[3] |= 1 << 60;
+                let alternate = instruction.capture(&alternate_registers).unwrap();
+                assert_eq!(
+                    C220Load2dRequestPlan::new(alternate, NonZeroU32::new(width).unwrap())
+                        .unwrap()
+                        .collect::<Vec<_>>(),
+                    requests
+                );
                 assert_eq!(requests.len(), count);
                 assert_eq!(count, 2 * 512_u32.div_ceil(width) as usize);
                 assert_eq!(requests.iter().map(|r| r.input_bytes).sum::<u32>(), 1024);
