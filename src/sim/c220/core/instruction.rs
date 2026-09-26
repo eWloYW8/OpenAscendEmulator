@@ -94,6 +94,8 @@ pub enum C220CoreInstruction {
     },
     Mte2(C220Mte2Issue),
     Mte2Flag(FlagStep),
+    Mte2Queued(super::C220Mte2IssuedInstruction),
+    Mte2Scheduled(super::C220Mte2QueuedCommand),
     Cube(C220CubeIssue),
     CubeFlag(FlagStep),
     CubeQueued(crate::sim::c220::cube::frontend::C220CubeQueuedCommand),

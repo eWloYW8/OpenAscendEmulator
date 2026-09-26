@@ -54,14 +54,6 @@ pub struct C220Mte2CommandState {
     pub completion: C220Mte2Completion,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220Mte2EventState {
-    pub destination_pipe: u8,
-    pub event_id: u32,
-    pub dependency: Option<u64>,
-    pub ready: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum C220Mte2Result {
     CrossCore(crate::sim::c220::sync::C220DeviceSync),

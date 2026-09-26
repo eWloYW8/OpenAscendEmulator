@@ -2669,7 +2669,7 @@ mod tests {
 
     #[test]
     fn l1_fill_retires_captured_pattern_before_mte1_flags_release_load2d() {
-        use crate::sim::c220::mte::mte2::{C220Mte2Completion, C220Mte2IssueTiming};
+        use crate::sim::c220::mte::mte2::C220Mte2Completion;
         let mut core = matrix_core();
         core.advance_to(64).unwrap();
         let pattern = 0x4000_4000_u64;
@@ -2679,13 +2679,13 @@ mod tests {
         machine.set_spr_value(15, pattern).unwrap();
         let word = (3 << 29) | (1 << 22) | (1 << 17) | (3 << 7) | 6;
         let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Mte2(issue),
+            instruction: C220CoreInstruction::Mte2Queued(issue),
             ..
         } = core.step_word_at(65, word).unwrap()
         else {
             panic!("L1 fill issue")
         };
-        assert!(matches!(issue.timing, C220Mte2IssueTiming::L1(_)));
+        assert_eq!(issue.ready_tick, 66);
         let set = (2 << 29) | (5 << 21) | (4 << 10) | (3 << 7) | 3;
         let wait = (set & !(15 << 21)) | (6 << 21);
         for (tick, word) in [(66, set), (67, set), (68, set & !(7 << 7))] {
@@ -2697,9 +2697,9 @@ mod tests {
         let pc = core.state.scalar().pc();
         assert!(matches!(
             core.step_word_at(69, wait).unwrap(),
-            C220CoreStep::Stalled(_)
+            C220CoreStep::Executed { .. }
         ));
-        assert_eq!(core.state.scalar().pc(), pc);
+        assert_eq!(core.state.scalar().pc(), pc + 4);
         core.state
             .scalar_mut()
             .machine_mut()
@@ -2738,7 +2738,7 @@ mod tests {
             );
         }
         assert!(core.local_memory.l1().read_known(2560, 512).is_err());
-        for (offset, word) in [(1, wait), (2, wait), (3, wait & !(7 << 7))] {
+        for (offset, word) in [(2, wait), (3, wait & !(7 << 7))] {
             assert!(matches!(
                 core.step_word_at(retired + offset, word).unwrap(),
                 C220CoreStep::Executed { .. }
@@ -2762,7 +2762,7 @@ mod tests {
             expected.repeat(2)
         );
         assert!(core.mte_pipeline().unwrap().is_idle());
-        assert!(!core.mte2.is_busy());
+        assert!(!core.mte2_is_busy());
     }
 
     #[test]
@@ -2791,17 +2791,17 @@ mod tests {
         assert!(matches!(
             core.step_word_at(65, word).unwrap(),
             C220CoreStep::Executed {
-                instruction: C220CoreInstruction::Mte2(_),
+                instruction: C220CoreInstruction::Mte2Queued(_),
                 ..
             }
         ));
         assert!(core.state.ub().read_known(0x100, 32).is_err());
-        core.advance_to(97).unwrap();
+        core.advance_to(101).unwrap();
         assert_eq!(core.state.ub().read_known(0x100, 32).unwrap(), vec![7; 32]);
         assert_eq!(core.mte2.last_outcomes().len(), 1);
-        assert!(!core.mte2.is_busy());
+        assert!(!core.mte2_is_busy());
         assert!(matches!(
-            core.step_word_at(98, 0x40e0_1800).unwrap(),
+            core.step_word_at(102, 0x40e0_1800).unwrap(),
             C220CoreStep::Executed { .. }
         ));
 
@@ -2837,7 +2837,7 @@ mod tests {
         machine.set_spr_value(100, u64::MAX).unwrap();
         machine.set_spr_value(101, 0).unwrap();
         assert!(matches!(
-            core.step_word_at(100, 0x83c6_2392).unwrap(),
+            core.step_word_at(104, 0x83c6_2392).unwrap(),
             C220CoreStep::Executed { .. }
         ));
         let machine = core.state.scalar_mut().machine_mut();
@@ -2849,7 +2849,7 @@ mod tests {
             .set_xreg(decoded.descriptor_register, (1 << 4) | (8 << 16))
             .unwrap();
         assert!(matches!(
-            core.step_word_at(101, word).unwrap(),
+            core.step_word_at(105, word).unwrap(),
             C220CoreStep::Executed { .. }
         ));
         core.advance_to(400).unwrap();
@@ -3072,31 +3072,28 @@ mod tests {
             .set_xreg(6, 0xc10)
             .unwrap();
         let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Mte2(issue),
+            instruction: C220CoreInstruction::Mte2Queued(issue),
             ..
         } = bulk.step_word_at(167, mte2_cross).unwrap()
         else {
             panic!("MTE2 cross-core admission")
         };
-        assert!(matches!(
-            issue.timing,
-            crate::sim::c220::mte::mte2::C220Mte2IssueTiming::CrossCore { dispatch_tick: 167 }
-        ));
+        assert_eq!(issue.ready_tick, 168);
         assert!(bulk.mte2.last_outcomes().is_empty());
-        assert!(bulk.mte2.is_busy());
+        assert!(bulk.mte2_is_busy());
         bulk.state
             .scalar_mut()
             .machine_mut()
             .set_xreg(6, 0)
             .unwrap();
-        bulk.advance_to(168).unwrap();
+        bulk.advance_to(172).unwrap();
         let reception = bulk.mte2.last_outcomes()[0].cross_core_reception().unwrap();
         assert_eq!(reception.instruction_id, issue.instruction_id);
-        assert_eq!(reception.tick, 168);
+        assert_eq!(reception.tick, 172);
         assert_eq!(reception.payload.value, 0xc10);
         assert_eq!((reception.payload.mode, reception.payload.flag_id), (1, 12));
-        assert!(!bulk.mte2.is_busy());
-        flags.advance_to(168).unwrap();
+        assert!(!bulk.mte2_is_busy());
+        flags.advance_to(172).unwrap();
         assert_eq!(bulk.hardware_flags, flags);
         bulk.connect_mte3_dma().unwrap();
         bulk.state
@@ -3108,18 +3105,18 @@ mod tests {
         let C220CoreStep::Executed {
             instruction: C220CoreInstruction::Mte3CrossCore(record),
             ..
-        } = bulk.step_word_at(169, mte3_cross).unwrap()
+        } = bulk.step_word_at(173, mte3_cross).unwrap()
         else {
             panic!("MTE3 cross-core admission")
         };
-        assert_eq!(record.issue_tick, 169);
+        assert_eq!(record.issue_tick, 173);
         assert_eq!(record.dispatch_tick, None);
         bulk.state
             .scalar_mut()
             .machine_mut()
             .set_xreg(6, 0)
             .unwrap();
-        bulk.advance_to(172).unwrap();
+        bulk.advance_to(176).unwrap();
         assert!(bulk.last_mte3_cross_core_outcomes().is_empty());
         assert!(bulk.take_mte3_dma_request().is_none());
         assert_eq!(
@@ -3129,10 +3126,10 @@ mod tests {
                 .selected_generator(),
             Some(crate::sim::c220::mte::mte3::frontend::C220Mte3Generator::Load3d)
         );
-        bulk.advance_to(173).unwrap();
+        bulk.advance_to(177).unwrap();
         let reception = bulk.last_mte3_cross_core_outcomes()[0];
         assert_eq!(reception.instruction_id, record.instruction_id);
-        assert_eq!(reception.tick, 173);
+        assert_eq!(reception.tick, 177);
         assert_eq!(reception.payload.value, 0xd30);
         assert_eq!((reception.payload.mode, reception.payload.flag_id), (3, 13));
         assert!(bulk.mte_pipeline().unwrap().mte3_frontend().is_idle());

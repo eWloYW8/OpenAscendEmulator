@@ -1,7 +1,7 @@
 mod command;
 pub use command::{
-    C220Mte2Command, C220Mte2CommandState, C220Mte2Completion, C220Mte2EventState, C220Mte2Issue,
-    C220Mte2IssueTiming, C220Mte2Outcome, C220Mte2Result,
+    C220Mte2Command, C220Mte2CommandState, C220Mte2Completion, C220Mte2Issue, C220Mte2IssueTiming,
+    C220Mte2Outcome, C220Mte2Result,
 };
 mod pipeline;
 pub(crate) use pipeline::is_mte2_transfer;

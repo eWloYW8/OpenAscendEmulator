@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 use super::C220Mte2L1TransferPlan;
 use super::timing::C220Mte2DmaTiming;
 use super::{
-    C220Mte2Command, C220Mte2CommandState, C220Mte2Completion, C220Mte2EventState, C220Mte2Issue,
-    C220Mte2IssueTiming, C220Mte2Outcome, C220Mte2Result, C220Mte2TimingError, C220Mte2TimingRules,
+    C220Mte2Command, C220Mte2CommandState, C220Mte2Completion, C220Mte2Issue, C220Mte2IssueTiming,
+    C220Mte2Outcome, C220Mte2Result, C220Mte2TimingError, C220Mte2TimingRules,
     C220Mte2TransferPlan, copy_c220_mov_out_to_ub,
 };
 use crate::isa::c220::mte::set2d::C220Set2dFill;
@@ -49,7 +49,6 @@ pub enum C220Mte2RuntimeError {
 pub struct C220Mte2Pipeline {
     dma: C220Mte2DmaTiming,
     pending: VecDeque<C220Mte2CommandState>,
-    events: BTreeMap<(u8, u32), VecDeque<Option<u64>>>,
     outcomes: Vec<C220Mte2Outcome>,
     now: u64,
     advanced: Option<u64>,
@@ -60,7 +59,6 @@ impl C220Mte2Pipeline {
         Self {
             dma: C220Mte2DmaTiming::new(rules),
             pending: VecDeque::new(),
-            events: BTreeMap::new(),
             outcomes: Vec::new(),
             now: 0,
             advanced: None,
@@ -77,20 +75,6 @@ impl C220Mte2Pipeline {
 
     pub fn last_outcomes(&self) -> &[C220Mte2Outcome] {
         &self.outcomes
-    }
-
-    pub fn pending_events(&self) -> impl Iterator<Item = C220Mte2EventState> + '_ {
-        self.events
-            .iter()
-            .flat_map(move |(&(destination_pipe, event_id), tokens)| {
-                tokens.iter().map(move |&dependency| C220Mte2EventState {
-                    destination_pipe,
-                    event_id,
-                    dependency,
-                    ready: !dependency
-                        .is_some_and(|id| self.pending.iter().any(|p| p.instruction_id <= id)),
-                })
-            })
     }
 
     pub const fn rules(&self) -> C220Mte2TimingRules {
@@ -312,34 +296,6 @@ impl C220Mte2Pipeline {
             command,
             timing: C220Mte2IssueTiming::AggregateDma(ticket),
         })
-    }
-
-    /// Every SET refers to the latest preceding command, including repeated
-    /// SETs for different consumers. SET never removes a command from retirement.
-    pub(crate) fn set_event(&mut self, destination: u8, event_id: u32) {
-        let dependency = self.pending.back().map(|p| p.instruction_id);
-        self.events
-            .entry((destination, event_id))
-            .or_default()
-            .push_back(dependency);
-    }
-
-    pub(crate) fn wait_event(&mut self, destination: u8, event_id: u32) -> bool {
-        let key = (destination, event_id);
-        let Some(tokens) = self.events.get_mut(&key) else {
-            return false;
-        };
-        let Some(target) = tokens.front() else {
-            return false;
-        };
-        if target.is_some_and(|id| self.pending.iter().any(|p| p.instruction_id <= id)) {
-            return false;
-        }
-        tokens.pop_front();
-        if tokens.is_empty() {
-            self.events.remove(&key);
-        }
-        true
     }
 
     pub(crate) fn begin_advance(&mut self) {

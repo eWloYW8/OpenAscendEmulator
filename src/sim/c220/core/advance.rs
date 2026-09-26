@@ -8,6 +8,7 @@ impl C220Core {
         self.mte1.begin_advance();
         self.mte1_frontend.outcomes.clear();
         self.mte2.begin_advance();
+        self.mte2_frontend.outcomes.clear();
         self.mte3.begin_advance();
         self.vector.begin_advance();
         self.fixp_frontend.outcomes.clear();
@@ -73,12 +74,17 @@ impl C220Core {
                     self.fixp_frontend.cross_core_outcomes.push(reception);
                 }
             }
+            let previous_mte2_outcomes = self.mte2.last_outcomes().len();
             self.mte2.commit_ready_at(
                 event_tick,
                 &mut self.local_memory,
                 &mut self.state.ub,
                 &self.memory,
             )?;
+            for outcome in &self.mte2.last_outcomes()[previous_mte2_outcomes..] {
+                self.pipeline_events
+                    .retire(4, outcome.command.instruction_id, outcome.retire_tick);
+            }
             self.publish_fixp_retirement();
             while self.mte_pipeline.is_some() {
                 let pipeline = self.mte_pipeline.as_mut().expect("configured MTE pipeline");
@@ -121,6 +127,14 @@ impl C220Core {
                 }
                 if pipeline.mte1_issue_pending() {
                     self.transfer_mte1_issue_at(event_tick)?;
+                    continue;
+                }
+                if pipeline.mte2_issue_pending() {
+                    self.transfer_mte2_issue_at(event_tick)?;
+                    continue;
+                }
+                if pipeline.mte2_dispatch_pending() {
+                    self.dispatch_mte2_head_at(event_tick)?;
                     continue;
                 }
                 if pipeline.mte1_sync_pending() {

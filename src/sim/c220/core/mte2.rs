@@ -35,7 +35,7 @@ impl C220Core {
         config: C220BiuReadConfig,
         subcore: C220BiuSubcore,
     ) -> Result<(), C220CoreError> {
-        if self.mte2.is_busy() {
+        if self.mte2_is_busy() {
             return Err(C220CoreError::MtePipelineBusy);
         }
         self.mte_pipeline
@@ -71,7 +71,7 @@ impl C220Core {
     /// aggregate timing. A transport consumer must drain requests and return
     /// completion only after the destination has accepted the entire command.
     pub fn connect_mte2_dma(&mut self) -> Result<(), C220CoreError> {
-        if self.mte2.is_busy() {
+        if self.mte2_is_busy() {
             return Err(C220CoreError::MtePipelineBusy);
         }
         self.mte_pipeline
@@ -113,6 +113,49 @@ impl C220Core {
         Ok(())
     }
 
+    pub(super) fn capture_mte2_operation(
+        &self,
+        pc: u64,
+        word: u32,
+    ) -> Result<super::C220Mte2Operation, C220CoreError> {
+        use super::C220Mte2Operation;
+        use crate::sim::c220::mte::mte2::C220Mte2Command;
+        let machine = self.state.scalar().machine();
+        if let Some(flag) = FlagInstruction::decode(Architecture::Dav2201, word) {
+            return Ok(C220Mte2Operation::Flag(flag.resolve(pc, machine.xregs())));
+        }
+        let command = if let Some(instruction) =
+            crate::isa::c220::control::C220SetCrossCoreInstruction::decode(word)
+        {
+            C220Mte2Command::CrossCore {
+                instruction,
+                payload: crate::sim::c220::sync::C220DeviceSync::from_value(
+                    machine.xregs()[usize::from(instruction.source_register)],
+                ),
+            }
+        } else if let Some(decoded) = C220Set2dInstruction::decode(word) {
+            let pattern = machine
+                .spr_value(15)
+                .ok_or(C220CoreError::MissingSet2dPatternSpr)?;
+            C220Mte2Command::Set2d(decoded.capture(machine.xregs(), pattern))
+        } else if C220MovOutToL1Instruction::decode(word).is_some() {
+            C220Mte2Command::MovOutToL1(C220Mte2L1TransferPlan::decode(
+                machine,
+                pc,
+                word,
+                self.state.isa_instance_index,
+            )?)
+        } else {
+            C220Mte2Command::MovOutToUb(decode_mte2_transfer(
+                machine,
+                pc,
+                word,
+                self.state.isa_instance_index,
+            )?)
+        };
+        Ok(C220Mte2Operation::Command(command))
+    }
+
     pub(super) fn step_mte2_at(
         &mut self,
         tick: u64,
@@ -122,118 +165,157 @@ impl C220Core {
         if self.state.scalar().is_halted() {
             return Err(C220ExecutionError::ProgramEnded { pc }.into());
         }
-        let stall = |resume_tick, cause| {
-            C220CoreStep::Stalled(C220Stall {
-                tick,
-                pc,
-                resume_tick,
-                cause,
-            })
-        };
-        let instruction = if let Some(decoded) = C220Set2dInstruction::decode(word) {
-            let machine = self.state.scalar().machine();
-            let pattern = machine
-                .spr_value(15)
-                .ok_or(C220CoreError::MissingSet2dPatternSpr)?;
-            let fill = decoded.capture(machine.xregs(), pattern);
-            let pipeline = self
-                .mte_pipeline
-                .as_mut()
-                .ok_or(C220CoreError::MteUnconfigured)?;
-            if !self.mte2.can_issue_l1_fill(pipeline, fill)? {
-                return Ok(stall(
-                    tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
-                    C220StallCause::Mte2IssueRate,
-                ));
+        let flag = FlagInstruction::decode(Architecture::Dav2201, word);
+        let inline_wait = flag.is_some_and(|flag| {
+            flag.operation == FlagOperation::Wait && matches!(flag.trigger_pipe_code, 0 | 1)
+        });
+        if self.mte_pipeline.is_some() && !inline_wait {
+            if let Some(cause) = self.mte2_accept_blocker() {
+                return self.mte2_stall(tick, pc, cause);
             }
-            C220CoreInstruction::Mte2(self.mte2.issue_l1_fill(
-                pipeline,
-                self.next_instruction_id,
-                pc,
-                fill,
-            )?)
-        } else if C220MovOutToL1Instruction::decode(word).is_some() {
-            let transfer = C220Mte2L1TransferPlan::decode(
-                self.state.scalar().machine(),
-                pc,
-                word,
-                self.state.isa_instance_index,
-            )?;
-            let pipeline = self
-                .mte_pipeline
-                .as_mut()
-                .ok_or(C220CoreError::MteUnconfigured)?;
-            if !transfer.descriptor.is_disabled()
-                && pipeline.mte2_dma_connected()
-                && !pipeline.can_issue_mte2_dma()
-            {
-                return Ok(stall(
-                    tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
-                    C220StallCause::Mte2IssueRate,
-                ));
-            }
-            C220CoreInstruction::Mte2(self.mte2.issue_l1_dma(
-                pipeline,
-                self.next_instruction_id,
-                pc,
-                transfer,
-            )?)
-        } else if let Some(flag) = FlagInstruction::decode(Architecture::Dav2201, word) {
-            let flag = flag.resolve(pc, self.state.scalar().machine().xregs());
-            let destination = flag.instruction.trigger_pipe_code;
-            match flag.instruction.operation {
-                FlagOperation::Set => self.mte2.set_event(destination, flag.flag_id),
-                FlagOperation::Wait => {
-                    if !self.mte2.wait_event(destination, flag.flag_id) {
-                        return Ok(stall(
-                            tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
-                            C220StallCause::Mte2Dependency,
-                        ));
+            let operation = self.capture_mte2_operation(pc, word)?;
+            return self.enqueue_mte2_issue_at(tick, pc, word, operation);
+        }
+        let operation = self.capture_mte2_operation(pc, word)?;
+        let instruction = match operation {
+            super::C220Mte2Operation::Flag(step) => {
+                match step.instruction.operation {
+                    FlagOperation::Set => {
+                        let predecessor = self
+                            .mte2
+                            .pending_commands()
+                            .last()
+                            .map(|c| c.instruction_id);
+                        self.pipeline_events
+                            .set(self.next_instruction_id, step, predecessor, tick);
+                    }
+                    FlagOperation::Wait => {
+                        if self
+                            .pipeline_events
+                            .consume(self.next_instruction_id, step, tick)
+                            .is_none()
+                        {
+                            return self.mte2_stall(tick, pc, C220StallCause::Mte2Dependency);
+                        }
                     }
                 }
+                C220CoreInstruction::Mte2Flag(step)
             }
-            C220CoreInstruction::Mte2Flag(flag)
-        } else {
-            let transfer = decode_mte2_transfer(
-                self.state.scalar().machine(),
-                pc,
-                word,
-                self.state.isa_instance_index,
-            )?;
-            let physical = self
-                .mte_pipeline
-                .as_ref()
-                .filter(|p| p.mte2_dma_connected());
-            let generator_ready = match physical {
-                Some(pipeline) => pipeline.can_issue_mte2_dma(),
-                None => self
-                    .mte_pipeline
-                    .as_ref()
-                    .is_none_or(|p| p.l1_fill_generator().is_idle()),
-            };
-            if !transfer.descriptor.is_disabled() && !generator_ready {
-                return Ok(stall(
-                    tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
-                    C220StallCause::Mte2IssueRate,
-                ));
+            super::C220Mte2Operation::Command(command) => {
+                if !self.can_dispatch_mte2(command, tick)? {
+                    return self.mte2_stall(tick, pc, C220StallCause::Mte2IssueRate);
+                }
+                C220CoreInstruction::Mte2(self.dispatch_mte2_command(
+                    self.next_instruction_id,
+                    pc,
+                    command,
+                )?)
             }
-            if !transfer.descriptor.is_disabled()
-                && physical.is_none()
-                && tick < self.mte2.next_mte2_issue_tick()
-            {
-                return Ok(stall(
-                    self.mte2.next_mte2_issue_tick(),
-                    C220StallCause::Mte2IssueRate,
-                ));
-            }
-            C220CoreInstruction::Mte2(self.mte2.issue_dma(
-                self.mte_pipeline.as_mut(),
-                self.next_instruction_id,
-                pc,
-                transfer,
-            )?)
         };
         self.state.commit_c220_sequential_issue();
         Ok(C220CoreStep::Executed { tick, instruction })
+    }
+
+    pub(super) fn mte2_stall(
+        &self,
+        tick: u64,
+        pc: u64,
+        cause: C220StallCause,
+    ) -> Result<C220CoreStep, C220CoreError> {
+        Ok(C220CoreStep::Stalled(C220Stall {
+            tick,
+            pc,
+            cause,
+            resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
+        }))
+    }
+
+    pub(super) fn can_dispatch_mte2(
+        &self,
+        command: crate::sim::c220::mte::mte2::C220Mte2Command,
+        tick: u64,
+    ) -> Result<bool, C220CoreError> {
+        use crate::sim::c220::mte::mte2::C220Mte2Command;
+        Ok(match command {
+            C220Mte2Command::Set2d(fill) => self.mte2.can_issue_l1_fill(
+                self.mte_pipeline
+                    .as_ref()
+                    .ok_or(C220CoreError::MteUnconfigured)?,
+                fill,
+            )?,
+            C220Mte2Command::MovOutToL1(transfer) => {
+                transfer.descriptor.is_disabled()
+                    || self
+                        .mte_pipeline
+                        .as_ref()
+                        .ok_or(C220CoreError::MteUnconfigured)?
+                        .can_issue_mte2_dma()
+            }
+            C220Mte2Command::MovOutToUb(transfer) => {
+                transfer.descriptor.is_disabled()
+                    || match &self.mte_pipeline {
+                        Some(pipeline) if pipeline.mte2_dma_connected() => {
+                            pipeline.can_issue_mte2_dma()
+                        }
+                        pipeline => {
+                            pipeline
+                                .as_ref()
+                                .is_none_or(|p| p.l1_fill_generator().is_idle())
+                                && tick >= self.mte2.next_mte2_issue_tick()
+                        }
+                    }
+            }
+            C220Mte2Command::CrossCore { .. } => {
+                !self.mte2.is_busy()
+                    && self
+                        .mte_pipeline
+                        .as_ref()
+                        .ok_or(C220CoreError::MteUnconfigured)?
+                        .can_issue_mte2_cross_core()
+            }
+        })
+    }
+
+    pub(super) fn dispatch_mte2_command(
+        &mut self,
+        id: u64,
+        pc: u64,
+        command: crate::sim::c220::mte::mte2::C220Mte2Command,
+    ) -> Result<crate::sim::c220::mte::mte2::C220Mte2Issue, C220CoreError> {
+        use crate::sim::c220::mte::mte2::C220Mte2Command;
+        Ok(match command {
+            C220Mte2Command::MovOutToUb(transfer) => {
+                self.mte2
+                    .issue_dma(self.mte_pipeline.as_mut(), id, pc, transfer)?
+            }
+            C220Mte2Command::MovOutToL1(transfer) => self.mte2.issue_l1_dma(
+                self.mte_pipeline
+                    .as_mut()
+                    .ok_or(C220CoreError::MteUnconfigured)?,
+                id,
+                pc,
+                transfer,
+            )?,
+            C220Mte2Command::Set2d(fill) => self.mte2.issue_l1_fill(
+                self.mte_pipeline
+                    .as_mut()
+                    .ok_or(C220CoreError::MteUnconfigured)?,
+                id,
+                pc,
+                fill,
+            )?,
+            C220Mte2Command::CrossCore {
+                instruction,
+                payload,
+            } => self.mte2.issue_cross_core(
+                self.mte_pipeline
+                    .as_mut()
+                    .ok_or(C220CoreError::MteUnconfigured)?,
+                id,
+                pc,
+                instruction,
+                payload,
+            )?,
+        })
     }
 }

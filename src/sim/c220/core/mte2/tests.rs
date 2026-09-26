@@ -7,7 +7,7 @@ use crate::sim::c220::core::C220CoreTimingRules;
 use crate::sim::c220::memory::l1::C220L1Geometry;
 use crate::sim::c220::mte::C220MtePipelineConfig;
 use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadBandwidths;
-use crate::sim::c220::mte::mte2::{C220Mte2Completion, C220Mte2IssueTiming, C220Mte2TimingRules};
+use crate::sim::c220::mte::mte2::{C220Mte2Completion, C220Mte2TimingRules};
 use crate::sim::c220::mte::mte3::C220Mte3TimingRules;
 use crate::sim::c220::mte::set2d::C220Set2dBandwidths;
 use crate::sim::c220::state::C220State;
@@ -76,6 +76,69 @@ fn configured_dma_core() -> C220Core {
     })
     .unwrap();
     core
+}
+
+#[test]
+fn mte2_issue_queue_preserves_operands_and_releases_mte1_at_retirement() {
+    let mut core = configured_dma_core();
+    core.mte2_frontend.config.vector_issue_queue_depth = NonZeroU32::new(2).unwrap();
+    core.mte2_frontend.config.outstanding_limit = NonZeroU32::new(1).unwrap();
+    let flag = |op: u32, source: u32, dest: u32| {
+        (2 << 29) | (op << 21) | (1 << 17) | (source << 10) | (dest << 7) | (12 << 2)
+    };
+    let machine = core.state.scalar_mut().machine_mut();
+    machine.set_xreg(1, 0).unwrap();
+    machine.set_xreg(3, 1 | (2 << 16)).unwrap();
+    machine.set_xreg(12, 0x1234_5678).unwrap();
+    machine.set_spr_value(15, 0x4321_4321).unwrap();
+    let fill = (3 << 29) | (1 << 22) | (1 << 17) | (3 << 7) | 6;
+    core.step_word_at(0, flag(6, 2, 4)).unwrap();
+    core.step_word_at(1, fill).unwrap();
+    assert!(matches!(core.step_word_at(2, flag(5, 4, 3)).unwrap(),
+        C220CoreStep::Stalled(stall) if stall.cause == C220StallCause::Mte2IssueQueueFull));
+    assert_eq!(core.queued_mte2_instructions().len(), 2);
+    assert_eq!(core.outstanding_mte2_commands(), 0);
+    assert!(matches!(
+        core.step_word_at(3, 0x4140_0000).unwrap(),
+        C220CoreStep::Executed { .. }
+    ));
+    core.step_word_at(4, flag(5, 2, 4)).unwrap();
+    core.step_word_at(6, flag(5, 4, 3)).unwrap();
+    core.step_word_at(8, fill).unwrap();
+    let identity = (core.state.scalar().pc(), core.next_instruction_id);
+    assert!(matches!(core.step_word_at(9, flag(5, 4, 3)).unwrap(),
+        C220CoreStep::Stalled(stall) if stall.cause == C220StallCause::Mte2IssueQueueFull));
+    assert_eq!(
+        (core.state.scalar().pc(), core.next_instruction_id),
+        identity
+    );
+    assert_eq!(core.outstanding_mte2_commands(), 1);
+    assert!(
+        core.mte2_frontend_outcomes()
+            .iter()
+            .any(|step| matches!(step,
+        C220CoreStep::Stalled(stall) if stall.cause == C220StallCause::Mte2OutstandingLimit))
+    );
+    core.step_word_at(10, flag(6, 4, 3)).unwrap();
+    let machine = core.state.scalar_mut().machine_mut();
+    machine.set_xreg(12, 0).unwrap();
+    machine.set_xreg(3, 0).unwrap();
+    machine.set_spr_value(15, 0).unwrap();
+    core.advance_to(150).unwrap();
+    assert!(!core.mte2_is_busy());
+    assert_eq!(core.mte2.last_outcomes().len(), 2);
+    assert_eq!(core.queued_mte1_instructions().count(), 0);
+    let event = core.pipeline_events().last_consumptions().last().unwrap();
+    assert_eq!(event.step.flag_id, 0x1234_5678);
+    assert_eq!(
+        event.event.published_tick,
+        core.mte2.last_outcomes()[0].retire_tick
+    );
+    assert!(event.tick >= event.event.published_tick);
+    assert_eq!(
+        core.local_memory.l1().read_known(0, 64).unwrap(),
+        0x4321_4321_u32.to_le_bytes().repeat(16)
+    );
 }
 
 #[test]
@@ -153,7 +216,7 @@ fn l1_dma_routes_cube_returns_and_commits_after_l1_acknowledgment() {
         machine.set_xreg(3, xm).unwrap();
         machine.set_spr_value(13, 0xbbaa).unwrap();
         assert!(core.step_word_at(0, word | (1 << 22) | 1).is_err());
-        assert!(!core.mte2.is_busy());
+        assert!(!core.mte2_is_busy());
         let mode = layout as u32;
         let word = word | (mode & 7) | ((mode & 8) << 19);
         core.step_word_at(0, word).unwrap();
@@ -226,7 +289,7 @@ fn l1_dma_routes_cube_returns_and_commits_after_l1_acknowledgment() {
                     .l1_fill_completions()
                     .is_empty()
             );
-            if !core.mte2.is_busy() {
+            if !core.mte2_is_busy() {
                 assert_eq!(Some(tick - 1), acknowledged);
                 break;
             }
@@ -241,7 +304,7 @@ fn l1_dma_routes_cube_returns_and_commits_after_l1_acknowledgment() {
                 beats.pop_front();
             }
         }
-        assert!(!core.mte2.is_busy());
+        assert!(!core.mte2_is_busy());
         assert!(core.mte_pipeline().unwrap().is_idle());
         assert!(beats.is_empty());
         let descriptor = C220L1DmaDescriptor { xm, layout };
@@ -442,7 +505,7 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
     let mut cache_completed = false;
     assert!(
         matches!(core.step_word_at(0, word).unwrap(), C220CoreStep::Executed {
-        instruction: C220CoreInstruction::Mte2(issue), ..
+        instruction: C220CoreInstruction::Mte2Queued(issue), ..
     } if issue.instruction_id == id)
     );
     core.memory.write_unknown_at(source, 1).unwrap();
@@ -595,12 +658,12 @@ fn run_native_memory_retirement(descriptor: u64, source_offset: u64) {
             }
         }
         assert!(core.take_mte2_biu_request().is_none());
-        if !core.mte2.is_busy() {
+        if !core.mte2_is_busy() {
             break;
         }
         assert_eq!(core.state.ub().read_states(0, 8192).unwrap(), initial_ub);
     }
-    assert!(!core.mte2.is_busy());
+    assert!(!core.mte2_is_busy());
     assert!(core.mte_pipeline().unwrap().is_idle());
     assert_eq!(
         core.mte_pipeline()
@@ -820,7 +883,7 @@ fn run_biu_dma(bus_connected: bool) {
             .unwrap();
     }
     let C220CoreStep::Executed {
-        instruction: C220CoreInstruction::Mte2(issue),
+        instruction: C220CoreInstruction::Mte2Queued(issue),
         ..
     } = core
         .step_word_at(0, CAPTURED_C220_MOV_OUT_TO_UB_X_WORD)
@@ -828,12 +891,12 @@ fn run_biu_dma(bus_connected: bool) {
     else {
         panic!("DMA issue expected");
     };
-    core.advance_to(7).unwrap();
+    core.advance_to(11).unwrap();
     assert!(core.take_mte2_biu_request().is_none());
-    core.advance_to(8).unwrap();
+    core.advance_to(12).unwrap();
     assert!(
         core.receive_mte2_biu_at(
-            8,
+            12,
             [
                 Some(C220BiuReadBeat {
                     tag: NonZeroU32::new(1).unwrap(),
@@ -844,7 +907,7 @@ fn run_biu_dma(bus_connected: bool) {
         )
         .is_err()
     );
-    let first_tick = if bus_connected { 10 } else { 8 };
+    let first_tick = if bus_connected { 14 } else { 12 };
     core.advance_to(first_tick).unwrap();
     let first = core.take_mte2_biu_request().unwrap();
     core.advance_to(first_tick + 1).unwrap();
@@ -941,12 +1004,12 @@ fn run_biu_dma(bus_connected: bool) {
     }
     core.advance_to(completed_at.unwrap() + 1).unwrap();
     assert!(core.state.ub().read_known(0, 32).is_err());
-    assert!(core.mte2.is_busy());
+    assert!(core.mte2_is_busy());
     // Reentering the same tick must not apply the acknowledgment twice.
     core.advance_to(completed_at.unwrap() + 1).unwrap();
     core.advance_to(completed_at.unwrap() + 2).unwrap();
     assert_eq!(core.state.ub().read_known(0, 4096).unwrap(), vec![7; 4096]);
-    assert!(!core.mte2.is_busy());
+    assert!(!core.mte2_is_busy());
     assert!(core.mte_pipeline().unwrap().is_idle());
 }
 
@@ -957,23 +1020,23 @@ fn dma_credit_stalls_generation_but_destination_response_controls_retirement() {
     core.connect_mte2_dma().unwrap();
     core.set_mte2_dma_hardware_sync_blocked(true).unwrap();
     let C220CoreStep::Executed {
-        instruction: C220CoreInstruction::Mte2(issue),
+        instruction: C220CoreInstruction::Mte2Queued(issue),
         ..
     } = core.step_word_at(0, word).unwrap()
     else {
         panic!("DMA issue expected");
     };
-    assert!(matches!(issue.timing, C220Mte2IssueTiming::Dma(_)));
+    assert_eq!(issue.ready_tick, 1);
     assert!(core.connect_mte2_dma().is_err());
-    core.advance_to(8).unwrap();
+    core.advance_to(12).unwrap();
     let generator = core.mte_pipeline().unwrap().dma_generator();
     assert_eq!(generator.generated().len(), 4);
-    assert_eq!(generator.generated().front().unwrap().ready_tick, 4);
+    assert_eq!(generator.generated().front().unwrap().ready_tick, 8);
     assert_eq!(generator.pending_instruction(), Some(issue.instruction_id));
     assert!(core.take_mte2_dma_request().is_none());
-    assert!(core.complete_mte2_dma_at(8, issue.instruction_id).is_err());
+    assert!(core.complete_mte2_dma_at(12, issue.instruction_id).is_err());
     core.set_mte2_dma_hardware_sync_blocked(false).unwrap();
-    core.advance_to(9).unwrap();
+    core.advance_to(13).unwrap();
     let offered = core.mte_pipeline().unwrap().dma_output().unwrap();
     core.advance_to(20).unwrap();
     assert_eq!(core.mte_pipeline().unwrap().dma_output(), Some(offered));
@@ -994,9 +1057,9 @@ fn dma_credit_stalls_generation_but_destination_response_controls_retirement() {
     let pc = core.state.scalar().pc();
     assert!(matches!(
         core.step_word_at(20, fill_word).unwrap(),
-        C220CoreStep::Stalled(_)
+        C220CoreStep::Executed { .. }
     ));
-    assert_eq!(core.state.scalar().pc(), pc);
+    assert_eq!(core.state.scalar().pc(), pc + 4);
 
     let mut requests = Vec::new();
     let mut tail_tick = None;
@@ -1026,10 +1089,6 @@ fn dma_credit_stalls_generation_but_destination_response_controls_retirement() {
         }
     );
     assert!(core.state.ub().read_known(0, 32).is_err());
-    assert!(matches!(
-        core.step_word_at(tail_tick + 1, fill_word).unwrap(),
-        C220CoreStep::Executed { .. }
-    ));
     let set = (2 << 29) | (5 << 21) | (4 << 10) | 3;
     let wait = (set & !(15 << 21)) | (6 << 21);
     core.step_word_at(tail_tick + 2, set).unwrap();
@@ -1057,5 +1116,5 @@ fn dma_credit_stalls_generation_but_destination_response_controls_retirement() {
         core.step_word_at(62, wait).unwrap(),
         C220CoreStep::Executed { .. }
     ));
-    assert!(!core.mte2.is_busy());
+    assert!(!core.mte2_is_busy());
 }

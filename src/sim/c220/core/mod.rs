@@ -52,6 +52,10 @@ pub use mte1_barrier::C220Mte1Barrier;
 mod mte1_issue;
 pub use mte1_issue::{C220Mte1FrontendConfig, C220Mte1IssuedInstruction, C220Mte1Operation};
 mod mte2;
+mod mte2_frontend;
+pub use mte2_frontend::{
+    C220Mte2FrontendConfig, C220Mte2IssuedInstruction, C220Mte2Operation, C220Mte2QueuedCommand,
+};
 mod mte3;
 
 use crate::sim::c220::cube::runtime::CubeEngine;
@@ -74,6 +78,7 @@ pub struct C220CoreConfig {
     pub cube: C220CubeConfig,
     pub cube_frontend: crate::sim::c220::cube::frontend::C220CubeFrontendConfig,
     pub mte1_frontend: C220Mte1FrontendConfig,
+    pub mte2_frontend: C220Mte2FrontendConfig,
     pub timing: C220CoreTimingRules,
 }
 
@@ -84,6 +89,7 @@ impl C220CoreConfig {
             cube: C220CubeConfig::default(),
             cube_frontend: Default::default(),
             mte1_frontend: Default::default(),
+            mte2_frontend: Default::default(),
             timing,
         }
     }
@@ -131,6 +137,7 @@ pub struct C220Core {
     device: C220Device,
     state: C220State,
     mte2: C220Mte2Pipeline,
+    mte2_frontend: mte2_frontend::Mte2Frontend,
     scalar_timing: C220ScalarTimingLane,
     lsu: Option<lsu::CoreLsu>,
     mte1: Mte1Engine,
@@ -169,6 +176,7 @@ impl C220Core {
             cube: cube_config,
             cube_frontend,
             mte1_frontend,
+            mte2_frontend,
             timing,
         } = config;
         if state.scalar().machine().architecture() != Architecture::Dav2201 {
@@ -184,6 +192,7 @@ impl C220Core {
             device,
             state,
             mte2: C220Mte2Pipeline::new(timing.mte2),
+            mte2_frontend: mte2_frontend::Mte2Frontend::new(mte2_frontend),
             scalar_timing: C220ScalarTimingLane::default(),
             lsu: None,
             mte1: Mte1Engine::with_outstanding_limit(mte1_frontend.outstanding_limit),
