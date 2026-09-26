@@ -90,6 +90,7 @@ fn destination_splitting_preserves_reserved_tags_and_recycles_after_response() {
         subcore: C220BiuSubcore::Vector0,
         gather_stride: None,
         generated: C220DmaGenerated {
+            sid: Some(11),
             instruction_id: 9,
             uop_index: 0,
             ready_tick: 0,

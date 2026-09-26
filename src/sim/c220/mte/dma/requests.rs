@@ -9,6 +9,13 @@ pub(super) enum Requests {
 }
 
 impl Requests {
+    pub(super) fn sid(&self) -> u8 {
+        match self {
+            Self::Dma(requests) => requests.sid(),
+            Self::Load2d(requests) => requests.sid(),
+        }
+    }
+
     pub(super) fn metadata(&self) -> (C220DmaDestinationLayout, C220DmaUopMode, bool) {
         match self {
             Self::Dma(requests) => (

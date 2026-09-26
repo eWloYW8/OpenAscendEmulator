@@ -10,6 +10,8 @@ use requests::Requests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220DmaGenerated {
+    /// Captured descriptor SID, absent for requests without a DMA descriptor.
+    pub sid: Option<u8>,
     pub instruction_id: u64,
     pub uop_index: u64,
     pub ready_tick: u64,
@@ -181,6 +183,7 @@ impl C220DmaFrontend {
             let (destination, mode, out_of_order) = generation.requests.metadata();
             let last_in_instruction = generation.requests.clone().next().is_none();
             let entry = C220DmaGenerated {
+                sid: Some(generation.requests.sid()),
                 instruction_id: generation.instruction_id,
                 uop_index: generation.next_index,
                 ready_tick,

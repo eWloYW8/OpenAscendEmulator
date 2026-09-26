@@ -42,6 +42,7 @@ pub struct C220Load2dExternalRequest {
 /// sends whole blocks; an aligned base uses the selected DMA split mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220Load2dExternalRequests {
+    sid: u8,
     segments: C220Load2dSegments,
     current: Option<C220Load2dSegment>,
     offset: u32,
@@ -58,6 +59,7 @@ impl C220Load2dExternalRequests {
     ) -> Result<Self, C220Load2dError> {
         check_external(transfer)?;
         Ok(Self {
+            sid: transfer.descriptor.sid,
             segments: transfer.segments(),
             current: None,
             offset: 0,
@@ -80,6 +82,10 @@ impl C220Load2dExternalRequests {
         bool,
     ) {
         (self.layout, self.mode, self.aligned_source)
+    }
+
+    pub const fn sid(&self) -> u8 {
+        self.sid
     }
 }
 

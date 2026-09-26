@@ -135,6 +135,7 @@ pub fn mte2_requests(
 
 pub fn mte2_uops(transfer: C220Mte2TransferPlan) -> Result<C220DmaUops, C220DmaUopError> {
     let mut requests = mte2_request_stream(transfer)?;
+    requests.sid = transfer.descriptor.sid();
     requests.destination = C220DmaDestinationLayout {
         base: transfer.destination_address,
         burst_bytes: u32::from(transfer.descriptor.burst_length) * 32,
@@ -191,6 +192,22 @@ fn mte2_request_stream(transfer: C220Mte2TransferPlan) -> Result<C220DmaUops, C2
 }
 
 pub fn mte2_l1_uops(
+    descriptor: C220L1DmaDescriptor,
+    source_address: u64,
+    destination_address: u64,
+    dma_mode_word: u64,
+) -> Result<C220DmaUops, C220DmaUopError> {
+    let mut requests = mte2_l1_request_stream(
+        descriptor,
+        source_address,
+        destination_address,
+        dma_mode_word,
+    )?;
+    requests.sid = (descriptor.xm & 0xf) as u8;
+    Ok(requests)
+}
+
+fn mte2_l1_request_stream(
     descriptor: C220L1DmaDescriptor,
     source_address: u64,
     destination_address: u64,
@@ -346,6 +363,12 @@ pub fn mte3_requests(
 }
 
 pub fn mte3_uops(transfer: C220Mte3TransferPlan) -> Result<C220DmaUops, C220DmaUopError> {
+    let mut requests = mte3_request_stream(transfer)?;
+    requests.sid = (transfer.descriptor.xm & 0xf) as u8;
+    Ok(requests)
+}
+
+fn mte3_request_stream(transfer: C220Mte3TransferPlan) -> Result<C220DmaUops, C220DmaUopError> {
     let descriptor =
         C220DmaMovDescriptor::decode(transfer.descriptor.instruction_word, transfer.descriptor.xm)?;
     if descriptor != transfer.descriptor {
@@ -404,6 +427,7 @@ fn split_requests(
         return Err(C220DmaUopError::SizeOverflow);
     }
     Ok(C220DmaUops {
+        sid: 0,
         destination: C220DmaDestinationLayout {
             base: geometry.destination_base,
             burst_bytes: geometry.burst_bytes as u32,
@@ -421,6 +445,7 @@ fn split_requests(
 /// destination offsets and both base addresses remain 64-bit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220DmaUops {
+    sid: u8,
     destination: C220DmaDestinationLayout,
     geometry: DmaRequestGeometry,
     route: C220DmaUopRoute,
@@ -430,6 +455,10 @@ pub struct C220DmaUops {
 }
 
 impl C220DmaUops {
+    pub const fn sid(&self) -> u8 {
+        self.sid
+    }
+
     pub(super) fn destination(&self) -> C220DmaDestinationLayout {
         self.destination
     }

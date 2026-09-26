@@ -11,6 +11,7 @@ fn input(subcore: C220BiuSubcore, id: u64, address: u64, bytes: u32) -> C220BiuR
         },
         prefetch: false,
         generated: C220DmaGenerated {
+            sid: Some(11),
             instruction_id: id,
             uop_index: 0,
             ready_tick: 0,
@@ -89,6 +90,9 @@ fn weighted_arbitration_split_backpressure_and_reserved_tags() {
     let tail = frontend.send(9, true).unwrap().sent().unwrap();
     assert_eq!(tail.input.generated.request.bytes, 1);
     assert_eq!(tail.byte_offset, 511);
+    for request in [held, second, third, tail] {
+        assert_eq!(request.input.generated.sid, Some(11));
+    }
     assert!(tail.input.generated.last_in_instruction);
     assert!(frontend.contains_instruction(1));
     frontend.release_tag(9, third.tag).unwrap();

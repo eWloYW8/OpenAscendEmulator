@@ -115,7 +115,11 @@ fn external_load2d_retires_only_after_its_selected_local_destination() {
             machine
                 .set_xreg(
                     3,
-                    (2 << 16) | (1 << 24) | (1 << 44) | if offset == 0 { 0 } else { 7 << 61 },
+                    (2 << 16)
+                        | (1 << 24)
+                        | (11 << 40)
+                        | (1 << 44)
+                        | if offset == 0 { 0 } else { 7 << 61 },
                 )
                 .unwrap();
             let transpose = destination != 2;
@@ -150,6 +154,7 @@ fn external_load2d_retires_only_after_its_selected_local_destination() {
                             Some(request),
                         )) => {
                             assert_eq!(request.ready_tick, tick + 2);
+                            assert_eq!(request.sid, Some(11));
                             generated += 1;
                         }
                         C220MtePipelineEvent::L0a(C220L0WriteEventOutcome::Acknowledged(Some(
@@ -165,6 +170,7 @@ fn external_load2d_retires_only_after_its_selected_local_destination() {
                     }
                 }
                 if let Some(request) = core.take_mte2_biu_request() {
+                    assert_eq!(request.input.generated.sid, Some(11));
                     assert_eq!(
                         request.input.destination,
                         [
@@ -1162,6 +1168,12 @@ fn biu_tags_backpressure_dma_without_retiring_on_request_delivery() {
 
 fn run_biu_dma(bus_connected: bool) {
     let mut core = configured_dma_core();
+    let operands = C220MovInstruction::decode(CAPTURED_C220_MOV_OUT_TO_UB_X_WORD).unwrap();
+    core.state
+        .scalar_mut()
+        .machine_mut()
+        .set_xreg(operands.descriptor_register, (128 << 16) | (1 << 4) | 13)
+        .unwrap();
     core.connect_mte2_biu(
         C220BiuReadConfig {
             outstanding: NonZeroU32::new(2).unwrap(),
@@ -1213,8 +1225,10 @@ fn run_biu_dma(bus_connected: bool) {
     let first_tick = if bus_connected { 14 } else { 12 };
     core.advance_to(first_tick).unwrap();
     let first = core.take_mte2_biu_request().unwrap();
+    assert_eq!(first.input.generated.sid, Some(13));
     core.advance_to(first_tick + 1).unwrap();
     let second = core.take_mte2_biu_request().unwrap();
+    assert_eq!(second.input.generated.sid, Some(13));
     core.advance_to(20).unwrap();
     assert!(core.take_mte2_biu_request().is_none());
     assert!(core.take_mte2_dma_request().is_none());
@@ -1243,6 +1257,7 @@ fn run_biu_dma(bus_connected: bool) {
         core.advance_to(tick).unwrap();
         if let Some(request) = core.take_mte2_biu_request() {
             requests.push(request);
+            assert_eq!(request.input.generated.sid, Some(13));
             beats.extend((0..4).rev().map(|transaction_id| C220BiuReadBeat {
                 tag: request.tag,
                 transaction_id,

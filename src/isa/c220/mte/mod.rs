@@ -111,8 +111,6 @@ pub struct C220MovOutToUbSegment {
 pub enum C220MovOutToUbError {
     #[error("unsupported C220 MOV_OUT_TO_UB word {word:#010x}")]
     UnsupportedWord { word: u32 },
-    #[error("unsupported C220 MOV_OUT_TO_UB XM descriptor {xm:#x}")]
-    UnsupportedXm { xm: u64 },
     #[error("cannot allocate C220 MOV_OUT_TO_UB segment records")]
     AllocationFailed,
     #[error("C220 MOV_OUT_TO_UB descriptor fields disagree with XM")]
@@ -137,9 +135,6 @@ impl C220MovOutToUbDescriptor {
             return Err(C220MovOutToUbError::UnsupportedWord {
                 word: instruction_word,
             });
-        }
-        if xm & 0xf != 0 {
-            return Err(C220MovOutToUbError::UnsupportedXm { xm });
         }
         let layout = BurstLayout::decode(xm);
         Ok(Self {
@@ -168,6 +163,10 @@ impl C220MovOutToUbDescriptor {
 
     pub const fn is_disabled(self) -> bool {
         self.burst_count == 0 || self.burst_length == 0
+    }
+
+    pub const fn sid(self) -> u8 {
+        (self.xm & 0xf) as u8
     }
 
     pub fn segment_iter(
@@ -455,17 +454,22 @@ mod tests {
     }
 
     #[test]
-    fn captured_mte2_plan_rejects_other_modes_and_overflow() {
+    fn captured_mte2_plan_preserves_sid_and_rejects_overflow() {
         assert!(matches!(
             C220MovOutToUbDescriptor::decode(0, 0x40010),
             Err(C220MovOutToUbError::UnsupportedWord { .. })
         ));
-        assert!(matches!(
-            C220MovOutToUbDescriptor::decode(CAPTURED_C220_MOV_OUT_TO_UB_X_WORD, 0x40011),
-            Err(C220MovOutToUbError::UnsupportedXm { .. })
-        ));
         let descriptor =
             C220MovOutToUbDescriptor::decode(CAPTURED_C220_MOV_OUT_TO_UB_X_WORD, 0x40010).unwrap();
+        for sid in 0..16 {
+            let tagged = C220MovOutToUbDescriptor::decode(
+                CAPTURED_C220_MOV_OUT_TO_UB_X_WORD,
+                0x40010 | u64::from(sid),
+            )
+            .unwrap();
+            assert_eq!(tagged.sid(), sid);
+            assert_eq!(tagged.segments(0, 0), descriptor.segments(0, 0));
+        }
         assert_eq!(
             descriptor.segments(u64::MAX - 32, 0),
             Err(C220MovOutToUbError::AddressOverflow)

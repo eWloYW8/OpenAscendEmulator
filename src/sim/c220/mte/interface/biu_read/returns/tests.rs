@@ -16,6 +16,7 @@ fn request(tag: u32, id: u64, core: C220BiuSubcore, bytes: u32) -> C220BiuReadRe
             },
             prefetch: false,
             generated: C220DmaGenerated {
+                sid: Some(11),
                 instruction_id: id,
                 uop_index: 0,
                 ready_tick: 0,

@@ -41,6 +41,7 @@ impl C220BiuWriteInput {
             gather_stride: None,
             store_token: Some(write.token),
             generated: C220DmaGenerated {
+                sid: None,
                 instruction_id: fragment.instruction_id,
                 uop_index: fragment.request_id,
                 ready_tick: tick,
