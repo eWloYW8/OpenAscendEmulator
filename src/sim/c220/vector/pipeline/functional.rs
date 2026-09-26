@@ -13,6 +13,7 @@ use crate::sim::c220::vector::ops::{
     scalar::C220VectorScalarIssue,
     select::{C220SelectIssue, C220SelectMode},
     shift::C220ShiftIssue,
+    sort::C220SortIssue,
     special::C220SpecialUnaryIssue,
     ternary::C220TernaryIssue,
     transpose::C220TransposeIssue,
@@ -37,6 +38,7 @@ pub(super) enum FunctionalInstruction {
     PackedCompare(Box<C220PackedCompareIssue>),
     Transpose(Box<C220TransposeIssue>),
     Broadcast(Box<C220BroadcastIssue>),
+    Sort(Box<C220SortIssue>),
 }
 
 impl FunctionalInstruction {
@@ -65,6 +67,7 @@ impl FunctionalInstruction {
             }
             C220VectorReadIssue::Transpose(issue) => Some(Self::Transpose(Box::new(issue.clone()))),
             C220VectorReadIssue::Broadcast(issue) => Some(Self::Broadcast(Box::new(issue.clone()))),
+            C220VectorReadIssue::Sort(issue) => Some(Self::Sort(Box::new(issue.clone()))),
             _ => None,
         }
     }
@@ -86,6 +89,7 @@ impl FunctionalInstruction {
             Self::PackedCompare(issue) => C220VectorReadIssue::PackedCompare(issue),
             Self::Transpose(issue) => C220VectorReadIssue::Transpose(issue),
             Self::Broadcast(issue) => C220VectorReadIssue::Broadcast(issue),
+            Self::Sort(issue) => C220VectorReadIssue::Sort(issue),
         }
     }
 
@@ -139,6 +143,7 @@ impl FunctionalInstruction {
             }
             Self::MoveMask(_) | Self::Transpose(_) => return (1, 0),
             Self::Broadcast(issue) => return (usize::from(issue.control.repeat_count), 0),
+            Self::Sort(issue) => return (usize::from(issue.repeat_count), 0),
             Self::PackedCompare(issue) => {
                 return (issue.uop_count(), issue.instruction.width.lane_count());
             }
@@ -171,6 +176,7 @@ impl C220VectorPipeline {
                 FunctionalInstruction::MoveMask(_)
                     | FunctionalInstruction::Transpose(_)
                     | FunctionalInstruction::Broadcast(_)
+                    | FunctionalInstruction::Sort(_)
             ) {
                 (None, C220VectorUopKind::Ordinary)
             } else {

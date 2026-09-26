@@ -12,6 +12,114 @@ use crate::sim::common::scalar::ScalarMachine;
 use crate::sim::common::scalar::ScalarStepper;
 
 #[test]
+fn sort_functional_completion_observes_live_inputs_and_repeat_feedback() {
+    use crate::sim::c220::numeric::fp16::to_f64;
+    use crate::sim::c220::vector::C220VectorInstruction;
+    use crate::sim::c220::vector::ops::sort::plan_c220_sort_issue;
+
+    for (word, width) in [(0x8540_0002, 2), (0x85c0_0002, 4)] {
+        for destination in [0, 256, 1024] {
+            let mut bytes = vec![0_u8; 2048];
+            for repeat in 0..2 {
+                for lane in 0..32 {
+                    let value = if width == 2 {
+                        u32::from(0x3c00_u16 + lane as u16 * 32)
+                    } else {
+                        (lane as f32 + 1.0).to_bits()
+                    };
+                    let offset = repeat * 256 + lane * width;
+                    bytes[offset..offset + width].copy_from_slice(&value.to_le_bytes()[..width]);
+                    let offset = 768 + repeat * 256 + lane * 4;
+                    bytes[offset..offset + 4].copy_from_slice(&(lane as f32 + 100.0).to_le_bytes());
+                }
+            }
+            let mut ub = UbMemory::new(2048, 2048);
+            ub.write_states(0, &vec![MemoryByteState::Known(0); 2048])
+                .unwrap();
+            let instruction = C220VectorInstruction::Sort(
+                plan_c220_sort_issue(
+                    0,
+                    word,
+                    2 << 56,
+                    C220VectorAddresses {
+                        source_0: 0,
+                        source_1: 768,
+                        destination,
+                    },
+                    &ub,
+                )
+                .unwrap(),
+            );
+            let mut pipeline = C220VectorPipeline::new(C220VectorTimingRules {
+                dispatch_ticks: 0,
+                uop_issue_interval: NonZeroU64::new(1).unwrap(),
+                ub_response_ticks: 2,
+            });
+            pipeline
+                .issue_at(
+                    0,
+                    &instruction.uops().unwrap(),
+                    instruction.stores(),
+                    instruction.read_issue(),
+                )
+                .unwrap();
+            ub.write_states(
+                0,
+                &bytes
+                    .iter()
+                    .copied()
+                    .map(MemoryByteState::Known)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+            let mut core = C220State::new(ScalarStepper::new(machine, 0), ub);
+            for repeat in 0..2 {
+                let mut records = (0..32)
+                    .map(|lane| {
+                        let offset = repeat * 256 + lane * width;
+                        let mut record = [0_u8; 8];
+                        record[..width].copy_from_slice(&bytes[offset..offset + width]);
+                        let offset = 768 + repeat * 256 + lane * 4;
+                        record[4..].copy_from_slice(&bytes[offset..offset + 4]);
+                        record
+                    })
+                    .collect::<Vec<_>>();
+                let value = |record: &[u8; 8]| {
+                    if width == 2 {
+                        to_f64(u16::from_le_bytes(record[..2].try_into().unwrap()))
+                    } else {
+                        f64::from(f32::from_le_bytes(record[..4].try_into().unwrap()))
+                    }
+                };
+                records.sort_by(|left, right| value(right).partial_cmp(&value(left)).unwrap());
+                for (lane, record) in records.iter().enumerate() {
+                    let offset = destination as usize + repeat * 256 + lane * 8;
+                    bytes[offset..offset + 8].copy_from_slice(record);
+                }
+            }
+            let releases = pipeline.advance_to(512, &mut core).unwrap();
+            let samples = pipeline.last_functional_samples();
+            assert_eq!(samples.len(), 2);
+            assert!(
+                samples
+                    .iter()
+                    .all(|sample| sample.tick == releases.last().unwrap().release_tick + 1)
+            );
+            assert!(
+                pipeline
+                    .last_read_samples()
+                    .iter()
+                    .all(|sample| sample.sort_lanes.is_none())
+            );
+            assert_eq!(core.ub().read_known(0, 2048).unwrap(), bytes);
+            assert_eq!(pipeline.pending_uops(), 0);
+            assert_eq!(pipeline.pending_ub_responses(), 0);
+        }
+    }
+}
+
+#[test]
 fn accumulator_reads_use_two_ports_and_share_aliased_grants() {
     use crate::sim::c220::numeric::fp16::C220Fp16Mode;
     use crate::sim::c220::vector::C220VectorInstruction;
