@@ -19,6 +19,8 @@ pub enum C220StallCause {
     Mte3Dependency,
     VectorDependency,
     CubeDependency,
+    CubeIssueQueueFull,
+    CubeOutstandingLimit,
     FixpDependency,
     FixpIssueQueueFull,
     FixpCommandQueueFull,

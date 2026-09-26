@@ -15,6 +15,22 @@ impl C220Core {
         instruction: crate::isa::c220::hflag::C220HardwareFlagInstruction,
     ) -> Result<C220CoreStep, C220CoreError> {
         let step = instruction.resolve(pc, self.state.scalar().machine().xregs())?;
+        self.enqueue_cube_at(
+            tick,
+            pc,
+            instruction.word,
+            crate::sim::c220::cube::frontend::C220CubeCommand::HardwareFlag(step),
+        )
+    }
+
+    pub(super) fn dispatch_cube_hardware_flag_at(
+        &mut self,
+        tick: u64,
+        instruction_id: u64,
+        step: crate::isa::c220::hflag::C220HardwareFlagStep,
+    ) -> Result<C220CoreStep, C220CoreError> {
+        let instruction = step.instruction;
+        let pc = step.pc;
         let result = if instruction.operation == C220HardwareFlagOperation::Set {
             if self.hardware_flags.has_pending_cube_flag(step) {
                 return Ok(C220CoreStep::Stalled(C220Stall {
@@ -25,8 +41,7 @@ impl C220Core {
                 }));
             }
             let ready = if !instruction.trigger {
-                self.hardware_flags
-                    .enqueue_cube_set(self.next_instruction_id, step)?;
+                self.hardware_flags.enqueue_cube_set(instruction_id, step)?;
                 None
             } else {
                 match self.hardware_flags.schedule_set(step, tick) {
@@ -45,17 +60,14 @@ impl C220Core {
             C220CoreStep::Executed {
                 tick,
                 instruction: C220CoreInstruction::HardwareFlag {
-                    instruction_id: self.next_instruction_id,
+                    instruction_id,
                     step,
                     token_ready_tick: ready,
                 },
             }
         } else {
-            self.dispatch_cube_hardware_wait_at(tick, self.next_instruction_id, step)?
+            self.dispatch_cube_hardware_wait_at(tick, instruction_id, step)?
         };
-        if matches!(result, C220CoreStep::Executed { .. }) {
-            self.state.commit_c220_sequential_issue();
-        }
         Ok(result)
     }
 
@@ -111,7 +123,7 @@ impl C220Core {
         let instruction = step.instruction;
         let pc = step.pc;
         if instruction.execution_pipe_code() == 2 {
-            return self.dispatch_cube_hardware_wait_at(tick, instruction_id, step);
+            return self.dispatch_cube_hardware_flag_at(tick, instruction_id, step);
         }
         let trigger_blocked = match instruction.execution_pipe_code() {
             3 => self

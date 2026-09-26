@@ -29,6 +29,7 @@ pub use lsu::{C220CoreMaintenanceCompletion, C220CoreMaintenanceIssue};
 pub use lsu::{C220CorePreloadCompletion, C220CorePreloadIssue};
 pub use lsu::{C220CoreStoreCompletion, C220CoreStoreIssue};
 mod cube;
+mod cube_frontend;
 mod decode;
 mod dispatch;
 mod external_fixp;
@@ -66,6 +67,7 @@ pub use instruction::C220CoreInstruction;
 pub struct C220CoreConfig {
     pub device: C220Device,
     pub cube: C220CubeConfig,
+    pub cube_frontend: crate::sim::c220::cube::frontend::C220CubeFrontendConfig,
     pub timing: C220CoreTimingRules,
 }
 
@@ -74,6 +76,7 @@ impl C220CoreConfig {
         Self {
             device: C220Device::default(),
             cube: C220CubeConfig::default(),
+            cube_frontend: Default::default(),
             timing,
         }
     }
@@ -133,6 +136,7 @@ pub struct C220Core {
     device_flags: crate::sim::c220::sync::C220DeviceFlagState,
     mte3: Mte3Engine,
     cube: CubeEngine,
+    cube_frontend: cube_frontend::CubeFrontend,
     vector: VectorEngine,
     local_memory: C220LocalMemory,
     memory: MappedMemory,
@@ -155,6 +159,7 @@ impl C220Core {
         let C220CoreConfig {
             device,
             cube: cube_config,
+            cube_frontend,
             timing,
         } = config;
         if state.scalar().machine().architecture() != Architecture::Dav2201 {
@@ -182,6 +187,7 @@ impl C220Core {
             device_flags: crate::sim::c220::sync::C220DeviceFlagState::default(),
             mte3: Mte3Engine::new(timing.mte3),
             cube: CubeEngine::new(cube_config)?,
+            cube_frontend: cube_frontend::CubeFrontend::new(cube_frontend),
             vector: VectorEngine::new(timing.vector, initial_compare_mask),
             local_memory: C220LocalMemory::new(C220LocalMemoryConfig::for_device(device))?,
             memory,
@@ -448,6 +454,9 @@ impl C220Core {
             self.cube
                 .pipeline
                 .pending_drain_tick()
+                .map(|tick| (tick, C220StallCause::CubeDependency)),
+            self.cube_frontend
+                .next_tick
                 .map(|tick| (tick, C220StallCause::CubeDependency)),
             self.pending_mte1_tick()
                 .map(|tick| (tick, C220StallCause::Mte1Dependency)),

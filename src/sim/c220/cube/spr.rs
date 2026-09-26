@@ -1,14 +1,14 @@
 use crate::isa::c220::cube::spr::C220CubeSprWrite;
-use crate::sim::common::scalar::{ScalarMachine, ScalarMachineError, ScalarSprStep};
+use crate::sim::common::scalar::{ScalarMachine, ScalarSprStep};
 
-pub(in crate::sim::c220) fn execute_write(
-    machine: &mut ScalarMachine,
+pub(in crate::sim::c220) fn capture_write(
+    machine: &ScalarMachine,
     pc: u64,
     word: u32,
     instruction: C220CubeSprWrite,
-) -> Result<ScalarSprStep, ScalarMachineError> {
+) -> ScalarSprStep {
     let source_value = machine.xregs()[usize::from(instruction.source_register)];
-    let step = ScalarSprStep {
+    ScalarSprStep {
         pc,
         word,
         destination_spr: instruction.destination_spr,
@@ -16,7 +16,5 @@ pub(in crate::sim::c220) fn execute_write(
         source_register: Some(instruction.source_register),
         source_value,
         value: source_value,
-    };
-    machine.set_spr_value(step.destination_spr, step.value)?;
-    Ok(step)
+    }
 }

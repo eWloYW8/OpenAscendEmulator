@@ -3,6 +3,7 @@ use super::{C220Core, C220CoreError};
 impl C220Core {
     pub(super) fn advance_engines_to(&mut self, tick: u64) -> Result<(), C220CoreError> {
         self.cube.begin_advance();
+        self.cube_frontend.outcomes.clear();
         self.mte1.begin_advance();
         self.mte1_frontend.outcomes.clear();
         self.mte2.begin_advance();
@@ -22,6 +23,7 @@ impl C220Core {
                 .pipeline
                 .next_event_tick()
                 .into_iter()
+                .chain(self.cube_frontend.next_tick)
                 .chain(self.hardware_flags.next_notification_tick())
                 .chain(self.mte1.next_event_tick())
                 .chain(self.lsu.as_ref().and_then(|lsu| lsu.next_tick))
@@ -141,6 +143,7 @@ impl C220Core {
                 &mut self.hardware_flags,
                 self.state.scalar_mut().machine_mut(),
             )?;
+            self.dispatch_cube_head_at(event_tick)?;
             self.vector.advance_event(event_tick, &mut self.state)?;
             if let Some(pipeline) = &mut self.mte_pipeline {
                 pipeline.advance_ub_service(self.vector.ub_activity_at(event_tick))?;

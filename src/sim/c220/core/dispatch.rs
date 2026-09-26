@@ -163,6 +163,9 @@ impl C220Core {
             C220DispatchKind::CubeSpr(instruction) => {
                 return self.step_cube_spr_at(tick, pc, word, instruction);
             }
+            C220DispatchKind::Cube(instruction) => {
+                return self.issue_cube_at(tick, pc, word, instruction);
+            }
             C220DispatchKind::Mte2 => return self.step_mte2_at(tick, pc, word),
             C220DispatchKind::HardwareFlag(instruction) => {
                 return match instruction.execution_pipe_code() {
@@ -173,26 +176,10 @@ impl C220Core {
             }
             _ => {}
         }
-        let cube_instruction = match decoded_word.kind {
-            C220DispatchKind::Cube(instruction) => Some(instruction),
-            _ => None,
-        };
-        if cube_instruction.is_some() && tick < self.cube.pipeline.next_accept_tick() {
-            return Ok(C220CoreStep::Stalled(C220Stall {
-                tick,
-                pc,
-                resume_tick: self.cube.pipeline.next_accept_tick(),
-                cause: C220StallCause::CubeDependency,
-            }));
-        }
         if decoded_word.kind == C220DispatchKind::Mte3 {
             return self.step_mte3_at(tick, pc, word, decoded_word.flow_flag);
         }
         let instruction = match word {
-            _ if cube_instruction.is_some() => {
-                let decoded = cube_instruction.expect("matched Cube decode");
-                self.issue_cube_at(tick, pc, word, decoded)?
-            }
             _ if decoded_word
                 .flow_flag
                 .is_some_and(|flag| flag.source_pipe_code == 1 && flag.trigger_pipe_code == 0) =>

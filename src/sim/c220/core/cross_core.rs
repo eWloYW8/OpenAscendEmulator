@@ -76,6 +76,19 @@ impl C220Core {
         if instruction.pipe_code == 10 {
             return self.step_fixp_at(tick, pc, instruction.word);
         }
+        if instruction.pipe_code == 2 {
+            let value =
+                self.state.scalar().machine().xregs()[usize::from(instruction.source_register)];
+            return self.enqueue_cube_at(
+                tick,
+                pc,
+                instruction.word,
+                crate::sim::c220::cube::frontend::C220CubeCommand::CrossCore {
+                    instruction,
+                    payload: C220DeviceSync::from_value(value),
+                },
+            );
+        }
         if instruction.pipe_code == 5 {
             if !self.mte3.physical {
                 return Err(C220CoreError::Mte3FrontendRequired);
@@ -140,10 +153,6 @@ impl C220Core {
             1 => (
                 self.vector.pending_drain_tick(),
                 C220StallCause::VectorDependency,
-            ),
-            2 => (
-                self.cube.pipeline.pending_drain_tick(),
-                C220StallCause::CubeDependency,
             ),
             pipe => return Err(C220CoreError::UnsupportedCrossCorePipe { pc, pipe }),
         };

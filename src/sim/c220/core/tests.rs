@@ -3072,14 +3072,16 @@ fn vabs_uses_modeled_five_tick_execution_stage() {
         .machine_mut()
         .set_xreg(6, 0x710)
         .unwrap();
+    timed.step_word_at(1, cross | (2 << 10)).unwrap();
+    timed.advance_to(2).unwrap();
     let C220CoreStep::Executed {
         instruction: C220CoreInstruction::CrossCore(reception),
         ..
-    } = timed.step_word_at(1, cross | (2 << 10)).unwrap()
+    } = timed.cube_frontend_outcomes().last().unwrap()
     else {
         panic!("idle cube notification must not drain the vector pipeline")
     };
-    assert_eq!(reception.tick, 1);
+    assert_eq!(reception.tick, 2);
     assert_eq!(reception.payload.mode, 1);
     assert_eq!(reception.payload.flag_id, 7);
     let pc = timed.state.scalar().pc();

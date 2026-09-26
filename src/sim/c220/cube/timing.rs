@@ -54,6 +54,7 @@ impl Default for C220CubeConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CubeTicket {
+    /// Reception by the execution pipeline, after the frontend queue.
     pub accept_tick: u64,
     pub first_uop_tick: Option<u64>,
     pub last_uop_tick: Option<u64>,

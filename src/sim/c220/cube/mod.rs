@@ -4,6 +4,7 @@ mod accumulator;
 pub use accumulator::C220CubeAccumulatorSource;
 mod control;
 mod execute;
+pub mod frontend;
 mod fsm_v0;
 mod fsm_v1;
 mod layout;
