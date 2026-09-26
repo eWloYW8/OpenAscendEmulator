@@ -2,6 +2,9 @@ use crate::isa::c220::mte::smask::C220SmaskTransfer;
 use crate::memory::pv_memory::PvMemoryError;
 use crate::sim::c220::memory::{C220LocalBufferError, C220LocalMemory};
 
+mod request;
+pub use request::{C220SmaskReadUop, C220SmaskRequestPlan};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220SmaskTransferResult {
     pub elements: u8,
