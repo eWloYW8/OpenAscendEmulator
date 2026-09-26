@@ -79,7 +79,9 @@ impl C220Core {
                 &mut self.state.ub,
                 &self.memory,
             )?;
-            while let Some(pipeline) = &mut self.mte_pipeline {
+            self.publish_fixp_retirement();
+            while self.mte_pipeline.is_some() {
+                let pipeline = self.mte_pipeline.as_mut().expect("configured MTE pipeline");
                 if let Some(fixp) = &mut self.fixp {
                     self.hardware_flags.advance_to(event_tick)?;
                     let (l0c, l1) = self.local_memory.fixp_destinations_mut();
@@ -111,6 +113,8 @@ impl C220Core {
                 } else {
                     pipeline.advance(event_tick)?;
                 }
+                self.publish_fixp_retirement();
+                let pipeline = self.mte_pipeline.as_mut().expect("configured MTE pipeline");
                 if pipeline.fixp_issue_pending() {
                     self.transfer_fixp_issue_at(event_tick)?;
                     continue;

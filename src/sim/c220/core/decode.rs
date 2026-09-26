@@ -19,6 +19,7 @@ pub(super) enum C220DispatchKind {
     Mte2,
     HardwareFlag(C220HardwareFlagInstruction),
     Cube(C220CubeInstruction),
+    CubeFlag,
     CubeSpr(crate::isa::c220::cube::spr::C220CubeSprWrite),
     Vector,
     Mte3,
@@ -34,7 +35,23 @@ pub(super) struct C220DecodedWord {
 impl C220DecodedWord {
     pub(super) fn decode(word: u32) -> Self {
         let flow_flag = FlagInstruction::decode(Architecture::Dav2201, word);
-        let kind = if crate::isa::c220::mte::fixp::C220FixpInstruction::decode(word).is_some() {
+        let shared_flag_pipe = flow_flag
+            .filter(|flag| {
+                matches!(flag.source_pipe_code, 2 | 3 | 10)
+                    && matches!(flag.trigger_pipe_code, 2 | 3 | 10)
+            })
+            .map(|flag| match flag.operation {
+                FlagOperation::Set => flag.source_pipe_code,
+                FlagOperation::Wait => flag.trigger_pipe_code,
+            });
+        let kind = if let Some(pipe) = shared_flag_pipe {
+            match pipe {
+                2 => C220DispatchKind::CubeFlag,
+                3 => C220DispatchKind::Mte1,
+                10 => C220DispatchKind::Fixp,
+                _ => unreachable!("shared event route was checked"),
+            }
+        } else if crate::isa::c220::mte::fixp::C220FixpInstruction::decode(word).is_some() {
             C220DispatchKind::Fixp
         } else if let Some(instruction) =
             crate::isa::c220::mte::factor::C220FactorLoadInstruction::decode(word)
@@ -49,14 +66,6 @@ impl C220DecodedWord {
             || C220MovL1ToBtInstruction::decode(word).is_some()
             || C220Set2dInstruction::decode(word)
                 .is_some_and(|instruction| instruction.destination != C220Set2dDestination::L1)
-            || flow_flag.is_some_and(|instruction| {
-                (instruction.source_pipe_code == 3
-                    && instruction.trigger_pipe_code == 2
-                    && instruction.operation == FlagOperation::Set)
-                    || (instruction.source_pipe_code == 2
-                        && instruction.trigger_pipe_code == 3
-                        && instruction.operation == FlagOperation::Wait)
-            })
         {
             C220DispatchKind::Mte1
         } else if is_mte2_transfer(word)

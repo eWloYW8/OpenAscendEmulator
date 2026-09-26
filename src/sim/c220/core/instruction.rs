@@ -30,6 +30,7 @@ pub enum C220CoreInstruction {
         barrier: super::C220FixpBarrier,
         completed_tick: Option<u64>,
     },
+    FixpFlag(FlagStep),
     FixpQueued {
         instruction_id: u64,
         pc: u64,

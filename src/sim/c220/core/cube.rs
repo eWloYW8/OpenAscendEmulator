@@ -82,6 +82,141 @@ mod tests {
     use std::num::NonZeroU32;
 
     #[test]
+    fn ordinary_fixp_events_connect_cube_and_mte1_at_retirement() {
+        use crate::sim::c220::memory::C220LocalBuffer;
+        use crate::sim::c220::mte::fixp::{C220FixpEngineConfig, C220FixpStage::*};
+
+        let mut core = matrix_core();
+        core.advance_to(300).unwrap();
+        core.configure_fixp_l1(
+            C220FixpEngineConfig {
+                instruction_fifo_depth: 1,
+                read_bandwidth: 256,
+                read_bank_count: 32,
+                read_data_latency: 4,
+                l0c_capacity: core.local_memory.l0c().buffer().capacity(),
+            },
+            super::super::C220FixpFrontendConfig {
+                issue_queue_depth: NonZeroU32::new(8).unwrap(),
+                outstanding_limit: NonZeroU32::new(4).unwrap(),
+            },
+            C220LocalBuffer::new(4096),
+            &[
+                GenerateRead,
+                SendRead,
+                SendL0c,
+                ReceiveL0c,
+                Convert,
+                Slice,
+                Packetize,
+                GenerateWrite,
+                SendWrite,
+            ],
+        )
+        .unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        for (reg, value) in [
+            (1, 4096),
+            (2, 0),
+            (3, (8 << 32) | (8 << 16) | (16 << 4)),
+            (4, 1 << 34),
+            (12, 0x1234_5678),
+        ] {
+            machine.set_xreg(reg, value).unwrap();
+        }
+        for reg in [3, 61, 64, 97] {
+            machine.set_spr_value(reg, 0).unwrap();
+        }
+        core.local_memory
+            .l0c_mut()
+            .buffer_mut()
+            .write_known_linear(0, &2_f32.to_le_bytes().repeat(128))
+            .unwrap();
+        let flag = |op: u32, source: u32, dest: u32| {
+            (2 << 29)
+                | (op << 21)
+                | (1 << 17)
+                | (source << 10)
+                | ((dest >> 3) << 14)
+                | ((dest & 7) << 7)
+                | (12 << 2)
+        };
+        let fix = (6 << 29) | (3 << 24) | (1 << 17) | (2 << 12) | (3 << 7) | (4 << 2);
+        let first_fix = core.next_instruction_id + 1;
+        for (tick, word) in [
+            (301, flag(6, 2, 10)),
+            (302, fix),
+            (303, flag(5, 10, 3)),
+            (304, flag(5, 10, 2)),
+            (305, 0x40e0_2800),
+            (306, fix),
+            (307, flag(6, 10, 3)),
+            (308, 0x4140_0000),
+        ] {
+            assert!(matches!(
+                core.step_word_at(tick, word).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+        }
+        assert_eq!(core.fixp_command_queue_len(), 0);
+        assert_eq!(core.outstanding_fixp_commands(), 0);
+        assert!(core.pending_fixp_barriers().next().unwrap().requires_idle);
+        assert_eq!(core.queued_mte1_instructions().count(), 1);
+        core.step_word_at(309, flag(5, 2, 10)).unwrap();
+        core.step_word_at(310, flag(6, 10, 2)).unwrap();
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(12, 0)
+            .unwrap();
+        core.advance_to(500).unwrap();
+        let consumed = core.pipeline_events().last_consumptions();
+        assert_eq!(consumed.len(), 3);
+        assert!(
+            consumed
+                .iter()
+                .all(|event| event.step.flag_id == 0x1234_5678)
+        );
+        let outputs: Vec<_> = consumed
+            .iter()
+            .filter(|event| event.step.instruction.source_pipe_code == 10)
+            .collect();
+        assert_eq!(outputs.len(), 2);
+        let published_tick = outputs[0].event.published_tick;
+        assert!(
+            outputs
+                .iter()
+                .all(|event| event.event.published_tick == published_tick
+                    && event.event.received_tick < published_tick
+                    && event.tick >= published_tick)
+        );
+        assert!(
+            core.fixp_frontend_outcomes()
+                .iter()
+                .any(|step| matches!(step,
+            C220CoreStep::Executed { instruction: C220CoreInstruction::FixpBarrier {
+                completed_tick: Some(tick), .. }, .. } if *tick == published_tick))
+        );
+        assert_eq!(
+            core.fixp_engine()
+                .unwrap()
+                .last_retirement()
+                .unwrap()
+                .instruction_id,
+            first_fix + 4
+        );
+        assert!(core.fixp_engine().unwrap().last_retirement().unwrap().tick > published_tick);
+        assert_eq!(core.pending_fixp_barriers().len(), 0);
+        assert_eq!(core.queued_fixp_commands(), 0);
+        assert_eq!(core.queued_mte1_instructions().count(), 0);
+        assert_eq!(core.pipeline_events().pending().count(), 0);
+        assert_eq!(
+            core.local_memory.l1().read_known(4096, 256).unwrap(),
+            0x4000_u16.to_le_bytes().repeat(128)
+        );
+    }
+
+    #[test]
     fn fixp_instruction_dispatches_and_drains_on_shared_core_clock() {
         use crate::sim::c220::memory::C220LocalBuffer;
         use crate::sim::c220::mte::fixp::{C220FixpEngineConfig, C220FixpStage::*};

@@ -53,7 +53,7 @@ mod store;
 mod sync;
 pub use engine::{
     C220FactorCommandState, C220FixpAdmission, C220FixpCommandState, C220FixpCrossCoreCommand,
-    C220FixpEngine, C220FixpEngineConfig, C220FixpEngineError,
+    C220FixpEngine, C220FixpEngineConfig, C220FixpEngineError, C220FixpRetirement,
 };
 pub use store::{C220FixpStoreBuffer, C220FixpStoreProbe, C220FixpStoreRead, C220FixpStoreWrite};
 pub use sync::{

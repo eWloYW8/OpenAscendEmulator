@@ -10,6 +10,7 @@ pub struct C220FixpBarrier {
     pub step: PipelineBarrierStep,
     pub predecessor: Option<u64>,
     pub issued_tick: u64,
+    pub requires_idle: bool,
 }
 
 impl C220Core {
@@ -46,6 +47,16 @@ impl C220Core {
             step,
             predecessor: self.fixp_frontend.last_issued,
             issued_tick: tick,
+            requires_idle: self
+                .fixp_frontend
+                .issued
+                .back()
+                .is_some_and(|(_, command)| {
+                    matches!(
+                        command.operation,
+                        super::fixp_frontend::CapturedFixpOperation::Flag(_)
+                    )
+                }),
         };
         let pending = barrier
             .predecessor
@@ -68,6 +79,7 @@ impl C220Core {
             if barrier
                 .predecessor
                 .is_some_and(|id| self.fixp_instruction_pending(id))
+                || (barrier.requires_idle && self.outstanding_fixp_commands() != 0)
             {
                 break;
             }

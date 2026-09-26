@@ -94,6 +94,12 @@ pub enum C220FixpAdmission {
     HardwareSync,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220FixpRetirement {
+    pub instruction_id: u64,
+    pub tick: u64,
+}
+
 /// FIX command lifecycle and shared read, conversion and dispatch resources.
 /// Can execute the L1-only path directly or be owned by the multi-destination runtime.
 /// The owner supplies memory, synchronization and clock callbacks.
@@ -109,7 +115,7 @@ pub struct C220FixpEngine {
     retirement_fifo: VecDeque<u64>,
     command_retirement: VecDeque<u64>,
     write_completions: BTreeMap<u64, u64>,
-    last_retirement_tick: Option<u64>,
+    last_retirement: Option<C220FixpRetirement>,
     output: C220FixpL1Output,
 }
 
@@ -146,7 +152,7 @@ impl C220FixpEngine {
             retirement_fifo: VecDeque::new(),
             command_retirement: VecDeque::new(),
             write_completions: BTreeMap::new(),
-            last_retirement_tick: None,
+            last_retirement: None,
             datapath: super::datapath::C220FixpDatapath::new(config)?,
             output: C220FixpL1Output::default(),
         })
@@ -223,7 +229,10 @@ impl C220FixpEngine {
         }
         self.cross_core_commands.remove(&id);
         self.command_retirement.pop_front();
-        self.last_retirement_tick = Some(tick);
+        self.last_retirement = Some(C220FixpRetirement {
+            instruction_id: id,
+            tick,
+        });
         Some(C220CrossCoreReception {
             instruction_id: id,
             pc: command.pc,
@@ -253,7 +262,10 @@ impl C220FixpEngine {
         }
         self.control_commands.remove(&id);
         self.command_retirement.pop_front();
-        self.last_retirement_tick = Some(tick);
+        self.last_retirement = Some(C220FixpRetirement {
+            instruction_id: id,
+            tick,
+        });
         Some(id)
     }
     pub fn command_retirement_head(&self) -> Option<u64> {
@@ -264,6 +276,10 @@ impl C220FixpEngine {
         &self.command_retirement
     }
 
+    pub const fn last_retirement(&self) -> Option<C220FixpRetirement> {
+        self.last_retirement
+    }
+
     pub fn write_completion_tick(&self, id: u64) -> Option<u64> {
         self.write_completions.get(&id).copied()
     }
@@ -271,8 +287,8 @@ impl C220FixpEngine {
     pub fn can_retire_at(&self, tick: u64, id: u64) -> bool {
         self.command_retirement_head() == Some(id)
             && self
-                .last_retirement_tick
-                .is_none_or(|previous| previous < tick)
+                .last_retirement
+                .is_none_or(|previous| previous.tick < tick)
     }
     pub fn instruction_fifo(&self) -> &VecDeque<u64> {
         &self.instruction_fifo
@@ -706,7 +722,10 @@ impl C220FixpEngine {
             return Err(C220FixpEngineError::RetirementOrder(id));
         }
         self.command_retirement.pop_front();
-        self.last_retirement_tick = Some(tick);
+        self.last_retirement = Some(C220FixpRetirement {
+            instruction_id: id,
+            tick,
+        });
         Ok(self
             .factor_commands
             .remove(&id)
@@ -750,7 +769,10 @@ impl C220FixpEngine {
         {
             let state = self.retire(id)?;
             self.write_completions.remove(&id);
-            self.last_retirement_tick = Some(tick);
+            self.last_retirement = Some(C220FixpRetirement {
+                instruction_id: id,
+                tick,
+            });
             return Ok(Some((id, state)));
         }
         Ok(None)

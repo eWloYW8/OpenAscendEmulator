@@ -3,6 +3,7 @@ use crate::isa::c220::control::C220SetCrossCoreInstruction;
 use crate::isa::c220::hflag::{C220HardwareFlagInstruction, C220HardwareFlagStep};
 use crate::isa::c220::mte::factor::{C220FactorLoad, C220FactorLoadInstruction};
 use crate::isa::c220::mte::fixp::{C220FixpDestination, C220FixpInstruction};
+use crate::isa::flow::{FlagInstruction, FlagOperation, FlagStep};
 use crate::sim::c220::mte::fixp::{
     C220FixpCommand, C220FixpExecutionError, C220FixpExternalCommand,
 };
@@ -30,6 +31,7 @@ pub(super) struct FixpIssue {
 /// dispatch attempt. Memory contents remain live execution inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CapturedFixpOperation {
+    Flag(FlagStep),
     L1(C220FixpCommand),
     Transport {
         destination: C220FixpDestination,
@@ -52,9 +54,11 @@ pub(super) struct CapturedFixpCommand {
 #[derive(Default)]
 pub(super) struct FixpFrontend {
     pub config: Option<C220FixpFrontendConfig>,
-    issued: VecDeque<(u64, CapturedFixpCommand)>,
+    pub(super) issued: VecDeque<(u64, CapturedFixpCommand)>,
     commands: VecDeque<(u64, CapturedFixpCommand)>,
     pub last_issued: Option<u64>,
+    last_received: Option<u64>,
+    last_published_retirement: Option<u64>,
     pub barriers: VecDeque<super::C220FixpBarrier>,
     pub outcomes: Vec<C220CoreStep>,
     pub cross_core_outcomes: Vec<C220CrossCoreReception>,
@@ -76,7 +80,11 @@ impl C220Core {
         word: u32,
     ) -> Result<CapturedFixpCommand, C220CoreError> {
         let machine = self.state.scalar().machine();
-        let operation = if let Some(instruction) = C220SetCrossCoreInstruction::decode(word) {
+        let operation = if let Some(instruction) =
+            FlagInstruction::decode(crate::architecture::Architecture::Dav2201, word)
+        {
+            CapturedFixpOperation::Flag(instruction.resolve(pc, machine.xregs()))
+        } else if let Some(instruction) = C220SetCrossCoreInstruction::decode(word) {
             CapturedFixpOperation::CrossCore {
                 instruction,
                 payload: C220DeviceSync::from_value(
@@ -206,41 +214,40 @@ impl C220Core {
             .fixp_frontend
             .config
             .ok_or(C220CoreError::FixpUnconfigured)?;
-        let blocked = if self.fixp_frontend.commands.len() == 3 {
+        let command = self
+            .fixp_frontend
+            .issued
+            .front()
+            .expect("armed FIX issue")
+            .1;
+        let mut blocked = if self.fixp_frontend.commands.len() == 3 {
             Some(C220StallCause::FixpCommandQueueFull)
         } else if self.outstanding_fixp_commands() >= config.outstanding_limit.get() as usize {
             Some(C220StallCause::FixpOutstandingLimit)
         } else if self.outstanding_fixp_commands() != 0
-            && self
-                .fixp_frontend
-                .issued
-                .front()
-                .is_some_and(|(_, command)| {
-                    matches!(command.operation, CapturedFixpOperation::CrossCore { .. })
-                })
+            && matches!(command.operation, CapturedFixpOperation::CrossCore { .. })
         {
             Some(C220StallCause::FixpDependency)
         } else if self.fixp_frontend.barriers.front().is_some_and(|barrier| {
-            self.fixp_frontend
-                .issued
-                .front()
-                .is_some_and(|(_, command)| {
-                    barrier
-                        .predecessor
-                        .is_some_and(|id| id < command.issue.instruction_id)
-                })
+            barrier
+                .predecessor
+                .is_some_and(|id| id < command.issue.instruction_id)
         }) {
             Some(C220StallCause::FixpBarrier)
         } else {
             None
         };
+        if blocked.is_none()
+            && let CapturedFixpOperation::Flag(step) = command.operation
+            && step.instruction.operation == FlagOperation::Wait
+            && self
+                .pipeline_events
+                .consume(command.issue.instruction_id, step, tick)
+                .is_none()
+        {
+            blocked = Some(C220StallCause::PipelineEventDependency);
+        }
         if let Some(cause) = blocked {
-            let command = self
-                .fixp_frontend
-                .issued
-                .front()
-                .expect("armed FIX issue")
-                .1;
             self.fixp_frontend
                 .outcomes
                 .push(C220CoreStep::Stalled(C220Stall {
@@ -249,6 +256,22 @@ impl C220Core {
                     resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
                     cause,
                 }));
+        } else if let CapturedFixpOperation::Flag(step) = command.operation {
+            if step.instruction.operation == FlagOperation::Set {
+                let predecessor = (self.outstanding_fixp_commands() != 0).then(|| {
+                    self.fixp_frontend
+                        .last_received
+                        .expect("outstanding FIX command")
+                });
+                self.pipeline_events
+                    .set(command.issue.instruction_id, step, predecessor, tick);
+            }
+            self.fixp_frontend.issued.pop_front();
+            self.fixp_frontend.outcomes.push(C220CoreStep::Executed {
+                tick,
+                instruction: C220CoreInstruction::FixpFlag(step),
+            });
+            self.release_fixp_barriers_at(tick);
         } else {
             let ready_tick = tick.checked_add(3).ok_or(C220CoreError::TimeOverflow)?;
             let (_, command) = self
@@ -257,6 +280,7 @@ impl C220Core {
                 .pop_front()
                 .expect("armed FIX issue");
             self.fixp_frontend.commands.push_back((ready_tick, command));
+            self.fixp_frontend.last_received = Some(command.issue.instruction_id);
             self.fixp_frontend.outcomes.push(C220CoreStep::Executed {
                 tick,
                 instruction: C220CoreInstruction::FixpScheduled {
@@ -290,6 +314,18 @@ impl C220Core {
         }
     }
 
+    pub(super) fn publish_fixp_retirement(&mut self) {
+        if let Some(retirement) = self
+            .fixp_engine()
+            .and_then(|engine| engine.last_retirement())
+            && self.fixp_frontend.last_published_retirement != Some(retirement.instruction_id)
+        {
+            self.pipeline_events
+                .retire(10, retirement.instruction_id, retirement.tick);
+            self.fixp_frontend.last_published_retirement = Some(retirement.instruction_id);
+        }
+    }
+
     pub(super) fn dispatch_fixp_head_at(&mut self, tick: u64) -> Result<(), C220CoreError> {
         let (_, command) = *self
             .fixp_frontend
@@ -317,6 +353,9 @@ impl C220Core {
     ) -> Result<C220CoreStep, C220CoreError> {
         let issue = command.issue;
         match command.operation {
+            CapturedFixpOperation::Flag(_) => {
+                unreachable!("ordinary flags complete at issue reception")
+            }
             CapturedFixpOperation::L1(command) => self.dispatch_fixp_l1_at(tick, issue, command),
             CapturedFixpOperation::Transport {
                 destination,
