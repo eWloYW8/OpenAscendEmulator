@@ -4,6 +4,7 @@ use crate::isa::c220::mte::load2d::C220Load2dInstruction;
 use crate::isa::c220::mte::load2d_sparse::C220Load2dSparseInstruction;
 use crate::isa::c220::mte::load2d_transpose::C220Load2dTransposeInstruction;
 use crate::isa::c220::mte::set2d::C220Set2dInstruction;
+use crate::isa::c220::mte::spr::C220Mte1SprWrite;
 use crate::isa::flow::{FlagInstruction, FlagOperation};
 use crate::sim::c220::mte::mte1::C220Mte1Command;
 use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadTransfer;
@@ -41,7 +42,17 @@ impl C220Core {
         word: u32,
     ) -> Result<C220CoreStep, C220CoreError> {
         let registers = self.state.scalar().machine().xregs();
-        let command = if let Some(instruction) =
+        let command = if let Some(instruction) = C220Mte1SprWrite::decode(word) {
+            Some(C220Mte1Command::WriteSpr(
+                crate::sim::c220::mte::mte1::spr::capture_write(
+                    self.state.scalar().machine(),
+                    pc,
+                    word,
+                    instruction,
+                )
+                .map_err(C220CoreError::MteSpr)?,
+            ))
+        } else if let Some(instruction) =
             crate::isa::c220::control::C220SetCrossCoreInstruction::decode(word)
         {
             if let Some(resume_tick) = self.mte1.next_event_tick() {
@@ -112,6 +123,13 @@ impl C220Core {
                 command,
                 &mut self.hardware_flags,
             )?;
+            if let C220Mte1Command::WriteSpr(step) = command {
+                self.state
+                    .scalar_mut()
+                    .machine_mut()
+                    .set_spr_value(step.destination_spr, step.value)
+                    .map_err(C220CoreError::MteSpr)?;
+            }
             self.state.commit_c220_sequential_issue();
             C220CoreInstruction::Mte1 {
                 instruction_id: self.next_instruction_id,

@@ -503,6 +503,9 @@ impl C220MtePipeline {
     }
 
     pub fn can_issue_mte1(&self, command: C220Mte1Command) -> bool {
+        if matches!(command, C220Mte1Command::WriteSpr(_)) {
+            return self.selected_generator_idle();
+        }
         if matches!(command, C220Mte1Command::Set2d(fill) if fill.instruction.destination == C220Set2dDestination::L1)
         {
             return false;
@@ -510,9 +513,10 @@ impl C220MtePipeline {
         command.is_disabled()
             || (match command {
                 C220Mte1Command::CrossCore { .. } => true,
+                C220Mte1Command::WriteSpr(_) => unreachable!("handled above"),
                 C220Mte1Command::Read(transfer) => self.generator(transfer.kind()).can_issue(),
                 C220Mte1Command::Set2d(_) => self.set2d.can_issue(),
-            } && (self.selected_generator == Some(command.generator())
+            } && (self.selected_generator == command.generator()
                 || self.selected_generator_idle()))
     }
     pub fn selected_generator_idle(&self) -> bool {
@@ -1059,7 +1063,7 @@ impl C220MtePipeline {
             });
         }
         let issue = match command {
-            C220Mte1Command::CrossCore { .. } => C220Mte1Issue {
+            C220Mte1Command::CrossCore { .. } | C220Mte1Command::WriteSpr(_) => C220Mte1Issue {
                 tick: self.events.tick(),
                 instruction_id,
                 uop_count: 0,
@@ -1081,7 +1085,9 @@ impl C220MtePipeline {
                 .issue(&mut self.events, &mut self.set2d, instruction_id, fill)?
                 .into(),
         };
-        self.selected_generator = Some(command.generator());
+        if let Some(generator) = command.generator() {
+            self.selected_generator = Some(generator);
+        }
         Ok(issue)
     }
 

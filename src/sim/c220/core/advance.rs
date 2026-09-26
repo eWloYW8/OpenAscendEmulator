@@ -54,7 +54,7 @@ impl C220Core {
                         .scalar_mut()
                         .machine_mut()
                         .set_spr_value(54, value)
-                        .map_err(C220CoreError::Load3dSpr)?;
+                        .map_err(C220CoreError::MteSpr)?;
                 }
             }
             self.retire_factor_at(event_tick)?;

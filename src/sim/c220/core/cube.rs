@@ -1062,7 +1062,6 @@ mod tests {
         use crate::sim::c220::mte::mte1::C220Mte1TransferResult;
         use crate::sim::c220::schedule::{C220Stall, C220StallCause};
         let mut core = matrix_core();
-        core.advance_to(300).unwrap();
         let machine = core.state.scalar_mut().machine_mut();
         for (register, value) in [
             (10, 4096),
@@ -1072,6 +1071,49 @@ mod tests {
         ] {
             machine.set_xreg(register, value).unwrap();
         }
+        let mut setup_tick = 280;
+        let selected = core.mte_pipeline().unwrap().selected_generator();
+        for (register, mask) in [
+            (10, u64::MAX),
+            (13, 0xffff_ffff),
+            (15, 0xffff_ffff),
+            (22, 0xffff_ffff),
+            (53, u64::MAX),
+            (54, 0xfff),
+            (58, 0xffff_ffff),
+            (92, u64::MAX),
+        ] {
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_xreg(14, u64::MAX)
+                .unwrap();
+            let word = (2 << 24) | (register << 17) | (14 << 12) | (18 << 7);
+            assert_eq!(
+                crate::isa::c220::mte::read_register_mask(word),
+                Some(1 << 14)
+            );
+            let C220CoreStep::Executed {
+                instruction:
+                    C220CoreInstruction::Mte1 {
+                        command: C220Mte1Command::WriteSpr(step),
+                        issue,
+                        ..
+                    },
+                ..
+            } = core.step_word_at(setup_tick, word).unwrap()
+            else {
+                panic!("MTE1 SPR write should issue");
+            };
+            assert_eq!(step.value, mask);
+            assert_eq!(issue.uop_count, 0);
+            assert_eq!(
+                core.state.scalar().machine().spr_value(register as u16),
+                Some(mask)
+            );
+            assert_eq!(core.mte_pipeline().unwrap().selected_generator(), selected);
+            setup_tick += 1;
+        }
         for (register, value) in [
             (10, 4 | (4 << 16)),
             (92, 0),
@@ -1080,8 +1122,19 @@ mod tests {
             (22, 0),
             (54, 0),
         ] {
-            machine.set_spr_value(register, value).unwrap();
+            core.state
+                .scalar_mut()
+                .machine_mut()
+                .set_xreg(14, value)
+                .unwrap();
+            let word = (2 << 24) | (register << 17) | (14 << 12) | (18 << 7);
+            assert!(matches!(
+                core.step_word_at(setup_tick, word).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+            setup_tick += 1;
         }
+        core.advance_to(300).unwrap();
         let word = (3 << 29) | (20 << 22) | (10 << 17) | (11 << 12) | (12 << 7) | (13 << 2);
         let C220CoreStep::Executed {
             instruction: C220CoreInstruction::Mte1 { issue, .. },

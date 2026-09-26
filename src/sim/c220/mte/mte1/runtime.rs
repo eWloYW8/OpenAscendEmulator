@@ -41,6 +41,7 @@ pub enum C220Mte1RuntimeError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1TransferResult {
+    WriteSpr(crate::sim::common::scalar::ScalarSprStep),
     Load3dv2(crate::sim::c220::mte::load3d::C220Load3dExecutionReport),
     CrossCore(crate::sim::c220::sync::C220DeviceSync),
     Load2dSparse(C220SparseTransferResult),
@@ -138,7 +139,7 @@ impl Mte1Engine {
                     }
                 })
             }
-            C220Mte1Command::CrossCore { .. } => None,
+            C220Mte1Command::CrossCore { .. } | C220Mte1Command::WriteSpr(_) => None,
             C220Mte1Command::Set2d(fill) => match fill.instruction.destination {
                 C220Set2dDestination::L0a => Some(C220MatrixMemory::L0a),
                 C220Set2dDestination::L0b => Some(C220MatrixMemory::L0b),
@@ -292,6 +293,7 @@ impl Mte1Engine {
                 return Ok(());
             }
             let result = match pending.command {
+                C220Mte1Command::WriteSpr(step) => C220Mte1TransferResult::WriteSpr(step),
                 C220Mte1Command::Read(C220Mte1ReadTransfer::Load3dv2(command)) => {
                     C220Mte1TransferResult::Load3dv2(command.execute(memory)?)
                 }

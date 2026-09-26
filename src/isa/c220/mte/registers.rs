@@ -13,7 +13,9 @@ pub const fn read_register_mask(word: u32) -> Option<u32> {
     let xn = 1 << ((word >> 12) & 31);
     let xm = 1 << ((word >> 7) & 31);
     let xt = 1 << ((word >> 2) & 31);
-    if C220Set2dInstruction::decode(word).is_some() {
+    if super::spr::C220Mte1SprWrite::decode(word).is_some() {
+        Some(xn)
+    } else if C220Set2dInstruction::decode(word).is_some() {
         Some(xd | xm)
     } else if C220Load2dTransposeInstruction::decode(word).is_some()
         || C220FixpInstruction::decode(word).is_some()

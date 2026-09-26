@@ -44,6 +44,7 @@ impl C220DecodedWord {
             || C220Load2dTransposeInstruction::decode(word).is_some()
             || C220Load2dSparseInstruction::decode(word).is_some()
             || crate::isa::c220::mte::load3d::C220Load3dV2Instruction::decode(word).is_some()
+            || crate::isa::c220::mte::spr::C220Mte1SprWrite::decode(word).is_some()
             || C220MovL1ToBtInstruction::decode(word).is_some()
             || C220Set2dInstruction::decode(word)
                 .is_some_and(|instruction| instruction.destination != C220Set2dDestination::L1)

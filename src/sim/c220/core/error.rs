@@ -20,7 +20,7 @@ pub enum C220CoreError {
     #[error(transparent)]
     Load3dCapture(#[from] crate::sim::c220::mte::load3d::C220Load3dCaptureError),
     #[error(transparent)]
-    Load3dSpr(crate::sim::common::scalar::ScalarMachineError),
+    MteSpr(crate::sim::common::scalar::ScalarMachineError),
     #[error("MTE3 cross-core notification requires the native command frontend")]
     Mte3FrontendRequired,
     #[error("cross-core notification at PC {pc:#x} is not implemented for pipe {pipe}")]
