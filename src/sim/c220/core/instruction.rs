@@ -6,7 +6,6 @@ use crate::sim::c220::mte::mte2::C220Mte2Issue;
 use crate::sim::c220::mte::mte3::C220Mte3Ticket;
 use crate::sim::c220::mte::mte3::C220OutputStep;
 use crate::sim::c220::scalar::timing::C220ScalarTimingTicket;
-use crate::sim::c220::vector::C220VectorInstruction;
 use crate::sim::common::scalar::ScalarProgramStep;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,7 +116,7 @@ pub enum C220CoreInstruction {
         instruction_id: u64,
         step: crate::sim::common::scalar::ScalarSprStep,
     },
-    Vector(C220VectorInstruction),
+    VectorQueued(crate::sim::c220::vector::C220VectorQueuedInstruction),
     VectorToScalarFlag(FlagStep),
     Mte3 {
         step: C220OutputStep,
@@ -127,13 +126,4 @@ pub enum C220CoreInstruction {
         step: C220OutputStep,
         record: crate::sim::c220::mte::mte3::frontend::C220Mte3Record,
     },
-}
-
-impl C220CoreInstruction {
-    pub const fn as_vector(&self) -> Option<&C220VectorInstruction> {
-        match self {
-            Self::Vector(instruction) => Some(instruction),
-            _ => None,
-        }
-    }
 }

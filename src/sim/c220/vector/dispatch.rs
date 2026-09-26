@@ -246,7 +246,7 @@ impl VectorEngine {
             _ if C220MoveMaskInstruction::decode(word).is_some() => {
                 let decoded = C220MoveMaskInstruction::decode(word).expect("matched decode");
                 if matches!(decoded.direction, C220MoveMaskDirection::FromMemory)
-                    && let Some(resume_tick) = self.pending_drain_tick()
+                    && let Some(resume_tick) = self.pending_execution_drain_tick()
                     && tick < resume_tick
                 {
                     return Ok(VectorStep::Stalled(C220Stall {
@@ -365,7 +365,7 @@ impl VectorEngine {
                 instruction
             }
             _ if C220MergeInstruction::decode(word).is_some() => {
-                if let Some(resume_tick) = self.pending_drain_tick()
+                if let Some(resume_tick) = self.pending_execution_drain_tick()
                     && tick < resume_tick
                 {
                     return Ok(VectorStep::Stalled(C220Stall {

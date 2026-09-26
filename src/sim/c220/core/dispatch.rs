@@ -5,7 +5,7 @@ use crate::isa::flow::{FlagOperation, PipelineBarrierScope, PipelineBarrierStep}
 use crate::sim::c220::scalar::timing::C220ScalarTimingRule;
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 use crate::sim::c220::state::C220ExecutionError;
-use crate::sim::c220::vector::dispatch::VectorStep;
+use crate::sim::c220::vector::frontend::VectorAdmission;
 use crate::sim::common::scalar::{ScalarInstructionStep, ScalarProgramStep};
 
 impl C220Core {
@@ -171,20 +171,18 @@ impl C220Core {
                     word,
                 )?;
                 return Ok(
-                    match self.vector.dispatch_at(
-                        tick,
-                        self.next_instruction_id,
-                        &request,
-                        &mut self.state,
-                    )? {
-                        VectorStep::Issued(instruction) => {
+                    match self
+                        .vector
+                        .enqueue_at(tick, self.next_instruction_id, request)?
+                    {
+                        VectorAdmission::Queued(instruction) => {
                             self.state.commit_c220_sequential_issue();
                             C220CoreStep::Executed {
                                 tick,
-                                instruction: C220CoreInstruction::Vector(instruction),
+                                instruction: C220CoreInstruction::VectorQueued(instruction),
                             }
                         }
-                        VectorStep::Stalled(stall) => C220CoreStep::Stalled(stall),
+                        VectorAdmission::Stalled(stall) => C220CoreStep::Stalled(stall),
                     },
                 );
             }

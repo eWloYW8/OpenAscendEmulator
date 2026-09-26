@@ -83,6 +83,7 @@ pub struct C220CoreConfig {
     pub device: C220Device,
     pub cube: C220CubeConfig,
     pub cube_frontend: crate::sim::c220::cube::frontend::C220CubeFrontendConfig,
+    pub vector_frontend: crate::sim::c220::vector::C220VectorFrontendConfig,
     pub mte1_frontend: C220Mte1FrontendConfig,
     pub mte2_frontend: C220Mte2FrontendConfig,
     pub mte3_issue_queue: C220Mte3IssueQueueConfig,
@@ -95,6 +96,7 @@ impl C220CoreConfig {
             device: C220Device::default(),
             cube: C220CubeConfig::default(),
             cube_frontend: Default::default(),
+            vector_frontend: Default::default(),
             mte1_frontend: Default::default(),
             mte2_frontend: Default::default(),
             mte3_issue_queue: Default::default(),
@@ -184,6 +186,7 @@ impl C220Core {
             device,
             cube: cube_config,
             cube_frontend,
+            vector_frontend,
             mte1_frontend,
             mte2_frontend,
             mte3_issue_queue,
@@ -221,7 +224,7 @@ impl C220Core {
             mte3_issue_queue: mte3_frontend::Mte3IssueQueue::new(mte3_issue_queue),
             cube: CubeEngine::new(cube_config)?,
             cube_frontend: cube_frontend::CubeFrontend::new(cube_frontend),
-            vector: VectorEngine::new(timing.vector, initial_compare_mask),
+            vector: VectorEngine::new(timing.vector, initial_compare_mask, vector_frontend),
             local_memory: C220LocalMemory::new(C220LocalMemoryConfig::for_device(device))?,
             memory,
         })
@@ -343,6 +346,25 @@ impl C220Core {
 
     pub fn outstanding_vector_instructions(&self) -> usize {
         self.vector.outstanding_instructions()
+    }
+
+    pub fn queued_vector_instructions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = crate::sim::c220::vector::C220VectorQueuedInstruction> + '_
+    {
+        self.vector.queued_instructions()
+    }
+
+    pub fn received_vector_instructions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = crate::sim::c220::vector::C220VectorReception> + '_ {
+        self.vector.received_instructions()
+    }
+
+    pub fn last_vector_frontend_events(
+        &self,
+    ) -> &[crate::sim::c220::vector::C220VectorFrontendEvent] {
+        self.vector.frontend_events()
     }
 
     pub fn last_cube_outcomes(&self) -> &[C220CubeExecutionOutcome] {

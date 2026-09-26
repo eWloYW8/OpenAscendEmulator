@@ -350,7 +350,6 @@ mod tests {
 
     use crate::architecture::Architecture;
     use crate::memory::sparse::MemoryByteState;
-    use crate::sim::c220::core::C220CoreInstruction;
     use crate::sim::c220::state::C220State;
     use crate::sim::c220::vector::ops::compare::{
         plan_c220_compare_mask_issue, plan_c220_move_mask_issue,
@@ -523,9 +522,7 @@ mod tests {
         pipeline
             .issue_at(
                 0,
-                &C220CoreInstruction::Vector(C220VectorInstruction::CompareMask(compare.clone()))
-                    .as_vector()
-                    .unwrap()
+                &C220VectorInstruction::CompareMask(compare.clone())
                     .uops()
                     .unwrap(),
                 &[],
@@ -535,9 +532,7 @@ mod tests {
         pipeline
             .issue_at(
                 1,
-                &C220CoreInstruction::Vector(C220VectorInstruction::Select(select.clone()))
-                    .as_vector()
-                    .unwrap()
+                &C220VectorInstruction::Select(select.clone())
                     .uops()
                     .unwrap(),
                 &select.write_targets,
@@ -554,9 +549,7 @@ mod tests {
         pipeline
             .issue_at(
                 301,
-                &C220CoreInstruction::Vector(C220VectorInstruction::MoveMask(save.clone()))
-                    .as_vector()
-                    .unwrap()
+                &C220VectorInstruction::MoveMask(save.clone())
                     .uops()
                     .unwrap(),
                 &save.write_targets,
@@ -583,9 +576,7 @@ mod tests {
         pipeline
             .issue_at(
                 401,
-                &C220CoreInstruction::Vector(C220VectorInstruction::CompareMask(clear.clone()))
-                    .as_vector()
-                    .unwrap()
+                &C220VectorInstruction::CompareMask(clear.clone())
                     .uops()
                     .unwrap(),
                 &[],
@@ -603,9 +594,7 @@ mod tests {
         pipeline
             .issue_at(
                 501,
-                &C220CoreInstruction::Vector(C220VectorInstruction::MoveMask(restore.clone()))
-                    .as_vector()
-                    .unwrap()
+                &C220VectorInstruction::MoveMask(restore.clone())
                     .uops()
                     .unwrap(),
                 &[],
@@ -652,9 +641,7 @@ mod tests {
         pipeline
             .issue_at(
                 601,
-                &C220CoreInstruction::Vector(C220VectorInstruction::Select(tensor_scalar.clone()))
-                    .as_vector()
-                    .unwrap()
+                &C220VectorInstruction::Select(tensor_scalar.clone())
                     .uops()
                     .unwrap(),
                 &tensor_scalar.write_targets,
@@ -672,13 +659,9 @@ mod tests {
         pipeline
             .issue_at(
                 901,
-                &C220CoreInstruction::Vector(C220VectorInstruction::MoveMask(
-                    load_tensor_mask.clone(),
-                ))
-                .as_vector()
-                .unwrap()
-                .uops()
-                .unwrap(),
+                &C220VectorInstruction::MoveMask(load_tensor_mask.clone())
+                    .uops()
+                    .unwrap(),
                 &[],
                 Some(C220VectorReadIssue::MoveMask(&load_tensor_mask)),
             )
@@ -703,9 +686,7 @@ mod tests {
         pipeline
             .issue_at(
                 1001,
-                &C220CoreInstruction::Vector(C220VectorInstruction::Select(tensor_tensor.clone()))
-                    .as_vector()
-                    .unwrap()
+                &C220VectorInstruction::Select(tensor_tensor.clone())
                     .uops()
                     .unwrap(),
                 &tensor_tensor.write_targets,

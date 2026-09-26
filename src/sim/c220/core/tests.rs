@@ -1403,7 +1403,7 @@ fn reduction_state_waits_for_both_repeats() {
     assert!(matches!(
         core.step_word_at(0, 0x83c6_2392).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Reduction(_)),
+            instruction: C220CoreInstruction::VectorQueued(_),
             ..
         }
     ));
@@ -1432,7 +1432,7 @@ fn reduction_state_waits_for_both_repeats() {
     assert!(matches!(
         core.step_word_at(max_tick, 0x83c6_2410).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Reduction(_)),
+            instruction: C220CoreInstruction::VectorQueued(_),
             ..
         }
     ));
@@ -1481,15 +1481,19 @@ fn moveva_updates_only_its_selected_pair_and_retires_as_vector_work() {
     )
     .unwrap();
     let C220CoreStep::Executed {
-        instruction: first @ C220CoreInstruction::Vector(C220VectorInstruction::MoveAddress { .. }),
+        instruction: C220CoreInstruction::VectorQueued(first),
         ..
     } = core.step_word_at(0, 0x8000_6380).unwrap()
     else {
         panic!("MOVEVA should issue");
     };
-    assert!(first.as_vector().unwrap().uops().unwrap().is_empty());
+    assert_eq!(first.ready_tick, 1);
+    assert_eq!(core.queued_vector_instructions().len(), 1);
+    assert_eq!(core.va_registers().entry(0, 0), None);
     let first_fence = core.vector.instruction_fence();
-    assert_eq!(core.vector.fence_retirement_tick(first_fence), Some(2));
+    assert_eq!(core.vector.fence_retirement_tick(first_fence), Some(1));
+    core.advance_to(1).unwrap();
+    assert_eq!(core.vector.fence_retirement_tick(first_fence), Some(3));
     assert_eq!(core.vector_pipeline().pending_uops(), 0);
     assert_eq!(core.va_registers().entry(0, 0), Some(9));
     assert_eq!(core.va_registers().entry(0, 1), Some(11));
@@ -1497,16 +1501,17 @@ fn moveva_updates_only_its_selected_pair_and_retires_as_vector_work() {
     assert!(matches!(
         core.step_word_at(1, 0x8000_6390).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::MoveAddress { .. }),
+            instruction: C220CoreInstruction::VectorQueued(_),
             ..
         }
     ));
-    assert_eq!(core.va_registers().entry(0, 2), Some(9));
-    assert_eq!(core.va_registers().entry(0, 3), Some(11));
     assert_eq!(core.vector.pending_drain_tick(), Some(3));
     core.advance_to(2).unwrap();
+    assert_eq!(core.va_registers().entry(0, 2), Some(9));
+    assert_eq!(core.va_registers().entry(0, 3), Some(11));
+    core.advance_to(3).unwrap();
     assert_eq!(core.vector.fence_retirement_tick(first_fence), None);
-    assert_eq!(core.vector.pending_drain_tick(), Some(3));
+    assert_eq!(core.vector.pending_drain_tick(), Some(4));
     core.advance_to(30).unwrap();
     assert!(core.last_vector_releases().is_empty());
     assert!(core.vector_pipeline().last_read_samples().is_empty());
@@ -1535,10 +1540,8 @@ fn moveva_updates_only_its_selected_pair_and_retires_as_vector_work() {
     for (index, (spr, expected)) in cases.into_iter().enumerate() {
         let tick = 32 + index as u64 * 3;
         let word = (2 << 24) | (spr << 17) | (6 << 12) | (18 << 7);
-        let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::WriteSpr(step)),
-            ..
-        } = core.step_word_at(tick, word).unwrap()
+        let C220VectorInstruction::WriteSpr(step) =
+            crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, tick, word)
         else {
             panic!("vector SPR {spr} should issue");
         };
@@ -1548,7 +1551,7 @@ fn moveva_updates_only_its_selected_pair_and_retires_as_vector_work() {
             core.state().scalar().machine().spr_value(spr as u16),
             Some(expected)
         );
-        assert_eq!(core.vector.pending_drain_tick(), Some(tick + 2));
+        assert_eq!(core.vector.pending_drain_tick(), Some(tick + 3));
         assert_eq!(core.vector_pipeline().pending_uops(), 0);
     }
 }
@@ -1596,39 +1599,43 @@ fn loadva_commits_at_execute_and_high_half_observes_the_ldvad_hazard() {
     assert!(matches!(
         core.step_word_at(0, 0x8080_1000).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::LoadAddress(_)),
+            instruction: C220CoreInstruction::VectorQueued(_),
             ..
         }
     ));
     assert_eq!(core.va_registers().entry(0, 0), None);
-    let C220CoreStep::Stalled(stall) = core.step_word_at(1, 0x8082_1002).unwrap() else {
-        panic!("high-half LD_VAD should wait for an in-flight LD_VAD");
-    };
     assert!(matches!(
-        core.step_word_at(stall.resume_tick, 0x8082_1002).unwrap(),
+        core.step_word_at(1, 0x8082_1002).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::LoadAddress(_)),
+            instruction: C220CoreInstruction::VectorQueued(_),
             ..
         }
     ));
+    assert!(matches!(
+        core.step_word_at(2, 0x8040_000c).unwrap(),
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::VectorQueued(_),
+            ..
+        }
+    ));
+    assert!(
+        core.last_vector_frontend_events()
+            .iter()
+            .any(|event| matches!(
+                event,
+                crate::sim::c220::vector::C220VectorFrontendEvent::Stalled(_)
+            ))
+    );
+    assert_eq!(core.state().scalar().pc(), 0x400c);
+    core.advance_to(32).unwrap();
     assert_eq!(core.va_registers().entry(0, 0), Some(0));
     assert_eq!(core.va_registers().entry(0, 7), Some(7));
-
-    assert!(matches!(
-        core.step_word_at(stall.resume_tick + 1, 0x8040_000c)
-            .unwrap(),
-        C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Movemask(_)),
-            ..
-        }
-    ));
+    assert_eq!(core.va_registers().entry(1, 0), Some(8));
+    assert_eq!(core.va_registers().entry(1, 7), Some(15));
     assert_eq!(
         core.state().scalar().machine().spr_value(100),
         Some(0x1234_5678)
     );
-    core.advance_to(stall.resume_tick + 16).unwrap();
-    assert_eq!(core.va_registers().entry(1, 0), Some(8));
-    assert_eq!(core.va_registers().entry(1, 7), Some(15));
 }
 
 #[test]
@@ -1715,18 +1722,12 @@ fn nchw_uses_va_rows_and_two_timed_uops_for_each_element_width() {
             | (5 << 2)
             | u32::from(destination_high)
             | (u32::from(source_high) << 1);
-        let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Nchw(issue)),
-            ..
-        } = core.step_word_at(tick, word).unwrap()
+        let C220VectorInstruction::Nchw(issue) =
+            crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, tick, word)
         else {
             panic!("VNCHWCONV should issue");
         };
-        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Nchw(issue))
-            .as_vector()
-            .unwrap()
-            .uops()
-            .unwrap();
+        let uops = C220VectorInstruction::Nchw(issue).uops().unwrap();
         assert_eq!(uops.len(), 2);
         assert!(uops.iter().all(|uop| uop.stages.execute_ticks == 1));
         core.advance_to(300).unwrap();
@@ -1818,18 +1819,12 @@ fn transpose_reads_full_matrix_at_functional_completion() {
             },
         )
         .unwrap();
-        let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Transpose(issue)),
-            ..
-        } = core.step_word_at(0, word).unwrap()
+        let C220VectorInstruction::Transpose(issue) =
+            crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, word)
         else {
             panic!("transpose should issue");
         };
-        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Transpose(issue))
-            .as_vector()
-            .unwrap()
-            .uops()
-            .unwrap();
+        let uops = C220VectorInstruction::Transpose(issue).uops().unwrap();
         assert_eq!(uops.len(), 2);
         assert!(
             uops.iter()
@@ -1837,7 +1832,7 @@ fn transpose_reads_full_matrix_at_functional_completion() {
         );
         let mut releases = 0;
         let mut timing_reads = 0;
-        for tick in 0..100 {
+        for tick in 2..100 {
             core.advance_to(tick).unwrap();
             releases += core.last_vector_releases().len();
             for sample in core.vector_pipeline().last_read_samples() {
@@ -1949,18 +1944,12 @@ fn broadcast_issues_one_full_tile_uop_per_repeat() {
             },
         )
         .unwrap();
-        let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Broadcast(issue)),
-            ..
-        } = core.step_word_at(0, word).unwrap()
+        let C220VectorInstruction::Broadcast(issue) =
+            crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, word)
         else {
             panic!("broadcast should issue");
         };
-        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Broadcast(issue))
-            .as_vector()
-            .unwrap()
-            .uops()
-            .unwrap();
+        let uops = C220VectorInstruction::Broadcast(issue).uops().unwrap();
         assert_eq!(uops.len(), 2);
         assert!(
             uops.iter()
@@ -2013,8 +2002,9 @@ fn broadcast_issues_one_full_tile_uop_per_repeat() {
             core.step_word_at(102, word).unwrap(),
             C220CoreStep::Executed { .. }
         ));
-        assert!(core.vector_pipeline().pending_retirement_tick().unwrap() > 103);
+        assert_eq!(core.queued_vector_instructions().len(), 1);
         core.step_word_at(103, set | 1).unwrap();
+        assert!(core.vector_pipeline().pending_retirement_tick().unwrap() > 103);
         assert!(matches!(
             core.step_word_at(104, word).unwrap(),
             C220CoreStep::Executed { .. }
@@ -2197,10 +2187,8 @@ fn vector_scalar_s32_and_f32_capture_scalar_and_delay_writeback() {
             },
         )
         .unwrap();
-        let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Scalar(issue)),
-            ..
-        } = core.step_word_at(0, word).unwrap()
+        let C220VectorInstruction::Scalar(issue) =
+            crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, word)
         else {
             panic!("vector-scalar instruction should issue");
         };
@@ -2214,11 +2202,7 @@ fn vector_scalar_s32_and_f32_capture_scalar_and_delay_writeback() {
                 .unwrap();
         }
         assert_eq!(
-            C220CoreInstruction::Vector(C220VectorInstruction::Scalar(issue))
-                .as_vector()
-                .unwrap()
-                .uops()
-                .unwrap()[0]
+            C220VectorInstruction::Scalar(issue).uops().unwrap()[0]
                 .stages
                 .execute_ticks,
             execute_ticks
@@ -2350,10 +2334,8 @@ fn vector_scalar_16_bit_forms_use_native_uop_widths_and_preserve_inactive_tail()
             },
         )
         .unwrap();
-        let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Scalar(issue)),
-            ..
-        } = core.step_word_at(0, word).unwrap()
+        let C220VectorInstruction::Scalar(issue) =
+            crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, word)
         else {
             panic!("s16 vector-scalar instruction should issue");
         };
@@ -2382,11 +2364,7 @@ fn vector_scalar_16_bit_forms_use_native_uop_widths_and_preserve_inactive_tail()
                 && issue.instruction.dtype
                     == crate::isa::c220::vector::scalar::C220VectorScalarType::S16,
         ) + 1;
-        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Scalar(issue))
-            .as_vector()
-            .unwrap()
-            .uops()
-            .unwrap();
+        let uops = C220VectorInstruction::Scalar(issue).uops().unwrap();
         assert_eq!(uops.len(), expected_uops);
         assert_eq!(uops[0].stages.execute_ticks, execute_ticks);
         core.advance_to(200).unwrap();
@@ -2477,21 +2455,15 @@ fn vector_s32_binary_operations_use_delayed_reads_and_captured_saturation() {
             },
         )
         .unwrap();
-        let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue)),
-            ..
-        } = core.step_word_at(0, word).unwrap()
+        let C220VectorInstruction::Arithmetic(issue) =
+            crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, word)
         else {
             panic!("S32 vector instruction should issue");
         };
         assert_eq!(issue.modes.integer_saturating, saturating);
         assert!(issue.hint.has_s32_value_path());
         assert_eq!(
-            C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue))
-                .as_vector()
-                .unwrap()
-                .uops()
-                .unwrap()[0]
+            C220VectorInstruction::Arithmetic(issue).uops().unwrap()[0]
                 .stages
                 .execute_ticks,
             execute_ticks
@@ -2588,10 +2560,8 @@ fn vector_s16_binary_operations_use_native_uop_widths() {
             },
         )
         .unwrap();
-        let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue)),
-            ..
-        } = core.step_word_at(0, word).unwrap()
+        let C220VectorInstruction::Arithmetic(issue) =
+            crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, word)
         else {
             panic!("S16 vector instruction should issue");
         };
@@ -2599,11 +2569,7 @@ fn vector_s16_binary_operations_use_native_uop_widths() {
         assert_eq!(issue.modes.integer_saturating, saturating);
         assert_eq!(issue.modes.widen_s16, widen_bit);
         let operation = issue.hint.operation;
-        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue))
-            .as_vector()
-            .unwrap()
-            .uops()
-            .unwrap();
+        let uops = C220VectorInstruction::Arithmetic(issue).uops().unwrap();
         let expected_uops = usize::from(
             operation == crate::isa::c220::vector::C220VecArithmeticOperation::Multiply,
         ) + 1;
@@ -3047,19 +3013,13 @@ fn vabs_uses_modeled_five_tick_execution_stage() {
         .unwrap()
     };
     let mut timed = make_core();
-    let C220CoreStep::Executed {
-        instruction: C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue)),
-        ..
-    } = timed.step_word_at(0, word).unwrap()
+    let C220VectorInstruction::Arithmetic(issue) =
+        crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut timed, 0, word)
     else {
         panic!("VABS should issue to the vector pipeline");
     };
     assert_eq!(
-        C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue))
-            .as_vector()
-            .unwrap()
-            .uops()
-            .unwrap()[0]
+        C220VectorInstruction::Arithmetic(issue).uops().unwrap()[0]
             .stages
             .execute_ticks,
         5
@@ -3256,20 +3216,14 @@ fn vnot_b16_reads_one_source_and_preserves_inactive_ub_lanes() {
         },
     )
     .unwrap();
-    let C220CoreStep::Executed {
-        instruction: C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue)),
-        ..
-    } = core.step_word_at(0, word).unwrap()
+    let C220VectorInstruction::Arithmetic(issue) =
+        crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, word)
     else {
         panic!("VNOT should issue to the vector pipeline");
     };
     assert_eq!(issue.hint.source_1_register, None);
     assert_eq!(issue.result_element_bytes, 2);
-    let uops = C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue))
-        .as_vector()
-        .unwrap()
-        .uops()
-        .unwrap();
+    let uops = C220VectorInstruction::Arithmetic(issue).uops().unwrap();
     assert_eq!(uops[0].stages.execute_ticks, 1);
     core.advance_to(100).unwrap();
     let ub = core.state().ub();
@@ -3339,20 +3293,14 @@ fn vector_shifts_capture_scalar_and_follow_masked_pipeline() {
             },
         )
         .unwrap();
-        let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Shift(issue)),
-            ..
-        } = core.step_word_at(0, word).unwrap()
+        let C220VectorInstruction::Shift(issue) =
+            crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, word)
         else {
             panic!("shift should issue to the vector pipeline");
         };
         assert_eq!(issue.shift, shift as u32);
         assert_eq!(
-            C220CoreInstruction::Vector(C220VectorInstruction::Shift(issue))
-                .as_vector()
-                .unwrap()
-                .uops()
-                .unwrap()[0]
+            C220VectorInstruction::Shift(issue).uops().unwrap()[0]
                 .stages
                 .execute_ticks,
             6
@@ -3432,20 +3380,14 @@ fn vector_copy_uses_both_lane_groups_and_preserves_masked_destinations() {
             },
         )
         .unwrap();
-        let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Copy(issue)),
-            ..
-        } = core.step_word_at(0, word).unwrap()
+        let C220VectorInstruction::Copy(issue) =
+            crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, word)
         else {
             panic!("copy should issue to the vector pipeline");
         };
         assert_eq!(issue.control.source_0_block_stride, 1);
         assert_eq!(
-            C220CoreInstruction::Vector(C220VectorInstruction::Copy(issue))
-                .as_vector()
-                .unwrap()
-                .uops()
-                .unwrap()[0]
+            C220VectorInstruction::Copy(issue).uops().unwrap()[0]
                 .stages
                 .execute_ticks,
             1
@@ -3526,8 +3468,6 @@ fn vector_read_samples_ub_after_issue_without_an_implicit_raw_wait() {
         core.step_word_at(0, C220_CAPTURED_MOVEV_WORD).unwrap(),
         C220CoreStep::Executed { .. }
     ));
-    let movev_visible = core.vector_pipeline().pending_visibility_tick().unwrap();
-    assert!(movev_visible < 21);
     core.state
         .scalar_mut()
         .machine_mut()
@@ -3536,12 +3476,15 @@ fn vector_read_samples_ub_after_issue_without_an_implicit_raw_wait() {
     assert!(matches!(
         core.step_word_at(1, C220_CAPTURED_VADD_WORD).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(_)),
+            instruction: C220CoreInstruction::VectorQueued(_),
             ..
         }
     ));
     assert!(core.vector_pipeline().last_read_samples().is_empty());
     assert!(core.state().ub().read_known(0x400, 4).is_err());
+    core.advance_to(3).unwrap();
+    let movev_visible = core.vector_pipeline().pending_visibility_tick().unwrap();
+    assert!(movev_visible > 3);
     core.advance_to(30).unwrap();
     assert_eq!(
         core.state().ub().read_known(0, 4).unwrap(),
@@ -3614,19 +3557,12 @@ fn halfword_movev_uses_one_native_128_lane_uop() {
     )
     .unwrap();
     let halfword_word = (C220_CAPTURED_MOVEV_WORD & !(7 << 22)) | (1 << 22);
-    let step = core.step_word_at(0, halfword_word).unwrap();
-    let C220CoreStep::Executed {
-        instruction: C220CoreInstruction::Vector(C220VectorInstruction::Move(step)),
-        ..
-    } = step
+    let C220VectorInstruction::Move(step) =
+        crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, halfword_word)
     else {
         panic!("expected MOVEV");
     };
-    let uops = C220CoreInstruction::Vector(C220VectorInstruction::Move(step))
-        .as_vector()
-        .unwrap()
-        .uops()
-        .unwrap();
+    let uops = C220VectorInstruction::Move(step).uops().unwrap();
     assert_eq!(uops.len(), 1);
     assert!(matches!(
         uops[0].kind,
@@ -3653,7 +3589,7 @@ fn halfword_movev_uses_one_native_128_lane_uop() {
 }
 
 #[test]
-fn vector_issue_failure_keeps_execution_state_uncommitted() {
+fn vector_reception_failure_preserves_queued_work_and_execution_state() {
     let memory = SparseMemory::new(vec![MemoryRegion::unknown(256)], 512, 512);
     let memory = MappedMemory::bind(memory, &[0x2000]).unwrap();
     let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
@@ -3664,7 +3600,6 @@ fn vector_issue_failure_keeps_execution_state_uncommitted() {
     machine.set_spr_value(100, 1).unwrap();
     machine.set_spr_value(101, 0).unwrap();
     let execution = C220State::new(ScalarStepper::new(machine, 0x4000), UbMemory::new(256, 256));
-    let before = execution.clone();
     let rate = NonZeroU64::new(32).unwrap();
     let mut core = C220Core::new(
         execution,
@@ -3691,7 +3626,15 @@ fn vector_issue_failure_keeps_execution_state_uncommitted() {
     )
     .unwrap();
     assert!(matches!(
-        core.step_word_at(1, C220_CAPTURED_MOVEV_WORD),
+        core.step_word_at(1, C220_CAPTURED_MOVEV_WORD).unwrap(),
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::VectorQueued(_),
+            ..
+        }
+    ));
+    let before = core.state().clone();
+    assert!(matches!(
+        core.advance_to(2),
         Err(C220CoreError::VectorRuntime(
             crate::sim::c220::vector::C220VectorRuntimeError::Issue(
                 C220VectorPipelineError::TimeOverflow
@@ -3699,6 +3642,8 @@ fn vector_issue_failure_keeps_execution_state_uncommitted() {
         ))
     ));
     assert_eq!(core.state(), &before);
+    assert_eq!(core.queued_vector_instructions().len(), 1);
+    assert_eq!(core.received_vector_instructions().len(), 0);
     assert_eq!(core.vector_pipeline().pending_uops(), 0);
 }
 
@@ -3889,7 +3834,6 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
     let machine = core.state.scalar_mut().machine_mut();
     machine.set_xreg(16, 0x100).unwrap();
     core.step_word_at(4, C220_CAPTURED_MOVEV_WORD).unwrap();
-    let read_ready_tick = core.vector_pipeline().pending_visibility_tick().unwrap();
     core.state
         .scalar_mut()
         .machine_mut()
@@ -3900,21 +3844,18 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
     machine.set_xreg(8, C220_CAPTURED_VADD_CONTROL).unwrap();
     machine.set_xreg(13, 0).unwrap();
     machine.set_xreg(14, 0x80).unwrap();
-    let movev_visible = core.vector_pipeline().pending_visibility_tick().unwrap();
-    assert!(read_ready_tick < movev_visible);
-    let last_release = movev_visible - 3;
-    core.advance_to(last_release).unwrap();
-    assert_eq!(core.last_vector_releases().len(), 4);
-    assert!(core.state().ub().read_known(0x180, 4).is_err());
-    core.advance_to(read_ready_tick).unwrap();
-    core.step_word_at(read_ready_tick, C220_CAPTURED_VADD_WORD)
-        .unwrap();
+    core.advance_to(64).unwrap();
+    assert_eq!(
+        core.state().ub().read_known(0x180, 4).unwrap(),
+        1_f32.to_le_bytes()
+    );
+    core.step_word_at(64, C220_CAPTURED_VADD_WORD).unwrap();
     core.state
         .scalar_mut()
         .machine_mut()
         .set_xreg(14, 0)
         .unwrap();
-    let set_tick = read_ready_tick + 1;
+    let set_tick = 65;
     core.step_word_at(set_tick, C220_VECTOR_TO_MTE3_SET_FLAG_WORD)
         .unwrap();
     core.state
@@ -3922,18 +3863,25 @@ fn mte3_completion_wait_uses_the_scheduled_request_service() {
         .machine_mut()
         .set_xreg(13, 0)
         .unwrap();
-    let vector_retired = core.vector_pipeline().pending_retirement_tick().unwrap();
-    assert!(matches!(
-        core.step_word_at(set_tick + 1, C220_VECTOR_TO_MTE3_WAIT_FLAG_WORD)
-            .unwrap(),
-        C220CoreStep::Stalled(C220Stall {
-            resume_tick,
-            cause: C220StallCause::VectorDependency,
-            ..
-        }) if resume_tick == vector_retired
-    ));
-    core.step_word_at(vector_retired, C220_VECTOR_TO_MTE3_WAIT_FLAG_WORD)
-        .unwrap();
+    let C220CoreStep::Stalled(stall) = core
+        .step_word_at(set_tick + 1, C220_VECTOR_TO_MTE3_WAIT_FLAG_WORD)
+        .unwrap()
+    else {
+        panic!("WAIT must observe the Vector instruction still in reception");
+    };
+    assert_eq!(stall.cause, C220StallCause::VectorDependency);
+    let mut vector_retired = None;
+    for now in set_tick + 2..256 {
+        if matches!(
+            core.step_word_at(now, C220_VECTOR_TO_MTE3_WAIT_FLAG_WORD)
+                .unwrap(),
+            C220CoreStep::Executed { .. }
+        ) {
+            vector_retired = Some(now);
+            break;
+        }
+    }
+    let vector_retired = vector_retired.expect("Vector fence must complete");
     let machine = core.state.scalar_mut().machine_mut();
     machine.set_xreg(14, 0x180).unwrap();
     machine.set_xreg(10, 0x2000).unwrap();
@@ -4174,11 +4122,8 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     .unwrap();
     let word = 0x85c0_0003 | (1 << 17) | (2 << 12) | (3 << 7) | (4 << 2);
     assert!(matches!(
-        core.step_word_at(0, word).unwrap(),
-        C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Merge(_)),
-            ..
-        }
+        crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, word),
+        C220VectorInstruction::Merge(_)
     ));
     let visibility = core.vmsu_pipeline().pending_visibility_tick().unwrap();
     let retirement = core.vmsu_pipeline().pending_drain_tick().unwrap();
@@ -4213,18 +4158,17 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     assert!(initial_trace.ub_cycles.is_empty());
     assert!(initial_trace.comparisons.is_empty());
     assert!(matches!(
-        core.step_word_at(1, word).unwrap(),
-        C220CoreStep::Stalled(C220Stall {
-            resume_tick,
-            cause: C220StallCause::VectorDependency,
+        core.step_word_at(2, 0x8040_0000).unwrap(),
+        C220CoreStep::Executed {
+            instruction: C220CoreInstruction::VectorQueued(_),
             ..
-        }) if resume_tick == retirement
+        }
     ));
     let mut standalone = core.vmsu_pipeline().clone();
     let waiting_pc = core.state().scalar().pc();
     let prior_status = core.state().scalar().machine().spr_value(2);
     assert!(matches!(
-        core.step_word_at(2, write_spr(2)).unwrap(),
+        core.step_word_at(3, write_spr(2)).unwrap(),
         C220CoreStep::Stalled(C220Stall {
             cause: C220StallCause::VectorDependency,
             ..
@@ -4232,7 +4176,7 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     ));
     assert_eq!(core.state().scalar().machine().spr_value(2), prior_status);
     assert!(matches!(
-        core.step_word_at(2, read_spr(17)).unwrap(),
+        core.step_word_at(3, read_spr(17)).unwrap(),
         C220CoreStep::Stalled(C220Stall {
             cause: C220StallCause::VectorDependency,
             resume_tick,
@@ -4244,11 +4188,11 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
     standalone
         .advance_to(retirement, &mut standalone_state)
         .unwrap();
-    core.advance_to(3).unwrap();
+    core.advance_to(4).unwrap();
     let partial_trace = &core.vmsu_pipeline().trace().unwrap().repeats[0];
     assert_eq!(partial_trace.completion_tick, None);
     assert!(!partial_trace.ub_cycles.is_empty());
-    assert!(partial_trace.ub_cycles.iter().all(|cycle| cycle.tick <= 3));
+    assert!(partial_trace.ub_cycles.iter().all(|cycle| cycle.tick <= 4));
     assert!(partial_trace.write_groups.is_empty());
     core.advance_to(visibility).unwrap();
     let output = core.state().ub().read_known(0x100, 64).unwrap();
@@ -4257,13 +4201,6 @@ fn vms4v2_merges_four_lists_through_the_vmsu_pipeline() {
         .map(|record| u32::from_le_bytes(record[4..8].try_into().unwrap()))
         .collect::<Vec<_>>();
     assert_eq!(payloads, [0, 10, 20, 30, 1, 11, 21, 31]);
-    assert!(matches!(
-        core.step_word_at(visibility, 0x8040_0000).unwrap(),
-        C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Movemask(_)),
-            ..
-        }
-    ));
     core.advance_to(retirement).unwrap();
     assert!(!core.vmsu_pipeline().is_active());
     assert_eq!(core.vmsu_pipeline().trace(), standalone.trace());

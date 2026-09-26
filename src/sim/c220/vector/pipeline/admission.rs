@@ -160,7 +160,8 @@ impl C220VectorPipeline {
 
         let first_admission = tick
             .checked_add(self.rules.dispatch_ticks)
-            .ok_or(C220VectorPipelineError::TimeOverflow)?;
+            .ok_or(C220VectorPipelineError::TimeOverflow)?
+            .max(self.next_service_tick);
         let mut next_admission_tick = self.next_admission_tick;
         let issue_variant = C220VectorIssueVariant::from_compute(compute);
         let repeat_opcode = compute.and_then(RepeatOpcode::from_compute);

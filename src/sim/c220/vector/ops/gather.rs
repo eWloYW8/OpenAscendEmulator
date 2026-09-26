@@ -471,7 +471,6 @@ fn packed_destination_address(
 mod tests {
     use super::*;
     use crate::memory::sparse::MemoryByteState;
-    use crate::sim::c220::core::C220CoreInstruction;
     use crate::sim::c220::vector::C220VectorInstruction;
     use crate::sim::c220::vector::timing::C220VectorUopKind;
 
@@ -501,11 +500,7 @@ mod tests {
             &ub,
         )
         .unwrap();
-        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Gather(issue.clone()))
-            .as_vector()
-            .unwrap()
-            .uops()
-            .unwrap();
+        let uops = C220VectorInstruction::Gather(issue.clone()).uops().unwrap();
         assert_eq!(uops.len(), 5);
         assert!(matches!(
             uops[0].kind,

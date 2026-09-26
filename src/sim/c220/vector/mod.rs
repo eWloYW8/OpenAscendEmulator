@@ -1,6 +1,7 @@
 mod access;
 pub(super) mod dispatch;
 mod error;
+pub(super) mod frontend;
 mod instruction;
 mod issue;
 mod lanes;
@@ -18,6 +19,10 @@ mod uop;
 pub mod va;
 pub mod vmsu;
 
+pub use frontend::{
+    C220VectorFrontendConfig, C220VectorFrontendEvent, C220VectorQueuedInstruction,
+    C220VectorReception,
+};
 pub use instruction::C220VectorInstruction;
 pub use request::C220VectorRequest;
 pub use retirement::{C220VectorFence, C220VectorRetirement};
@@ -63,6 +68,37 @@ mod test_words {
 
 #[cfg(test)]
 pub use test_words::*;
+
+#[cfg(test)]
+pub(crate) fn issue_and_wait_for_dispatch(
+    core: &mut crate::sim::c220::core::C220Core,
+    tick: u64,
+    word: u32,
+) -> C220VectorInstruction {
+    use crate::sim::c220::core::{C220CoreInstruction, C220CoreStep};
+    let C220CoreStep::Executed {
+        instruction: C220CoreInstruction::VectorQueued(ticket),
+        ..
+    } = core.step_word_at(tick, word).unwrap()
+    else {
+        panic!("Vector instruction should enter the issue queue");
+    };
+    for now in tick + 1..tick + 1024 {
+        core.advance_to(now).unwrap();
+        for event in core.last_vector_frontend_events() {
+            if let C220VectorFrontendEvent::Dispatched {
+                instruction_id,
+                instruction,
+                ..
+            } = event
+                && *instruction_id == ticket.instruction_id
+            {
+                return *instruction.clone();
+            }
+        }
+    }
+    panic!("Vector instruction did not dispatch");
+}
 
 #[cfg(test)]
 mod tests;

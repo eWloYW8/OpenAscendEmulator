@@ -6,7 +6,7 @@ use crate::memory::mapped::MappedMemory;
 use crate::memory::region::MemoryRegion;
 use crate::memory::sparse::{MemoryByteState, SparseMemory};
 use crate::memory::ub::UbMemory;
-use crate::sim::c220::core::{C220Core, C220CoreInstruction, C220CoreStep, C220CoreTimingRules};
+use crate::sim::c220::core::{C220Core, C220CoreTimingRules};
 use crate::sim::c220::mte::mte2::C220Mte2TimingRules;
 use crate::sim::c220::mte::mte3::C220Mte3TimingRules;
 use crate::sim::c220::state::C220State;
@@ -76,10 +76,8 @@ fn widened_s16_binary_arithmetic_writes_one_s32_uop() {
             },
         )
         .unwrap();
-        let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue)),
-            ..
-        } = core.step_word_at(0, word).unwrap()
+        let C220VectorInstruction::Arithmetic(issue) =
+            crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, word)
         else {
             panic!("widened S16 vector instruction should issue");
         };
@@ -88,11 +86,7 @@ fn widened_s16_binary_arithmetic_writes_one_s32_uop() {
         assert_eq!(issue.result_element_bytes, 4);
         assert_eq!(issue.write_targets.len(), 2);
         assert_eq!(issue.write_targets[1].address, 0x2fc);
-        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue))
-            .as_vector()
-            .unwrap()
-            .uops()
-            .unwrap();
+        let uops = C220VectorInstruction::Arithmetic(issue).uops().unwrap();
         assert_eq!(uops.len(), 1);
         assert_eq!(uops[0].stages.execute_ticks, execute_ticks);
         core.advance_to(100).unwrap();

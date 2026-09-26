@@ -139,6 +139,7 @@ mod tests {
                 ub_response_ticks: 1,
             },
             C220CompareMask::from_bits([0; 2]),
+            Default::default(),
         );
         assert!(matches!(
             engine.dispatch_at(20, 0, &request, &mut state).unwrap(),

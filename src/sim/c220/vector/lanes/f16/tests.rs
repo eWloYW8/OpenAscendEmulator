@@ -6,7 +6,7 @@ use crate::memory::mapped::MappedMemory;
 use crate::memory::region::MemoryRegion;
 use crate::memory::sparse::{MemoryByteState, SparseMemory};
 use crate::memory::ub::UbMemory;
-use crate::sim::c220::core::{C220Core, C220CoreInstruction, C220CoreStep, C220CoreTimingRules};
+use crate::sim::c220::core::{C220Core, C220CoreTimingRules};
 use crate::sim::c220::mte::mte2::C220Mte2TimingRules;
 use crate::sim::c220::mte::mte3::C220Mte3TimingRules;
 use crate::sim::c220::numeric::fp16::C220Fp16Mode;
@@ -155,20 +155,14 @@ fn f16_arithmetic_captures_mode_and_commits_one_native_uop() {
             },
         )
         .unwrap();
-        let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue)),
-            ..
-        } = core.step_word_at(0, word).unwrap()
+        let C220VectorInstruction::Arithmetic(issue) =
+            crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, word)
         else {
             panic!("F16 vector instruction should issue");
         };
         assert_eq!(issue.modes.fp16_mode, mode);
         assert_eq!(issue.result_element_bytes, 2);
-        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Arithmetic(issue))
-            .as_vector()
-            .unwrap()
-            .uops()
-            .unwrap();
+        let uops = C220VectorInstruction::Arithmetic(issue).uops().unwrap();
         assert_eq!(uops.len(), 1);
         assert!(
             uops.iter()

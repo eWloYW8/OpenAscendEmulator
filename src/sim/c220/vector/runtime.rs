@@ -7,6 +7,7 @@ use crate::sim::c220::vector::timing::C220VectorUopRelease;
 use crate::sim::c220::vector::va::C220VaRegisters;
 use crate::sim::c220::vector::vmsu::C220VmsuPipeline;
 
+use super::frontend::{C220VectorFrontendConfig, VectorFrontend};
 use super::pipeline::{C220VectorAdvanceError, C220VectorPipelineError};
 use super::retirement::PendingVectorInstruction;
 use super::vmsu::C220VmsuError;
@@ -14,6 +15,7 @@ use super::{C220VectorFence, C220VectorRetirement};
 use super::{C220VectorInstruction, C220VectorUopError};
 
 pub(in crate::sim::c220) struct VectorEngine {
+    pub(super) frontend: VectorFrontend,
     pub(in crate::sim::c220) pipeline: C220VectorPipeline,
     pub(in crate::sim::c220) vmsu: C220VmsuPipeline,
     pub(in crate::sim::c220) va: C220VaRegisters,
@@ -90,10 +92,17 @@ impl VectorEngine {
             )
     }
 
-    pub(in crate::sim::c220) fn new(rules: C220VectorTimingRules, mask: C220CompareMask) -> Self {
+    pub(in crate::sim::c220) fn new(
+        mut rules: C220VectorTimingRules,
+        mask: C220CompareMask,
+        config: C220VectorFrontendConfig,
+    ) -> Self {
+        let frontend = VectorFrontend::new(config, rules.dispatch_ticks);
+        rules.dispatch_ticks = 0;
         let mut pipeline = C220VectorPipeline::new(rules);
         pipeline.set_compare_mask(mask);
         Self {
+            frontend,
             pipeline,
             vmsu: C220VmsuPipeline::new(rules),
             va: C220VaRegisters::default(),
@@ -108,6 +117,7 @@ impl VectorEngine {
     }
 
     pub(in crate::sim::c220) fn begin_advance(&mut self) {
+        self.frontend.events.clear();
         self.releases.clear();
         self.retirements.clear();
         self.pipeline.begin_advance();
@@ -119,6 +129,7 @@ impl VectorEngine {
             .into_iter()
             .chain(self.vmsu.next_event_tick())
             .chain(self.next_retirement_tick())
+            .chain(self.frontend.next_tick)
             .min()
     }
 
@@ -136,6 +147,7 @@ impl VectorEngine {
         self.vmsu.advance_to(tick, state)?;
         self.retire_ready(tick);
         self.observed_tick = Some(tick);
+        self.advance_frontend(tick, state)?;
         Ok(())
     }
 
@@ -164,11 +176,25 @@ impl VectorEngine {
     }
 
     pub(in crate::sim::c220) fn pending_drain_tick(&self) -> Option<u64> {
+        self.pending_execution_drain_tick()
+            .into_iter()
+            .chain(self.fence_retirement_tick(self.instruction_fence()))
+            .max()
+    }
+
+    pub(super) fn pending_execution_drain_tick(&self) -> Option<u64> {
         self.pipeline
             .pending_drain_tick()
             .into_iter()
             .chain(self.vmsu.pending_drain_tick())
-            .chain(self.fence_retirement_tick(self.instruction_fence()))
+            .chain(
+                self.fence_retirement_tick(C220VectorFence {
+                    instruction_id: self
+                        .pending_instructions
+                        .back()
+                        .map(|entry| entry.instruction_id),
+                }),
+            )
             .max()
     }
 }

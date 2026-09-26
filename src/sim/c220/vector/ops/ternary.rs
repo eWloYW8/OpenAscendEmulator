@@ -350,9 +350,7 @@ mod tests {
     use crate::memory::mapped::MappedMemory;
     use crate::memory::region::MemoryRegion;
     use crate::memory::sparse::{MemoryByteState, SparseMemory};
-    use crate::sim::c220::core::{
-        C220Core, C220CoreInstruction, C220CoreStep, C220CoreTimingRules,
-    };
+    use crate::sim::c220::core::{C220Core, C220CoreTimingRules};
     use crate::sim::c220::mte::mte2::C220Mte2TimingRules;
     use crate::sim::c220::mte::mte3::C220Mte3TimingRules;
     use crate::sim::c220::state::C220State;
@@ -415,18 +413,12 @@ mod tests {
         )
         .unwrap();
         let word = 0x8940_0001 | (3 << 17) | (4 << 12) | (5 << 7) | (6 << 2);
-        let C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Vector(C220VectorInstruction::Ternary(issue)),
-            ..
-        } = core.step_word_at(0, word).unwrap()
+        let C220VectorInstruction::Ternary(issue) =
+            crate::sim::c220::vector::issue_and_wait_for_dispatch(&mut core, 0, word)
         else {
             panic!("ternary instruction should issue");
         };
-        let uops = C220CoreInstruction::Vector(C220VectorInstruction::Ternary(issue))
-            .as_vector()
-            .unwrap()
-            .uops()
-            .unwrap();
+        let uops = C220VectorInstruction::Ternary(issue).uops().unwrap();
         assert_eq!(uops.len(), 2);
         assert!(matches!(
             uops[0].kind,

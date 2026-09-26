@@ -505,7 +505,6 @@ mod tests {
 
     use crate::architecture::Architecture;
     use crate::memory::sparse::MemoryByteState;
-    use crate::sim::c220::core::C220CoreInstruction;
     use crate::sim::c220::state::C220State;
     use crate::sim::c220::vector::pipeline::{C220VectorPipeline, C220VectorTimingRules};
     use crate::sim::c220::vector::read::C220VectorReadIssue;
@@ -659,9 +658,8 @@ mod tests {
             );
             assert!(issue.write_targets.iter().all(|store| store.data == [0; 8]));
 
-            let instruction =
-                C220CoreInstruction::Vector(C220VectorInstruction::PackedCompare(issue.clone()));
-            let uops = instruction.as_vector().unwrap().uops().unwrap();
+            let instruction = C220VectorInstruction::PackedCompare(issue.clone());
+            let uops = instruction.uops().unwrap();
             let mut pipeline = C220VectorPipeline::new(C220VectorTimingRules {
                 dispatch_ticks: 0,
                 uop_issue_interval: NonZeroU64::new(1).unwrap(),

@@ -26,7 +26,7 @@ pub(super) struct PendingVectorInstruction {
 
 impl VectorEngine {
     pub(in crate::sim::c220) fn outstanding_instructions(&self) -> usize {
-        self.pending_instructions.len()
+        self.pending_instructions.len() + self.frontend.received_count()
     }
 
     pub(super) fn record_dispatch(&mut self, tick: u64, id: u64, pc: u64, word: u32) {
@@ -60,7 +60,10 @@ impl VectorEngine {
             instruction_id: self
                 .pending_instructions
                 .back()
-                .map(|entry| entry.instruction_id),
+                .map(|entry| entry.instruction_id)
+                .into_iter()
+                .chain(self.frontend.fence_id())
+                .max(),
         }
     }
 
@@ -83,6 +86,13 @@ impl VectorEngine {
             let ready = ready.max(self.observed_tick.map_or(0, |tick| tick.saturating_add(1)));
             result = Some(ready);
             previous = result;
+        }
+        if self.frontend.fence_pending(id) {
+            result = result
+                .into_iter()
+                .chain(self.frontend.next_tick)
+                .chain(self.observed_tick.map(|tick| tick.saturating_add(1)))
+                .max();
         }
         result
     }
