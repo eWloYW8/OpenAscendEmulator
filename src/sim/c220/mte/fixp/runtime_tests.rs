@@ -183,6 +183,7 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
             .issue_mte3_dma(
                 1,
                 crate::sim::c220::mte::mte3::C220Mte3TransferPlan {
+                    control: 0,
                     descriptor: C220DmaMovDescriptor::decode(CAPTURED_C220_MOV_UB_TO_OUT_WORD, 0)
                         .unwrap(),
                     source_address: 0,
@@ -282,6 +283,7 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
                     .issue_mte3_dma(
                         id,
                         crate::sim::c220::mte::mte3::C220Mte3TransferPlan {
+                            control: 0,
                             descriptor: C220DmaMovDescriptor::decode(
                                 CAPTURED_C220_MOV_UB_TO_OUT_WORD,
                                 descriptor,
@@ -306,7 +308,7 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
                             l1: &mut probe_l1,
                             slopes: &slopes,
                             external: &mut probe_memory,
-                            atomics: C220FixpAtomicConfig::default(),
+                            atomics: C220AtomicConfig::default(),
                         },
                         false,
                     )
@@ -341,7 +343,7 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
                         l1: &mut l1,
                         slopes: &slopes,
                         external: &mut memory,
-                        atomics: C220FixpAtomicConfig::default(),
+                        atomics: C220AtomicConfig::default(),
                     },
                     false,
                 )

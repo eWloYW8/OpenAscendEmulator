@@ -1,4 +1,3 @@
-use super::copy_c220_mov_ub_to_hbm;
 use super::frontend::C220Mte3Record;
 use super::{C220Mte3Ticket, C220Mte3TimingError, C220Mte3TimingRules, C220TimedMte3Lane};
 use crate::memory::mapped::MappedMemory;
@@ -49,6 +48,7 @@ pub struct C220Mte3DmaOutcome {
 }
 
 pub(in crate::sim::c220) struct Mte3Engine {
+    pub(in crate::sim::c220) atomics: crate::sim::c220::mte::atomic::C220AtomicConfig,
     pub(in crate::sim::c220) timing: C220TimedMte3Lane,
     pending: VecDeque<C220Mte3CommandState>,
     pub(in crate::sim::c220) outcomes: Vec<C220Mte3Outcome>,
@@ -90,6 +90,7 @@ impl Mte3Engine {
 
     pub(in crate::sim::c220) fn new(rules: C220Mte3TimingRules) -> Self {
         Self {
+            atomics: Default::default(),
             timing: C220TimedMte3Lane::new(rules),
             pending: VecDeque::new(),
             outcomes: Vec::new(),
@@ -121,13 +122,9 @@ impl Mte3Engine {
             .get(&record.instruction_id)
             .ok_or(C220Mte3RuntimeError::UnknownCommand(record.instruction_id))?;
         let result = match record.command {
-            super::frontend::C220Mte3Command::Dma(plan) => copy_c220_mov_ub_to_hbm(
-                ub,
-                memory,
-                plan.descriptor,
-                plan.source_address,
-                plan.destination_address,
-            )?,
+            super::frontend::C220Mte3Command::Dma(plan) => {
+                plan.execute(ub, memory, self.atomics)?
+            }
             super::frontend::C220Mte3Command::MovPad(command) => {
                 crate::sim::c220::mte::mov_pad::prepare_c220_mov_pad(
                     command.transfer,
@@ -135,7 +132,11 @@ impl Mte3Engine {
                     ub,
                     command.padding,
                 )?
-                .commit_to_external(memory)?
+                .commit_to_external_with_atomics(
+                    memory,
+                    command.control,
+                    self.atomics,
+                )?
             }
             super::frontend::C220Mte3Command::CrossCore {
                 instruction,
@@ -192,13 +193,7 @@ impl Mte3Engine {
             && tick >= pending.ticket.retire_tick
         {
             let plan = pending.ticket.transfer;
-            let result = copy_c220_mov_ub_to_hbm(
-                ub,
-                memory,
-                plan.descriptor,
-                plan.source_address,
-                plan.destination_address,
-            )?;
+            let result = plan.execute(ub, memory, self.atomics)?;
             self.outcomes.push(C220Mte3Outcome {
                 instruction_id: pending.instruction_id,
                 tick,
@@ -232,6 +227,7 @@ mod tests {
         });
         let word = CAPTURED_C220_MOV_UB_TO_OUT_WORD;
         let plan = C220Mte3TransferPlan {
+            control: 0,
             descriptor: C220DmaMovDescriptor::decode(word, 0x40010).unwrap(),
             source_address: 0,
             destination_address: 0x2000,

@@ -653,6 +653,7 @@ mod tests {
         let descriptor =
             C220DmaMovDescriptor::decode(CAPTURED_C220_MOV_UB_TO_OUT_WORD, xm).unwrap();
         C220Mte3TransferPlan {
+            control: 0,
             descriptor,
             source_address: 0x200,
             destination_address,

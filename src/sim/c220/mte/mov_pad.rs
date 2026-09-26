@@ -8,6 +8,7 @@ use crate::sim::common::scalar::ScalarMachine;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220MovPadCommand {
     pub transfer: C220MovPadTransfer,
+    pub control: u64,
     pub padding: u32,
     pub biu_mode_word: u64,
     pub dma_mode_word: u64,
@@ -37,6 +38,7 @@ impl C220MovPadCommand {
         };
         Ok(Self {
             transfer: instruction.capture(machine.xregs()),
+            control: spr(3)?,
             padding: spr(70)? as u32,
             biu_mode_word,
             dma_mode_word,
@@ -81,6 +83,24 @@ impl C220PreparedMovPad {
         }
         destination.write_segments_at(&self.writes)?;
         Ok(self.result)
+    }
+
+    pub fn commit_to_external_with_atomics(
+        &self,
+        destination: &mut MappedMemory,
+        control: u64,
+        config: super::atomic::C220AtomicConfig,
+    ) -> Result<UbTransferResult, C220MovPadError> {
+        if self.transfer.is_input() {
+            return Err(C220MovPadError::DirectionMismatch);
+        }
+        Ok(super::atomic::commit_output(
+            &self.writes,
+            destination,
+            control,
+            config,
+            self.result,
+        )?)
     }
 }
 

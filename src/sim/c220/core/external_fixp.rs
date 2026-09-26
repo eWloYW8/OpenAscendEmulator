@@ -10,14 +10,14 @@ pub struct C220CoreFixpConfig {
     pub frontend: super::C220FixpFrontendConfig,
     pub main_transpose_slots: u32,
     pub total_transpose_slots: usize,
-    pub atomics: C220FixpAtomicConfig,
+    pub atomics: C220AtomicConfig,
 }
 
 pub(super) struct CoreExternalFixp {
     pub engine: C220FixpRuntime,
     pub factors: C220LocalBuffer,
     pub bindings: C220FixpSyncBindings,
-    pub atomics: C220FixpAtomicConfig,
+    pub atomics: C220AtomicConfig,
     pub factor_reads: Option<super::factor::C220FactorReadConfig>,
     pub factor_outcomes: Vec<super::factor::C220FactorOutcome>,
     pub(super) next_request: u64,

@@ -950,13 +950,15 @@ fn run_core_device_loads(core: &mut C220Core, mut tick: u64) {
 #[test]
 fn native_mte3_waits_for_responses_and_reads_ub_at_retirement() {
     for mode in 0..4 {
-        for encoding in 0..3 {
+        for encoding in 0..6 {
             native_mte3_write_path(mode, encoding);
         }
     }
 }
 
 fn native_mte3_write_path(mode: u8, encoding: u8) {
+    let atomic = encoding >= 3;
+    let encoding = encoding % 3;
     let bus = mode != 0;
     use crate::isa::c220::mte::C220MovInstruction;
     use crate::sim::c220::memory::biu_write::C220BiuWriteReturnKind::{Completion, Dbid};
@@ -979,6 +981,9 @@ fn native_mte3_write_path(mode: u8, encoding: u8) {
         CAPTURED_C220_MOV_UB_TO_OUT_WORD | u32::from(encoding)
     };
     let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+    machine
+        .set_spr_value(3, if atomic { 3 << 6 } else { 0 })
+        .unwrap();
     machine.set_xreg(operands.source_register, 0).unwrap();
     machine
         .set_xreg(operands.destination_register, 0x2000)
@@ -1022,6 +1027,15 @@ fn native_mte3_write_path(mode: u8, encoding: u8) {
         },
     )
     .unwrap();
+    core.configure_mte3_atomics(crate::sim::c220::mte::atomic::C220AtomicConfig {
+        enabled: true,
+        ..Default::default()
+    })
+    .unwrap();
+    if atomic {
+        core.memory.write_known_at(0x2000, &[1; 128]).unwrap();
+    }
+    let initial_output = core.memory.read_states_at(0x2000, 128).unwrap();
     let width = NonZeroU32::new(32).unwrap();
     core.configure_mte_pipeline(C220MtePipelineConfig {
         core_kind: crate::sim::c220::device::C220CoreKind::Vector0,
@@ -1134,6 +1148,12 @@ fn native_mte3_write_path(mode: u8, encoding: u8) {
         .machine_mut()
         .set_xreg(10, 0)
         .unwrap();
+    assert!(core.configure_mte3_atomics(Default::default()).is_err());
+    core.state
+        .scalar_mut()
+        .machine_mut()
+        .set_spr_value(3, 3 << 9)
+        .unwrap();
     core.state
         .scalar_mut()
         .machine_mut()
@@ -1239,7 +1259,7 @@ fn native_mte3_write_path(mode: u8, encoding: u8) {
             .expect("native memory service completes without externally injected responses");
         assert_eq!(
             core.memory().read_known_at(0x2000, 128).unwrap(),
-            vec![9; 128]
+            vec![9 + u8::from(atomic); 128]
         );
         assert!(matches!(
             core.step_word_at(retired + 1, C220_MTE3_TO_VECTOR_WAIT_FLAG_WORD)
@@ -1263,6 +1283,9 @@ fn native_mte3_write_path(mode: u8, encoding: u8) {
                 .pending_completions(),
             0
         );
+        if atomic {
+            core.memory.write_known_at(0x2000, &[9; 128]).unwrap();
+        }
         run_core_loads(&mut core, retired + 2, mode == 3);
         return;
     }
@@ -1324,7 +1347,10 @@ fn native_mte3_write_path(mode: u8, encoding: u8) {
         .find_map(|tick| core.take_biu_write_data_at(tick).unwrap())
         .expect("source packets reach the shared data port");
     assert_eq!(data.source.request.tag, tag);
-    assert!(core.memory().read_known_at(0x2000, 128).is_err());
+    assert_eq!(
+        core.memory().read_states_at(0x2000, 128).unwrap(),
+        initial_output
+    );
     assert!(core.last_mte3_dma_outcomes().is_empty());
     core.state
         .ub
@@ -1353,7 +1379,10 @@ fn native_mte3_write_path(mode: u8, encoding: u8) {
                 .outstanding(),
             0
         );
-        assert!(core.memory().read_known_at(0x2000, 128).is_err());
+        assert_eq!(
+            core.memory().read_states_at(0x2000, 128).unwrap(),
+            initial_output
+        );
         response_tick + 2
     } else {
         let response = core
@@ -1365,7 +1394,7 @@ fn native_mte3_write_path(mode: u8, encoding: u8) {
     core.advance_to(retirement_tick).unwrap();
     assert_eq!(
         core.memory().read_known_at(0x2000, 128).unwrap(),
-        vec![9; 128]
+        vec![9 + u8::from(atomic); 128]
     );
     assert_eq!(core.last_mte3_dma_outcomes().len(), 1);
     assert_eq!(core.last_mte3_dma_outcomes()[0].tick, retirement_tick);

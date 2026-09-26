@@ -4,9 +4,8 @@ pub use external_queue::{
     C220FixpExternalWriteBatch,
 };
 mod external_output;
+pub use super::atomic::C220AtomicConfig;
 pub use external_output::C220FixpExternalOutputPolicy;
-mod atomic;
-pub use atomic::C220FixpAtomicConfig;
 mod conversion;
 mod datapath;
 mod resource;

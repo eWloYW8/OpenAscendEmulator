@@ -1,8 +1,9 @@
-use super::atomic::{C220FixpAtomicConfig, combine_atomic};
+use super::C220AtomicConfig;
 use crate::isa::c220::mte::fixp::C220FixpDestination;
 use crate::memory::mapped::MappedMemory;
 use crate::sim::c220::memory::C220LocalBuffer;
 use crate::sim::c220::mte::uop::C220DmaUopMode;
+use crate::sim::c220::numeric::atomic::combine_atomic;
 
 use super::{
     C220FixpCommand, C220FixpExecutionError, C220FixpExternalOutputPolicy,
@@ -28,7 +29,7 @@ impl C220FixpExternalCommand {
         l0c: &C220LocalBuffer,
         slopes: &C220LocalBuffer,
         memory: &mut MappedMemory,
-        atomics: C220FixpAtomicConfig,
+        atomics: C220AtomicConfig,
         mut observe: impl FnMut(&C220FixpSliceResult, &[u8]),
     ) -> Result<(), C220FixpExecutionError> {
         let operation = ((self.command.control >> 9) & 3) as u8;
@@ -141,11 +142,11 @@ impl C220FixpExternalCommand {
 mod tests {
     use super::*;
     use crate::sim::c220::numeric::fp16::C220Fp16AddRounding;
-    const ENABLED: C220FixpAtomicConfig = C220FixpAtomicConfig {
+    const ENABLED: C220AtomicConfig = C220AtomicConfig {
         enabled: true,
         fp16_rounding: C220Fp16AddRounding::NearestEven,
     };
-    const DISABLED: C220FixpAtomicConfig = C220FixpAtomicConfig {
+    const DISABLED: C220AtomicConfig = C220AtomicConfig {
         enabled: false,
         ..ENABLED
     };

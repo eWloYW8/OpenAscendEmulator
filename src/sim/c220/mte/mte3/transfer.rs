@@ -21,6 +21,21 @@ impl C220PreparedOutput {
         destination.write_segments_at(&self.writes)?;
         Ok(self.result)
     }
+
+    pub fn commit_with_atomics(
+        &self,
+        destination: &mut MappedMemory,
+        control: u64,
+        config: crate::sim::c220::mte::atomic::C220AtomicConfig,
+    ) -> Result<UbTransferResult, MappedMemoryError> {
+        crate::sim::c220::mte::atomic::commit_output(
+            &self.writes,
+            destination,
+            control,
+            config,
+            self.result,
+        )
+    }
 }
 
 pub fn copy_c220_mov_ub_to_hbm(
@@ -46,22 +61,33 @@ pub fn prepare_c220_mov_ub_to_hbm(
         .len()
         .checked_mul(descriptor.unit_bytes() as usize)
         .ok_or(UbMemoryError::ResultSizeOverflow)?;
-    let mut writes = Vec::new();
+    let mut writes: Vec<(u64, Vec<MemoryByteState>)> = Vec::new();
     let mut known_bytes = 0;
     for segment in segments {
         let states = ub.read_states(segment.source_local, segment.bytes as usize)?;
-        if writes.len() == writes.capacity() {
+        if segment.unit_index == 0 {
             writes
                 .try_reserve(1)
                 .map_err(|_| UbMemoryError::HostAllocationFailed {
                     requested: writes.len() + 1,
                 })?;
+            let mut burst = Vec::new();
+            burst
+                .try_reserve_exact(descriptor.burst_bytes() as usize)
+                .map_err(|_| UbMemoryError::HostAllocationFailed {
+                    requested: descriptor.burst_bytes() as usize,
+                })?;
+            writes.push((segment.destination_hbm, burst));
         }
         known_bytes += states
             .iter()
             .filter(|state| matches!(state, MemoryByteState::Known(_)))
             .count();
-        writes.push((segment.destination_hbm, states));
+        writes
+            .last_mut()
+            .expect("burst begins at unit zero")
+            .1
+            .extend(states);
     }
     Ok(C220PreparedOutput {
         writes,
@@ -76,12 +102,30 @@ pub fn prepare_c220_mov_ub_to_hbm(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220Mte3TransferPlan {
+    pub control: u64,
     pub descriptor: C220DmaMovDescriptor,
     pub source_address: u64,
     pub destination_address: u64,
     pub bytes: usize,
     pub dma_mode_word: u64,
     pub biu_mode_word: u64,
+}
+
+impl C220Mte3TransferPlan {
+    pub fn execute(
+        self,
+        ub: &UbMemory,
+        destination: &mut MappedMemory,
+        atomics: crate::sim::c220::mte::atomic::C220AtomicConfig,
+    ) -> Result<UbTransferResult, C220TransferError> {
+        Ok(prepare_c220_mov_ub_to_hbm(
+            ub,
+            self.descriptor,
+            self.source_address,
+            self.destination_address,
+        )?
+        .commit_with_atomics(destination, self.control, atomics)?)
+    }
 }
 
 pub(crate) fn decode_mte3_transfer(
@@ -116,6 +160,9 @@ pub(crate) fn decode_mte3_transfer(
         )
     };
     Ok(C220Mte3TransferPlan {
+        control: machine
+            .spr_value(3)
+            .ok_or(C220ExecutionError::MissingSpr { pc, index: 3 })?,
         descriptor,
         source_address,
         destination_address,
@@ -179,6 +226,7 @@ mod tests {
                     }
                 }
                 let requests = mte3_uops(C220Mte3TransferPlan {
+                    control: 0,
                     descriptor,
                     source_address: 1,
                     destination_address: 0x2003,

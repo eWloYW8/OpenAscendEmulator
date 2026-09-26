@@ -489,6 +489,7 @@ mod tests {
                 frontend.connect_biu_retirement().unwrap();
             }
             let plan = C220Mte3TransferPlan {
+                control: 0,
                 descriptor: C220DmaMovDescriptor::decode(
                     CAPTURED_C220_MOV_UB_TO_OUT_WORD,
                     (32 << 16) | (1 << 4),

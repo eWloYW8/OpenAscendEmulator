@@ -531,7 +531,7 @@ mod tests {
         use crate::sim::c220::core::C220CoreFixpConfig;
         use crate::sim::c220::memory::C220LocalBuffer;
         use crate::sim::c220::mte::fixp::{
-            C220FixpAtomicConfig, C220FixpEngineConfig, C220FixpRuntimeStage::*,
+            C220AtomicConfig, C220FixpEngineConfig, C220FixpRuntimeStage::*,
         };
         use crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteConfig;
         use crate::sim::c220::schedule::{C220Stall, C220StallCause};
@@ -561,7 +561,7 @@ mod tests {
                 },
                 main_transpose_slots: 8,
                 total_transpose_slots: 16,
-                atomics: C220FixpAtomicConfig::default(),
+                atomics: C220AtomicConfig::default(),
             },
             C220LocalBuffer::new(4096),
             &[

@@ -1,3 +1,4 @@
+pub mod atomic;
 pub mod dma;
 mod error;
 pub mod factor;

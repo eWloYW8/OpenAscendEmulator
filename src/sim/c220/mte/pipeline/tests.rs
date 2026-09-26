@@ -152,6 +152,7 @@ fn mte3_output_and_biu_split_use_independent_captured_modes() {
         .issue_mte3_dma(
             8,
             C220Mte3TransferPlan {
+                control: 0,
                 descriptor: C220DmaMovDescriptor::decode(
                     CAPTURED_C220_MOV_UB_TO_OUT_WORD,
                     (16 << 16) | (1 << 4),

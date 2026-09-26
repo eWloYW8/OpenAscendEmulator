@@ -37,7 +37,7 @@ pub struct C220FixpRuntimeMemory<'a> {
     pub l1: &'a mut C220LocalBuffer,
     pub slopes: &'a C220LocalBuffer,
     pub external: &'a mut MappedMemory,
-    pub atomics: C220FixpAtomicConfig,
+    pub atomics: C220AtomicConfig,
 }
 
 impl C220FixpRuntime {
