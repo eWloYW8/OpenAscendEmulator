@@ -140,10 +140,12 @@ impl C220Core {
                 _ => {}
             }
         }
-        if let Some(barrier) = PipelineBarrierStep::decode(Architecture::Dav2201, pc, word)
-            .filter(|barrier| barrier.scope == PipelineBarrierScope::Fix)
-        {
-            return self.step_fixp_barrier_at(tick, barrier);
+        if let Some(barrier) = PipelineBarrierStep::decode(Architecture::Dav2201, pc, word) {
+            match barrier.scope {
+                PipelineBarrierScope::Fix => return self.step_fixp_barrier_at(tick, barrier),
+                PipelineBarrierScope::Cube => return self.step_cube_barrier_at(tick, barrier),
+                _ => {}
+            }
         }
         let decoded_word = C220DecodedWord::decode(word);
         match decoded_word.kind {

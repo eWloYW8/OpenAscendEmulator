@@ -3,6 +3,7 @@ use std::num::NonZeroU32;
 use crate::isa::c220::control::C220SetCrossCoreInstruction;
 use crate::isa::c220::cube::{C220CubeInstruction, C220CubeRegisterValues};
 use crate::isa::c220::hflag::C220HardwareFlagStep;
+use crate::isa::flow::PipelineBarrierStep;
 use crate::sim::c220::sync::C220DeviceSync;
 use crate::sim::common::scalar::ScalarSprStep;
 
@@ -51,4 +52,13 @@ pub struct C220CubeQueuedCommand {
     /// Earliest reception; dependencies can delay the actual reception.
     pub ready_tick: u64,
     pub command: C220CubeCommand,
+}
+
+/// An ordering marker that occupies neither a queue slot nor a retirement credit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct C220CubeBarrier {
+    pub instruction_id: u64,
+    pub step: PipelineBarrierStep,
+    pub predecessor: Option<u64>,
+    pub issued_tick: u64,
 }

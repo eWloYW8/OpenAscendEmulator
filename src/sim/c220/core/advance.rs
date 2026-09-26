@@ -143,6 +143,7 @@ impl C220Core {
                 &mut self.hardware_flags,
                 self.state.scalar_mut().machine_mut(),
             )?;
+            self.release_cube_barriers_at(event_tick);
             self.dispatch_cube_head_at(event_tick)?;
             self.vector.advance_event(event_tick, &mut self.state)?;
             if let Some(pipeline) = &mut self.mte_pipeline {

@@ -3,14 +3,16 @@ use std::collections::VecDeque;
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
 use crate::sim::c220::cube::C220CubeIssue;
 use crate::sim::c220::cube::frontend::{
-    C220CubeCommand, C220CubeFrontendConfig, C220CubeQueuedCommand,
+    C220CubeBarrier, C220CubeCommand, C220CubeFrontendConfig, C220CubeQueuedCommand,
 };
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 
 pub(super) struct CubeFrontend {
-    config: C220CubeFrontendConfig,
-    commands: VecDeque<C220CubeQueuedCommand>,
-    active: Option<C220CubeQueuedCommand>,
+    pub(super) config: C220CubeFrontendConfig,
+    pub(super) commands: VecDeque<C220CubeQueuedCommand>,
+    pub(super) active: Option<C220CubeQueuedCommand>,
+    pub(super) last_accepted: Option<u64>,
+    pub(super) barriers: VecDeque<C220CubeBarrier>,
     pub next_tick: Option<u64>,
     pub outcomes: Vec<C220CoreStep>,
 }
@@ -21,6 +23,8 @@ impl CubeFrontend {
             config,
             commands: VecDeque::new(),
             active: None,
+            last_accepted: None,
+            barriers: VecDeque::new(),
             next_tick: None,
             outcomes: Vec::new(),
         }
@@ -71,6 +75,7 @@ impl C220Core {
             command,
         };
         self.cube_frontend.commands.push_back(queued);
+        self.cube_frontend.last_accepted = Some(queued.instruction_id);
         self.cube_frontend.next_tick.get_or_insert(ready_tick);
         self.state.commit_c220_sequential_issue();
         Ok(C220CoreStep::Executed {
@@ -95,6 +100,12 @@ impl C220Core {
                 Some(C220StallCause::CubeDependency)
             } else if pending >= self.cube_frontend.config.outstanding_limit.get() as usize {
                 Some(C220StallCause::CubeOutstandingLimit)
+            } else if self.cube_frontend.barriers.iter().any(|barrier| {
+                barrier
+                    .predecessor
+                    .is_some_and(|id| id < queued.instruction_id)
+            }) {
+                Some(C220StallCause::CubeBarrier)
             } else if pending != 0
                 && matches!(
                     queued.command,
@@ -194,6 +205,7 @@ impl C220Core {
             &mut self.hardware_flags,
             self.state.scalar_mut().machine_mut(),
         )?;
+        self.release_cube_barriers_at(tick);
         Ok(())
     }
 }

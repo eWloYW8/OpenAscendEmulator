@@ -227,6 +227,12 @@ impl C220CubePipeline {
         self.next_accept_tick
     }
 
+    pub fn has_pending_instruction(&self, instruction_id: u64) -> bool {
+        self.in_flight
+            .iter()
+            .any(|flight| flight.instruction_id == instruction_id)
+    }
+
     pub fn pending_drain_tick(&self) -> Option<u64> {
         self.in_flight
             .iter()

@@ -799,6 +799,66 @@ mod tests {
     }
 
     #[test]
+    fn cube_barriers_hold_later_reception_without_blocking_scalar_admission() {
+        let mut core = matrix_core();
+        core.advance_to(300).unwrap();
+        let word = (7 << 29) | (3 << 22) | (1 << 12) | (2 << 7) | (3 << 2);
+        let first_id = core.next_instruction_id();
+        core.step_word_at(301, word).unwrap();
+        for tick in [302, 303] {
+            assert!(matches!(core.step_word_at(tick, 0x40e0_0800).unwrap(),
+                C220CoreStep::Executed { instruction: C220CoreInstruction::CubeBarrier {
+                    barrier, completed_tick: None }, .. } if barrier.predecessor == Some(first_id)));
+            assert_eq!(core.outstanding_cube_commands(), 1);
+            assert_eq!(core.queued_cube_commands().count(), 0);
+        }
+        assert_eq!(core.pending_cube_barriers().len(), 2);
+        assert!(matches!(
+            core.step_word_at(304, 0x4140_0000).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        let second_id = core.next_instruction_id();
+        core.step_word_at(305, word).unwrap();
+        let retirement = core.cube.pipeline.pending_drain_tick().unwrap();
+        core.advance_to(retirement - 1).unwrap();
+        assert_eq!(core.queued_cube_commands().count(), 1);
+        assert_eq!(core.pending_cube_barriers().len(), 2);
+        assert!(!core.cube.pipeline.has_pending_instruction(second_id));
+        core.advance_to(retirement).unwrap();
+        assert_eq!(core.pending_cube_barriers().len(), 0);
+        assert_eq!(core.queued_cube_commands().count(), 0);
+        assert!(core.cube.pipeline.has_pending_instruction(second_id));
+        assert_eq!(
+            core.cube_frontend_outcomes()
+                .iter()
+                .filter(|event| matches!(event,
+            C220CoreStep::Executed { instruction: C220CoreInstruction::CubeBarrier {
+                completed_tick: Some(tick), .. }, .. } if *tick == retirement))
+                .count(),
+            2
+        );
+        assert!(
+            core.cube_frontend_outcomes()
+                .iter()
+                .any(|event| matches!(event,
+            C220CoreStep::Executed { instruction: C220CoreInstruction::Cube(issue), .. }
+                if issue.instruction_id == second_id && issue.ticket.accept_tick == retirement))
+        );
+        core.advance_to(400).unwrap();
+        assert!(matches!(
+            core.step_word_at(401, 0x40e0_0800).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::CubeBarrier {
+                    completed_tick: Some(401),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(core.pending_compute_drain().is_none());
+    }
+
+    #[test]
     fn cube_queue_preserves_operands_and_releases_retirement_credits() {
         use crate::sim::c220::cube::frontend::C220CubeFrontendConfig;
         use crate::sim::c220::schedule::C220StallCause;
@@ -841,6 +901,10 @@ mod tests {
                 if stall.cause == C220StallCause::CubeIssueQueueFull)
             );
             assert_eq!(core.state.scalar().pc(), pc);
+            assert_eq!(core.next_instruction_id(), id);
+            assert!(matches!(core.step_word_at(319, 0x40e0_0800).unwrap(),
+                C220CoreStep::Stalled(stall) if stall.cause == C220StallCause::CubeIssueQueueFull));
+            assert_eq!(core.pending_cube_barriers().len(), 0);
             assert_eq!(core.next_instruction_id(), id);
             for register in 0..4 {
                 core.state

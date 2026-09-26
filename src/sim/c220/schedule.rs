@@ -21,6 +21,7 @@ pub enum C220StallCause {
     CubeDependency,
     CubeIssueQueueFull,
     CubeOutstandingLimit,
+    CubeBarrier,
     FixpDependency,
     FixpIssueQueueFull,
     FixpCommandQueueFull,

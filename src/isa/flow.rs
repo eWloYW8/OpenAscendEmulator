@@ -90,6 +90,7 @@ pub struct DsbStep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineBarrierScope {
     Vector,
+    Cube,
     Fix,
     All,
 }
@@ -105,6 +106,7 @@ impl PipelineBarrierStep {
     pub const fn decode(architecture: Architecture, pc: u64, word: u32) -> Option<Self> {
         let scope = match (architecture, word) {
             (Architecture::Dav2201, 0x40e0_0400) => PipelineBarrierScope::Vector,
+            (Architecture::Dav2201, 0x40e0_0800) => PipelineBarrierScope::Cube,
             (Architecture::Dav2201, 0x40e0_2800) => PipelineBarrierScope::Fix,
             (Architecture::Dav2201 | Architecture::Dav3510, 0x40e0_1800) => {
                 PipelineBarrierScope::All

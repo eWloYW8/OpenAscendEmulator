@@ -90,6 +90,10 @@ pub enum C220CoreInstruction {
     Mte2Flag(FlagStep),
     Cube(C220CubeIssue),
     CubeQueued(crate::sim::c220::cube::frontend::C220CubeQueuedCommand),
+    CubeBarrier {
+        barrier: crate::sim::c220::cube::frontend::C220CubeBarrier,
+        completed_tick: Option<u64>,
+    },
     CubeSpr {
         instruction_id: u64,
         step: crate::sim::common::scalar::ScalarSprStep,

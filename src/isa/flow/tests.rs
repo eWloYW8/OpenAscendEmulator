@@ -78,7 +78,7 @@ fn barriers_decode_only_the_supported_scope_words() {
             .scope,
         PipelineBarrierScope::All
     );
-    for word in [0x40e0_0401, 0x40e0_0800, 0x40e0_1801] {
+    for word in [0x40e0_0401, 0x40e0_0801, 0x40e0_1801] {
         assert!(PipelineBarrierStep::decode(Architecture::Dav2201, 0x1000, word).is_none());
     }
     assert_eq!(
@@ -88,6 +88,13 @@ fn barriers_decode_only_the_supported_scope_words() {
         PipelineBarrierScope::Fix
     );
     assert!(PipelineBarrierStep::decode(Architecture::Dav3510, 0x1000, 0x40e0_2800).is_none());
+    assert_eq!(
+        PipelineBarrierStep::decode(Architecture::Dav2201, 0x1000, 0x40e0_0800)
+            .unwrap()
+            .scope,
+        PipelineBarrierScope::Cube
+    );
+    assert!(PipelineBarrierStep::decode(Architecture::Dav3510, 0x1000, 0x40e0_0800).is_none());
     for word in [0x40e0_0400, 0x40e0_1801] {
         assert!(PipelineBarrierStep::decode(Architecture::Dav3510, 0x1000, word).is_none());
     }

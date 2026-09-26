@@ -29,6 +29,7 @@ pub use lsu::{C220CoreMaintenanceCompletion, C220CoreMaintenanceIssue};
 pub use lsu::{C220CorePreloadCompletion, C220CorePreloadIssue};
 pub use lsu::{C220CoreStoreCompletion, C220CoreStoreIssue};
 mod cube;
+mod cube_barrier;
 mod cube_frontend;
 mod decode;
 mod dispatch;
