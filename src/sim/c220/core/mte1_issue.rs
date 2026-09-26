@@ -1,7 +1,7 @@
 use std::num::NonZeroU32;
 
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep, C220Mte1QueuedCommand};
-use crate::isa::flow::FlagStep;
+use crate::isa::flow::{FlagOperation, FlagStep};
 use crate::sim::c220::mte::mte1::C220Mte1Command;
 use crate::sim::c220::schedule::{C220Stall, C220StallCause};
 
@@ -23,7 +23,7 @@ impl Default for C220Mte1FrontendConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1Operation {
     Command(C220Mte1Command),
-    SetEvent(FlagStep),
+    Flag(FlagStep),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,16 +38,6 @@ pub struct C220Mte1IssuedInstruction {
 }
 
 impl C220Core {
-    /// Published ordinary MTE1-to-Cube tokens, including duplicate IDs.
-    pub fn ready_mte1_events(&self) -> &[u32] {
-        self.mte1.ready_events()
-    }
-
-    /// Ordinary event IDs paired with the instruction whose retirement publishes them.
-    pub fn pending_mte1_events(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
-        self.mte1.deferred_events()
-    }
-
     pub fn queued_mte1_instructions(&self) -> impl Iterator<Item = C220Mte1IssuedInstruction> + '_ {
         self.mte1_frontend.issued.iter().copied()
     }
@@ -89,7 +79,7 @@ impl C220Core {
             .issued
             .front()
             .expect("armed MTE1 reception");
-        let cause = if self.mte1_frontend.commands.len() == 3 {
+        let mut cause = if self.mte1_frontend.commands.len() == 3 {
             Some(C220StallCause::Mte1CommandQueueFull)
         } else if self.outstanding_mte1_commands()
             >= self.mte1_frontend.config.outstanding_limit.get() as usize
@@ -104,6 +94,16 @@ impl C220Core {
         } else {
             None
         };
+        if cause.is_none()
+            && let C220Mte1Operation::Flag(step) = queued.operation
+            && step.instruction.operation == FlagOperation::Wait
+            && self
+                .pipeline_events
+                .consume(queued.instruction_id, step, tick)
+                .is_none()
+        {
+            cause = Some(C220StallCause::PipelineEventDependency);
+        }
         let result = if let Some(cause) = cause {
             C220CoreStep::Stalled(C220Stall {
                 tick,
@@ -113,14 +113,22 @@ impl C220Core {
             })
         } else {
             let instruction = match queued.operation {
-                C220Mte1Operation::SetEvent(step) => {
-                    self.mte1.set_event(
-                        step.flag_id,
-                        self.mte1_frontend
+                C220Mte1Operation::Flag(step) => {
+                    if step.instruction.operation == FlagOperation::Set {
+                        let predecessor = self
+                            .mte1_frontend
                             .commands
                             .back()
-                            .map(|command| command.instruction_id),
-                    );
+                            .map(|command| command.instruction_id)
+                            .or_else(|| {
+                                self.mte1
+                                    .pending_commands()
+                                    .last()
+                                    .map(|command| command.instruction_id)
+                            });
+                        self.pipeline_events
+                            .set(queued.instruction_id, step, predecessor, tick);
+                    }
                     C220CoreInstruction::Mte1Flag(step)
                 }
                 C220Mte1Operation::Command(command) => {

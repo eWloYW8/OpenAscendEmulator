@@ -13,7 +13,7 @@ use crate::sim::c220::mte::{C220MtePipeline, C220MtePipelineError};
 use crate::sim::c220::sync::{
     C220HardwareFlagEvent, C220HardwareFlagState, C220HardwareFlagTimingError,
 };
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 /// Maximum outstanding instructions, including completed commands awaiting
 /// retirement. This is separate from the physical generator queue capacity.
@@ -98,8 +98,6 @@ pub(in crate::sim::c220) struct Mte1Engine {
     pub(in crate::sim::c220) outcomes: Vec<C220Mte1Outcome>,
     now: u64,
     advanced: Option<u64>,
-    events: Vec<u32>,
-    deferred_events: BTreeMap<u64, Vec<u32>>,
     outstanding_limit: std::num::NonZeroU32,
 }
 
@@ -126,8 +124,6 @@ impl Mte1Engine {
             outcomes: Vec::new(),
             now: 0,
             advanced: None,
-            events: Vec::new(),
-            deferred_events: BTreeMap::new(),
             outstanding_limit,
         }
     }
@@ -260,39 +256,6 @@ impl Mte1Engine {
         (!self.pending.is_empty()).then(|| self.now.saturating_add(1))
     }
 
-    pub(in crate::sim::c220) fn set_event(&mut self, event_id: u32, queued_tail: Option<u64>) {
-        let dependency =
-            queued_tail.or_else(|| self.pending.back().map(|p| p.state.instruction_id));
-        if let Some(dependency) = dependency {
-            self.deferred_events
-                .entry(dependency)
-                .or_default()
-                .push(event_id);
-        } else {
-            self.events.push(event_id);
-        }
-    }
-
-    pub(in crate::sim::c220) fn wait_event(&mut self, event_id: u32) -> bool {
-        let Some(index) = self.events.iter().position(|&id| id == event_id) else {
-            return false;
-        };
-        self.events.remove(index);
-        true
-    }
-
-    pub(in crate::sim::c220) fn ready_events(&self) -> &[u32] {
-        &self.events
-    }
-
-    pub(in crate::sim::c220) fn deferred_events(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
-        self.deferred_events
-            .iter()
-            .flat_map(|(&predecessor, events)| {
-                events.iter().map(move |&event| (predecessor, event))
-            })
-    }
-
     pub(in crate::sim::c220) fn commit_ready_at(
         &mut self,
         tick: u64,
@@ -389,9 +352,6 @@ impl Mte1Engine {
                 result,
             };
             self.pending.pop_front();
-            if let Some(events) = self.deferred_events.remove(&outcome.instruction_id) {
-                self.events.extend(events);
-            }
             self.outcomes.push(outcome);
         }
         Ok(())
@@ -487,11 +447,6 @@ mod tests {
             .unwrap();
         assert_eq!(issue.uop_count, 2);
         assert!(!engine.can_issue(&pipeline, command));
-        engine.set_event(7, None);
-        engine.set_event(7, None);
-        engine.set_event(8, None);
-        assert!(!engine.wait_event(7));
-        assert!(!engine.wait_event(8));
         memory.l1_mut().write_known(0, &[7; 512]).unwrap();
         let completed = (1..100)
             .find(|&tick| {
@@ -507,7 +462,6 @@ mod tests {
             .expect("destination completion");
         assert!(pipeline.selected_generator_idle());
         assert_eq!(memory.l0a().tracked_bytes(), 0);
-        assert!(!engine.wait_event(7));
         for tick in completed + 1..=completed + 3 {
             advance(&mut engine, &mut pipeline, tick, &mut memory, &mut flags).unwrap();
             assert!(engine.outcomes.is_empty());
@@ -562,10 +516,6 @@ mod tests {
         assert_eq!(engine.outcomes[0].hardware_flag_stall_ticks, 3);
         assert_eq!(memory.l0a().read_known(0, 512).unwrap(), vec![9; 512]);
         assert!(engine.pending_commands().next().is_none());
-        assert!(engine.wait_event(7));
-        assert!(engine.wait_event(7));
-        assert!(engine.wait_event(8));
-        assert!(!engine.wait_event(7));
         flags.advance_to(completed + 5).unwrap();
         assert_eq!(flags.count(2, C220MatrixMemory::L0a, 0), 32);
         assert_eq!(flags.count(2, C220MatrixMemory::L0a, 1), 1);
@@ -589,8 +539,6 @@ mod tests {
             .unwrap();
         assert!(issue.completion_ready);
         assert_eq!(issue.uop_count, 0);
-        engine.set_event(9, None);
-        assert!(!engine.wait_event(9));
         advance(
             &mut engine,
             &mut pipeline,
@@ -599,7 +547,6 @@ mod tests {
             &mut flags,
         )
         .unwrap();
-        assert!(engine.wait_event(9));
         let outcome = engine.outcomes.last().unwrap();
         assert_eq!(outcome.instruction_id, 3);
         assert!(

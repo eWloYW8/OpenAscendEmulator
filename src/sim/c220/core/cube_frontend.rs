@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
+use crate::isa::flow::FlagOperation;
 use crate::sim::c220::cube::C220CubeIssue;
 use crate::sim::c220::cube::frontend::{
     C220CubeBarrier, C220CubeCommand, C220CubeFrontendConfig, C220CubeQueuedCommand,
@@ -12,6 +13,7 @@ pub(super) struct CubeFrontend {
     pub(super) commands: VecDeque<C220CubeQueuedCommand>,
     pub(super) active: Option<C220CubeQueuedCommand>,
     pub(super) last_accepted: Option<u64>,
+    pub(super) last_received: Option<u64>,
     pub(super) barriers: VecDeque<C220CubeBarrier>,
     pub next_tick: Option<u64>,
     pub outcomes: Vec<C220CoreStep>,
@@ -24,6 +26,7 @@ impl CubeFrontend {
             commands: VecDeque::new(),
             active: None,
             last_accepted: None,
+            last_received: None,
             barriers: VecDeque::new(),
             next_tick: None,
             outcomes: Vec::new(),
@@ -117,8 +120,12 @@ impl C220Core {
                 None
             };
             if cause.is_none()
-                && let C220CubeCommand::WaitMte1(step) = queued.command
-                && !self.mte1.wait_event(step.flag_id)
+                && let C220CubeCommand::Flag(step) = queued.command
+                && step.instruction.operation == FlagOperation::Wait
+                && self
+                    .pipeline_events
+                    .consume(queued.instruction_id, step, tick)
+                    .is_none()
             {
                 cause = Some(C220StallCause::PipelineEventDependency);
             }
@@ -135,10 +142,25 @@ impl C220Core {
                 return Ok(());
             }
             self.cube_frontend.active = self.cube_frontend.commands.pop_front();
+            if !matches!(queued.command, C220CubeCommand::Flag(_)) {
+                self.cube_frontend.last_received = Some(queued.instruction_id);
+            }
         }
         let queued = self.cube_frontend.active.expect("received Cube command");
         let instruction = match queued.command {
-            C220CubeCommand::WaitMte1(step) => C220CoreInstruction::CubeFlag(step),
+            C220CubeCommand::Flag(step) => {
+                if step.instruction.operation == FlagOperation::Set {
+                    let predecessor =
+                        (self.cube.pipeline.pending_retirement_count() != 0).then(|| {
+                            self.cube_frontend
+                                .last_received
+                                .expect("running Cube predecessor")
+                        });
+                    self.pipeline_events
+                        .set(queued.instruction_id, step, predecessor, tick);
+                }
+                C220CoreInstruction::CubeFlag(step)
+            }
             C220CubeCommand::Mmad {
                 instruction,
                 registers,
@@ -211,6 +233,7 @@ impl C220Core {
             &mut self.local_memory,
             &mut self.hardware_flags,
             self.state.scalar_mut().machine_mut(),
+            &mut self.pipeline_events,
         )?;
         self.release_cube_barriers_at(tick);
         Ok(())

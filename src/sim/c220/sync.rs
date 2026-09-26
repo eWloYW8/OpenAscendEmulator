@@ -4,6 +4,10 @@ mod cross_core;
 pub use cross_core::{C220CrossCoreReception, C220DeviceSync};
 mod device_flags;
 pub use device_flags::{C220DeviceFlagDelivery, C220DeviceFlagState};
+mod pipeline_events;
+pub use pipeline_events::{
+    C220DeferredPipelineEvent, C220PipelineEvent, C220PipelineEventConsumption, C220PipelineEvents,
+};
 mod cube;
 pub use cube::{C220CubeFlagCheckpoint, C220CubeFlagStages};
 

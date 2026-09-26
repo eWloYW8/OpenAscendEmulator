@@ -36,7 +36,7 @@ pub enum C220CubeCommand {
     },
     WriteSpr(ScalarSprStep),
     HardwareFlag(C220HardwareFlagStep),
-    WaitMte1(FlagStep),
+    Flag(FlagStep),
     CrossCore {
         instruction: C220SetCrossCoreInstruction,
         payload: C220DeviceSync,

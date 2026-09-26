@@ -50,9 +50,12 @@ impl C220DecodedWord {
             || C220Set2dInstruction::decode(word)
                 .is_some_and(|instruction| instruction.destination != C220Set2dDestination::L1)
             || flow_flag.is_some_and(|instruction| {
-                instruction.source_pipe_code == 3
+                (instruction.source_pipe_code == 3
                     && instruction.trigger_pipe_code == 2
-                    && instruction.operation == FlagOperation::Set
+                    && instruction.operation == FlagOperation::Set)
+                    || (instruction.source_pipe_code == 2
+                        && instruction.trigger_pipe_code == 3
+                        && instruction.operation == FlagOperation::Wait)
             })
         {
             C220DispatchKind::Mte1

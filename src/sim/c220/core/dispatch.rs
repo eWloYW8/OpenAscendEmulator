@@ -149,16 +149,19 @@ impl C220Core {
         }
         let decoded_word = C220DecodedWord::decode(word);
         if let Some(flag) = decoded_word.flow_flag.filter(|flag| {
-            flag.source_pipe_code == 3
+            (flag.source_pipe_code == 3
                 && flag.trigger_pipe_code == 2
-                && flag.operation == FlagOperation::Wait
+                && flag.operation == FlagOperation::Wait)
+                || (flag.source_pipe_code == 2
+                    && flag.trigger_pipe_code == 3
+                    && flag.operation == FlagOperation::Set)
         }) {
             let step = flag.resolve(pc, self.state.scalar().machine().xregs());
             return self.enqueue_cube_at(
                 tick,
                 pc,
                 word,
-                crate::sim::c220::cube::frontend::C220CubeCommand::WaitMte1(step),
+                crate::sim::c220::cube::frontend::C220CubeCommand::Flag(step),
             );
         }
         match decoded_word.kind {

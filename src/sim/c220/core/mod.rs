@@ -138,6 +138,7 @@ pub struct C220Core {
     external_fixp: Option<external_fixp::CoreExternalFixp>,
     fixp_frontend: fixp_frontend::FixpFrontend,
     hardware_flags: C220HardwareFlagState,
+    pipeline_events: crate::sim::c220::sync::C220PipelineEvents,
     device_flags: crate::sim::c220::sync::C220DeviceFlagState,
     mte3: Mte3Engine,
     cube: CubeEngine,
@@ -193,6 +194,7 @@ impl C220Core {
             external_fixp: None,
             fixp_frontend: fixp_frontend::FixpFrontend::default(),
             hardware_flags: C220HardwareFlagState::default(),
+            pipeline_events: Default::default(),
             device_flags: crate::sim::c220::sync::C220DeviceFlagState::default(),
             mte3: Mte3Engine::new(timing.mte3),
             cube: CubeEngine::new(cube_config)?,
@@ -275,6 +277,10 @@ impl C220Core {
 
     pub const fn hardware_flags(&self) -> &C220HardwareFlagState {
         &self.hardware_flags
+    }
+
+    pub const fn pipeline_events(&self) -> &crate::sim::c220::sync::C220PipelineEvents {
+        &self.pipeline_events
     }
 
     pub const fn memory(&self) -> &MappedMemory {

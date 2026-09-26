@@ -44,7 +44,7 @@ impl C220Core {
                 .cube_frontend
                 .commands
                 .back()
-                .is_some_and(|command| matches!(command.command, C220CubeCommand::WaitMte1(_))),
+                .is_some_and(|command| matches!(command.command, C220CubeCommand::Flag(_))),
         };
         let pending = barrier
             .predecessor

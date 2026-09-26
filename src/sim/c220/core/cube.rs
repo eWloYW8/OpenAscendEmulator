@@ -836,8 +836,8 @@ mod tests {
                 .any(|step| matches!(step,
             C220CoreStep::Stalled(stall) if stall.cause == C220StallCause::Mte1OutstandingLimit))
         );
-        assert!(core.ready_mte1_events().is_empty());
-        assert_eq!(core.pending_mte1_events().count(), 0);
+        assert!(core.pipeline_events().ready(3, 2).is_empty());
+        assert_eq!(core.pipeline_events().pending().count(), 0);
         assert!(matches!(
             core.step_word_at(305, 0x4140_0000).unwrap(),
             C220CoreStep::Executed { .. }
@@ -852,7 +852,14 @@ mod tests {
         assert_eq!(core.queued_mte1_instructions().count(), 0);
         assert_eq!(core.queued_mte1_commands().count(), 0);
         assert_eq!(core.outstanding_mte1_commands(), 0);
-        assert_eq!(core.ready_mte1_events(), &[0x1234_5678, 0x1234_5678]);
+        assert_eq!(
+            core.pipeline_events()
+                .ready(3, 2)
+                .iter()
+                .map(|event| event.step.flag_id)
+                .collect::<Vec<_>>(),
+            [0x1234_5678, 0x1234_5678]
+        );
         let retired_tick = core.last_mte1_outcomes().last().unwrap().retire_tick;
         let published: Vec<_> = core
             .mte1_frontend_outcomes()
@@ -866,6 +873,96 @@ mod tests {
             })
             .collect();
         assert_eq!(published, [retired_tick, retired_tick + 1]);
+    }
+
+    #[test]
+    fn cube_events_release_mte1_waits_without_consuming_reverse_route_tokens() {
+        let mut core = matrix_core();
+        core.advance_to(300).unwrap();
+        core.local_memory
+            .l0a_mut()
+            .write_known(0, &0x3c00_u16.to_le_bytes().repeat(256))
+            .unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        for (register, value) in [(0, 4096), (6, 0), (7, 512), (12, 0x1234_5678)] {
+            machine.set_xreg(register, value).unwrap();
+        }
+        let set = (2 << 29) | (5 << 21) | (1 << 17) | (2 << 10) | (3 << 7) | (12 << 2);
+        let wait = (set & !(15 << 21)) | (6 << 21);
+        let reverse_set = (set & !((7 << 10) | (7 << 7))) | (3 << 10) | (2 << 7);
+        let load = (3 << 29) | (6 << 17) | (7 << 12) | (8 << 7) | 8;
+        let cube = (7 << 29) | (3 << 22) | (1 << 12) | (2 << 7) | (3 << 2);
+        for (tick, word) in [(301, reverse_set), (302, wait), (303, wait), (304, load)] {
+            assert!(matches!(
+                core.step_word_at(tick, word).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+        }
+        assert_eq!(core.pipeline_events().ready(3, 2).len(), 1);
+        assert!(core.pipeline_events().last_consumptions().is_empty());
+        assert_eq!(core.queued_mte1_instructions().count(), 3);
+        assert_eq!(core.outstanding_mte1_commands(), 0);
+        core.step_word_at(305, cube).unwrap();
+        for (tick, word) in [(306, set), (307, set), (308, 0x4140_0000)] {
+            assert!(matches!(
+                core.step_word_at(tick, word).unwrap(),
+                C220CoreStep::Executed { .. }
+            ));
+        }
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_xreg(12, 0)
+            .unwrap();
+        core.advance_to(500).unwrap();
+        let consumed = core.pipeline_events().last_consumptions();
+        assert_eq!(consumed.len(), 2);
+        let retire_tick = core
+            .cube
+            .pipeline
+            .last_retirements()
+            .last()
+            .unwrap()
+            .retire_tick;
+        for token in consumed {
+            assert_eq!(token.step.flag_id, 0x1234_5678);
+            assert_eq!(token.event.step.flag_id, 0x1234_5678);
+            assert_eq!(token.event.published_tick, retire_tick);
+            assert!(token.tick >= retire_tick);
+        }
+        assert_eq!(consumed[1].tick, consumed[0].tick + 1);
+        assert_ne!(
+            consumed[0].event.instruction_id,
+            consumed[1].event.instruction_id
+        );
+        let load_reception = core
+            .mte1_frontend_outcomes()
+            .iter()
+            .find_map(|step| match step {
+                C220CoreStep::Executed {
+                    tick,
+                    instruction: C220CoreInstruction::Mte1Scheduled(_),
+                } => Some(*tick),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(load_reception, consumed[1].tick + 1);
+        assert!(core.pipeline_events().ready(2, 3).is_empty());
+        assert_eq!(core.pipeline_events().ready(3, 2).len(), 1);
+        assert_eq!(core.pipeline_events().pending().count(), 0);
+        assert_eq!(
+            core.local_memory.l0a().read_known(0, 512).unwrap(),
+            0x4200_u16.to_le_bytes().repeat(256)
+        );
+        assert_eq!(
+            core.local_memory
+                .l0c()
+                .buffer()
+                .read_known(4096, 4)
+                .unwrap(),
+            16.0_f32.to_le_bytes()
+        );
+        assert!(core.pending_compute_drain().is_none());
     }
 
     #[test]

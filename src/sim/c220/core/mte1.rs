@@ -118,7 +118,7 @@ impl C220Core {
             let flag = flow_flag
                 .expect("matched C220 MTE1 flag")
                 .resolve(pc, self.state.scalar().machine().xregs());
-            self.enqueue_mte1_issue_at(tick, pc, word, super::C220Mte1Operation::SetEvent(flag))
+            self.enqueue_mte1_issue_at(tick, pc, word, super::C220Mte1Operation::Flag(flag))
         }
     }
 }

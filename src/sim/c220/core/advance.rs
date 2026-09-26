@@ -2,6 +2,7 @@ use super::{C220Core, C220CoreError};
 
 impl C220Core {
     pub(super) fn advance_engines_to(&mut self, tick: u64) -> Result<(), C220CoreError> {
+        self.pipeline_events.begin_advance();
         self.cube.begin_advance();
         self.cube_frontend.outcomes.clear();
         self.mte1.begin_advance();
@@ -51,6 +52,8 @@ impl C220Core {
                 &mut self.hardware_flags,
             )?;
             for outcome in &self.mte1.outcomes[previous_mte1_outcomes..] {
+                self.pipeline_events
+                    .retire(3, outcome.instruction_id, outcome.retire_tick);
                 if let crate::sim::c220::mte::mte1::C220Mte1TransferResult::Load3dv2(report) =
                     outcome.result
                     && let Some(value) = report.spr54
@@ -146,6 +149,7 @@ impl C220Core {
                 &mut self.local_memory,
                 &mut self.hardware_flags,
                 self.state.scalar_mut().machine_mut(),
+                &mut self.pipeline_events,
             )?;
             self.release_cube_barriers_at(event_tick);
             self.dispatch_cube_head_at(event_tick)?;

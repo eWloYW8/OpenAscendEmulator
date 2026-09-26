@@ -3,7 +3,7 @@ use crate::sim::c220::cube::{
     C220CubeTicket, C220CubeTimingError, C220CubeUopRelease, update_cube_status_spr2,
 };
 use crate::sim::c220::memory::{C220LocalBuffer, C220LocalMemory};
-use crate::sim::c220::sync::C220HardwareFlagState;
+use crate::sim::c220::sync::{C220HardwareFlagState, C220PipelineEvents};
 use crate::sim::common::scalar::ScalarMachine;
 
 pub(in crate::sim::c220) struct CubeEngine {
@@ -60,6 +60,7 @@ impl CubeEngine {
         memory: &mut C220LocalMemory,
         flags: &mut C220HardwareFlagState,
         machine: &mut ScalarMachine,
+        events: &mut C220PipelineEvents,
     ) -> Result<(), C220CubeRuntimeError> {
         let release_start = self.pipeline.last_uop_releases().len();
         let retirement_start = self.pipeline.last_retirements().len();
@@ -77,7 +78,7 @@ impl CubeEngine {
         let releases = self.pipeline.last_uop_releases()[release_start..].to_vec();
         let retired = self.pipeline.last_retirements()[retirement_start..].to_vec();
         self.execute_released(&releases, memory, machine)?;
-        self.commit_retired(&retired, memory, machine)
+        self.commit_retired(&retired, memory, machine, events)
     }
 
     fn execute_released(
@@ -129,6 +130,7 @@ impl CubeEngine {
         retired: &[C220CubeTicket],
         memory: &mut C220LocalMemory,
         machine: &mut ScalarMachine,
+        events: &mut C220PipelineEvents,
     ) -> Result<(), C220CubeRuntimeError> {
         for ticket in retired {
             let index = self
@@ -150,6 +152,7 @@ impl CubeEngine {
                     outcome
                 }
             };
+            events.retire(2, pending.issue.instruction_id, ticket.retire_tick);
             self.outcomes.push(outcome);
         }
         Ok(())
