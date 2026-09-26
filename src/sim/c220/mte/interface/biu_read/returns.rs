@@ -8,6 +8,8 @@ use super::write::{
 use super::{C220BiuReadRequest, C220BiuSubcore};
 
 mod events;
+mod nd2nz;
+pub use nd2nz::C220BiuNd2NzProgress;
 #[cfg(test)]
 mod tests;
 pub use events::{C220BiuReturnCallback, C220BiuReturnEvent, C220BiuReturnEvents};
@@ -45,6 +47,12 @@ pub struct C220BiuReadProgress {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220BiuReturnError {
+    #[error(transparent)]
+    Nd2Nz(#[from] crate::sim::c220::mte::nd2nz::C220Nd2NzEngineError),
+    #[error("ND2NZ return requires its dedicated egress callback")]
+    DedicatedEgressRequired,
+    #[error("invalid ND2NZ BIU request")]
+    InvalidNd2NzRequest,
     #[error(transparent)]
     Write(#[from] C220BiuWriteError),
     #[error("BIU return time reversed from {previous} to {requested}")]
@@ -127,6 +135,8 @@ pub struct C220BiuReadReturns {
     adapters: [VecDeque<C220BiuReadOutput>; 3],
     aligners: [WriteAligner; 5],
     write_plans: [Option<WritePlan>; 3],
+    nd2nz_rows: [Option<C220BiuReadOutput>; 8],
+    nd2nz_tick: Option<u64>,
     receive_arbiter: RoundRobin<2>,
     core_arbiter: RoundRobin<3>,
     order_arbiters: [RoundRobin<2>; 3],
@@ -164,6 +174,8 @@ impl C220BiuReadReturns {
             adapters: std::array::from_fn(|_| VecDeque::new()),
             aligners: bandwidths.widths().map(WriteAligner::new),
             write_plans: std::array::from_fn(|_| None),
+            nd2nz_rows: [None; 8],
+            nd2nz_tick: None,
             receive_arbiter: RoundRobin::default(),
             core_arbiter: RoundRobin::default(),
             order_arbiters: [RoundRobin::default(); 3],
@@ -245,8 +257,13 @@ impl C220BiuReadReturns {
             .and_then(WritePlan::front)
     }
 
-    pub fn write_progress(&self, destination: C220BiuWriteDestination) -> C220BiuWriteProgress {
-        self.aligners[destination as usize].progress
+    pub fn write_progress(
+        &self,
+        destination: C220BiuWriteDestination,
+    ) -> Option<C220BiuWriteProgress> {
+        destination
+            .aligner_index()
+            .map(|index| self.aligners[index].progress)
     }
 
     pub fn track(
@@ -255,6 +272,17 @@ impl C220BiuReadReturns {
         request: C220BiuReadRequest,
     ) -> Result<(), C220BiuReturnError> {
         self.check_time(tick)?;
+        if let C220BiuWriteDestination::Nd2Nz { row_slot } = request.input.destination
+            && (row_slot.is_some_and(|row| row >= 8)
+                || request.input.generated.out_of_order
+                || request.byte_offset != 0
+                || request.input.generated.mode.split_bytes(
+                    request.input.generated.request.source_address,
+                    request.input.generated.request.bytes,
+                ) != request.input.generated.request.bytes)
+        {
+            return Err(C220BiuReturnError::InvalidNd2NzRequest);
+        }
         if request.input.generated.request.bytes == 0 {
             return Err(C220BiuReturnError::EmptyRequest);
         }
@@ -305,7 +333,7 @@ impl C220BiuReadReturns {
         heads: [Option<C220BiuReadBeat>; 2],
     ) -> Result<[bool; 2], C220BiuReturnError> {
         self.check_callback(tick, self.receive_tick, "receive")?;
-        let ready_tick = tick
+        let ordinary_ready = tick
             .checked_add(2)
             .ok_or(C220BiuReturnError::TimeOverflow)?;
         let free = self.occupancy.map(|used| used < self.capacity);
@@ -350,6 +378,13 @@ impl C220BiuReadReturns {
                 if record.received.saturating_add(*count) > record.expected {
                     return Err(C220BiuReturnError::ExcessResponse(beat.tag));
                 }
+                if matches!(
+                    record.request.input.destination,
+                    C220BiuWriteDestination::Nd2Nz { .. }
+                ) {
+                    tick.checked_add(18)
+                        .ok_or(C220BiuReturnError::TimeOverflow)?;
+                }
             }
         }
         self.receive_arbiter = arbiter;
@@ -369,7 +404,14 @@ impl C220BiuReadReturns {
                         .sort_unstable_by_key(|transaction| transaction.beat.transaction_id);
                     self.ingress[port].push_back(TimedTag {
                         tag: beat.tag,
-                        ready_tick,
+                        ready_tick: if matches!(
+                            record.request.input.destination,
+                            C220BiuWriteDestination::Nd2Nz { .. }
+                        ) {
+                            tick + 18
+                        } else {
+                            ordinary_ready
+                        },
                     });
                 }
             }
@@ -528,6 +570,12 @@ impl C220BiuReadReturns {
     ) -> Result<Option<C220BiuReadOutput>, C220BiuReturnError> {
         let index = core as usize;
         self.check_callback(tick, self.egress_ticks[index], "egress")?;
+        if self.egress[index]
+            .front()
+            .is_some_and(|output| output.request.input.destination.aligner_index().is_none())
+        {
+            return Err(C220BiuReturnError::DedicatedEgressRequired);
+        }
         let mut sent = None;
         if self.adapters[index].len() < 2
             && let Some(mut output) = self.egress[index].front().copied()
@@ -567,7 +615,13 @@ impl C220BiuReadReturns {
             } else {
                 if self.write_plans[index].is_none() {
                     self.write_plans[index] = Some(
-                        self.aligners[output.request.input.destination as usize].plan(output)?,
+                        self.aligners[output
+                            .request
+                            .input
+                            .destination
+                            .aligner_index()
+                            .ok_or(C220BiuReturnError::DedicatedEgressRequired)?]
+                        .plan(output)?,
                     );
                 }
                 let plan = self.write_plans[index].as_mut().expect("prepared output");

@@ -305,7 +305,7 @@ fn ordered_destination_coalesces_across_requests_and_restores_collapsed_gaps() {
     assert!(tail[0].last_in_instruction);
     assert_eq!(
         returns.write_progress(C220BiuWriteDestination::Ub0),
-        C220BiuWriteProgress::default()
+        Some(C220BiuWriteProgress::default())
     );
     assert!(returns.is_idle());
 }

@@ -9,6 +9,139 @@ use crate::sim::c220::memory::C220LocalBuffer;
 use std::num::NonZeroU32;
 
 #[test]
+fn biu_returns_preserve_nd2nz_latency_tag_lifetime_and_both_routes() {
+    use crate::isa::c220::mte::nd2nz::C220Nd2NzTransfer;
+    use crate::sim::c220::mte::{
+        interface::{
+            C220MteL1WriteInterface,
+            biu_read::{
+                C220BiuReadConfig, C220BiuReadFrontend, C220BiuSubcore,
+                returns::{C220BiuReadBeat, C220BiuReadReturns},
+                write::C220BiuWriteBandwidths,
+            },
+        },
+        uop::C220DmaUopMode,
+    };
+    use std::collections::VecDeque;
+    let nz = |value| NonZeroU32::new(value).unwrap();
+    for route in [
+        C220Nd2NzReadRoute::PerRow,
+        C220Nd2NzReadRoute::ContiguousRows,
+    ] {
+        let mut engine = C220Nd2NzEngine::new(C220Nd2NzStagingConfig {
+            rows: nz(8),
+            alignment_depth: 256,
+            small_data_capacity: nz(64),
+            receive_bandwidth: nz(32),
+        })
+        .unwrap();
+        let bandwidths = C220BiuWriteBandwidths {
+            l1: nz(64),
+            l0a: nz(64),
+            l0b: nz(64),
+            ub: nz(32),
+        };
+        let mut frontend = C220BiuReadFrontend::new(C220BiuReadConfig {
+            outstanding: nz(4),
+            weights: [1; 3],
+            group_vector_returns: false,
+            write_bandwidths: bandwidths,
+        });
+        let mut returns = C220BiuReadReturns::new(nz(4), false, bandwidths).unwrap();
+        let mut l1 = C220MteL1WriteInterface::default();
+        let transfer = C220Nd2NzTransfer {
+            instruction: C220Nd2NzInstruction::decode((3 << 29) | (1 << 27) | (12 << 22)).unwrap(),
+            source_base: 0x1000,
+            destination_base: 256,
+            xm: 5 | (1 << 4) | (2 << 16) | (64 << 32),
+            xt: 64 | (2 << 16) | (1 << 32),
+        };
+        engine
+            .submit(0, 1, transfer, route, C220DmaUopMode::Fixed128)
+            .unwrap();
+        let mut memory = VecDeque::new();
+        let mut received_at = std::collections::BTreeMap::new();
+        let mut writes = Vec::new();
+        let mut released = 0;
+        for tick in 0..100 {
+            engine.generate(tick).unwrap();
+            engine.send_biu(tick, &mut frontend, false).unwrap();
+            frontend.arbitrate(tick).unwrap();
+            if let Some(request) = frontend.send(tick, true).unwrap().sent() {
+                assert_eq!(request.input.generated.sid, Some(5));
+                returns.track(tick, request).unwrap();
+                memory.push_back((
+                    tick + 1,
+                    C220BiuReadBeat {
+                        tag: request.tag,
+                        transaction_id: 0,
+                    },
+                ));
+            }
+            let beat = memory
+                .front()
+                .filter(|(ready, _)| *ready <= tick)
+                .map(|(_, beat)| *beat);
+            if returns.receive(tick, [beat, None]).unwrap()[0] {
+                let (_, beat) = memory.pop_front().unwrap();
+                received_at.insert(beat.tag, tick);
+            }
+            for port in 0..2 {
+                if let Some(tag) = returns.ingress(tick, port).unwrap() {
+                    assert_eq!(tick, received_at[&tag] + 18);
+                }
+            }
+            returns.select(tick).unwrap();
+            returns.read(tick).unwrap();
+            let direct = returns.egress_nd2nz(tick, &mut engine).unwrap();
+            let row = returns.push_nd2nz(tick, &mut engine).unwrap();
+            for progress in [direct, row] {
+                if let Some(output) = progress.released {
+                    assert!(tick > received_at[&output.request.tag] + 18);
+                    assert!(
+                        engine
+                            .response_remaining(1, output.request.input.generated.uop_index)
+                            .is_none()
+                    );
+                    frontend.release_tag(tick, output.request.tag).unwrap();
+                    released += 1;
+                }
+            }
+            assert!(returns.adapter(C220BiuSubcore::Cube).is_empty());
+            engine.stage_small(tick).unwrap();
+            for lane in 0..4 {
+                engine.stage_lane(tick, lane).unwrap();
+            }
+            if let Some(write) = engine.send_l1(tick, &mut l1).unwrap() {
+                writes.push(write);
+            }
+            if let Some(request) = l1.send(tick, true).unwrap().sent {
+                l1.receive_response(tick, request.id).unwrap();
+            }
+            l1.retire(tick).unwrap();
+        }
+        assert_eq!(
+            released,
+            if route == C220Nd2NzReadRoute::PerRow {
+                2
+            } else {
+                1
+            }
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .map(|w| (w.destination_address, w.bytes))
+                .collect::<Vec<_>>(),
+            [(256, 64), (320, 64)]
+        );
+        assert!(writes.last().unwrap().last_in_instruction);
+        assert!(engine.is_drained() && frontend.is_idle() && returns.is_idle() && l1.is_idle());
+        assert_eq!(frontend.free_tag_count(), 4);
+    }
+}
+
+#[test]
 fn engine_pipelines_reads_gates_response_ownership_and_sends_to_l1_port1() {
     use crate::isa::c220::mte::nd2nz::C220Nd2NzTransfer;
     use crate::sim::c220::mte::{

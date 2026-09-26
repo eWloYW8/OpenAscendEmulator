@@ -76,6 +76,8 @@ pub struct C220BiuReadArbitration {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220BiuReadError {
+    #[error("invalid ND2NZ BIU request")]
+    InvalidNd2NzRequest,
     #[error("BIU write destination does not belong to the request subcore")]
     WrongDestination,
     #[error("BIU time reversed from {previous} to {requested}")]
@@ -214,6 +216,17 @@ impl C220BiuReadFrontend {
 
     pub fn push(&mut self, tick: u64, input: C220BiuReadInput) -> Result<bool, C220BiuReadError> {
         self.check_time(tick)?;
+        if let write::C220BiuWriteDestination::Nd2Nz { row_slot } = input.destination
+            && (row_slot.is_some_and(|row| row >= 8)
+                || input.generated.out_of_order
+                || input.prefetch
+                || input.generated.mode.split_bytes(
+                    input.generated.request.source_address,
+                    input.generated.request.bytes,
+                ) != input.generated.request.bytes)
+        {
+            return Err(C220BiuReadError::InvalidNd2NzRequest);
+        }
         if input.destination.subcore() != input.subcore {
             return Err(C220BiuReadError::WrongDestination);
         }

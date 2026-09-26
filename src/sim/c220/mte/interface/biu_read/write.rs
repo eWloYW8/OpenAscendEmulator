@@ -12,14 +12,26 @@ pub enum C220BiuWriteDestination {
     L0B,
     Ub0,
     Ub1,
+    Nd2Nz { row_slot: Option<u8> },
 }
 
 impl C220BiuWriteDestination {
     pub const fn subcore(self) -> C220BiuSubcore {
         match self {
-            Self::L1 | Self::L0A | Self::L0B => C220BiuSubcore::Cube,
+            Self::L1 | Self::L0A | Self::L0B | Self::Nd2Nz { .. } => C220BiuSubcore::Cube,
             Self::Ub0 => C220BiuSubcore::Vector0,
             Self::Ub1 => C220BiuSubcore::Vector1,
+        }
+    }
+
+    pub(super) const fn aligner_index(self) -> Option<usize> {
+        match self {
+            Self::L1 => Some(0),
+            Self::L0A => Some(1),
+            Self::L0B => Some(2),
+            Self::Ub0 => Some(3),
+            Self::Ub1 => Some(4),
+            Self::Nd2Nz { .. } => None,
         }
     }
 }

@@ -1,4 +1,6 @@
+use crate::sim::c220::mte::interface::biu_read::C220BiuReadError;
 use std::collections::{BTreeMap, VecDeque};
+mod biu;
 
 use super::{
     C220Nd2NzReadPlan, C220Nd2NzReadRequest, C220Nd2NzReadRoute, C220Nd2NzResponse,
@@ -15,6 +17,8 @@ use crate::sim::c220::mte::{
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum C220Nd2NzEngineError {
+    #[error(transparent)]
+    Biu(#[from] C220BiuReadError),
     #[error(transparent)]
     Staging(#[from] C220Nd2NzStagingError),
     #[error(transparent)]
@@ -38,6 +42,7 @@ pub enum C220Nd2NzEngineError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct C220Nd2NzIssuedRead {
+    pub sid: u8,
     pub instruction_id: u64,
     pub request_id: u64,
     pub ready_tick: u64,
@@ -47,6 +52,7 @@ pub struct C220Nd2NzIssuedRead {
 
 #[derive(Debug, Clone)]
 struct Source {
+    sid: u8,
     instruction_id: u64,
     ready_tick: u64,
     mode: C220DmaUopMode,
@@ -76,7 +82,7 @@ pub struct C220Nd2NzEngine {
     observed_tick: Option<u64>,
     generate_tick: Option<u64>,
     read_tick: Option<u64>,
-    response_tick: Option<u64>,
+    response_ticks: [Option<u64>; 2],
     write_tick: Option<u64>,
 }
 
@@ -91,7 +97,7 @@ impl C220Nd2NzEngine {
             observed_tick: None,
             generate_tick: None,
             read_tick: None,
-            response_tick: None,
+            response_ticks: [None; 2],
             write_tick: None,
         })
     }
@@ -161,6 +167,7 @@ impl C220Nd2NzEngine {
             .next()
             .ok_or(C220Nd2NzEngineError::EmptyInstruction)?;
         self.source = Some(Source {
+            sid: transfer.sid(),
             instruction_id,
             ready_tick,
             mode,
@@ -194,6 +201,7 @@ impl C220Nd2NzEngine {
             .checked_add(1)
             .ok_or(C220Nd2NzEngineError::Overflow)?;
         self.generated.push_back(C220Nd2NzIssuedRead {
+            sid: source.sid,
             instruction_id: source.instruction_id,
             request_id: source.next_id,
             ready_tick,
@@ -237,7 +245,6 @@ impl C220Nd2NzEngine {
         request_id: u64,
     ) -> Result<u32, C220Nd2NzEngineError> {
         self.observe(tick)?;
-        Self::callback(&mut self.response_tick, tick, "response")?;
         let key = (instruction_id, request_id);
         if !self.responses.contains_key(&key) {
             return Err(C220Nd2NzEngineError::UnknownResponse {
@@ -249,6 +256,11 @@ impl C220Nd2NzEngine {
             return Ok(0);
         }
         let response = self.responses.get_mut(&key).expect("validated response");
+        let route = match response.route() {
+            C220Nd2NzReadRoute::PerRow => 0,
+            C220Nd2NzReadRoute::ContiguousRows => 1,
+        };
+        Self::callback(&mut self.response_ticks[route], tick, "response")?;
         let accepted = self.staging.receive(tick, response)?;
         if response.is_complete() {
             self.responses.remove(&key);

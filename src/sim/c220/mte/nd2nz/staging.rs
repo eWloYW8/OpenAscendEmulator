@@ -62,6 +62,10 @@ impl C220Nd2NzResponse {
         self.remaining_bytes
     }
 
+    pub fn route(&self) -> C220Nd2NzReadRoute {
+        self.route
+    }
+
     pub fn is_complete(&self) -> bool {
         self.remaining_bytes == 0
     }
@@ -90,7 +94,7 @@ pub struct C220Nd2NzStaging {
     small: VecDeque<SmallBatch>,
     rows: Vec<VecDeque<RowFragment>>,
     observed_tick: Option<u64>,
-    receive_tick: Option<u64>,
+    receive_ticks: [Option<u64>; 2],
     small_tick: Option<u64>,
     lane_ticks: [Option<u64>; 4],
     write_tick: Option<u64>,
@@ -109,7 +113,7 @@ impl C220Nd2NzStaging {
             small: VecDeque::new(),
             rows: vec![VecDeque::new(); rows],
             observed_tick: None,
-            receive_tick: None,
+            receive_ticks: [None; 2],
             small_tick: None,
             lane_ticks: [None; 4],
             write_tick: None,
@@ -156,7 +160,11 @@ impl C220Nd2NzStaging {
             .checked_add(1)
             .ok_or(C220Nd2NzStagingError::TimeOverflow)?;
         self.observe(tick)?;
-        Self::callback(&mut self.receive_tick, tick, "receive")?;
+        let route = match response.route {
+            C220Nd2NzReadRoute::PerRow => 0,
+            C220Nd2NzReadRoute::ContiguousRows => 1,
+        };
+        Self::callback(&mut self.receive_ticks[route], tick, "receive")?;
         if response.is_complete() {
             return Ok(0);
         }
