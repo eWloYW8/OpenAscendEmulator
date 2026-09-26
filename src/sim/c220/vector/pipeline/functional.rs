@@ -10,6 +10,7 @@ use crate::sim::c220::vector::ops::{
     conversion::C220ConversionIssue,
     copy::C220CopyIssue,
     fused::C220FusedIssue,
+    gather::{C220GatherIssue, execute_gather_repeat},
     nchw::C220NchwIssue,
     scalar::C220VectorScalarIssue,
     select::{C220SelectIssue, C220SelectMode},
@@ -41,6 +42,7 @@ pub(super) enum FunctionalInstruction {
     Broadcast(Box<C220BroadcastIssue>),
     Sort(Box<C220SortIssue>),
     Nchw(Box<C220NchwIssue>),
+    Gather(Box<C220GatherIssue>),
 }
 
 impl FunctionalInstruction {
@@ -71,6 +73,7 @@ impl FunctionalInstruction {
             C220VectorReadIssue::Broadcast(issue) => Some(Self::Broadcast(Box::new(issue.clone()))),
             C220VectorReadIssue::Sort(issue) => Some(Self::Sort(Box::new(issue.clone()))),
             C220VectorReadIssue::Nchw(issue) => Some(Self::Nchw(Box::new(issue.clone()))),
+            C220VectorReadIssue::Gather(issue) => Some(Self::Gather(Box::new(issue.clone()))),
             _ => None,
         }
     }
@@ -94,6 +97,7 @@ impl FunctionalInstruction {
             Self::Broadcast(issue) => C220VectorReadIssue::Broadcast(issue),
             Self::Sort(issue) => C220VectorReadIssue::Sort(issue),
             Self::Nchw(issue) => C220VectorReadIssue::Nchw(issue),
+            Self::Gather(issue) => C220VectorReadIssue::Gather(issue),
         }
     }
 
@@ -149,6 +153,7 @@ impl FunctionalInstruction {
             Self::Broadcast(issue) => return (usize::from(issue.control.repeat_count), 0),
             Self::Sort(issue) => return (usize::from(issue.repeat_count), 0),
             Self::Nchw(issue) => return (issue.rows.len(), 0),
+            Self::Gather(issue) => return (issue.repeat_count(), 0),
             Self::PackedCompare(issue) => {
                 return (issue.uop_count(), issue.instruction.width.lane_count());
             }
@@ -176,6 +181,15 @@ impl C220VectorPipeline {
         for repeat in 0..repeats {
             let instruction = self.functional_instructions.get_mut(&group).unwrap();
             instruction.prepare_repeat(core);
+            if let FunctionalInstruction::Gather(issue) = instruction {
+                self.last_gather_executions.push(execute_gather_repeat(
+                    issue,
+                    repeat,
+                    tick,
+                    core.ub_mut(),
+                )?);
+                continue;
+            }
             let (lane_group, kind) = if matches!(
                 instruction,
                 FunctionalInstruction::MoveMask(_)

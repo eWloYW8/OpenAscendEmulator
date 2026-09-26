@@ -12,6 +12,7 @@ use crate::memory::ub::UbMemory;
 use crate::sim::c220::memory::{C220UbCycle, C220UbPort, C220UbRequest, C220UbRequestError};
 use crate::sim::c220::state::{C220ExecutionError, C220State};
 use crate::sim::c220::vector::ops::compare::C220CompareMask;
+use crate::sim::c220::vector::ops::gather::C220GatherExecution;
 use crate::sim::c220::vector::ops::reduce::{C220ReductionState, C220ReductionStateUpdate};
 use crate::sim::c220::vector::read::{
     C220VectorReadError, C220VectorReadSample, PendingVectorRead,
@@ -113,6 +114,7 @@ pub struct C220VectorPipeline {
     pending: VecDeque<PendingVectorUop>,
     last_read_samples: Vec<C220VectorReadSample>,
     last_functional_samples: Vec<C220VectorReadSample>,
+    last_gather_executions: Vec<C220GatherExecution>,
     functional_instructions: BTreeMap<u64, FunctionalInstruction>,
     last_ub_cycles: Vec<C220UbCycle>,
     last_write_completions: Vec<C220VectorWriteCompletion>,
@@ -137,6 +139,7 @@ impl C220VectorPipeline {
             pending: VecDeque::new(),
             last_read_samples: Vec::new(),
             last_functional_samples: Vec::new(),
+            last_gather_executions: Vec::new(),
             functional_instructions: BTreeMap::new(),
             last_ub_cycles: Vec::new(),
             last_write_completions: Vec::new(),
@@ -193,6 +196,10 @@ impl C220VectorPipeline {
     /// Whole-repeat numerical results, separate from timing-only UB request samples.
     pub fn last_functional_samples(&self) -> &[C220VectorReadSample] {
         &self.last_functional_samples
+    }
+
+    pub fn last_gather_executions(&self) -> &[C220GatherExecution] {
+        &self.last_gather_executions
     }
 
     pub fn last_ub_cycles(&self) -> &[C220UbCycle] {
@@ -465,6 +472,7 @@ impl C220VectorPipeline {
     pub(crate) fn begin_advance(&mut self) {
         self.last_read_samples.clear();
         self.last_functional_samples.clear();
+        self.last_gather_executions.clear();
         self.last_ub_cycles.clear();
         self.last_write_completions.clear();
         self.last_va_updates.clear();

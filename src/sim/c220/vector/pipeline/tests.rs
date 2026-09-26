@@ -12,6 +12,99 @@ use crate::sim::common::scalar::ScalarMachine;
 use crate::sim::common::scalar::ScalarStepper;
 
 #[test]
+fn gather_completion_uses_live_indices_and_sequential_data_feedback() {
+    use crate::sim::c220::vector::C220VectorInstruction;
+    use crate::sim::c220::vector::ops::gather::plan_c220_gather_issue;
+
+    for (word, width, count) in [
+        (0x8000_0042, 2, 128),
+        (0x8000_004a, 4, 64),
+        (0x8000_0043, 32, 8),
+    ] {
+        let mut bytes = vec![0_u8; 4096];
+        for (index, byte) in bytes[..512].iter_mut().enumerate() {
+            *byte = (index * 19) as u8;
+        }
+        let mut ub = UbMemory::new(4096, 4096);
+        ub.write_states(
+            0,
+            &bytes
+                .iter()
+                .copied()
+                .map(MemoryByteState::Known)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let instruction = C220VectorInstruction::Gather(
+            plan_c220_gather_issue(
+                0,
+                word,
+                (2 << 56) | (8 << 32),
+                128,
+                1024,
+                vec![[u64::MAX; 4]; 2],
+                &ub,
+            )
+            .unwrap(),
+        );
+        let mut pipeline = C220VectorPipeline::new(C220VectorTimingRules {
+            dispatch_ticks: 0,
+            uop_issue_interval: NonZeroU64::new(1).unwrap(),
+            ub_response_ticks: 2,
+        });
+        pipeline
+            .issue_at(
+                0,
+                &instruction.uops().unwrap(),
+                instruction.stores(),
+                instruction.read_issue(),
+            )
+            .unwrap();
+        for repeat in 0..2 {
+            for lane in 0..count {
+                let index = if lane == 0 {
+                    0
+                } else {
+                    128 + repeat * 256 + (lane - 1) * width
+                };
+                let offset = 1024 + (repeat * count + lane) * 4;
+                bytes[offset..offset + 4].copy_from_slice(&(index as u32).to_le_bytes());
+            }
+        }
+        ub.write_states(
+            0,
+            &bytes
+                .iter()
+                .copied()
+                .map(MemoryByteState::Known)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
+        let mut core = C220State::new(ScalarStepper::new(machine, 0), ub);
+        for repeat in 0..2 {
+            for lane in 0..count {
+                let offset = 1024 + (repeat * count + lane) * 4;
+                let source =
+                    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                let data = bytes[source..source + width].to_vec();
+                let destination = 128 + repeat * 256 + lane * width;
+                bytes[destination..destination + width].copy_from_slice(&data);
+            }
+        }
+        let releases = pipeline.advance_to(1024, &mut core).unwrap();
+        let samples = pipeline.last_gather_executions();
+        assert_eq!(samples.len(), 2);
+        assert!(samples.iter().all(|sample| sample.transfers.len() == count
+            && sample.tick == releases.last().unwrap().release_tick + 1));
+        assert!(!pipeline.last_read_samples().is_empty());
+        assert_eq!(core.ub().read_known(0, 4096).unwrap(), bytes);
+        assert_eq!(pipeline.pending_uops(), 0);
+        assert_eq!(pipeline.pending_ub_responses(), 0);
+    }
+}
+
+#[test]
 fn nchw_repeats_commit_whole_tiles_and_keep_physical_reads() {
     use crate::sim::c220::vector::C220VectorInstruction;
     use crate::sim::c220::vector::ops::nchw::plan_c220_nchw_issue;

@@ -133,11 +133,10 @@ impl C220VectorPipeline {
                 .position(|uop| {
                     (uop.writes_ub || accumulator.is_some() || ordinary_reads.is_some())
                         && uop.repeat_index == store.repeat_index
-                        && if matches!(
-                            uop.kind,
-                            C220VectorUopKind::GatherData { .. }
-                                | C220VectorUopKind::LaneSlice { .. }
-                        ) {
+                        && if matches!(uop.kind, C220VectorUopKind::LaneSlice { .. })
+                            || (matches!(uop.kind, C220VectorUopKind::GatherData { .. })
+                                && lanes_per_group != usize::MAX)
+                        {
                             uop.kind.contains_lane(logical_lane, uop.lane_group)
                         } else {
                             let lane_group = logical_lane / lanes_per_group;
@@ -218,6 +217,7 @@ impl C220VectorPipeline {
                 && match compute {
                     Some(C220VectorReadIssue::Select(select)) => select.iteration_masks.is_empty(),
                     Some(C220VectorReadIssue::Broadcast(issue)) => issue.control.repeat_count == 0,
+                    Some(C220VectorReadIssue::Gather(issue)) => issue.repeat_count() == 0,
                     Some(
                         C220VectorReadIssue::MoveMask(_)
                         | C220VectorReadIssue::Transpose(_)

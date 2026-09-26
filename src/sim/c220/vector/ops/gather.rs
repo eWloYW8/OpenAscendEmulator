@@ -1,6 +1,9 @@
 use crate::isa::c220::vector::gather::{C220GatherInstruction, C220GatherKind, C220GatherWidth};
+mod functional;
 use crate::memory::ub::UbMemory;
 use crate::sim::c220::memory::C220UbBank;
+pub(crate) use functional::execute_gather_repeat;
+pub use functional::{C220GatherExecution, C220GatherTransfer};
 
 use crate::sim::c220::vector::{
     C220_VECTOR_BLOCK_BYTES, C220VectorError, C220VectorReadAccess, C220VectorStore,
