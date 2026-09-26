@@ -91,7 +91,7 @@ acknowledgments and arbitration decisions remain inspectable.
 
 The shared MTE L1 read arbiter exposes per-port eligibility and round-robin
 selection, including output-fragment backpressure. LOAD2D has a lazy physical
-read planner under `mte/mte1/load2d/`. Completing reads expand into L0 output
+read planner under `mte/load2d/`. Completing reads expand into L0 output
 fragments using the same lazy output plan as BT. The L1 output scheduler owns
 the shared acknowledgment FIFO, lazy expansion, destination backpressure and
 BT retirement. A blocked target holds later responses behind it, including

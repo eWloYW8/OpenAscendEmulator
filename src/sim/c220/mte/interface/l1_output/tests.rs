@@ -1,7 +1,7 @@
 use super::*;
 use crate::isa::c220::mte::load2d::C220Load2dInstruction;
 use crate::sim::c220::mte::interface::C220L0WritePipeline;
-use crate::sim::c220::mte::mte1::load2d::C220Load2dRequestPlan;
+use crate::sim::c220::mte::load2d::C220Load2dRequestPlan;
 use std::num::NonZeroU32;
 
 #[test]

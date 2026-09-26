@@ -100,7 +100,7 @@ impl C220Load2dInstruction {
     }
 
     pub fn capture(self, xregs: &[u64; 32]) -> Result<C220Load2dTransfer, C220Load2dError> {
-        if !self.is_mte1() {
+        if !self.is_mte1() && !self.is_external() {
             return Err(C220Load2dError::UnsupportedRoute {
                 source_buffer: self.source,
                 destination_buffer: self.destination,
@@ -119,6 +119,11 @@ impl C220Load2dInstruction {
             source_base: xregs[usize::from(self.source_register)],
             destination_base: xregs[usize::from(self.destination_register)],
         })
+    }
+
+    pub const fn is_external(self) -> bool {
+        matches!(self.source, C220Load2dSource::Out)
+            && !matches!(self.destination, C220Load2dDestination::Reserved)
     }
 }
 
@@ -231,7 +236,7 @@ pub struct C220Load2dSegment {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum C220Load2dError {
-    #[error("LOAD_2D route {source_buffer:?} -> {destination_buffer:?} is not an MTE1 route")]
+    #[error("unsupported LOAD_2D route {source_buffer:?} -> {destination_buffer:?}")]
     UnsupportedRoute {
         source_buffer: C220Load2dSource,
         destination_buffer: C220Load2dDestination,

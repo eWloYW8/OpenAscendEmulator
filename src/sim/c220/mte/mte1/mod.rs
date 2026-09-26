@@ -1,6 +1,5 @@
 pub mod bias;
 mod command;
-pub mod load2d;
 pub mod sparse;
 pub(crate) mod spr;
 pub use command::{C220Mte1Command, C220Mte1Generator, C220Mte1Issue};

@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
 
+use super::load2d::{C220Load2dReadUop, C220Load2dRequestPlan};
 use super::mte1::bias::{C220BtReadUop, C220BtRequestPlan};
-use super::mte1::load2d::{C220Load2dReadUop, C220Load2dRequestPlan};
 use super::mte1::sparse::{C220SparseOutput, C220SparseReadUop, C220SparseRequestPlan};
 use crate::isa::c220::mte::bias::C220BtTransfer;
 use crate::isa::c220::mte::load2d::{C220Load2dDestination, C220Load2dError, C220Load2dTransfer};

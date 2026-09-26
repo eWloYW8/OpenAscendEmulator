@@ -1,4 +1,8 @@
+mod external;
 mod transpose;
+pub use external::{
+    C220Load2dExternalRequest, C220Load2dExternalRequests, prepare_c220_external_load2d,
+};
 mod uop;
 pub use transpose::prepare_c220_load2d_transpose;
 pub use uop::{C220Load2dReadUop, C220Load2dRequestPlan};
@@ -38,6 +42,9 @@ impl C220PreparedLoad2d {
                 C220Load2dDestination::L0b => {
                     memory.l0b_mut().write_states_linear(address, &states)?;
                 }
+                C220Load2dDestination::L1 => {
+                    memory.l1_mut().write_states_linear(address, &states)?;
+                }
                 destination => {
                     return Err(C220Load2dTransferError::UnsupportedDestination(destination));
                 }
@@ -53,7 +60,9 @@ pub enum C220Load2dTransferError {
     Decode(#[from] C220Load2dError),
     #[error(transparent)]
     LocalBuffer(#[from] C220LocalBufferError),
-    #[error("LOAD_2D destination {0:?} is not implemented by the MTE1 data path")]
+    #[error(transparent)]
+    ExternalMemory(#[from] crate::memory::mapped::MappedMemoryError),
+    #[error("unsupported LOAD_2D destination {0:?}")]
     UnsupportedDestination(C220Load2dDestination),
     #[error("cannot reserve {requested} LOAD_2D write records")]
     AllocationFailed { requested: usize },
@@ -63,9 +72,25 @@ pub fn prepare_c220_load2d(
     memory: &C220LocalMemory,
     transfer: C220Load2dTransfer,
 ) -> Result<C220PreparedLoad2d, C220Load2dTransferError> {
+    if !transfer.instruction.is_mte1() {
+        return Err(C220Load2dError::UnsupportedRoute {
+            source_buffer: transfer.instruction.source,
+            destination_buffer: transfer.instruction.destination,
+        }
+        .into());
+    }
+    prepare_blocks(transfer, |address, bytes| {
+        Ok(memory.l1().read_initialized_states_linear(address, bytes)?)
+    })
+}
+
+fn prepare_blocks(
+    transfer: C220Load2dTransfer,
+    mut read: impl FnMut(u64, usize) -> Result<Vec<MemoryByteState>, C220Load2dTransferError>,
+) -> Result<C220PreparedLoad2d, C220Load2dTransferError> {
     if !matches!(
         transfer.instruction.destination,
-        C220Load2dDestination::L0a | C220Load2dDestination::L0b
+        C220Load2dDestination::L0a | C220Load2dDestination::L0b | C220Load2dDestination::L1
     ) {
         return Err(C220Load2dTransferError::UnsupportedDestination(
             transfer.instruction.destination,
@@ -78,9 +103,7 @@ pub fn prepare_c220_load2d(
         .map_err(|_| C220Load2dTransferError::AllocationFailed { requested: count })?;
     let mut known_bytes = 0;
     for segment in transfer.segments() {
-        let mut states = memory
-            .l1()
-            .read_initialized_states_linear(segment.source_address, segment.bytes as usize)?;
+        let mut states = read(segment.source_address, segment.bytes as usize)?;
         if transfer.instruction.transpose {
             states = transpose_halfwords(states);
         }

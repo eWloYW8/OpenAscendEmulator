@@ -1,13 +1,15 @@
 use super::super::read::C220MteReadTransfer;
 use super::bias::{C220BtTransferError, C220BtTransferResult, prepare_c220_mov_l1_to_bt};
-use super::load2d::prepare_c220_load2d_transpose;
-use super::load2d::{C220Load2dTransferError, C220Load2dTransferResult, prepare_c220_load2d};
 use super::sparse::{C220SparseTransferResult, prepare_c220_load2d_sparse};
 use super::{C220Mte1Command, C220Mte1Issue};
 use crate::isa::c220::hflag::C220MatrixMemory;
 use crate::isa::c220::mte::load2d::C220Load2dDestination;
 use crate::isa::c220::mte::set2d::C220Set2dDestination;
 use crate::sim::c220::memory::{C220LocalBufferError, C220LocalMemory};
+use crate::sim::c220::mte::load2d::prepare_c220_load2d_transpose;
+use crate::sim::c220::mte::load2d::{
+    C220Load2dTransferError, C220Load2dTransferResult, prepare_c220_load2d,
+};
 use crate::sim::c220::mte::set2d::{C220Set2dResult, execute_c220_set2d};
 use crate::sim::c220::mte::smask::{
     C220SmaskTransferError, C220SmaskTransferResult, execute_c220_mov_l1_to_smask,

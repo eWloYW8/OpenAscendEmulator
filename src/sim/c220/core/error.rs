@@ -7,7 +7,7 @@ use crate::isa::c220::hflag::{
 use crate::memory::mapped::MappedMemoryError;
 use crate::sim::c220::cube::C220CubeTimingError;
 use crate::sim::c220::memory::C220L0cError;
-use crate::sim::c220::mte::mte1::load2d::C220Load2dTransferError;
+use crate::sim::c220::mte::load2d::C220Load2dTransferError;
 use crate::sim::c220::mte::mte3::C220Mte3TimingError;
 use crate::sim::c220::scalar::bus::C220ScalarBusError;
 use crate::sim::c220::schedule::C220ScheduleError;

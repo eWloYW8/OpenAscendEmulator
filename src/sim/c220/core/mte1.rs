@@ -6,8 +6,8 @@ use crate::isa::c220::mte::load2d_transpose::C220Load2dTransposeInstruction;
 use crate::isa::c220::mte::set2d::C220Set2dInstruction;
 use crate::isa::c220::mte::spr::C220Mte1SprWrite;
 use crate::isa::flow::FlagInstruction;
+use crate::sim::c220::mte::load2d::C220Load2dTransferError;
 use crate::sim::c220::mte::mte1::C220Mte1Command;
-use crate::sim::c220::mte::mte1::load2d::C220Load2dTransferError;
 use crate::sim::c220::mte::read::C220MteReadTransfer;
 
 use crate::sim::c220::schedule::C220Stall;
