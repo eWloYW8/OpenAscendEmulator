@@ -85,6 +85,7 @@ impl C220Core {
                 self.pipeline_events
                     .retire(4, outcome.command.instruction_id, outcome.retire_tick);
             }
+            self.release_mte2_barriers_at(event_tick);
             self.publish_fixp_retirement();
             while self.mte_pipeline.is_some() {
                 let pipeline = self.mte_pipeline.as_mut().expect("configured MTE pipeline");

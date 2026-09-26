@@ -1014,6 +1014,101 @@ fn run_biu_dma(bus_connected: bool) {
 }
 
 #[test]
+fn mte2_barrier_releases_on_destination_retirement_without_blocking_scalar() {
+    for flag_predecessor in [false, true] {
+        let mut core = configured_dma_core();
+        core.connect_mte2_dma().unwrap();
+        if flag_predecessor {
+            core.mte2_frontend.config.outstanding_limit = NonZeroU32::new(1).unwrap();
+        }
+        let dma_id = core.next_instruction_id();
+        core.step_word_at(0, CAPTURED_C220_MOV_OUT_TO_UB_X_WORD)
+            .unwrap();
+        if flag_predecessor {
+            let set = (2 << 29) | (5 << 21) | (4 << 10) | (3 << 7) | 3;
+            core.step_word_at(1, set).unwrap();
+        }
+        for tick in 2..4 {
+            assert!(matches!(
+                core.step_word_at(tick, 0x40e0_1000).unwrap(),
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::Mte2Barrier {
+                        completed_tick: None,
+                        ..
+                    },
+                    ..
+                }
+            ));
+        }
+        assert_eq!(core.pending_mte2_barriers().len(), 2);
+        assert_eq!(core.outstanding_mte2_commands(), 1);
+        assert_eq!(
+            core.pending_mte2_barriers().next().unwrap().requires_idle,
+            flag_predecessor
+        );
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(1, 0).unwrap();
+        machine.set_xreg(3, 1 | (2 << 16)).unwrap();
+        machine.set_spr_value(15, 0x1234_5678).unwrap();
+        let fill = (3 << 29) | (1 << 22) | (1 << 17) | (3 << 7) | 6;
+        core.step_word_at(4, fill).unwrap();
+        assert!(matches!(
+            core.step_word_at(5, 0x4140_0000).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        let mut tail_delivered = false;
+        for tick in 6..60 {
+            core.advance_to(tick).unwrap();
+            if let Some(request) = core.take_mte2_dma_request() {
+                tail_delivered |= request.last_in_instruction;
+            }
+        }
+        assert!(tail_delivered);
+        assert_eq!(core.pending_mte2_barriers().len(), 2);
+        assert_eq!(core.outstanding_mte2_commands(), 1);
+        assert_eq!(core.queued_mte2_commands().len(), 0);
+        assert!(core.local_memory.l1().read_known(0, 64).is_err());
+        core.complete_mte2_dma_at(60, dma_id).unwrap();
+        assert_eq!(core.pending_mte2_barriers().len(), 2);
+        core.advance_to(61).unwrap();
+        assert_eq!(core.pending_mte2_barriers().len(), 0);
+        assert_eq!(
+            core.mte2_frontend_outcomes()
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    C220CoreStep::Executed {
+                        instruction: C220CoreInstruction::Mte2Barrier {
+                            completed_tick: Some(61),
+                            ..
+                        },
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        core.advance_to(100).unwrap();
+        assert!(!core.mte2_is_busy());
+        assert_eq!(core.state.ub().read_known(0, 4096).unwrap(), vec![7; 4096]);
+        assert_eq!(
+            core.local_memory.l1().read_known(0, 64).unwrap(),
+            0x1234_5678_u32.to_le_bytes().repeat(16)
+        );
+        assert!(matches!(
+            core.step_word_at(100, 0x40e0_1000).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Mte2Barrier {
+                    completed_tick: Some(100),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
 fn dma_credit_stalls_generation_but_destination_response_controls_retirement() {
     let mut core = configured_dma_core();
     let word = CAPTURED_C220_MOV_OUT_TO_UB_X_WORD;

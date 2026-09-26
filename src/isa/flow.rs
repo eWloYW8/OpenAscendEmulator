@@ -92,6 +92,7 @@ pub enum PipelineBarrierScope {
     Vector,
     Cube,
     Mte1,
+    Mte2,
     Fix,
     All,
 }
@@ -109,6 +110,7 @@ impl PipelineBarrierStep {
             (Architecture::Dav2201, 0x40e0_0400) => PipelineBarrierScope::Vector,
             (Architecture::Dav2201, 0x40e0_0800) => PipelineBarrierScope::Cube,
             (Architecture::Dav2201, 0x40e0_0c00) => PipelineBarrierScope::Mte1,
+            (Architecture::Dav2201, 0x40e0_1000) => PipelineBarrierScope::Mte2,
             (Architecture::Dav2201, 0x40e0_2800) => PipelineBarrierScope::Fix,
             (Architecture::Dav2201 | Architecture::Dav3510, 0x40e0_1800) => {
                 PipelineBarrierScope::All

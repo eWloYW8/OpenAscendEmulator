@@ -11,6 +11,7 @@ pub enum C220StallCause {
     Mte1OutstandingLimit,
     Mte1Dependency,
     Mte1Barrier,
+    Mte2Barrier,
     MtePhysicalDependency,
     HardwareFlagDependency,
     PipelineEventDependency,

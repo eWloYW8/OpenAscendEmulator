@@ -49,6 +49,8 @@ mod mte1_frontend;
 pub use mte1_frontend::C220Mte1QueuedCommand;
 mod mte1_barrier;
 pub use mte1_barrier::C220Mte1Barrier;
+mod mte2_barrier;
+pub use mte2_barrier::C220Mte2Barrier;
 mod mte1_issue;
 pub use mte1_issue::{C220Mte1FrontendConfig, C220Mte1IssuedInstruction, C220Mte1Operation};
 mod mte2;

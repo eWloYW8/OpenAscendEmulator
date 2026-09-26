@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, num::NonZeroU32};
 
-use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep};
+use super::{C220Core, C220CoreError, C220CoreInstruction, C220CoreStep, C220Mte2Barrier};
 use crate::isa::flow::{FlagOperation, FlagStep};
 use crate::sim::c220::device::C220CoreKind;
 use crate::sim::c220::mte::mte2::C220Mte2Command;
@@ -57,6 +57,8 @@ pub(super) struct Mte2Frontend {
     issued: VecDeque<C220Mte2IssuedInstruction>,
     commands: VecDeque<C220Mte2QueuedCommand>,
     last_received: Option<u64>,
+    pub last_accepted: Option<u64>,
+    pub barriers: VecDeque<C220Mte2Barrier>,
     pub outcomes: Vec<C220CoreStep>,
 }
 
@@ -118,6 +120,7 @@ impl C220Core {
             operation,
         };
         self.mte2_frontend.issued.push_back(queued);
+        self.mte2_frontend.last_accepted = Some(queued.instruction_id);
         self.update_mte2_heads();
         self.state.commit_c220_sequential_issue();
         Ok(C220CoreStep::Executed {
@@ -147,6 +150,12 @@ impl C220Core {
             >= self.mte2_frontend.config.outstanding_limit.get() as usize
         {
             Some(C220StallCause::Mte2OutstandingLimit)
+        } else if self.mte2_frontend.barriers.iter().any(|barrier| {
+            barrier
+                .predecessor
+                .is_some_and(|id| id < queued.instruction_id)
+        }) {
+            Some(C220StallCause::Mte2Barrier)
         } else if matches!(
             queued.operation,
             C220Mte2Operation::Command(C220Mte2Command::CrossCore { .. })
@@ -200,6 +209,7 @@ impl C220Core {
             C220CoreStep::Executed { tick, instruction }
         };
         self.mte2_frontend.outcomes.push(outcome);
+        self.release_mte2_barriers_at(tick);
         self.update_mte2_heads();
         self.mte_pipeline
             .as_mut()
