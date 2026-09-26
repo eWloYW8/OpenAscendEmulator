@@ -10,6 +10,7 @@ pub enum C220StallCause {
     Mte1CommandQueueFull,
     Mte1OutstandingLimit,
     Mte1Dependency,
+    Mte1Barrier,
     MtePhysicalDependency,
     HardwareFlagDependency,
     PipelineEventDependency,

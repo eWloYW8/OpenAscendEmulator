@@ -707,6 +707,57 @@ mod tests {
         assert_eq!(core.memory.read_known_at(4096, 128).unwrap(), [1; 128]);
     }
 
+    #[test]
+    fn mte1_barriers_order_reception_without_holding_scalar_or_command_slots() {
+        let mut core = matrix_core();
+        core.advance_to(300).unwrap();
+        let signal = (2 << 29) | (15 << 21) | (1 << 19) | (1 << 15) | (2 << 10) | (3 << 7);
+        let set = (2 << 29) | (5 << 21) | (3 << 10) | (2 << 7);
+        core.step_word_at(301, signal | (1 << 5)).unwrap();
+        let predecessor = core.mte1_frontend.last_accepted;
+        for tick in [302, 303] {
+            assert!(matches!(core.step_word_at(tick, 0x40e0_0c00).unwrap(),
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::Mte1Barrier { barrier, completed_tick: None }, ..
+                } if barrier.predecessor == predecessor));
+        }
+        core.step_word_at(304, set).unwrap();
+        core.step_word_at(305, 0x4140_0000).unwrap();
+        assert_eq!(core.pending_mte1_barriers().len(), 2);
+        assert_eq!(core.queued_mte1_instructions().count(), 1);
+        assert_eq!(core.outstanding_mte1_commands(), 1);
+        assert!(core.pipeline_events().ready(3, 2).is_empty());
+        core.step_word_at(306, signal).unwrap();
+        core.advance_to(340).unwrap();
+        assert_eq!(core.pending_mte1_barriers().len(), 0);
+        assert_eq!(core.outstanding_mte1_commands(), 0);
+        assert_eq!(core.queued_mte1_instructions().count(), 0);
+        let retired = core.last_mte1_outcomes().last().unwrap().retire_tick;
+        let completed: Vec<_> = core
+            .mte1_frontend_outcomes()
+            .iter()
+            .filter_map(|outcome| match outcome {
+                C220CoreStep::Executed {
+                    instruction: C220CoreInstruction::Mte1Barrier { completed_tick, .. },
+                    ..
+                } => *completed_tick,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed, [retired, retired]);
+        assert!(core.pipeline_events().ready(3, 2)[0].published_tick >= retired);
+        assert!(matches!(
+            core.step_word_at(341, 0x40e0_0c00).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Mte1Barrier {
+                    completed_tick: Some(341),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
     fn matrix_core() -> C220Core {
         let mut machine = ScalarMachine::from_pem_initial_state(Architecture::Dav2201);
         for (register, value) in [

@@ -82,6 +82,10 @@ pub enum C220CoreInstruction {
         issue: C220Mte1Issue,
     },
     Mte1Flag(FlagStep),
+    Mte1Barrier {
+        barrier: super::C220Mte1Barrier,
+        completed_tick: Option<u64>,
+    },
     HardwareFlag {
         instruction_id: u64,
         step: C220HardwareFlagStep,

@@ -19,6 +19,8 @@ pub(super) struct Mte1Frontend {
     pub issued: VecDeque<super::C220Mte1IssuedInstruction>,
     pub commands: VecDeque<C220Mte1QueuedCommand>,
     pub outcomes: Vec<C220CoreStep>,
+    pub last_accepted: Option<u64>,
+    pub barriers: VecDeque<super::C220Mte1Barrier>,
 }
 
 impl C220Core {

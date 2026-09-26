@@ -65,6 +65,7 @@ impl C220Core {
                 .map_err(C220CoreError::MteSpr)?;
         }
         self.mte1_frontend.issued.push_back(queued);
+        self.mte1_frontend.last_accepted = Some(queued.instruction_id);
         self.update_mte1_command_head();
         self.state.commit_c220_sequential_issue();
         Ok(C220CoreStep::Executed {
@@ -85,6 +86,12 @@ impl C220Core {
             >= self.mte1_frontend.config.outstanding_limit.get() as usize
         {
             Some(C220StallCause::Mte1OutstandingLimit)
+        } else if self.mte1_frontend.barriers.iter().any(|barrier| {
+            barrier
+                .predecessor
+                .is_some_and(|id| id < queued.instruction_id)
+        }) {
+            Some(C220StallCause::Mte1Barrier)
         } else if matches!(
             queued.operation,
             C220Mte1Operation::Command(C220Mte1Command::CrossCore { .. })
@@ -148,6 +155,7 @@ impl C220Core {
             C220CoreStep::Executed { tick, instruction }
         };
         self.mte1_frontend.outcomes.push(result);
+        self.release_mte1_barriers_at(tick);
         self.update_mte1_command_head();
         self.mte_pipeline
             .as_mut()

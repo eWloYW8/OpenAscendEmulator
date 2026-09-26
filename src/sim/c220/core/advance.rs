@@ -65,6 +65,7 @@ impl C220Core {
                         .map_err(C220CoreError::MteSpr)?;
                 }
             }
+            self.release_mte1_barriers_at(event_tick);
             self.retire_factor_at(event_tick)?;
             if let Some(engine) = self.fixp_engine_mut() {
                 engine.retire_ready_control(event_tick);

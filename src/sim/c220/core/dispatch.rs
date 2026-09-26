@@ -144,6 +144,7 @@ impl C220Core {
             match barrier.scope {
                 PipelineBarrierScope::Fix => return self.step_fixp_barrier_at(tick, barrier),
                 PipelineBarrierScope::Cube => return self.step_cube_barrier_at(tick, barrier),
+                PipelineBarrierScope::Mte1 => return self.step_mte1_barrier_at(tick, barrier),
                 _ => {}
             }
         }
