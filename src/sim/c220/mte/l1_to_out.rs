@@ -6,6 +6,9 @@ use crate::sim::c220::memory::{C220LocalBuffer, C220LocalBufferError};
 
 use super::atomic::{C220AtomicConfig, commit_output};
 
+mod read_plan;
+pub use read_plan::{C220L1OutputRead, C220L1OutputReadPlan, C220L1OutputRoute};
+
 #[derive(Debug, thiserror::Error)]
 pub enum C220L1OutputError {
     #[error("L1 output address range overflows")]
