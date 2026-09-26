@@ -10,6 +10,7 @@ impl C220Core {
         self.mte2.begin_advance();
         self.mte2_frontend.outcomes.clear();
         self.mte3.begin_advance();
+        self.mte3_issue_queue.outcomes.clear();
         self.vector.begin_advance();
         self.fixp_frontend.outcomes.clear();
         self.fixp_frontend.cross_core_outcomes.clear();
@@ -134,6 +135,10 @@ impl C220Core {
                     self.transfer_mte2_issue_at(event_tick)?;
                     continue;
                 }
+                if pipeline.mte3_issue_pending() {
+                    self.transfer_mte3_issue_at(event_tick)?;
+                    continue;
+                }
                 if pipeline.mte2_dispatch_pending() {
                     self.dispatch_mte2_head_at(event_tick)?;
                     continue;
@@ -181,14 +186,16 @@ impl C220Core {
                 .commit_ready_at(event_tick, self.state.ub(), &mut self.memory)?;
             if self.mte3.physical
                 && let Some(pipeline) = &mut self.mte_pipeline
-            {
-                self.mte3.commit_native_at(
+                && let Some(id) = self.mte3.commit_native_at(
                     event_tick,
                     pipeline,
                     self.state.ub(),
                     &mut self.memory,
-                )?;
+                )?
+            {
+                self.pipeline_events.retire(5, id, event_tick);
             }
+            self.release_mte3_barriers_at(event_tick);
             if event_tick == tick {
                 break;
             }

@@ -1103,7 +1103,7 @@ fn native_mte3_write_path(mode: u8) {
     assert!(matches!(
         core.step_word_at(0, word).unwrap(),
         C220CoreStep::Executed {
-            instruction: C220CoreInstruction::Mte3Dma { .. },
+            instruction: C220CoreInstruction::Mte3Queued(_),
             ..
         }
     ));
@@ -1238,7 +1238,7 @@ fn native_mte3_write_path(mode: u8) {
     let request = transfer.command.input.generated;
     let tag = transfer.command.tag;
     let command_tick = transfer.ready_tick;
-    assert_eq!(command_tick, if bus { 13 } else { 12 });
+    assert_eq!(command_tick, if bus { 14 } else { 13 });
     assert!(request.last_in_instruction);
     assert!(
         core.register_mte3_biu_write_at(command_tick, transfer.command.source_request())

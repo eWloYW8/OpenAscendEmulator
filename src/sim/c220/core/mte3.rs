@@ -44,7 +44,7 @@ impl C220Core {
     }
 
     pub fn connect_mte3_biu(&mut self, config: C220BiuWriteConfig) -> Result<(), C220CoreError> {
-        if self.mte3.pending_commands().next().is_some() || !self.mte3.native_commands.is_empty() {
+        if self.mte3_is_busy() {
             return Err(C220CoreError::MtePipelineBusy);
         }
         self.mte_pipeline
@@ -166,7 +166,7 @@ impl C220Core {
     /// Use the native command/generator path. The transport must drain and
     /// acknowledge each request; no aggregate completion estimate is used.
     pub fn connect_mte3_dma(&mut self) -> Result<(), C220CoreError> {
-        if self.mte3.pending_commands().next().is_some() || !self.mte3.native_commands.is_empty() {
+        if self.mte3_is_busy() {
             return Err(C220CoreError::MtePipelineBusy);
         }
         self.mte_pipeline
@@ -218,6 +218,58 @@ impl C220Core {
         word: u32,
         flag: Option<FlagInstruction>,
     ) -> Result<C220CoreStep, C220CoreError> {
+        if self.mte3.physical {
+            if let Some(instruction) = flag {
+                let step = instruction.resolve(pc, self.state.scalar().machine().xregs());
+                let owner = match instruction.operation {
+                    FlagOperation::Set => instruction.source_pipe_code,
+                    FlagOperation::Wait => instruction.trigger_pipe_code,
+                };
+                if owner == 5 {
+                    return self.enqueue_mte3_at(
+                        tick,
+                        pc,
+                        word,
+                        super::C220Mte3Operation::Flag(step),
+                    );
+                }
+                if instruction.source_pipe_code == 5 {
+                    if self
+                        .pipeline_events
+                        .consume(self.next_instruction_id, step, tick)
+                        .is_none()
+                    {
+                        return self.mte3_stall(tick, pc, C220StallCause::Mte3Dependency);
+                    }
+                    self.state.commit_c220_sequential_issue();
+                    return Ok(C220CoreStep::Executed {
+                        tick,
+                        instruction: C220CoreInstruction::Mte3Flag(step),
+                    });
+                }
+            } else {
+                let plan = decode_mte3_transfer(
+                    self.state.scalar.machine(),
+                    pc,
+                    word,
+                    self.state.isa_instance_index,
+                )?;
+                return self.enqueue_mte3_at(
+                    tick,
+                    pc,
+                    word,
+                    super::C220Mte3Operation::Command(
+                        crate::sim::c220::mte::mte3::frontend::C220Mte3Command::Dma(plan),
+                    ),
+                );
+            }
+        }
+        if flag.is_some_and(|instruction| {
+            matches!(instruction.source_pipe_code, 2 | 3 | 4 | 5 | 10)
+                && matches!(instruction.trigger_pipe_code, 2 | 3 | 4 | 5 | 10)
+        }) {
+            return Err(C220CoreError::Mte3FrontendRequired);
+        }
         let (action, ticket) = if let Some(instruction) = flag {
             let flag = instruction.resolve(pc, self.state.scalar().machine().xregs());
             let cause = if instruction.source_pipe_code == 5 {
@@ -227,11 +279,7 @@ impl C220Core {
             };
             let dependency = match instruction.operation {
                 FlagOperation::Set => {
-                    let dependency = if instruction.source_pipe_code == 5 && self.mte3.physical {
-                        C220OutputDependency::Mte3(
-                            self.mte3.native_commands.keys().next_back().copied(),
-                        )
-                    } else if instruction.source_pipe_code == 5 {
+                    let dependency = if instruction.source_pipe_code == 5 {
                         C220OutputDependency::NotBefore(
                             self.mte3
                                 .timing
@@ -247,23 +295,15 @@ impl C220Core {
                 }
                 FlagOperation::Wait => {
                     let ready =
-                        self.state.output.dependency(flag).and_then(
-                            |dependency| match dependency {
-                                C220OutputDependency::NotBefore(ready) => Some(ready),
-                                C220OutputDependency::Mte3(fence) => {
-                                    if fence.is_some_and(|id| {
-                                        self.mte3.native_commands.range(..=id).next().is_some()
-                                    }) {
-                                        None
-                                    } else {
-                                        Some(tick)
-                                    }
-                                }
+                        self.state
+                            .output
+                            .dependency(flag)
+                            .map(|dependency| match dependency {
+                                C220OutputDependency::NotBefore(ready) => ready,
                                 C220OutputDependency::Vector(fence) => {
-                                    Some(self.vector.fence_retirement_tick(fence).unwrap_or(tick))
+                                    self.vector.fence_retirement_tick(fence).unwrap_or(tick)
                                 }
-                            },
-                        );
+                            });
                     if ready.is_none_or(|ready| tick < ready) {
                         return Ok(C220CoreStep::Stalled(C220Stall {
                             tick,
@@ -287,37 +327,6 @@ impl C220Core {
                 word,
                 self.state.isa_instance_index,
             )?;
-            if self.mte3.physical {
-                let pipeline = self
-                    .mte_pipeline
-                    .as_mut()
-                    .ok_or(C220CoreError::MteUnconfigured)?;
-                if !pipeline.mte3_frontend().can_issue() {
-                    return Ok(C220CoreStep::Stalled(C220Stall {
-                        tick,
-                        pc,
-                        resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
-                        cause: C220StallCause::Mte3QueueFull,
-                    }));
-                }
-                let record = pipeline.issue_mte3_dma(self.next_instruction_id, plan)?;
-                self.mte3
-                    .native_commands
-                    .insert(self.next_instruction_id, (pc, word));
-                self.state.commit_c220_sequential_issue();
-                return Ok(C220CoreStep::Executed {
-                    tick,
-                    instruction: C220CoreInstruction::Mte3Dma {
-                        step: C220OutputStep {
-                            pc,
-                            word,
-                            next_pc: self.state.scalar().pc(),
-                            action: C220OutputAction::CopyToHbm { transfer: plan },
-                        },
-                        record,
-                    },
-                });
-            }
             if self.mte3.is_full() {
                 return Ok(C220CoreStep::Stalled(C220Stall {
                     tick,

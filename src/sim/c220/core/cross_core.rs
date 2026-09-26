@@ -93,33 +93,19 @@ impl C220Core {
             if !self.mte3.physical {
                 return Err(C220CoreError::Mte3FrontendRequired);
             }
-            let pipeline = self
-                .mte_pipeline
-                .as_mut()
-                .ok_or(C220CoreError::MteUnconfigured)?;
-            if !self.mte3.native_commands.is_empty() || !pipeline.mte3_frontend().can_issue() {
-                return Ok(C220CoreStep::Stalled(C220Stall {
-                    tick,
-                    pc,
-                    resume_tick: tick.checked_add(1).ok_or(C220CoreError::TimeOverflow)?,
-                    cause: C220StallCause::Mte3Dependency,
-                }));
-            }
             let value =
                 self.state.scalar().machine().xregs()[usize::from(instruction.source_register)];
-            let record = pipeline.issue_mte3_cross_core(
-                self.next_instruction_id,
-                instruction,
-                C220DeviceSync::from_value(value),
-            )?;
-            self.mte3
-                .native_commands
-                .insert(self.next_instruction_id, (pc, instruction.word));
-            self.state.commit_c220_sequential_issue();
-            return Ok(C220CoreStep::Executed {
+            return self.enqueue_mte3_at(
                 tick,
-                instruction: C220CoreInstruction::Mte3CrossCore(record),
-            });
+                pc,
+                instruction.word,
+                super::C220Mte3Operation::Command(
+                    crate::sim::c220::mte::mte3::frontend::C220Mte3Command::CrossCore {
+                        instruction,
+                        payload: C220DeviceSync::from_value(value),
+                    },
+                ),
+            );
         }
         if instruction.pipe_code == 4 {
             if self.mte_pipeline.is_none() {

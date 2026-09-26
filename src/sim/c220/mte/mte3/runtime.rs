@@ -95,9 +95,9 @@ impl Mte3Engine {
         pipeline: &mut C220MtePipeline,
         ub: &UbMemory,
         memory: &mut MappedMemory,
-    ) -> Result<(), C220Mte3RuntimeError> {
+    ) -> Result<Option<u64>, C220Mte3RuntimeError> {
         let Some(record) = pipeline.mte3_retirement_candidate() else {
-            return Ok(());
+            return Ok(None);
         };
         let &(pc, word) = self
             .native_commands
@@ -119,7 +119,7 @@ impl Mte3Engine {
                         instruction,
                         payload,
                     });
-                return Ok(());
+                return Ok(Some(record.instruction_id));
             }
         };
         let result = copy_c220_mov_ub_to_hbm(
@@ -138,7 +138,7 @@ impl Mte3Engine {
             record,
             result,
         });
-        Ok(())
+        Ok(Some(record.instruction_id))
     }
 
     pub(in crate::sim::c220) fn is_full(&self) -> bool {

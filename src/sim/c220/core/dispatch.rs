@@ -146,6 +146,7 @@ impl C220Core {
                 PipelineBarrierScope::Cube => return self.step_cube_barrier_at(tick, barrier),
                 PipelineBarrierScope::Mte1 => return self.step_mte1_barrier_at(tick, barrier),
                 PipelineBarrierScope::Mte2 => return self.step_mte2_barrier_at(tick, barrier),
+                PipelineBarrierScope::Mte3 => return self.step_mte3_barrier_at(tick, barrier),
                 _ => {}
             }
         }

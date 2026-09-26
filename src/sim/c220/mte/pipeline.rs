@@ -94,6 +94,8 @@ enum Callback {
     Mte1IssueTransfer,
     Mte2IssueProbe,
     Mte2IssueTransfer,
+    Mte3IssueProbe,
+    Mte3IssueTransfer,
     Mte2CommandProbe,
     Mte2CommandDispatch,
     FixpCommandProbe,
@@ -171,6 +173,8 @@ pub enum C220MtePipelineError {
     Mte1DispatchPending,
     #[error("MTE2 frontend must resolve its pending dispatch before resuming the MTE cycle")]
     Mte2DispatchPending,
+    #[error("MTE3 frontend must resolve its pending reception before resuming the MTE cycle")]
+    Mte3IssuePending,
     #[error("MTE1 synchronization callback must be resolved before resuming the cycle")]
     Mte1SyncPending,
     #[error(transparent)]
@@ -383,12 +387,27 @@ pub struct C220MtePipeline {
     mte2_issue_valid: EventId,
     mte2_issue_ready: Option<u64>,
     mte2_issue_pending: bool,
+    mte3_issue_valid: EventId,
+    mte3_issue_ready: Option<u64>,
+    mte3_issue_pending: bool,
     mte2_command_valid: EventId,
     mte2_command_ready: Option<u64>,
     mte2_dispatch_pending: bool,
 }
 
 impl C220MtePipeline {
+    pub(crate) fn set_mte3_issue_head(&mut self, ready: Option<u64>) {
+        self.mte3_issue_ready = ready;
+    }
+
+    pub(crate) fn mte3_issue_pending(&self) -> bool {
+        self.mte3_issue_pending
+    }
+
+    pub(crate) fn finish_mte3_issue(&mut self) {
+        self.mte3_issue_pending = false;
+    }
+
     pub const fn core_kind(&self) -> crate::sim::c220::device::C220CoreKind {
         self.core_kind
     }
@@ -484,6 +503,11 @@ impl C220MtePipeline {
         let issue_transfer = events.add_process(Callback::Mte2IssueTransfer, false);
         events.subscribe(clock, issue_probe);
         events.subscribe(mte2_issue_valid, issue_transfer);
+        let mte3_issue_valid = events.add_event();
+        let issue_probe = events.add_process(Callback::Mte3IssueProbe, false);
+        let issue_transfer = events.add_process(Callback::Mte3IssueTransfer, false);
+        events.subscribe(clock, issue_probe);
+        events.subscribe(mte3_issue_valid, issue_transfer);
         let mte3_events = C220Mte3Events::register(&mut events, clock, Callback::Mte3);
         let fixp_command_valid = events.add_event();
         let probe = events.add_process(Callback::FixpCommandProbe, false);
@@ -611,6 +635,9 @@ impl C220MtePipeline {
             mte2_issue_valid,
             mte2_issue_ready: None,
             mte2_issue_pending: false,
+            mte3_issue_valid,
+            mte3_issue_ready: None,
+            mte3_issue_pending: false,
             mte2_command_valid,
             mte2_command_ready: None,
             mte2_dispatch_pending: false,
@@ -655,6 +682,7 @@ impl C220MtePipeline {
             && self.fixp_issue_ready.is_none()
             && self.mte1_issue_ready.is_none()
             && self.mte2_issue_ready.is_none()
+            && self.mte3_issue_ready.is_none()
             && self.mte2_command_ready.is_none()
             && self.active_cycle.is_none()
             && self.fixp_write.is_idle()
@@ -1271,6 +1299,9 @@ impl C220MtePipeline {
             if self.mte2_dispatch_pending || self.mte2_issue_pending {
                 return Err(C220MtePipelineError::Mte2DispatchPending);
             }
+            if self.mte3_issue_pending {
+                return Err(C220MtePipelineError::Mte3IssuePending);
+            }
             if self.mte1_sync_pending() {
                 return Err(C220MtePipelineError::Mte1SyncPending);
             }
@@ -1361,6 +1392,15 @@ impl C220MtePipeline {
                 }
                 Callback::Mte2IssueTransfer => {
                     self.mte2_issue_pending = true;
+                    return Ok(());
+                }
+                Callback::Mte3IssueProbe => {
+                    if self.mte3_issue_ready.is_some_and(|ready| ready <= tick) {
+                        self.events.notify_at(self.mte3_issue_valid, tick);
+                    }
+                }
+                Callback::Mte3IssueTransfer => {
+                    self.mte3_issue_pending = true;
                     return Ok(());
                 }
                 Callback::Mte2CommandProbe => {

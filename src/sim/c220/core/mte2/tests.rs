@@ -1014,6 +1014,112 @@ fn run_biu_dma(bus_connected: bool) {
 }
 
 #[test]
+fn mte3_queue_and_barriers_order_shared_events_after_destination_acknowledgment() {
+    use crate::isa::c220::mte::CAPTURED_C220_MOV_UB_TO_OUT_WORD;
+    use crate::memory::sparse::MemoryByteState;
+
+    for source in [1, 2] {
+        let mut core = configured_dma_core();
+        core.connect_mte3_dma().unwrap();
+        core.mte3_issue_queue.config.vector_depth = NonZeroU32::new(2).unwrap();
+        core.state
+            .ub
+            .write_states(0, &vec![MemoryByteState::Known(9); 128])
+            .unwrap();
+        let word = CAPTURED_C220_MOV_UB_TO_OUT_WORD;
+        let operands = C220MovInstruction::decode(word).unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(operands.source_register, 0).unwrap();
+        machine
+            .set_xreg(operands.destination_register, 0x2000)
+            .unwrap();
+        machine
+            .set_xreg(operands.descriptor_register, (4 << 16) | (1 << 4))
+            .unwrap();
+        machine.set_xreg(12, 0x1234_5678).unwrap();
+        let flag = |op: u32, src: u32, dest: u32| {
+            (2 << 29) | (op << 21) | (1 << 17) | (src << 10) | (dest << 7) | (12 << 2)
+        };
+        core.step_word_at(0, flag(6, source, 5)).unwrap();
+        let dma_id = core.next_instruction_id();
+        core.step_word_at(1, word).unwrap();
+        let pc = core.state.scalar().pc();
+        assert!(matches!(core.step_word_at(2, 0x40e0_1400).unwrap(),
+            C220CoreStep::Stalled(stall) if stall.cause == C220StallCause::Mte3IssueQueueFull));
+        assert_eq!(core.state.scalar().pc(), pc);
+        assert!(core.connect_mte3_dma().is_err());
+        assert!(matches!(
+            core.step_word_at(3, 0x4140_0000).unwrap(),
+            C220CoreStep::Executed { .. }
+        ));
+        core.step_word_at(4, flag(5, source, 5)).unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(operands.destination_register, 0).unwrap();
+        machine.set_xreg(operands.descriptor_register, 0).unwrap();
+        assert!(matches!(
+            core.step_word_at(7, 0x40e0_1400).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Mte3Barrier {
+                    completed_tick: None,
+                    ..
+                },
+                ..
+            }
+        ));
+        core.step_word_at(8, flag(5, 5, 4)).unwrap();
+        core.step_word_at(9, flag(6, 5, 4)).unwrap();
+        let machine = core.state.scalar_mut().machine_mut();
+        machine.set_xreg(1, 0).unwrap();
+        machine.set_xreg(3, 1 | (2 << 16)).unwrap();
+        machine.set_spr_value(15, 0x4321_4321).unwrap();
+        let fill = (3 << 29) | (1 << 22) | (1 << 17) | (3 << 7) | 6;
+        core.step_word_at(10, fill).unwrap();
+        let mut requests = Vec::new();
+        for tick in 11..60 {
+            core.advance_to(tick).unwrap();
+            if let Some(request) = core.take_mte3_dma_request() {
+                requests.push(request);
+            }
+        }
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].instruction_id, dma_id);
+        assert!(requests[0].last_in_instruction);
+        assert_eq!(core.queued_mte3_instructions().len(), 1);
+        assert_eq!(core.queued_mte2_instructions().len(), 2);
+        assert_eq!(core.pending_mte3_barriers().len(), 1);
+        assert_eq!(
+            core.memory().read_known_at(0x2000, 128).unwrap(),
+            vec![7; 128]
+        );
+        core.acknowledge_mte3_dma_at(60, dma_id, requests[0].uop_index)
+            .unwrap();
+        core.advance_to(61).unwrap();
+        assert_eq!(core.pending_mte3_barriers().len(), 0);
+        assert_eq!(
+            core.memory().read_known_at(0x2000, 128).unwrap(),
+            vec![9; 128]
+        );
+        core.advance_to(100).unwrap();
+        assert!(!core.mte3_is_busy());
+        assert!(!core.mte2_is_busy());
+        assert_eq!(
+            core.local_memory.l1().read_known(0, 64).unwrap(),
+            0x4321_4321_u32.to_le_bytes().repeat(16)
+        );
+        assert!(matches!(
+            core.step_word_at(100, 0x40e0_1400).unwrap(),
+            C220CoreStep::Executed {
+                instruction: C220CoreInstruction::Mte3Barrier {
+                    completed_tick: Some(100),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
 fn mte2_barrier_releases_on_destination_retirement_without_blocking_scalar() {
     for flag_predecessor in [false, true] {
         let mut core = configured_dma_core();

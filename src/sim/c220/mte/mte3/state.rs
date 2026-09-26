@@ -8,7 +8,6 @@ use crate::sim::c220::vector::C220VectorFence;
 pub enum C220OutputDependency {
     NotBefore(u64),
     Vector(C220VectorFence),
-    Mte3(Option<u64>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

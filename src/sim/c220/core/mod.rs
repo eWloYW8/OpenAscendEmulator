@@ -59,6 +59,10 @@ pub use mte2_frontend::{
     C220Mte2FrontendConfig, C220Mte2IssuedInstruction, C220Mte2Operation, C220Mte2QueuedCommand,
 };
 mod mte3;
+mod mte3_barrier;
+pub use mte3_barrier::C220Mte3Barrier;
+mod mte3_frontend;
+pub use mte3_frontend::{C220Mte3IssueQueueConfig, C220Mte3IssuedInstruction, C220Mte3Operation};
 
 use crate::sim::c220::cube::runtime::CubeEngine;
 use crate::sim::c220::mte::mte1::runtime::Mte1Engine;
@@ -81,6 +85,7 @@ pub struct C220CoreConfig {
     pub cube_frontend: crate::sim::c220::cube::frontend::C220CubeFrontendConfig,
     pub mte1_frontend: C220Mte1FrontendConfig,
     pub mte2_frontend: C220Mte2FrontendConfig,
+    pub mte3_issue_queue: C220Mte3IssueQueueConfig,
     pub timing: C220CoreTimingRules,
 }
 
@@ -92,6 +97,7 @@ impl C220CoreConfig {
             cube_frontend: Default::default(),
             mte1_frontend: Default::default(),
             mte2_frontend: Default::default(),
+            mte3_issue_queue: Default::default(),
             timing,
         }
     }
@@ -152,6 +158,7 @@ pub struct C220Core {
     pipeline_events: crate::sim::c220::sync::C220PipelineEvents,
     device_flags: crate::sim::c220::sync::C220DeviceFlagState,
     mte3: Mte3Engine,
+    mte3_issue_queue: mte3_frontend::Mte3IssueQueue,
     cube: CubeEngine,
     cube_frontend: cube_frontend::CubeFrontend,
     vector: VectorEngine,
@@ -179,6 +186,7 @@ impl C220Core {
             cube_frontend,
             mte1_frontend,
             mte2_frontend,
+            mte3_issue_queue,
             timing,
         } = config;
         if state.scalar().machine().architecture() != Architecture::Dav2201 {
@@ -210,6 +218,7 @@ impl C220Core {
             pipeline_events: Default::default(),
             device_flags: crate::sim::c220::sync::C220DeviceFlagState::default(),
             mte3: Mte3Engine::new(timing.mte3),
+            mte3_issue_queue: mte3_frontend::Mte3IssueQueue::new(mte3_issue_queue),
             cube: CubeEngine::new(cube_config)?,
             cube_frontend: cube_frontend::CubeFrontend::new(cube_frontend),
             vector: VectorEngine::new(timing.vector, initial_compare_mask),

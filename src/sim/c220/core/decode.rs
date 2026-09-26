@@ -37,8 +37,8 @@ impl C220DecodedWord {
         let flow_flag = FlagInstruction::decode(Architecture::Dav2201, word);
         let shared_flag_pipe = flow_flag
             .filter(|flag| {
-                matches!(flag.source_pipe_code, 2 | 3 | 4 | 10)
-                    && matches!(flag.trigger_pipe_code, 2 | 3 | 4 | 10)
+                matches!(flag.source_pipe_code, 2 | 3 | 4 | 5 | 10)
+                    && matches!(flag.trigger_pipe_code, 2 | 3 | 4 | 5 | 10)
             })
             .map(|flag| match flag.operation {
                 FlagOperation::Set => flag.source_pipe_code,
@@ -49,6 +49,7 @@ impl C220DecodedWord {
                 2 => C220DispatchKind::CubeFlag,
                 3 => C220DispatchKind::Mte1,
                 4 => C220DispatchKind::Mte2,
+                5 => C220DispatchKind::Mte3,
                 10 => C220DispatchKind::Fixp,
                 _ => unreachable!("shared event route was checked"),
             }

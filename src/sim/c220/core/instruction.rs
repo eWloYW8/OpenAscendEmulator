@@ -19,6 +19,12 @@ pub enum C220CoreInstruction {
         remaining: u32,
     },
     Mte3CrossCore(crate::sim::c220::mte::mte3::frontend::C220Mte3Record),
+    Mte3Queued(super::C220Mte3IssuedInstruction),
+    Mte3Flag(FlagStep),
+    Mte3Barrier {
+        barrier: super::C220Mte3Barrier,
+        completed_tick: Option<u64>,
+    },
     CrossCore(crate::sim::c220::sync::C220CrossCoreReception),
     Preload(super::C220CorePreloadIssue),
     AtomicStore(super::C220CoreAtomicIssue),
