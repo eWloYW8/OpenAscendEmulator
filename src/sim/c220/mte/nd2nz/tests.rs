@@ -8,6 +8,128 @@ use crate::memory::{
 use crate::sim::c220::memory::C220LocalBuffer;
 use std::num::NonZeroU32;
 
+fn staging_request(route: C220Nd2NzReadRoute, bytes: &[u32], padding: u32) -> C220Nd2NzResponse {
+    C220Nd2NzResponse::new(&C220Nd2NzReadRequest {
+        matrix_index: 0,
+        source_address: 0,
+        bytes: bytes.iter().sum(),
+        padding_bytes: padding,
+        elements: bytes
+            .iter()
+            .enumerate()
+            .map(|(row, &bytes)| C220Nd2NzReadElement {
+                row_slot: row as u32,
+                bytes,
+            })
+            .collect(),
+        route,
+        last_in_instruction: true,
+    })
+    .unwrap()
+}
+
+#[test]
+fn per_row_responses_wait_one_cycle_and_preserve_fragment_padding() {
+    let mut staging = C220Nd2NzStaging::new(C220Nd2NzStagingConfig {
+        rows: NonZeroU32::new(2).unwrap(),
+        alignment_depth: 32,
+        small_data_capacity: NonZeroU32::new(64).unwrap(),
+        receive_bandwidth: NonZeroU32::new(32).unwrap(),
+    })
+    .unwrap();
+    let mut response = staging_request(C220Nd2NzReadRoute::PerRow, &[48], 16);
+    assert_eq!(staging.receive(0, &mut response).unwrap(), 32);
+    assert!(!response.is_complete());
+    assert_eq!(staging.stage_lane(0, 0).unwrap(), None);
+    assert_eq!(staging.receive(1, &mut response).unwrap(), 16);
+    assert!(response.is_complete());
+    assert_eq!(staging.stage_lane(1, 0).unwrap(), Some(0));
+    assert_eq!(staging.alignment_bytes(), [48, 0]);
+    assert_eq!(staging.stage_lane(2, 0).unwrap(), None);
+    assert!(!staging.take_write_credit(2, 1, false).unwrap());
+    assert_eq!(staging.alignment_bytes(), [48, 0]);
+    assert_eq!(staging.pending_row_fragments(0), Some(1));
+    assert!(staging.take_write_credit(3, 1, true).unwrap());
+    assert_eq!(staging.stage_lane(3, 0).unwrap(), Some(0));
+    assert_eq!(staging.alignment_bytes(), [48, 0]);
+    assert!(staging.take_write_credit(4, 1, true).unwrap());
+    assert_eq!(staging.alignment_bytes(), [16, 0]);
+    assert!(!staging.is_idle());
+    assert!(matches!(
+        staging.stage_lane(3, 0),
+        Err(C220Nd2NzStagingError::TimeReversed { .. })
+    ));
+    assert!(matches!(
+        staging.take_write_credit(4, 1, true),
+        Err(C220Nd2NzStagingError::RepeatedCallback { .. })
+    ));
+
+    let mut lanes = C220Nd2NzStaging::new(C220Nd2NzStagingConfig {
+        rows: NonZeroU32::new(8).unwrap(),
+        ..staging.config()
+    })
+    .unwrap();
+    let mut lower = staging_request(C220Nd2NzReadRoute::PerRow, &[64], 0);
+    let mut upper = C220Nd2NzResponse::new(&C220Nd2NzReadRequest {
+        matrix_index: 0,
+        source_address: 0,
+        bytes: 32,
+        padding_bytes: 0,
+        elements: vec![C220Nd2NzReadElement {
+            row_slot: 4,
+            bytes: 32,
+        }],
+        route: C220Nd2NzReadRoute::PerRow,
+        last_in_instruction: true,
+    })
+    .unwrap();
+    lanes.receive(0, &mut lower).unwrap();
+    lanes.receive(1, &mut upper).unwrap();
+    lanes.receive(2, &mut lower).unwrap();
+    assert_eq!(lanes.stage_lane(2, 0).unwrap(), Some(0));
+    assert_eq!(lanes.pending_row_fragments(4), Some(1));
+    assert_eq!(lanes.stage_lane(3, 0).unwrap(), Some(4));
+    assert_eq!(lanes.pending_row_fragments(0), Some(1));
+}
+
+#[test]
+fn small_data_retains_blocked_batch_heads_and_shared_capacity() {
+    let mut staging = C220Nd2NzStaging::new(C220Nd2NzStagingConfig {
+        rows: NonZeroU32::new(2).unwrap(),
+        alignment_depth: 32,
+        small_data_capacity: NonZeroU32::new(64).unwrap(),
+        receive_bandwidth: NonZeroU32::new(64).unwrap(),
+    })
+    .unwrap();
+    let mut first = staging_request(C220Nd2NzReadRoute::ContiguousRows, &[32, 32], 0);
+    let mut second = first.clone();
+    let mut third = first.clone();
+    assert_eq!(staging.receive(0, &mut first).unwrap(), 64);
+    assert_eq!(staging.stage_small(0).unwrap(), 0);
+    assert_eq!(staging.receive(1, &mut second).unwrap(), 0);
+    assert_eq!(staging.stage_small(1).unwrap(), 64);
+    assert_eq!(staging.receive(2, &mut second).unwrap(), 64);
+    assert_eq!(staging.stage_small(3).unwrap(), 0);
+    assert!(staging.take_write_credit(3, 1, true).unwrap());
+    assert_eq!(staging.stage_small(4).unwrap(), 32);
+    assert_eq!(staging.small_data_bytes(), 32);
+    assert_eq!(staging.alignment_bytes(), [32, 32]);
+    assert_eq!(staging.receive(4, &mut third).unwrap(), 32);
+    assert_eq!(third.remaining_bytes(), 32);
+    assert_eq!(staging.pending_small_batches(), 2);
+    assert!(staging.take_write_credit(4, 2, true).unwrap());
+    assert_eq!(staging.stage_small(5).unwrap(), 32);
+    assert_eq!(staging.alignment_bytes(), [0, 32]);
+    assert_eq!(staging.pending_small_batches(), 1);
+    assert_eq!(staging.stage_small(6).unwrap(), 32);
+    assert!(staging.take_write_credit(6, 2, true).unwrap());
+    assert_eq!(staging.receive(6, &mut third).unwrap(), 32);
+    assert!(third.is_complete());
+    assert_eq!(staging.stage_small(7).unwrap(), 32);
+    assert_eq!(staging.alignment_bytes(), [0, 32]);
+    assert_eq!(staging.small_data_bytes(), 0);
+}
+
 #[test]
 fn read_plans_retain_row_priority_splits_and_response_elements() {
     use crate::isa::c220::mte::nd2nz::C220Nd2NzTransfer;
