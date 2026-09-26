@@ -1027,7 +1027,7 @@ fn native_mte3_write_path(mode: u8, encoding: u8) {
         },
     )
     .unwrap();
-    core.configure_mte3_atomics(crate::sim::c220::mte::atomic::C220AtomicConfig {
+    core.configure_mte_atomics(crate::sim::c220::mte::atomic::C220AtomicConfig {
         enabled: true,
         ..Default::default()
     })
@@ -1148,7 +1148,7 @@ fn native_mte3_write_path(mode: u8, encoding: u8) {
         .machine_mut()
         .set_xreg(10, 0)
         .unwrap();
-    assert!(core.configure_mte3_atomics(Default::default()).is_err());
+    assert!(core.configure_mte_atomics(Default::default()).is_err());
     core.state
         .scalar_mut()
         .machine_mut()

@@ -530,9 +530,7 @@ mod tests {
         use crate::memory::region::MemoryRegion;
         use crate::sim::c220::core::C220CoreFixpConfig;
         use crate::sim::c220::memory::C220LocalBuffer;
-        use crate::sim::c220::mte::fixp::{
-            C220AtomicConfig, C220FixpEngineConfig, C220FixpRuntimeStage::*,
-        };
+        use crate::sim::c220::mte::fixp::{C220FixpEngineConfig, C220FixpRuntimeStage::*};
         use crate::sim::c220::mte::interface::biu_write::command::C220BiuWriteConfig;
         use crate::sim::c220::schedule::{C220Stall, C220StallCause};
         let mut core = matrix_core();
@@ -561,7 +559,6 @@ mod tests {
                 },
                 main_transpose_slots: 8,
                 total_transpose_slots: 16,
-                atomics: C220AtomicConfig::default(),
             },
             C220LocalBuffer::new(4096),
             &[
@@ -657,6 +654,18 @@ mod tests {
             [1; 128]
         );
         assert!(core.fixp_engine().unwrap().is_idle());
+        let atomics = crate::sim::c220::mte::atomic::C220AtomicConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        core.configure_mte_atomics(atomics).unwrap();
+        assert_eq!(core.mte_atomics(), atomics);
+        core.memory.write_known_at(4096, &[2; 128]).unwrap();
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_spr_value(3, 5 << 6)
+            .unwrap();
         assert!(matches!(
             core.step_word_at(401, word).unwrap(),
             C220CoreStep::Executed {
@@ -665,6 +674,8 @@ mod tests {
             }
         ));
         assert_eq!(core.state.scalar().pc(), pc + 8);
+        assert!(core.configure_mte_atomics(Default::default()).is_err());
+        assert_eq!(core.mte_atomics(), atomics);
         assert!(!core.activity().is_idle());
         assert!(core.fixp_engine().unwrap().hardware_flag_trigger_ready());
         core.state
@@ -767,8 +778,14 @@ mod tests {
         assert!(trigger_blocked && trigger_released);
         assert!(core.fixp_runtime().unwrap().is_idle());
         assert!(core.activity().is_idle());
-        assert_eq!(core.memory.read_known_at(4096, 128).unwrap(), [1; 128]);
+        assert_eq!(core.memory.read_known_at(4096, 128).unwrap(), [3; 128]);
         assert_eq!(core.memory.read_known_at(4224, 128).unwrap(), [0; 128]);
+        core.configure_mte_atomics(Default::default()).unwrap();
+        core.state
+            .scalar_mut()
+            .machine_mut()
+            .set_spr_value(3, 0)
+            .unwrap();
         core.advance_to(1000).unwrap();
         core.local_memory
             .l1_mut()
@@ -839,7 +856,7 @@ mod tests {
                 [0; 30]
             );
         }
-        assert_eq!(core.memory.read_known_at(4096, 128).unwrap(), [1; 128]);
+        assert_eq!(core.memory.read_known_at(4096, 128).unwrap(), [3; 128]);
     }
 
     #[test]

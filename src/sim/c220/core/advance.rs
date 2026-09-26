@@ -116,7 +116,7 @@ impl C220Core {
                             l1,
                             slopes: &fixp.factors,
                             external: &mut self.memory,
-                            atomics: fixp.atomics,
+                            atomics: self.mte_atomics,
                         },
                         fixp.bindings.resolver(&mut self.hardware_flags),
                     )?;
@@ -188,8 +188,12 @@ impl C220Core {
                 pipeline.advance_ub_service(self.vector.ub_activity_at(event_tick))?;
             }
             let previous_mte3_outcomes = self.mte3.outcomes.len();
-            self.mte3
-                .commit_ready_at(event_tick, self.state.ub(), &mut self.memory)?;
+            self.mte3.commit_ready_at(
+                event_tick,
+                self.state.ub(),
+                &mut self.memory,
+                self.mte_atomics,
+            )?;
             for outcome in &self.mte3.outcomes[previous_mte3_outcomes..] {
                 self.pipeline_events
                     .retire(5, outcome.instruction_id, outcome.tick);
@@ -201,6 +205,7 @@ impl C220Core {
                     pipeline,
                     self.state.ub(),
                     &mut self.memory,
+                    self.mte_atomics,
                 )?
             {
                 self.pipeline_events.retire(5, id, event_tick);

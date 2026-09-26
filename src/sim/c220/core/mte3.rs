@@ -12,18 +12,6 @@ use crate::sim::c220::mte::interface::ub_read::{C220UbReadAcknowledgment, C220Ub
 use std::num::NonZeroU32;
 
 impl C220Core {
-    /// Changes model-level arithmetic only while the output engine is idle.
-    pub fn configure_mte3_atomics(
-        &mut self,
-        config: crate::sim::c220::mte::atomic::C220AtomicConfig,
-    ) -> Result<(), C220CoreError> {
-        if self.mte3_is_busy() {
-            return Err(C220CoreError::MtePipelineBusy);
-        }
-        self.mte3.atomics = config;
-        Ok(())
-    }
-
     /// Connects MTE3 through the core BIU write route. The caller supplies a
     /// downstream bus/memory endpoint, not direct MTE acknowledgments.
     pub fn connect_mte3_bus(

@@ -70,6 +70,7 @@ mod mte3_frontend;
 pub use mte3_frontend::{C220Mte3IssueQueueConfig, C220Mte3IssuedInstruction, C220Mte3Operation};
 
 use crate::sim::c220::cube::runtime::CubeEngine;
+use crate::sim::c220::mte::atomic::C220AtomicConfig;
 use crate::sim::c220::mte::mte1::runtime::Mte1Engine;
 use crate::sim::c220::mte::mte3::runtime::Mte3Engine;
 use crate::sim::c220::vector::runtime::VectorEngine;
@@ -85,6 +86,7 @@ pub use instruction::C220CoreInstruction;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct C220CoreConfig {
+    pub mte_atomics: C220AtomicConfig,
     pub device: C220Device,
     pub cube: C220CubeConfig,
     pub cube_frontend: crate::sim::c220::cube::frontend::C220CubeFrontendConfig,
@@ -98,6 +100,7 @@ pub struct C220CoreConfig {
 impl C220CoreConfig {
     pub fn new(timing: C220CoreTimingRules) -> Self {
         Self {
+            mte_atomics: Default::default(),
             device: C220Device::default(),
             cube: C220CubeConfig::default(),
             cube_frontend: Default::default(),
@@ -147,6 +150,7 @@ pub struct C220CoreRun {
 }
 
 pub struct C220Core {
+    mte_atomics: C220AtomicConfig,
     clock: C220IssueClock,
     next_instruction_id: u64,
     device: C220Device,
@@ -189,6 +193,7 @@ impl C220Core {
         config: C220CoreConfig,
     ) -> Result<Self, C220CoreError> {
         let C220CoreConfig {
+            mte_atomics,
             device,
             cube: cube_config,
             cube_frontend,
@@ -206,6 +211,7 @@ impl C220Core {
             state.scalar().machine().spr_value(105).unwrap_or_default(),
         ]);
         Ok(Self {
+            mte_atomics,
             clock: C220IssueClock::default(),
             next_instruction_id: 0,
             device,
@@ -239,6 +245,25 @@ impl C220Core {
 
     pub const fn device(&self) -> C220Device {
         self.device
+    }
+
+    pub const fn mte_atomics(&self) -> C220AtomicConfig {
+        self.mte_atomics
+    }
+
+    /// Sets the shared FIX/MTE output arithmetic policy while both paths are idle.
+    pub fn configure_mte_atomics(&mut self, config: C220AtomicConfig) -> Result<(), C220CoreError> {
+        if self.mte3_is_busy()
+            || !self.fixp_frontend.is_idle()
+            || self
+                .external_fixp
+                .as_ref()
+                .is_some_and(|fixp| !fixp.engine.is_idle() || !fixp.bindings.is_idle())
+        {
+            return Err(C220CoreError::MtePipelineBusy);
+        }
+        self.mte_atomics = config;
+        Ok(())
     }
 
     pub const fn next_instruction_id(&self) -> u64 {

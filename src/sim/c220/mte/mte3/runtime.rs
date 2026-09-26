@@ -48,7 +48,6 @@ pub struct C220Mte3DmaOutcome {
 }
 
 pub(in crate::sim::c220) struct Mte3Engine {
-    pub(in crate::sim::c220) atomics: crate::sim::c220::mte::atomic::C220AtomicConfig,
     pub(in crate::sim::c220) timing: C220TimedMte3Lane,
     pending: VecDeque<C220Mte3CommandState>,
     pub(in crate::sim::c220) outcomes: Vec<C220Mte3Outcome>,
@@ -90,7 +89,6 @@ impl Mte3Engine {
 
     pub(in crate::sim::c220) fn new(rules: C220Mte3TimingRules) -> Self {
         Self {
-            atomics: Default::default(),
             timing: C220TimedMte3Lane::new(rules),
             pending: VecDeque::new(),
             outcomes: Vec::new(),
@@ -113,6 +111,7 @@ impl Mte3Engine {
         pipeline: &mut C220MtePipeline,
         ub: &UbMemory,
         memory: &mut MappedMemory,
+        atomics: crate::sim::c220::mte::atomic::C220AtomicConfig,
     ) -> Result<Option<u64>, C220Mte3RuntimeError> {
         let Some(record) = pipeline.mte3_retirement_candidate() else {
             return Ok(None);
@@ -122,9 +121,7 @@ impl Mte3Engine {
             .get(&record.instruction_id)
             .ok_or(C220Mte3RuntimeError::UnknownCommand(record.instruction_id))?;
         let result = match record.command {
-            super::frontend::C220Mte3Command::Dma(plan) => {
-                plan.execute(ub, memory, self.atomics)?
-            }
+            super::frontend::C220Mte3Command::Dma(plan) => plan.execute(ub, memory, atomics)?,
             super::frontend::C220Mte3Command::MovPad(command) => {
                 crate::sim::c220::mte::mov_pad::prepare_c220_mov_pad(
                     command.transfer,
@@ -135,7 +132,7 @@ impl Mte3Engine {
                 .commit_to_external_with_atomics(
                     memory,
                     command.control,
-                    self.atomics,
+                    atomics,
                 )?
             }
             super::frontend::C220Mte3Command::CrossCore {
@@ -188,12 +185,13 @@ impl Mte3Engine {
         tick: u64,
         ub: &UbMemory,
         memory: &mut MappedMemory,
+        atomics: crate::sim::c220::mte::atomic::C220AtomicConfig,
     ) -> Result<(), C220TransferError> {
         if let Some(pending) = self.pending.front()
             && tick >= pending.ticket.retire_tick
         {
             let plan = pending.ticket.transfer;
-            let result = plan.execute(ub, memory, self.atomics)?;
+            let result = plan.execute(ub, memory, atomics)?;
             self.outcomes.push(C220Mte3Outcome {
                 instruction_id: pending.instruction_id,
                 tick,
@@ -255,11 +253,11 @@ mod tests {
         .unwrap();
         let ub = UbMemory::new(256, 256);
         engine
-            .commit_ready_at(head.data_ready_tick, &ub, &mut memory)
+            .commit_ready_at(head.data_ready_tick, &ub, &mut memory, Default::default())
             .unwrap();
         assert!(engine.is_full());
         engine
-            .commit_ready_at(head.retire_tick, &ub, &mut memory)
+            .commit_ready_at(head.retire_tick, &ub, &mut memory, Default::default())
             .unwrap();
         assert!(!engine.is_full());
         assert_eq!(engine.outcomes.len(), 1);
