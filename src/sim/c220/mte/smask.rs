@@ -102,11 +102,7 @@ mod tests {
         let source_base = (1_u64 << 40) + 4096;
         let bytes: Vec<u8> = (0..510).map(|i| (i / 2) as u8).collect();
         let source = MappedMemory::bind(
-            SparseMemory::new(
-                vec![MemoryRegion::new(512, bytes).unwrap()],
-                16,
-                1024,
-            ),
+            SparseMemory::new(vec![MemoryRegion::new(512, bytes).unwrap()], 16, 1024),
             &[source_base],
         )
         .unwrap();

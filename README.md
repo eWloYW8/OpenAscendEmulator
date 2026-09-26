@@ -51,7 +51,8 @@ Cube numerical helpers are private; execution results
 and timing state remain inspectable.
 
 `mte/mte1/{bias,load2d}/` own data movement and lazy physical request expansion.
-`mte/mte1/frontend.rs` provides independent BT and LOAD2D generation engines.
+`mte/read/` owns the shared L1 read-generation engines for LOAD3Dv2, LOAD2D,
+BT and SMASK, independently of command-lane admission and retirement.
 They share one `C220MteL1Interface` instead of owning separate read/output lanes.
 The shared interface owns bounded input queues, unique request IDs, in-flight
 response tracking and output scheduling. L1 bank arbitration and transport stay

@@ -58,9 +58,9 @@ use crate::sim::c220::mte::set2d::{
 };
 use std::num::NonZeroU32;
 
-use super::mte1::frontend::{
-    C220Mte1ReadBandwidths, C220Mte1ReadEventOutcome, C220Mte1ReadEvents, C220Mte1ReadFrontend,
-    C220Mte1ReadFrontendError, C220Mte1ReadKind, C220Mte1ReadUop,
+use super::read::{
+    C220MteReadBandwidths, C220MteReadEventOutcome, C220MteReadEvents, C220MteReadFrontend,
+    C220MteReadFrontendError, C220MteReadKind, C220MteReadUop,
 };
 use crate::sim::c220::memory::l1::{
     C220L1Callback, C220L1EventOutcome, C220L1Events, C220L1Geometry, C220L1Port, C220L1Transport,
@@ -82,7 +82,7 @@ pub struct C220MtePipelineConfig {
     pub core_kind: crate::sim::c220::device::C220CoreKind,
     pub l1: C220L1Geometry,
     pub read_width: NonZeroU32,
-    pub output_bandwidths: C220Mte1ReadBandwidths,
+    pub output_bandwidths: C220MteReadBandwidths,
     pub set2d_bandwidths: C220Set2dBandwidths,
 }
 
@@ -109,7 +109,7 @@ enum Callback {
     Interface(C220MteL1Callback),
     L1Write(C220MteL1WriteCallback),
     L0(bool, C220L0WriteCallback),
-    Generator(C220Mte1ReadKind, C220MteGeneratorCallback),
+    Generator(C220MteReadKind, C220MteGeneratorCallback),
     Set2d(C220MteGeneratorCallback),
     Set2dL1(C220MteGeneratorCallback),
     Dma(C220MteGeneratorCallback),
@@ -137,7 +137,7 @@ pub enum C220MtePipelineEvent {
     L1Write(C220MteL1WriteEventOutcome),
     L0a(C220L0WriteEventOutcome),
     L0b(C220L0WriteEventOutcome),
-    Generator(C220Mte1ReadKind, C220Mte1ReadEventOutcome),
+    Generator(C220MteReadKind, C220MteReadEventOutcome),
     Set2d(C220Set2dEventOutcome),
     Set2dL1(C220Set2dEventOutcome),
     Dma(C220DmaEventOutcome),
@@ -274,7 +274,7 @@ pub enum C220MtePipelineError {
     #[error(transparent)]
     Events(#[from] EventError),
     #[error(transparent)]
-    Generator(#[from] C220Mte1ReadFrontendError),
+    Generator(#[from] C220MteReadFrontendError),
     #[error(transparent)]
     Interface(#[from] C220MteL1Error),
     #[error(transparent)]
@@ -298,7 +298,7 @@ mod sync;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220MteReadPayload {
-    Mte1(C220Mte1ReadUop),
+    Read(C220MteReadUop),
     Factor(super::factor::C220FactorReadPacket),
 }
 #[cfg(test)]
@@ -322,7 +322,7 @@ pub struct C220MtePipeline {
     interface_events: C220MteL1Events,
     write_events: C220MteL1WriteEvents,
     l0_events: [C220L0WriteEvents; 2],
-    generator_events: [C220Mte1ReadEvents; 4],
+    generator_events: [C220MteReadEvents; 4],
     set2d_events: C220Set2dEvents,
     set2d_l1_events: C220Set2dEvents,
     dma_events: C220DmaEvents,
@@ -336,7 +336,7 @@ pub struct C220MtePipeline {
     interface: C220MteL1Interface<C220MteReadPayload>,
     write_interface: C220MteL1WriteInterface,
     l0: [C220L0WritePipeline; 2],
-    generators: [C220Mte1ReadFrontend; 4],
+    generators: [C220MteReadFrontend; 4],
     set2d: C220Set2dFrontend,
     set2d_l1: C220Set2dFrontend,
     dma: C220DmaFrontend,
@@ -532,8 +532,8 @@ impl C220MtePipeline {
         let l0_events = [false, true].map(|b| {
             C220L0WriteEvents::register(&mut events, clock, |phase| Callback::L0(b, phase))
         });
-        let generator_events = C220Mte1ReadKind::ALL.map(|kind| {
-            C220Mte1ReadEvents::register(&mut events, clock, |phase| {
+        let generator_events = C220MteReadKind::ALL.map(|kind| {
+            C220MteReadEvents::register(&mut events, clock, |phase| {
                 Callback::Generator(kind, phase)
             })
         });
@@ -590,8 +590,8 @@ impl C220MtePipeline {
             interface: C220MteL1Interface::default(),
             write_interface: C220MteL1WriteInterface::default(),
             l0: std::array::from_fn(|_| C220L0WritePipeline::default()),
-            generators: C220Mte1ReadKind::ALL.map(|kind| {
-                C220Mte1ReadFrontend::new(kind, config.read_width, config.output_bandwidths)
+            generators: C220MteReadKind::ALL.map(|kind| {
+                C220MteReadFrontend::new(kind, config.read_width, config.output_bandwidths)
             }),
             selected_generator: None,
             set2d: C220Set2dFrontend::new(config.set2d_bandwidths),
@@ -688,7 +688,7 @@ impl C220MtePipeline {
             && self.fixp_write.is_idle()
             && self.biu_cube_source.is_idle()
             && self.fixp_stores.is_empty()
-            && self.generators.iter().all(C220Mte1ReadFrontend::is_idle)
+            && self.generators.iter().all(C220MteReadFrontend::is_idle)
             && self.set2d.is_idle()
             && self.set2d_l1.is_idle()
             && self.dma.is_idle()
@@ -744,7 +744,7 @@ impl C220MtePipeline {
     pub fn next_fixp_event_tick(&self, engine: &C220FixpEngine) -> Option<u64> {
         (!self.is_idle() || !engine.is_idle()).then(|| self.events.tick().saturating_add(1))
     }
-    pub fn generator(&self, kind: C220Mte1ReadKind) -> &C220Mte1ReadFrontend {
+    pub fn generator(&self, kind: C220MteReadKind) -> &C220MteReadFrontend {
         &self.generators[kind.index()]
     }
     pub fn set2d_generator(&self) -> &C220Set2dFrontend {
@@ -1817,7 +1817,7 @@ impl C220MtePipeline {
                             if output.fragment.last_in_instruction =>
                         {
                             match output.payload.operation.payload {
-                                C220MteReadPayload::Mte1(_) => {
+                                C220MteReadPayload::Read(_) => {
                                     self.completions.push(output.fragment.instruction_id)
                                 }
                                 C220MteReadPayload::Factor(_) => {

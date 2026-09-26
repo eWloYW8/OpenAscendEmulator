@@ -7,8 +7,8 @@ use crate::isa::c220::mte::set2d::C220Set2dInstruction;
 use crate::isa::c220::mte::spr::C220Mte1SprWrite;
 use crate::isa::flow::FlagInstruction;
 use crate::sim::c220::mte::mte1::C220Mte1Command;
-use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadTransfer;
 use crate::sim::c220::mte::mte1::load2d::C220Load2dTransferError;
+use crate::sim::c220::mte::read::C220MteReadTransfer;
 
 use crate::sim::c220::schedule::C220Stall;
 
@@ -85,7 +85,7 @@ impl C220Core {
                 ),
             })
         } else if let Some(command) = self.capture_load3d_v2(word)? {
-            Some(C220Mte1Command::Read(C220Mte1ReadTransfer::Load3dv2(
+            Some(C220Mte1Command::Read(C220MteReadTransfer::Load3dv2(
                 command,
             )))
         } else if let Some(decoded) = C220Set2dInstruction::decode(word) {
@@ -99,29 +99,29 @@ impl C220Core {
         } else if let Some(decoded) =
             C220Load2dInstruction::decode(word).filter(|instruction| instruction.is_mte1())
         {
-            Some(C220Mte1Command::Read(C220Mte1ReadTransfer::Load2d(
+            Some(C220Mte1Command::Read(C220MteReadTransfer::Load2d(
                 decoded
                     .capture(registers)
                     .map_err(C220Load2dTransferError::from)?,
             )))
         } else if let Some(decoded) = C220Load2dSparseInstruction::decode(word) {
-            Some(C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dSparse(
+            Some(C220Mte1Command::Read(C220MteReadTransfer::Load2dSparse(
                 decoded.capture(registers),
             )))
         } else if let Some(decoded) = C220Load2dTransposeInstruction::decode(word) {
-            Some(C220Mte1Command::Read(
-                C220Mte1ReadTransfer::Load2dTranspose(decoded.capture(registers)),
-            ))
+            Some(C220Mte1Command::Read(C220MteReadTransfer::Load2dTranspose(
+                decoded.capture(registers),
+            )))
         } else if let Some(decoded) =
             crate::isa::c220::mte::smask::C220MovSmaskInstruction::decode(word)
                 .filter(|instruction| instruction.source_mode == 2)
         {
-            Some(C220Mte1Command::Read(C220Mte1ReadTransfer::Smask(
+            Some(C220Mte1Command::Read(C220MteReadTransfer::Smask(
                 decoded.capture(registers),
             )))
         } else {
             C220MovL1ToBtInstruction::decode(word).map(|decoded| {
-                C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(decoded.capture(registers)))
+                C220Mte1Command::Read(C220MteReadTransfer::Bt(decoded.capture(registers)))
             })
         };
         if let Some(command) = command {

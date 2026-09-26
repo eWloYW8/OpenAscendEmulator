@@ -1,11 +1,11 @@
-use super::frontend::{C220Mte1ReadIssue, C220Mte1ReadKind, C220Mte1ReadTransfer};
+use super::super::read::{C220MteReadIssue, C220MteReadKind, C220MteReadTransfer};
 use crate::isa::c220::mte::set2d::C220Set2dFill;
 use crate::sim::c220::mte::set2d::C220Set2dIssue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C220Mte1Generator {
     Load3d,
-    Read(C220Mte1ReadKind),
+    Read(C220MteReadKind),
     Set2d,
 }
 
@@ -17,7 +17,7 @@ pub enum C220Mte1Command {
         instruction: crate::isa::c220::control::C220SetCrossCoreInstruction,
         payload: crate::sim::c220::sync::C220DeviceSync,
     },
-    Read(C220Mte1ReadTransfer),
+    Read(C220MteReadTransfer),
     Set2d(C220Set2dFill),
 }
 
@@ -49,8 +49,8 @@ pub struct C220Mte1Issue {
     pub completion_ready: bool,
 }
 
-impl From<C220Mte1ReadIssue> for C220Mte1Issue {
-    fn from(issue: C220Mte1ReadIssue) -> Self {
+impl From<C220MteReadIssue> for C220Mte1Issue {
+    fn from(issue: C220MteReadIssue) -> Self {
         Self {
             tick: issue.tick,
             instruction_id: issue.instruction_id,

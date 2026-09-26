@@ -5,8 +5,8 @@ use crate::memory::{region::MemoryRegion, sparse::SparseMemory};
 use crate::sim::c220::memory::C220LocalBuffer;
 use crate::sim::c220::memory::l1::C220L1Geometry;
 use crate::sim::c220::mte::{
-    interface::biu_write::command::C220BiuWriteConfig, mte1::frontend::C220Mte1ReadBandwidths,
-    pipeline::C220MtePipelineConfig, set2d::C220Set2dBandwidths,
+    interface::biu_write::command::C220BiuWriteConfig, pipeline::C220MtePipelineConfig,
+    read::C220MteReadBandwidths, set2d::C220Set2dBandwidths,
 };
 use std::num::NonZeroU32;
 
@@ -51,7 +51,7 @@ fn external_engine_executes_layouts_and_waits_for_ordered_retirement() {
                 core_kind,
                 l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
                 read_width: width,
-                output_bandwidths: C220Mte1ReadBandwidths {
+                output_bandwidths: C220MteReadBandwidths {
                     l0a: width,
                     l0b: width,
                     bt: width,

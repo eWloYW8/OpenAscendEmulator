@@ -71,10 +71,10 @@ mod tests {
     use crate::memory::{mapped::MappedMemory, sparse::SparseMemory, ub::UbMemory};
     use crate::sim::c220::core::{C220CoreInstruction, C220CoreStep, C220CoreTimingRules};
     use crate::sim::c220::memory::l1::C220L1Geometry;
-    use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadBandwidths;
     use crate::sim::c220::mte::mte1::{C220Mte1Command, C220Mte1Generator};
     use crate::sim::c220::mte::mte2::C220Mte2TimingRules;
     use crate::sim::c220::mte::mte3::C220Mte3TimingRules;
+    use crate::sim::c220::mte::read::C220MteReadBandwidths;
     use crate::sim::c220::mte::{C220MtePipelineConfig, C220MtePipelineEvent};
     use crate::sim::c220::state::C220State;
     use crate::sim::c220::vector::pipeline::C220VectorTimingRules;
@@ -937,7 +937,7 @@ mod tests {
             core_kind: crate::sim::c220::device::C220CoreKind::Cube,
             l1: C220L1Geometry::new(32, 4, 1, 0).unwrap(),
             read_width: NonZeroU32::new(256).unwrap(),
-            output_bandwidths: C220Mte1ReadBandwidths {
+            output_bandwidths: C220MteReadBandwidths {
                 l0a: NonZeroU32::new(256).unwrap(),
                 l0b: NonZeroU32::new(128).unwrap(),
                 bt: NonZeroU32::new(64).unwrap(),
@@ -2362,7 +2362,7 @@ mod tests {
     fn smask_core_dispatch_reads_l1_and_commits_after_output_completion() {
         use crate::sim::c220::mte::interface::C220MteL1EventOutcome;
         use crate::sim::c220::mte::mte1::C220Mte1TransferResult;
-        use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadKind;
+        use crate::sim::c220::mte::read::C220MteReadKind;
 
         let mut core = matrix_core();
         core.advance_to(300).unwrap();
@@ -2413,7 +2413,7 @@ mod tests {
         assert_eq!(retired.retire_tick, output_tail.unwrap() + 6);
         assert_eq!(
             core.mte_pipeline().unwrap().selected_generator(),
-            Some(C220Mte1Generator::Read(C220Mte1ReadKind::Smask))
+            Some(C220Mte1Generator::Read(C220MteReadKind::Smask))
         );
         let C220Mte1TransferResult::Smask(result) = retired.result else {
             panic!("SMASK result")
@@ -2436,7 +2436,7 @@ mod tests {
     fn bt_switches_after_load2d_generation_and_commits_after_local_completion() {
         use crate::sim::c220::mte::interface::C220MteL1EventOutcome;
         use crate::sim::c220::mte::mte1::C220Mte1TransferResult;
-        use crate::sim::c220::mte::mte1::frontend::{C220Mte1ReadKind, C220Mte1ReadTransfer};
+        use crate::sim::c220::mte::read::{C220MteReadKind, C220MteReadTransfer};
 
         let mut core = matrix_core();
         let machine = core.state.scalar_mut().machine_mut();
@@ -2463,7 +2463,7 @@ mod tests {
                             instruction:
                                 C220CoreInstruction::Mte1 {
                                     instruction_id,
-                                    command: C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(_)),
+                                    command: C220Mte1Command::Read(C220MteReadTransfer::Bt(_)),
                                     ..
                                 },
                             ..
@@ -2476,7 +2476,7 @@ mod tests {
         assert!(core.pending_mte1_commands().any(|p| p.instruction_id < id));
         assert_eq!(
             core.mte_pipeline().unwrap().selected_generator(),
-            Some(C220Mte1Generator::Read(C220Mte1ReadKind::Bt))
+            Some(C220Mte1Generator::Read(C220MteReadKind::Bt))
         );
         let trigger = set | (1 << 19) | 1;
         assert!(matches!(

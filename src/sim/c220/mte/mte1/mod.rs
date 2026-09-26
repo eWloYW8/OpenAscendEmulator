@@ -1,6 +1,5 @@
 pub mod bias;
 mod command;
-pub mod frontend;
 pub mod load2d;
 pub mod sparse;
 pub(crate) mod spr;

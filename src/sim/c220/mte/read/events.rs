@@ -1,27 +1,27 @@
 use super::{
-    C220Mte1ReadFrontend, C220Mte1ReadFrontendError, C220Mte1ReadGenerated, C220Mte1ReadIssue,
-    C220Mte1ReadSend, C220Mte1ReadTransfer, C220Mte1ReadUop,
+    C220MteReadFrontend, C220MteReadFrontendError, C220MteReadGenerated, C220MteReadIssue,
+    C220MteReadSend, C220MteReadTransfer, C220MteReadUop,
 };
 use crate::sim::c220::mte::generator::{C220MteGeneratorCallback, GeneratorEvents};
 use crate::sim::c220::mte::interface::C220MteL1Interface;
 use crate::sim::common::event::{EventDispatcher, EventId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum C220Mte1ReadEventOutcome {
+pub enum C220MteReadEventOutcome {
     Readiness,
-    Generated(Option<C220Mte1ReadGenerated>),
-    Sent(C220Mte1ReadSend),
+    Generated(Option<C220MteReadGenerated>),
+    Sent(C220MteReadSend),
 }
 
 /// One binding per LOAD2D or BT generator; both may feed the same L1 interface.
 /// Registration order determines producer callback order on the shared clock.
 /// Do not mix direct frontend callbacks with this binding for the same engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220Mte1ReadEvents {
+pub struct C220MteReadEvents {
     queues: GeneratorEvents,
 }
 
-impl C220Mte1ReadEvents {
+impl C220MteReadEvents {
     pub fn register<T: Copy>(
         events: &mut EventDispatcher<T>,
         clock: EventId,
@@ -35,10 +35,10 @@ impl C220Mte1ReadEvents {
     pub fn issue<T: Copy>(
         &self,
         events: &mut EventDispatcher<T>,
-        frontend: &mut C220Mte1ReadFrontend,
+        frontend: &mut C220MteReadFrontend,
         instruction_id: u64,
-        transfer: C220Mte1ReadTransfer,
-    ) -> Result<C220Mte1ReadIssue, C220Mte1ReadFrontendError> {
+        transfer: C220MteReadTransfer,
+    ) -> Result<C220MteReadIssue, C220MteReadFrontendError> {
         let issue = frontend.issue(events.tick(), instruction_id, transfer)?;
         if !issue.completion_ready {
             self.queues.arm_instruction(events);
@@ -50,10 +50,10 @@ impl C220Mte1ReadEvents {
         &self,
         callback: C220MteGeneratorCallback,
         events: &mut EventDispatcher<T>,
-        frontend: &mut C220Mte1ReadFrontend,
+        frontend: &mut C220MteReadFrontend,
         hardware_sync_blocked: bool,
-        interface: &mut C220MteL1Interface<C220Mte1ReadUop>,
-    ) -> Result<C220Mte1ReadEventOutcome, C220Mte1ReadFrontendError> {
+        interface: &mut C220MteL1Interface<C220MteReadUop>,
+    ) -> Result<C220MteReadEventOutcome, C220MteReadFrontendError> {
         self.handle_mapped(
             callback,
             events,
@@ -68,35 +68,35 @@ impl C220Mte1ReadEvents {
         &self,
         callback: C220MteGeneratorCallback,
         events: &mut EventDispatcher<T>,
-        frontend: &mut C220Mte1ReadFrontend,
+        frontend: &mut C220MteReadFrontend,
         hardware_sync_blocked: bool,
         interface: &mut C220MteL1Interface<U>,
-        map: impl FnOnce(C220Mte1ReadUop) -> U,
-    ) -> Result<C220Mte1ReadEventOutcome, C220Mte1ReadFrontendError> {
+        map: impl FnOnce(C220MteReadUop) -> U,
+    ) -> Result<C220MteReadEventOutcome, C220MteReadFrontendError> {
         let tick = events.tick();
         match callback {
             C220MteGeneratorCallback::InstructionReady => {
                 self.queues
                     .probe_instruction(events, frontend.instruction_ready_tick());
-                Ok(C220Mte1ReadEventOutcome::Readiness)
+                Ok(C220MteReadEventOutcome::Readiness)
             }
             C220MteGeneratorCallback::GeneratedReady => {
                 self.queues.probe_generated(
                     events,
                     frontend.generated().front().map(|head| head.ready_tick),
                 );
-                Ok(C220Mte1ReadEventOutcome::Readiness)
+                Ok(C220MteReadEventOutcome::Readiness)
             }
             C220MteGeneratorCallback::Generate => {
                 let generated = frontend.generate(tick)?;
                 if generated.is_some() {
                     self.queues.arm_generated(events);
                 }
-                Ok(C220Mte1ReadEventOutcome::Generated(generated))
+                Ok(C220MteReadEventOutcome::Generated(generated))
             }
             C220MteGeneratorCallback::Send => frontend
                 .send_mapped(tick, hardware_sync_blocked, interface, map)
-                .map(C220Mte1ReadEventOutcome::Sent),
+                .map(C220MteReadEventOutcome::Sent),
         }
     }
 }

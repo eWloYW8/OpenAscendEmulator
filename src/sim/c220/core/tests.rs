@@ -959,7 +959,7 @@ fn native_mte3_write_path(mode: u8) {
     use crate::isa::c220::mte::C220MovInstruction;
     use crate::sim::c220::memory::biu_write::C220BiuWriteReturnKind::{Completion, Dbid};
     use crate::sim::c220::memory::l1::C220L1Geometry;
-    use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadBandwidths;
+    use crate::sim::c220::mte::read::C220MteReadBandwidths;
     use crate::sim::c220::mte::set2d::C220Set2dBandwidths;
     use std::num::NonZeroU32;
 
@@ -1007,7 +1007,7 @@ fn native_mte3_write_path(mode: u8) {
         core_kind: crate::sim::c220::device::C220CoreKind::Vector0,
         l1: C220L1Geometry::new(32, 4, 1, 0).unwrap(),
         read_width: width,
-        output_bandwidths: C220Mte1ReadBandwidths {
+        output_bandwidths: C220MteReadBandwidths {
             l0a: width,
             l0b: width,
             bt: width,

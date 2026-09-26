@@ -6,9 +6,9 @@ use crate::memory::{
 use crate::sim::c220::core::C220CoreTimingRules;
 use crate::sim::c220::memory::l1::C220L1Geometry;
 use crate::sim::c220::mte::C220MtePipelineConfig;
-use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadBandwidths;
 use crate::sim::c220::mte::mte2::{C220Mte2Completion, C220Mte2TimingRules};
 use crate::sim::c220::mte::mte3::C220Mte3TimingRules;
+use crate::sim::c220::mte::read::C220MteReadBandwidths;
 use crate::sim::c220::mte::set2d::C220Set2dBandwidths;
 use crate::sim::c220::state::C220State;
 use crate::sim::c220::vector::pipeline::C220VectorTimingRules;
@@ -63,7 +63,7 @@ fn configured_dma_core() -> C220Core {
         core_kind: crate::sim::c220::device::C220CoreKind::Vector0,
         l1: C220L1Geometry::new(32, 4, 1, 0).unwrap(),
         read_width: width,
-        output_bandwidths: C220Mte1ReadBandwidths {
+        output_bandwidths: C220MteReadBandwidths {
             l0a: width,
             l0b: width,
             bt: width,

@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
 
-use super::bias::{C220BtReadUop, C220BtRequestPlan};
-use super::load2d::{C220Load2dReadUop, C220Load2dRequestPlan};
-use super::sparse::{C220SparseOutput, C220SparseReadUop, C220SparseRequestPlan};
+use super::mte1::bias::{C220BtReadUop, C220BtRequestPlan};
+use super::mte1::load2d::{C220Load2dReadUop, C220Load2dRequestPlan};
+use super::mte1::sparse::{C220SparseOutput, C220SparseReadUop, C220SparseRequestPlan};
 use crate::isa::c220::mte::bias::C220BtTransfer;
 use crate::isa::c220::mte::load2d::{C220Load2dDestination, C220Load2dError, C220Load2dTransfer};
 use crate::isa::c220::mte::load2d_sparse::C220Load2dSparseTransfer;
@@ -21,17 +21,17 @@ const GENERATED_TICKS: u64 = 3;
 const GENERATED_CAPACITY: usize = 4;
 
 mod events;
-pub use events::{C220Mte1ReadEventOutcome, C220Mte1ReadEvents};
+pub use events::{C220MteReadEventOutcome, C220MteReadEvents};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum C220Mte1ReadKind {
+pub enum C220MteReadKind {
     Load3dv2,
     Load2d,
     Bt,
     Smask,
 }
 
-impl C220Mte1ReadKind {
+impl C220MteReadKind {
     pub(in crate::sim::c220::mte) const ALL: [Self; 4] =
         [Self::Load3dv2, Self::Load2d, Self::Bt, Self::Smask];
 
@@ -60,7 +60,7 @@ impl C220Mte1ReadKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220Mte1ReadBandwidths {
+pub struct C220MteReadBandwidths {
     pub l0a: NonZeroU32,
     pub l0b: NonZeroU32,
     pub bt: NonZeroU32,
@@ -68,7 +68,7 @@ pub struct C220Mte1ReadBandwidths {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum C220Mte1ReadTransfer {
+pub enum C220MteReadTransfer {
     Load3dv2(crate::sim::c220::mte::load3d::C220Load3dV2Command),
     Load2d(C220Load2dTransfer),
     Load2dTranspose(C220Load2dTransposeTransfer),
@@ -77,7 +77,7 @@ pub enum C220Mte1ReadTransfer {
     Smask(C220SmaskTransfer),
 }
 
-impl C220Mte1ReadTransfer {
+impl C220MteReadTransfer {
     pub const fn is_empty(self) -> bool {
         match self {
             Self::Load3dv2(command) => command.disabled.any(),
@@ -89,20 +89,20 @@ impl C220Mte1ReadTransfer {
         }
     }
 
-    pub const fn kind(self) -> C220Mte1ReadKind {
+    pub const fn kind(self) -> C220MteReadKind {
         match self {
-            Self::Load3dv2(_) => C220Mte1ReadKind::Load3dv2,
+            Self::Load3dv2(_) => C220MteReadKind::Load3dv2,
             Self::Load2d(_) | Self::Load2dTranspose(_) | Self::Load2dSparse(_) => {
-                C220Mte1ReadKind::Load2d
+                C220MteReadKind::Load2d
             }
-            Self::Bt(_) => C220Mte1ReadKind::Bt,
-            Self::Smask(_) => C220Mte1ReadKind::Smask,
+            Self::Bt(_) => C220MteReadKind::Bt,
+            Self::Smask(_) => C220MteReadKind::Smask,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum C220Mte1ReadUop {
+pub enum C220MteReadUop {
     Load3dv2(crate::sim::c220::mte::load3d::C220Load3dReadUop),
     Sparse(C220SparseReadUop),
     Load2d(C220Load2dReadUop),
@@ -110,11 +110,11 @@ pub enum C220Mte1ReadUop {
     Smask(C220SmaskReadUop),
 }
 
-impl C220Mte1ReadUop {
+impl C220MteReadUop {
     fn operation(
         self,
         instruction_id: u64,
-        bandwidths: C220Mte1ReadBandwidths,
+        bandwidths: C220MteReadBandwidths,
     ) -> C220MteL1ReadOperation<Self> {
         if let Self::Smask(uop) = self {
             return uop
@@ -226,13 +226,13 @@ impl Plan {
         }
     }
 
-    fn next(&mut self) -> Option<C220Mte1ReadUop> {
+    fn next(&mut self) -> Option<C220MteReadUop> {
         match self {
-            Self::Load3dv2(plan) => plan.pop_front().map(C220Mte1ReadUop::Load3dv2),
-            Self::Sparse(plan) => plan.next().map(C220Mte1ReadUop::Sparse),
-            Self::Load2d(plan) => plan.next().map(C220Mte1ReadUop::Load2d),
-            Self::Bt(plan) => plan.next().map(C220Mte1ReadUop::Bt),
-            Self::Smask(plan) => plan.next().map(C220Mte1ReadUop::Smask),
+            Self::Load3dv2(plan) => plan.pop_front().map(C220MteReadUop::Load3dv2),
+            Self::Sparse(plan) => plan.next().map(C220MteReadUop::Sparse),
+            Self::Load2d(plan) => plan.next().map(C220MteReadUop::Load2d),
+            Self::Bt(plan) => plan.next().map(C220MteReadUop::Bt),
+            Self::Smask(plan) => plan.next().map(C220MteReadUop::Smask),
         }
     }
 }
@@ -245,13 +245,13 @@ struct Generation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220Mte1ReadGenerated {
+pub struct C220MteReadGenerated {
     pub ready_tick: u64,
-    pub operation: C220MteL1ReadOperation<C220Mte1ReadUop>,
+    pub operation: C220MteL1ReadOperation<C220MteReadUop>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220Mte1ReadIssue {
+pub struct C220MteReadIssue {
     pub tick: u64,
     pub instruction_id: u64,
     pub request_count: u64,
@@ -260,52 +260,52 @@ pub struct C220Mte1ReadIssue {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum C220Mte1ReadStall {
+pub enum C220MteReadStall {
     NotReady,
     HardwareFlag,
     OutputFull,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220Mte1ReadSend {
+pub struct C220MteReadSend {
     pub tick: u64,
-    pub offered: Option<C220Mte1ReadGenerated>,
-    pub stall: Option<C220Mte1ReadStall>,
-    pub queued: Option<C220MteL1ReadRequest<C220Mte1ReadUop>>,
+    pub offered: Option<C220MteReadGenerated>,
+    pub stall: Option<C220MteReadStall>,
+    pub queued: Option<C220MteL1ReadRequest<C220MteReadUop>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct C220Mte1ReadFrontendQueues {
+pub struct C220MteReadFrontendQueues {
     pub instruction_requests: u64,
     pub generated: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct C220Mte1ReadFrontendCycle {
+pub struct C220MteReadFrontendCycle {
     pub tick: u64,
-    pub generated: Option<C220MteL1ReadOperation<C220Mte1ReadUop>>,
-    pub queued: Option<C220MteL1ReadRequest<C220Mte1ReadUop>>,
-    pub queues: C220Mte1ReadFrontendQueues,
+    pub generated: Option<C220MteL1ReadOperation<C220MteReadUop>>,
+    pub queued: Option<C220MteL1ReadRequest<C220MteReadUop>>,
+    pub queues: C220MteReadFrontendQueues,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum C220Mte1ReadFrontendError {
+pub enum C220MteReadFrontendError {
     #[error("SMASK source mode {0} is not supported by the L1 generator")]
     SmaskSource(u8),
     #[error(transparent)]
     Load3dv2(#[from] crate::sim::c220::mte::load3d::C220Load3dRequestError),
-    #[error("MTE1 read generator cannot accept a command")]
+    #[error("MTE L1 read generator cannot accept a command")]
     CommandBusy,
-    #[error("MTE1 read generator {expected:?} cannot accept {requested:?}")]
+    #[error("MTE L1 read generator {expected:?} cannot accept {requested:?}")]
     WrongGenerator {
-        expected: C220Mte1ReadKind,
-        requested: C220Mte1ReadKind,
+        expected: C220MteReadKind,
+        requested: C220MteReadKind,
     },
-    #[error("MTE1 read generator time reversed from {previous} to {requested}")]
+    #[error("MTE L1 read generator time reversed from {previous} to {requested}")]
     TimeReversed { previous: u64, requested: u64 },
-    #[error("MTE1 read generator {phase} callback already ran at tick {tick}")]
+    #[error("MTE L1 read generator {phase} callback already ran at tick {tick}")]
     RepeatedCallback { phase: &'static str, tick: u64 },
-    #[error("MTE1 read generator time overflowed")]
+    #[error("MTE L1 read generator time overflowed")]
     TimeOverflow,
     #[error(transparent)]
     Load2d(#[from] C220Load2dError),
@@ -319,22 +319,22 @@ pub enum C220Mte1ReadFrontendError {
 /// producer callback order explicitly; this type does not invent cross-engine
 /// arbitration. An idle frontend does not imply its submitted work has retired.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct C220Mte1ReadFrontend {
-    kind: C220Mte1ReadKind,
+pub struct C220MteReadFrontend {
+    kind: C220MteReadKind,
     access_width: NonZeroU32,
-    bandwidths: C220Mte1ReadBandwidths,
+    bandwidths: C220MteReadBandwidths,
     generation: Option<Generation>,
-    generated: VecDeque<C220Mte1ReadGenerated>,
+    generated: VecDeque<C220MteReadGenerated>,
     observed_tick: Option<u64>,
     generation_tick: Option<u64>,
     send_tick: Option<u64>,
 }
 
-impl C220Mte1ReadFrontend {
+impl C220MteReadFrontend {
     pub fn new(
-        kind: C220Mte1ReadKind,
+        kind: C220MteReadKind,
         access_width: NonZeroU32,
-        bandwidths: C220Mte1ReadBandwidths,
+        bandwidths: C220MteReadBandwidths,
     ) -> Self {
         Self {
             kind,
@@ -348,7 +348,7 @@ impl C220Mte1ReadFrontend {
         }
     }
 
-    pub const fn kind(&self) -> C220Mte1ReadKind {
+    pub const fn kind(&self) -> C220MteReadKind {
         self.kind
     }
 
@@ -360,14 +360,14 @@ impl C220Mte1ReadFrontend {
         self.generation.is_none() && self.generated.len() < self.kind.generated_capacity()
     }
 
-    pub fn queue_state(&self) -> C220Mte1ReadFrontendQueues {
-        C220Mte1ReadFrontendQueues {
+    pub fn queue_state(&self) -> C220MteReadFrontendQueues {
+        C220MteReadFrontendQueues {
             instruction_requests: self.generation.as_ref().map_or(0, |g| g.plan.remaining()),
             generated: self.generated.len(),
         }
     }
 
-    pub fn generated(&self) -> &VecDeque<C220Mte1ReadGenerated> {
+    pub fn generated(&self) -> &VecDeque<C220MteReadGenerated> {
         &self.generated
     }
 
@@ -381,39 +381,39 @@ impl C220Mte1ReadFrontend {
         &mut self,
         tick: u64,
         instruction_id: u64,
-        transfer: C220Mte1ReadTransfer,
-    ) -> Result<C220Mte1ReadIssue, C220Mte1ReadFrontendError> {
+        transfer: C220MteReadTransfer,
+    ) -> Result<C220MteReadIssue, C220MteReadFrontendError> {
         self.check_time(tick)?;
         if transfer.kind() != self.kind {
-            return Err(C220Mte1ReadFrontendError::WrongGenerator {
+            return Err(C220MteReadFrontendError::WrongGenerator {
                 expected: self.kind,
                 requested: transfer.kind(),
             });
         }
         if !self.can_issue() {
-            return Err(C220Mte1ReadFrontendError::CommandBusy);
+            return Err(C220MteReadFrontendError::CommandBusy);
         }
         let plan = match transfer {
-            C220Mte1ReadTransfer::Smask(transfer) => Plan::Smask(
+            C220MteReadTransfer::Smask(transfer) => Plan::Smask(
                 C220SmaskRequestPlan::new(transfer, self.access_width).map_err(|_| {
-                    C220Mte1ReadFrontendError::SmaskSource(transfer.instruction.source_mode)
+                    C220MteReadFrontendError::SmaskSource(transfer.instruction.source_mode)
                 })?,
             ),
-            C220Mte1ReadTransfer::Load3dv2(command) => {
+            C220MteReadTransfer::Load3dv2(command) => {
                 Plan::Load3dv2(command.physical_reads(self.access_width)?.collect())
             }
-            C220Mte1ReadTransfer::Load2dSparse(transfer) => {
+            C220MteReadTransfer::Load2dSparse(transfer) => {
                 Plan::Sparse(C220SparseRequestPlan::new(transfer, self.access_width))
             }
-            C220Mte1ReadTransfer::Bt(transfer) => Plan::Bt(C220BtRequestPlan::new(
+            C220MteReadTransfer::Bt(transfer) => Plan::Bt(C220BtRequestPlan::new(
                 transfer,
                 self.bandwidths.bt,
                 self.access_width,
             )),
-            C220Mte1ReadTransfer::Load2d(transfer) => {
+            C220MteReadTransfer::Load2d(transfer) => {
                 Plan::Load2d(C220Load2dRequestPlan::new(transfer, self.access_width)?)
             }
-            C220Mte1ReadTransfer::Load2dTranspose(transfer) => Plan::Load2d(
+            C220MteReadTransfer::Load2dTranspose(transfer) => Plan::Load2d(
                 C220Load2dRequestPlan::new_transpose(transfer, self.access_width)?,
             ),
         };
@@ -421,7 +421,7 @@ impl C220Mte1ReadFrontend {
         if request_count != 0 {
             let ready_tick = tick
                 .checked_add(COMMAND_TICKS)
-                .ok_or(C220Mte1ReadFrontendError::TimeOverflow)?;
+                .ok_or(C220MteReadFrontendError::TimeOverflow)?;
             self.generation = Some(Generation {
                 ready_tick,
                 instruction_id,
@@ -429,7 +429,7 @@ impl C220Mte1ReadFrontend {
             });
         }
         self.observed_tick = Some(tick);
-        Ok(C220Mte1ReadIssue {
+        Ok(C220MteReadIssue {
             tick,
             instruction_id,
             request_count,
@@ -440,7 +440,7 @@ impl C220Mte1ReadFrontend {
     pub fn generate(
         &mut self,
         tick: u64,
-    ) -> Result<Option<C220Mte1ReadGenerated>, C220Mte1ReadFrontendError> {
+    ) -> Result<Option<C220MteReadGenerated>, C220MteReadFrontendError> {
         self.check_callback(tick, self.generation_tick, "generation")?;
         let eligible = self
             .instruction_ready_tick()
@@ -449,14 +449,14 @@ impl C220Mte1ReadFrontend {
         let generated = if eligible {
             let ready_tick = tick
                 .checked_add(self.kind.generated_ticks())
-                .ok_or(C220Mte1ReadFrontendError::TimeOverflow)?;
+                .ok_or(C220MteReadFrontendError::TimeOverflow)?;
             let generation = self.generation.as_mut().expect("eligible instruction");
             let operation = generation
                 .plan
                 .next()
                 .expect("nonempty request plan")
                 .operation(generation.instruction_id, self.bandwidths);
-            let entry = C220Mte1ReadGenerated {
+            let entry = C220MteReadGenerated {
                 ready_tick,
                 operation,
             };
@@ -477,8 +477,8 @@ impl C220Mte1ReadFrontend {
         &mut self,
         tick: u64,
         hardware_sync_blocked: bool,
-        interface: &mut C220MteL1Interface<C220Mte1ReadUop>,
-    ) -> Result<C220Mte1ReadSend, C220Mte1ReadFrontendError> {
+        interface: &mut C220MteL1Interface<C220MteReadUop>,
+    ) -> Result<C220MteReadSend, C220MteReadFrontendError> {
         self.send_mapped(tick, hardware_sync_blocked, interface, |payload| payload)
     }
 
@@ -487,17 +487,17 @@ impl C220Mte1ReadFrontend {
         tick: u64,
         hardware_sync_blocked: bool,
         interface: &mut C220MteL1Interface<T>,
-        map: impl FnOnce(C220Mte1ReadUop) -> T,
-    ) -> Result<C220Mte1ReadSend, C220Mte1ReadFrontendError> {
+        map: impl FnOnce(C220MteReadUop) -> T,
+    ) -> Result<C220MteReadSend, C220MteReadFrontendError> {
         self.check_callback(tick, self.send_tick, "send")?;
         let offered = self.generated.front().copied();
         let mut stall = None;
         let mut queued = None;
         if let Some(head) = offered {
             stall = if head.ready_tick > tick {
-                Some(C220Mte1ReadStall::NotReady)
+                Some(C220MteReadStall::NotReady)
             } else if hardware_sync_blocked {
-                Some(C220Mte1ReadStall::HardwareFlag)
+                Some(C220MteReadStall::HardwareFlag)
             } else {
                 queued = interface
                     .push(
@@ -513,13 +513,13 @@ impl C220Mte1ReadFrontend {
                     self.generated.pop_front();
                     None
                 } else {
-                    Some(C220Mte1ReadStall::OutputFull)
+                    Some(C220MteReadStall::OutputFull)
                 }
             };
         }
         self.send_tick = Some(tick);
         self.observed_tick = Some(tick);
-        Ok(C220Mte1ReadSend {
+        Ok(C220MteReadSend {
             tick,
             offered,
             stall,
@@ -533,8 +533,8 @@ impl C220Mte1ReadFrontend {
         &mut self,
         tick: u64,
         hardware_sync_blocked: bool,
-        interface: &mut C220MteL1Interface<C220Mte1ReadUop>,
-    ) -> Result<C220Mte1ReadFrontendCycle, C220Mte1ReadFrontendError> {
+        interface: &mut C220MteL1Interface<C220MteReadUop>,
+    ) -> Result<C220MteReadFrontendCycle, C220MteReadFrontendError> {
         self.check_callback(tick, self.send_tick, "send")?;
         self.check_callback(tick, self.generation_tick, "generation")?;
         let port = C220MteL1ReadPort::Port0;
@@ -554,11 +554,11 @@ impl C220Mte1ReadFrontend {
             && self.generated.len() - usize::from(dispatch) < GENERATED_CAPACITY;
         if generate {
             tick.checked_add(GENERATED_TICKS)
-                .ok_or(C220Mte1ReadFrontendError::TimeOverflow)?;
+                .ok_or(C220MteReadFrontendError::TimeOverflow)?;
         }
         let queued = self.send(tick, hardware_sync_blocked, interface)?.queued;
         let generated = self.generate(tick)?.map(|entry| entry.operation);
-        Ok(C220Mte1ReadFrontendCycle {
+        Ok(C220MteReadFrontendCycle {
             tick,
             generated,
             queued,
@@ -566,11 +566,11 @@ impl C220Mte1ReadFrontend {
         })
     }
 
-    fn check_time(&self, tick: u64) -> Result<(), C220Mte1ReadFrontendError> {
+    fn check_time(&self, tick: u64) -> Result<(), C220MteReadFrontendError> {
         if let Some(previous) = self.observed_tick
             && tick < previous
         {
-            return Err(C220Mte1ReadFrontendError::TimeReversed {
+            return Err(C220MteReadFrontendError::TimeReversed {
                 previous,
                 requested: tick,
             });
@@ -583,10 +583,10 @@ impl C220Mte1ReadFrontend {
         tick: u64,
         previous: Option<u64>,
         phase: &'static str,
-    ) -> Result<(), C220Mte1ReadFrontendError> {
+    ) -> Result<(), C220MteReadFrontendError> {
         self.check_time(tick)?;
         if previous == Some(tick) {
-            return Err(C220Mte1ReadFrontendError::RepeatedCallback { phase, tick });
+            return Err(C220MteReadFrontendError::RepeatedCallback { phase, tick });
         }
         Ok(())
     }

@@ -1,5 +1,5 @@
+use super::super::read::C220MteReadTransfer;
 use super::bias::{C220BtTransferError, C220BtTransferResult, prepare_c220_mov_l1_to_bt};
-use super::frontend::C220Mte1ReadTransfer;
 use super::load2d::prepare_c220_load2d_transpose;
 use super::load2d::{C220Load2dTransferError, C220Load2dTransferResult, prepare_c220_load2d};
 use super::sparse::{C220SparseTransferResult, prepare_c220_load2d_sparse};
@@ -150,7 +150,7 @@ impl Mte1Engine {
         command: C220Mte1Command,
     ) -> Result<Option<C220MatrixMemory>, C220Mte1RuntimeError> {
         let memory = match command {
-            C220Mte1Command::Read(C220Mte1ReadTransfer::Load3dv2(command)) => {
+            C220Mte1Command::Read(C220MteReadTransfer::Load3dv2(command)) => {
                 Some(match command.operands.instruction.destination {
                     crate::isa::c220::mte::load3d::C220Load3dDestination::L0a => {
                         C220MatrixMemory::L0a
@@ -170,23 +170,22 @@ impl Mte1Engine {
                     return Err(C220MtePipelineError::WrongCommandLane.into());
                 }
             },
-            C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(_)) => Some(C220MatrixMemory::BiasTable),
-            C220Mte1Command::Read(C220Mte1ReadTransfer::Smask(_)) => None,
-            C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dSparse(_)) => {
+            C220Mte1Command::Read(C220MteReadTransfer::Bt(_)) => Some(C220MatrixMemory::BiasTable),
+            C220Mte1Command::Read(C220MteReadTransfer::Smask(_)) => None,
+            C220Mte1Command::Read(C220MteReadTransfer::Load2dSparse(_)) => {
                 Some(C220MatrixMemory::L0b)
             }
-            C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dTranspose(transfer)) => {
-                match transfer.instruction.destination {
-                    C220Load2dDestination::L0a => Some(C220MatrixMemory::L0a),
-                    C220Load2dDestination::L0b => Some(C220MatrixMemory::L0b),
-                    destination => {
-                        return Err(
-                            C220Load2dTransferError::UnsupportedDestination(destination).into()
-                        );
-                    }
+            C220Mte1Command::Read(C220MteReadTransfer::Load2dTranspose(transfer)) => match transfer
+                .instruction
+                .destination
+            {
+                C220Load2dDestination::L0a => Some(C220MatrixMemory::L0a),
+                C220Load2dDestination::L0b => Some(C220MatrixMemory::L0b),
+                destination => {
+                    return Err(C220Load2dTransferError::UnsupportedDestination(destination).into());
                 }
-            }
-            C220Mte1Command::Read(C220Mte1ReadTransfer::Load2d(transfer)) => match transfer
+            },
+            C220Mte1Command::Read(C220MteReadTransfer::Load2d(transfer)) => match transfer
                 .instruction
                 .destination
             {
@@ -318,7 +317,7 @@ impl Mte1Engine {
             let result = match pending.command {
                 C220Mte1Command::WriteSpr(step) => C220Mte1TransferResult::WriteSpr(step),
                 C220Mte1Command::HardwareFlag(step) => C220Mte1TransferResult::HardwareFlag(step),
-                C220Mte1Command::Read(C220Mte1ReadTransfer::Load3dv2(command)) => {
+                C220Mte1Command::Read(C220MteReadTransfer::Load3dv2(command)) => {
                     C220Mte1TransferResult::Load3dv2(command.execute(memory)?)
                 }
                 C220Mte1Command::CrossCore { payload, .. } => {
@@ -327,27 +326,27 @@ impl Mte1Engine {
                 C220Mte1Command::Set2d(fill) => {
                     C220Mte1TransferResult::Set2d(execute_c220_set2d(memory, fill)?)
                 }
-                C220Mte1Command::Read(C220Mte1ReadTransfer::Load2d(transfer)) => {
+                C220Mte1Command::Read(C220MteReadTransfer::Load2d(transfer)) => {
                     let prepared = prepare_c220_load2d(memory, transfer)?;
                     let result = prepared.result;
                     prepared.commit(memory)?;
                     C220Mte1TransferResult::Load2d(result)
                 }
-                C220Mte1Command::Read(C220Mte1ReadTransfer::Bt(transfer)) => {
+                C220Mte1Command::Read(C220MteReadTransfer::Bt(transfer)) => {
                     C220Mte1TransferResult::Bt(
                         prepare_c220_mov_l1_to_bt(memory, transfer)?.commit(memory)?,
                     )
                 }
-                C220Mte1Command::Read(C220Mte1ReadTransfer::Smask(transfer)) => {
+                C220Mte1Command::Read(C220MteReadTransfer::Smask(transfer)) => {
                     C220Mte1TransferResult::Smask(execute_c220_mov_l1_to_smask(memory, transfer)?)
                 }
-                C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dTranspose(transfer)) => {
+                C220Mte1Command::Read(C220MteReadTransfer::Load2dTranspose(transfer)) => {
                     let prepared = prepare_c220_load2d_transpose(memory, transfer)?;
                     let result = prepared.result;
                     prepared.commit(memory)?;
                     C220Mte1TransferResult::Load2dTranspose(result)
                 }
-                C220Mte1Command::Read(C220Mte1ReadTransfer::Load2dSparse(transfer)) => {
+                C220Mte1Command::Read(C220MteReadTransfer::Load2dSparse(transfer)) => {
                     let prepared = prepare_c220_load2d_sparse(memory.l1(), transfer)?;
                     let (l0b, indices) = memory.sparse_weight_buffers_mut();
                     C220Mte1TransferResult::Load2dSparse(prepared.commit(l0b, indices)?)
@@ -386,7 +385,7 @@ mod tests {
     use crate::isa::c220::mte::load2d::C220Load2dInstruction;
     use crate::sim::c220::memory::l1::C220L1Geometry;
     use crate::sim::c220::mte::C220MtePipelineConfig;
-    use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadBandwidths;
+    use crate::sim::c220::mte::read::C220MteReadBandwidths;
     use std::num::NonZeroU32;
 
     fn advance(
@@ -414,7 +413,7 @@ mod tests {
                 core_kind: crate::sim::c220::device::C220CoreKind::Cube,
                 l1: C220L1Geometry::new(32, 4, 1, 0).unwrap(),
                 read_width: width,
-                output_bandwidths: C220Mte1ReadBandwidths {
+                output_bandwidths: C220MteReadBandwidths {
                     l0a: width,
                     l0b: width,
                     bt: width,
@@ -452,7 +451,7 @@ mod tests {
             .unwrap();
         flags.enqueue_mte_flag(1, independent_set, 0).unwrap();
         advance(&mut engine, &mut pipeline, 0, &mut memory, &mut flags).unwrap();
-        let command = C220Mte1Command::Read(C220Mte1ReadTransfer::Load2d(transfer));
+        let command = C220Mte1Command::Read(C220MteReadTransfer::Load2d(transfer));
         let issue = engine
             .issue(&mut pipeline, 2, 4, command, &mut flags)
             .unwrap();
@@ -544,7 +543,7 @@ mod tests {
                 &mut pipeline,
                 3,
                 8,
-                C220Mte1Command::Read(C220Mte1ReadTransfer::Load2d(empty)),
+                C220Mte1Command::Read(C220MteReadTransfer::Load2d(empty)),
                 &mut flags,
             )
             .unwrap();

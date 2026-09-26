@@ -2,7 +2,7 @@ use super::*;
 use crate::isa::c220::mte::load2d::C220Load2dInstruction;
 use crate::isa::c220::mte::set2d::C220Set2dInstruction;
 use crate::sim::c220::mte::interface::C220MteL1WritePort;
-use crate::sim::c220::mte::mte1::frontend::C220Mte1ReadTransfer;
+use crate::sim::c220::mte::read::C220MteReadTransfer;
 use std::collections::BTreeMap;
 
 #[test]
@@ -19,7 +19,7 @@ fn factor_reads_share_l1_and_complete_on_fix_lane() {
             core_kind: crate::sim::c220::device::C220CoreKind::Cube,
             l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
             read_width: width,
-            output_bandwidths: C220Mte1ReadBandwidths {
+            output_bandwidths: C220MteReadBandwidths {
                 l0a: width,
                 l0b: width,
                 bt: width,
@@ -128,7 +128,7 @@ fn mte3_output_and_biu_split_use_independent_captured_modes() {
             core_kind: crate::sim::c220::device::C220CoreKind::Cube,
             l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
             read_width: width,
-            output_bandwidths: C220Mte1ReadBandwidths {
+            output_bandwidths: C220MteReadBandwidths {
                 l0a: width,
                 l0b: width,
                 bt: width,
@@ -193,7 +193,7 @@ fn fixp_write_runs_on_shared_clock_and_retires_after_contended_response() {
             core_kind: crate::sim::c220::device::C220CoreKind::Cube,
             l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
             read_width: width,
-            output_bandwidths: C220Mte1ReadBandwidths {
+            output_bandwidths: C220MteReadBandwidths {
                 l0a: width,
                 l0b: width,
                 bt: width,
@@ -303,7 +303,7 @@ fn run_fixp_output(conversion_mode: u8, integer: bool, split: bool) {
             core_kind: crate::sim::c220::device::C220CoreKind::Cube,
             l1: C220L1Geometry::new(32, 16, 2, 9).unwrap(),
             read_width: width,
-            output_bandwidths: C220Mte1ReadBandwidths {
+            output_bandwidths: C220MteReadBandwidths {
                 l0a: width,
                 l0b: width,
                 bt: width,
@@ -516,7 +516,7 @@ fn biu_write_waits_for_dbid_and_all_source_packets_before_data_transport() {
             core_kind: crate::sim::c220::device::C220CoreKind::Cube,
             l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
             read_width: width,
-            output_bandwidths: C220Mte1ReadBandwidths {
+            output_bandwidths: C220MteReadBandwidths {
                 l0a: width,
                 l0b: width,
                 bt: width,
@@ -597,7 +597,7 @@ fn ub_reads_share_vector_banks_and_wait_for_matching_response_tags() {
         core_kind: crate::sim::c220::device::C220CoreKind::Cube,
         l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
         read_width: width,
-        output_bandwidths: C220Mte1ReadBandwidths {
+        output_bandwidths: C220MteReadBandwidths {
             l0a: width,
             l0b: width,
             bt: width,
@@ -738,7 +738,7 @@ fn l1_fill_contends_with_load2d_and_completes_after_write_response() {
         core_kind: crate::sim::c220::device::C220CoreKind::Cube,
         l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
         read_width: width,
-        output_bandwidths: C220Mte1ReadBandwidths {
+        output_bandwidths: C220MteReadBandwidths {
             l0a: width,
             l0b: width,
             bt: width,
@@ -752,7 +752,7 @@ fn l1_fill_contends_with_load2d_and_completes_after_write_response() {
     };
     let mut registers = [0; 32];
     registers[3] = (1 << 16) | (1 << 24);
-    let read = C220Mte1Command::Read(C220Mte1ReadTransfer::Load2d(
+    let read = C220Mte1Command::Read(C220MteReadTransfer::Load2d(
         C220Load2dInstruction::decode((3 << 29) | (1 << 17) | (2 << 12) | (3 << 7))
             .unwrap()
             .capture(&registers)

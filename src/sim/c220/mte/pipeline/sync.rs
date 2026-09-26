@@ -167,9 +167,9 @@ impl C220MtePipeline {
                     &mut self.generators[kind.index()],
                     blocked,
                     &mut self.interface,
-                    C220MteReadPayload::Mte1,
+                    C220MteReadPayload::Read,
                 )?;
-                if outcome != C220Mte1ReadEventOutcome::Readiness {
+                if outcome != C220MteReadEventOutcome::Readiness {
                     self.trace
                         .push(C220MtePipelineEvent::Generator(kind, outcome));
                 }

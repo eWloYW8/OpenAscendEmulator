@@ -122,8 +122,8 @@ mod tests {
         use crate::sim::c220::mte::{
             interface::biu_read::C220BiuSubcore,
             interface::biu_write::command::C220BiuWriteConfig,
-            mte1::frontend::C220Mte1ReadBandwidths,
             pipeline::{C220MtePipeline, C220MtePipelineConfig, C220MtePipelineEvent},
+            read::C220MteReadBandwidths,
             set2d::C220Set2dBandwidths,
             uop::C220DmaUopMode,
         };
@@ -134,7 +134,7 @@ mod tests {
                 core_kind: crate::sim::c220::device::C220CoreKind::Cube,
                 l1: C220L1Geometry::new(32, 1, 1, 0).unwrap(),
                 read_width: width,
-                output_bandwidths: C220Mte1ReadBandwidths {
+                output_bandwidths: C220MteReadBandwidths {
                     l0a: width,
                     l0b: width,
                     bt: width,

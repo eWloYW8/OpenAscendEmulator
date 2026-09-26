@@ -18,8 +18,8 @@ fn nz(value: u32) -> NonZeroU32 {
     NonZeroU32::new(value).unwrap()
 }
 
-fn bandwidths(bt: u32) -> C220Mte1ReadBandwidths {
-    C220Mte1ReadBandwidths {
+fn bandwidths(bt: u32) -> C220MteReadBandwidths {
+    C220MteReadBandwidths {
         bt: nz(bt),
         smask: nz(bt),
         l0a: nz(256),
@@ -40,10 +40,10 @@ fn bt_transfer(convert: bool) -> C220BtTransfer {
 
 #[test]
 fn expanded_output_stalls_reads_until_the_following_cycle() {
-    let mut frontend = C220Mte1ReadFrontend::new(C220Mte1ReadKind::Bt, nz(32), bandwidths(32));
+    let mut frontend = C220MteReadFrontend::new(C220MteReadKind::Bt, nz(32), bandwidths(32));
     let mut interface = C220MteL1Interface::default();
     frontend
-        .issue(0, 7, C220Mte1ReadTransfer::Bt(bt_transfer(true)))
+        .issue(0, 7, C220MteReadTransfer::Bt(bt_transfer(true)))
         .unwrap();
     let mut response = None;
     let mut gated_cycles = 0;
@@ -101,10 +101,10 @@ fn bt_frontend_preserves_physical_requests_backpressure_and_retirement() {
         );
         assert_eq!(requests[0].logical, requests[2].logical);
         assert_eq!(requests[3].logical.destination_address, 1120);
-        let mut frontend = C220Mte1ReadFrontend::new(C220Mte1ReadKind::Bt, nz(32), bandwidths(96));
+        let mut frontend = C220MteReadFrontend::new(C220MteReadKind::Bt, nz(32), bandwidths(96));
         let mut interface = C220MteL1Interface::default();
         let issue = frontend
-            .issue(0, 7, C220Mte1ReadTransfer::Bt(transfer))
+            .issue(0, 7, C220MteReadTransfer::Bt(transfer))
             .unwrap();
         assert!(!issue.completion_ready && issue.request_count == 8);
         let interface_before = interface.clone();
@@ -120,8 +120,8 @@ fn bt_frontend_preserves_physical_requests_backpressure_and_retirement() {
         ));
         assert_eq!(interface, interface_before);
         assert_eq!(
-            frontend.issue(0, 8, C220Mte1ReadTransfer::Bt(transfer)),
-            Err(C220Mte1ReadFrontendError::CommandBusy)
+            frontend.issue(0, 8, C220MteReadTransfer::Bt(transfer)),
+            Err(C220MteReadFrontendError::CommandBusy)
         );
 
         let mut l1 = C220L1Transport::new(C220L1Geometry::new(32, 4, 1, 0).unwrap());
@@ -154,7 +154,7 @@ fn bt_frontend_preserves_physical_requests_backpressure_and_retirement() {
                 let before = frontend.clone();
                 assert!(matches!(
                     frontend.step(tick, false, &mut interface),
-                    Err(C220Mte1ReadFrontendError::RepeatedCallback { .. })
+                    Err(C220MteReadFrontendError::RepeatedCallback { .. })
                 ));
                 assert_eq!(frontend, before);
             }
@@ -165,7 +165,7 @@ fn bt_frontend_preserves_physical_requests_backpressure_and_retirement() {
                 if physical.is_empty() {
                     assert_eq!(tick, 17);
                 }
-                let C220Mte1ReadUop::Bt(uop) = request.operation.payload else {
+                let C220MteReadUop::Bt(uop) = request.operation.payload else {
                     panic!("BT request")
                 };
                 physical.push(uop);
@@ -246,13 +246,13 @@ fn bt_frontend_preserves_physical_requests_backpressure_and_retirement() {
         let mut empty = transfer;
         empty.descriptor.burst_blocks = 0;
         let issue = frontend
-            .issue(200, 8, C220Mte1ReadTransfer::Bt(empty))
+            .issue(200, 8, C220MteReadTransfer::Bt(empty))
             .unwrap();
         assert!(issue.completion_ready && issue.request_count == 0 && frontend.is_idle());
         let before = frontend.clone();
         assert_eq!(
-            frontend.issue(u64::MAX, 9, C220Mte1ReadTransfer::Bt(transfer)),
-            Err(C220Mte1ReadFrontendError::TimeOverflow)
+            frontend.issue(u64::MAX, 9, C220MteReadTransfer::Bt(transfer)),
+            Err(C220MteReadFrontendError::TimeOverflow)
         );
         assert_eq!(frontend, before);
     }
@@ -271,7 +271,7 @@ fn bt_frontend_preserves_physical_requests_backpressure_and_retirement() {
 fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators() {
     #[derive(Clone, Copy)]
     enum Callback {
-        Generator(C220Mte1ReadKind, C220MteGeneratorCallback),
+        Generator(C220MteReadKind, C220MteGeneratorCallback),
         Memory(C220L1Callback),
         L1(C220MteL1Callback),
         L0(bool, C220L0WriteCallback),
@@ -288,8 +288,8 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
         let expected = C220Load2dRequestPlan::new(transfer, nz(96))
             .unwrap()
             .collect::<Vec<_>>();
-        let mut load = C220Mte1ReadFrontend::new(C220Mte1ReadKind::Load2d, nz(96), bandwidths(96));
-        let mut bt = C220Mte1ReadFrontend::new(C220Mte1ReadKind::Bt, nz(96), bandwidths(96));
+        let mut load = C220MteReadFrontend::new(C220MteReadKind::Load2d, nz(96), bandwidths(96));
+        let mut bt = C220MteReadFrontend::new(C220MteReadKind::Bt, nz(96), bandwidths(96));
         let mut interface = C220MteL1Interface::default();
         let mut l1 = C220L1Transport::new(C220L1Geometry::new(32, 4, 1, 0).unwrap());
         let mut l0a = C220L0WritePipeline::default();
@@ -302,18 +302,18 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
             C220L0WriteEvents::register(&mut events, clock, |phase| Callback::L0(false, phase));
         let l0b_events =
             C220L0WriteEvents::register(&mut events, clock, |phase| Callback::L0(true, phase));
-        let load_events = C220Mte1ReadEvents::register(&mut events, clock, |phase| {
-            Callback::Generator(C220Mte1ReadKind::Load2d, phase)
+        let load_events = C220MteReadEvents::register(&mut events, clock, |phase| {
+            Callback::Generator(C220MteReadKind::Load2d, phase)
         });
-        let bt_events = C220Mte1ReadEvents::register(&mut events, clock, |phase| {
-            Callback::Generator(C220Mte1ReadKind::Bt, phase)
+        let bt_events = C220MteReadEvents::register(&mut events, clock, |phase| {
+            Callback::Generator(C220MteReadKind::Bt, phase)
         });
         load_events
             .issue(
                 &mut events,
                 &mut load,
                 1,
-                C220Mte1ReadTransfer::Load2d(transfer),
+                C220MteReadTransfer::Load2d(transfer),
             )
             .unwrap();
         bt_events
@@ -321,7 +321,7 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
                 &mut events,
                 &mut bt,
                 2,
-                C220Mte1ReadTransfer::Bt(bt_transfer(true)),
+                C220MteReadTransfer::Bt(bt_transfer(true)),
             )
             .unwrap();
         let mut ids = BTreeSet::new();
@@ -381,8 +381,7 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
                             C220MteL1EventOutcome::Request(send) => {
                                 if let Some(request) = send.sent {
                                     assert!(ids.insert(request.id));
-                                    if let C220Mte1ReadUop::Load2d(uop) = request.operation.payload
-                                    {
+                                    if let C220MteReadUop::Load2d(uop) = request.operation.payload {
                                         reads.push(uop);
                                     }
                                     assert!(
@@ -442,11 +441,11 @@ fn load2d_and_bt_share_input_capacity_ids_and_output_with_independent_generators
                     }
                 };
                 let (binding, frontend, index) = match kind {
-                    C220Mte1ReadKind::Load3dv2 | C220Mte1ReadKind::Smask => {
+                    C220MteReadKind::Load3dv2 | C220MteReadKind::Smask => {
                         unreachable!("not registered in this test")
                     }
-                    C220Mte1ReadKind::Load2d => (&load_events, &mut load, 0),
-                    C220Mte1ReadKind::Bt => (&bt_events, &mut bt, 1),
+                    C220MteReadKind::Load2d => (&load_events, &mut load, 0),
+                    C220MteReadKind::Bt => (&bt_events, &mut bt, 1),
                 };
                 if matches!(
                     phase,
