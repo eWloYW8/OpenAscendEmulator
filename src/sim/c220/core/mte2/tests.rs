@@ -113,7 +113,10 @@ fn external_load2d_retires_only_after_its_selected_local_destination() {
             machine.set_xreg(1, 1024).unwrap();
             machine.set_xreg(2, 0x2000 + offset).unwrap();
             machine
-                .set_xreg(3, (2 << 16) | (1 << 24) | (1 << 44))
+                .set_xreg(
+                    3,
+                    (2 << 16) | (1 << 24) | (1 << 44) | if offset == 0 { 0 } else { 7 << 61 },
+                )
                 .unwrap();
             let transpose = destination != 2;
             let word = (3 << 29)
@@ -121,6 +124,7 @@ fn external_load2d_retires_only_after_its_selected_local_destination() {
                 | (2 << 12)
                 | (3 << 7)
                 | 16
+                | if offset == 0 { 0 } else { 64 }
                 | destination
                 | (u32::from(transpose) << 2);
             core.step_word_at(0, word).unwrap();

@@ -106,9 +106,6 @@ impl C220Load2dInstruction {
                 destination_buffer: self.destination,
             });
         }
-        if self.reserved_bit_6 {
-            return Err(C220Load2dError::UnsupportedInstructionBit6);
-        }
         let descriptor = C220Load2dDescriptor::decode(
             xregs[usize::from(self.descriptor_register)],
             self.address_mode,
@@ -144,10 +141,8 @@ impl C220Load2dDescriptor {
         address_mode: C220Load2dAddressMode,
     ) -> Result<Self, C220Load2dError> {
         let repeat_count = ((raw >> 16) & 0xff) as u8;
-        if repeat_count != 0 && raw >> 60 != 0 {
-            return Err(C220Load2dError::UnsupportedDescriptorHighBits {
-                bits: (raw >> 60) as u8,
-            });
+        if repeat_count != 0 && raw & (1 << 60) != 0 {
+            return Err(C220Load2dError::UnsupportedDescriptorBit60);
         }
         Ok(Self {
             raw,
@@ -241,8 +236,51 @@ pub enum C220Load2dError {
         source_buffer: C220Load2dSource,
         destination_buffer: C220Load2dDestination,
     },
-    #[error("LOAD_2D instruction bit 6 is unsupported")]
-    UnsupportedInstructionBit6,
-    #[error("LOAD_2D descriptor high bits 60:63 are unsupported: {bits:#x}")]
-    UnsupportedDescriptorHighBits { bits: u8 },
+    #[error("LOAD_2D descriptor bit 60 is unsupported")]
+    UnsupportedDescriptorBit60,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignored_bits_preserve_operands_and_segment_addresses() {
+        for route in [0, 1, 16, 17, 18] {
+            for transpose in [0, 4] {
+                for decrement in [0, 32] {
+                    let word = 0x6000_2180 | route | transpose | decrement;
+                    let mut registers = [0; 32];
+                    registers[0] = 64;
+                    registers[2] = 128;
+                    registers[3] = (3 << 16) | (2 << 24) | (7 << 44);
+                    let baseline = C220Load2dInstruction::decode(word)
+                        .unwrap()
+                        .capture(&registers)
+                        .unwrap();
+                    let expected = baseline.segments().collect::<Vec<_>>();
+                    for upper in 0..8_u64 {
+                        for bit6 in [0, 64] {
+                            registers[3] = baseline.descriptor.raw | (upper << 61);
+                            let transfer = C220Load2dInstruction::decode(word | bit6)
+                                .unwrap()
+                                .capture(&registers)
+                                .unwrap();
+                            assert_eq!(transfer.segments().collect::<Vec<_>>(), expected);
+                            assert_eq!(transfer.descriptor.raw, registers[3]);
+                            assert_eq!(transfer.instruction.reserved_bit_6, bit6 != 0);
+                        }
+                    }
+                    registers[3] |= 1 << 60;
+                    let instruction = C220Load2dInstruction::decode(word | 64).unwrap();
+                    assert_eq!(
+                        instruction.capture(&registers),
+                        Err(C220Load2dError::UnsupportedDescriptorBit60)
+                    );
+                    registers[3] &= !(0xff << 16);
+                    assert_eq!(instruction.capture(&registers).unwrap().segments().len(), 0);
+                }
+            }
+        }
+    }
 }

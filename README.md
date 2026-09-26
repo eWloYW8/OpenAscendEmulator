@@ -50,7 +50,8 @@ events in `mte/pipeline.rs`; it is not privately owned by a command lane.
 Cube numerical helpers are private; execution results
 and timing state remain inspectable.
 
-`mte/mte1/{bias,load2d}/` own data movement and lazy physical request expansion.
+`mte/mte1/bias/` and `mte/load2d/` own data movement and lazy physical request
+expansion; LOAD2D serves both L1 and external-memory source paths.
 `mte/read/` owns the shared L1 read-generation engines for LOAD3Dv2, LOAD2D,
 BT and SMASK, independently of command-lane admission and retirement.
 They share one `C220MteL1Interface` instead of owning separate read/output lanes.
@@ -112,8 +113,10 @@ complete callback-order equivalence is not established.
 The integrated core coordinates LOAD2D, BT and SET_2D through the shared physical
 MTE pipeline. Configure its geometry and bandwidths with `configure_mte_pipeline`;
 inspect queues and the latest physical events with `mte_pipeline()`.
-LOAD2D captures register operands on issue but reads L1 and commits L0 at
-ordered command retirement. Issue events contain the plan, not a premature
+LOAD2D captures register operands on issue and samples source memory at
+ordered command retirement. External LOAD2D uses an independent generator and
+the Cube BIU, waiting for L0A, L0B or L1 destination acknowledgment before
+retirement. Issue events contain the plan, not a premature
 transfer result. `core.last_mte1_outcomes()` reports the transfers completed
 during the latest advance, including instruction identity, retirement tick,
 and known/unknown byte counts. Non-triggered MTE1 HSETs are queued per memory

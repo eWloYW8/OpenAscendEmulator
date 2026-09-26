@@ -64,7 +64,7 @@ struct Generation {
     requests: Requests,
 }
 
-/// Ordinary DMA generation, independent of the destination response path.
+/// Ordinary DMA or external LOAD2D generation, using independent instances.
 /// Sending the final request permits generator switching but never retires
 /// the command. The consumer supplies output credit and synchronization gates.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -178,15 +178,16 @@ impl C220DmaFrontend {
                 .ok_or(C220DmaFrontendError::TimeOverflow)?;
             let generation = self.generation.as_mut().expect("eligible command");
             let request = generation.requests.next().expect("nonempty command");
+            let (destination, mode, out_of_order) = generation.requests.metadata();
             let last_in_instruction = generation.requests.clone().next().is_none();
             let entry = C220DmaGenerated {
                 instruction_id: generation.instruction_id,
                 uop_index: generation.next_index,
                 ready_tick,
                 request,
-                destination: generation.requests.metadata().0,
-                mode: generation.requests.metadata().1,
-                out_of_order: generation.requests.metadata().2,
+                destination,
+                mode,
+                out_of_order,
                 last_in_instruction,
             };
             generation.next_index += 1;
